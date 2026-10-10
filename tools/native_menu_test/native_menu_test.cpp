@@ -128,6 +128,9 @@ int wmain(int argc, wchar_t** argv) {
     EdvrNativeMenuRequest request{sizeof(request), EDVR_NATIVE_MENU_VERSION_1, device.Get(), 17};
     EdvrNativeMenuTable table{sizeof(table), EDVR_NATIVE_MENU_VERSION_1};
     check(edvrAcquireNativeMenu(&request, &table) == S_OK && table.context && nativeMenuActive() && !nativeMenuAvailable(), "provider acquire; session active before pose");
+    // The eye poses the Status-page notice for parallel projection reads (nativeMenuEyePoses): none before a pose, and the caller's array is left alone.
+    float heldEyes[2][12]; std::memset(heldEyes, 0x7f, sizeof(heldEyes)); float untouched[2][12]; std::memcpy(untouched, heldEyes, sizeof(untouched));
+    check(!nativeMenuEyePoses(heldEyes) && std::memcmp(heldEyes, untouched, sizeof(heldEyes)) == 0 && !nativeMenuEyePoses(nullptr), "eye poses: none before the first publish, the array untouched");
     float head[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
     float eyes[2][12] = {{1,0,0,-.03f,0,1,0,0,0,0,1,0}, {1,0,0,.03f,0,1,0,0,0,0,1,0}};
     float frusta[2][4] = {{-.9f,1.1f,-1.2f,.8f}, {-1.1f,.9f,-.8f,1.2f}};
@@ -140,6 +143,7 @@ int wmain(int argc, wchar_t** argv) {
     for (unsigned ms = 0; ms < 3000 && !ready; ms += 5) { ready = edvr::menuPanelWorkerReadyForTest(); if (!ready) Sleep(5); }
     check(ready, "bounded raster worker ready"); edvr::menuPanelTick(device.Get());
     check(table.publishPose(table.context, head, eyes, frusta, 17, 3) == S_OK && nativeMenuAvailable() && nativeMenuActive(), "publish valid pose; session active");
+    check(nativeMenuEyePoses(heldEyes) && std::memcmp(heldEyes, eyes, sizeof(heldEyes)) == 0, "eye poses: the published pair, both 3x4 rows intact");
 
     ComPtr<ID3D11Texture2D> source; check(makeSource(device.Get(), context.Get(), source, 0xff202020u), "source texture");
     ComPtr<ID3D11ShaderResourceView> sentinelSrv;
@@ -258,13 +262,18 @@ int wmain(int argc, wchar_t** argv) {
     check(table.treatEye(table.context, 0, foreignSource.Get(), normal, &rejected, rejectBounds) == E_INVALIDARG && !rejected, "foreign device rejected");
     float badBounds[4] = {-.1f,0,1,1}; check(table.treatEye(table.context, 0, source.Get(), badBounds, &rejected, rejectBounds) == E_INVALIDARG && !rejected, "bad bounds rejected");
     check(table.publishPose(table.context, nullptr, nullptr, nullptr, 17, 0) == S_OK && !nativeMenuAvailable() && nativeMenuActive(), "CPU invalidation keeps session active");
+    std::memcpy(heldEyes, untouched, sizeof(heldEyes));
+    check(!nativeMenuEyePoses(heldEyes) && std::memcmp(heldEyes, untouched, sizeof(heldEyes)) == 0, "eye poses: none after a CPU invalidation");
     check(table.close(table.context) == S_OK && !nativeMenuAvailable() && !nativeMenuActive(), "CPU close retires session");
+    check(!nativeMenuEyePoses(heldEyes), "eye poses: none after the close");
     EdvrNativeMenuTable second{sizeof(second), EDVR_NATIVE_MENU_VERSION_1}; EdvrNativeMenuRequest secondRequest{sizeof(secondRequest), EDVR_NATIVE_MENU_VERSION_1, device.Get(), 29};
     check(edvrAcquireNativeMenu(&secondRequest, &second) == S_OK && second.context && nativeMenuActive(), "reacquire after close; session active");
     check(second.publishPose(second.context, head, eyes, frusta, 29, 4) == S_OK && nativeMenuAvailable(), "second publish");
+    check(nativeMenuEyePoses(heldEyes) && std::memcmp(heldEyes, eyes, sizeof(heldEyes)) == 0, "eye poses: the second session's pair");
     check(table.publishPose(table.context, nullptr, nullptr, nullptr, 17, 0) == E_INVALIDARG && nativeMenuAvailable() && nativeMenuActive(), "stale context cannot invalidate active generation");
     check(table.close(table.context) == S_FALSE && nativeMenuActive(), "stale context cannot retire active generation");
     check(second.close(second.context) == S_OK && !nativeMenuAvailable() && !nativeMenuActive(), "second close");
+    check(!nativeMenuEyePoses(heldEyes), "eye poses: none once the last session closed");
     edvr::openxr::NativeMenuClient client;
     check(client.acquire(GetModuleHandleW(nullptr), device.Get(), 31) == S_OK && nativeMenuActive(), "client acquire; session active");
     edvr::openxr::GeometryInput gi{}; gi.generation = 31; gi.sequence = 1;

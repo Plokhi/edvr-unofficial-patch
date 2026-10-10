@@ -28,6 +28,7 @@
 #include <mutex>
 #include "../common/comfort_fade.h"
 #include "../common/frame_flag.h"
+#include "../common/parallel_projection_notice.h"
 #include "../common/periodic_work.h"
 #include "native_device.h"
 #include "native_menu_client.h"
@@ -414,6 +415,24 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   char systemLabel[64]{};
   static void copyLabel(char (&label)[64],const char* raw) {
     std::memset(label,0,sizeof(label)); if(raw) std::strncpy(label,raw,sizeof(label)-1);
+  }
+  // Parallel projection left on for a canted Pimax (parallel_projection_notice.h, docs/canted-projection.md): decided once a session, from
+  // the first pair of eye orientations that located and passed makeGeometrySnapshot, never before one, and said in the log when it applies.
+  // The graphics half decides the user-facing notice for itself from the eye poses and names that already cross to it. The verdict stays
+  // here for the rig to read.
+  bool projectionModeNoted=false;
+  edvr::ppn::Verdict projectionVerdict=edvr::ppn::Verdict::NotApplicable;
+  void noteProjectionMode(const GeometryInput& located) {
+    if(projectionModeNoted)return;
+    const auto& left=located.views[0].pose.orientation;const auto& right=located.views[1].pose.orientation;
+    const auto views=edvr::ppn::classifyViews(left,right);
+    if(views==edvr::ppn::Views::Unknown)return;   // not a pair of orientations: wait for the next locate, decide nothing
+    projectionModeNoted=true;
+    projectionVerdict=edvr::ppn::decide(systemLabel,runtimeLabel,views);
+    char line[1024]{};
+    if(edvr::ppn::formatLog(line,sizeof(line),projectionVerdict,systemLabel,runtimeLabel,
+         sizes[0].recommendedImageRectWidth,sizes[0].recommendedImageRectHeight,edvr::ppn::viewAngleDegrees(left,right))>0)
+      nativeTracePuts(line);
   }
   bool renderSettingsCaptured=false;
   uint64_t renderSizingGeneration=0;
@@ -906,6 +925,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(r!=XR_SUCCESS){if(!XR_FAILED(r))boundary.clear();return r;}
     GeometrySnapshot snapshot{};
     const bool valid=makeGeometrySnapshot(located,snapshot);
+    if(valid)noteProjectionMode(located);
     frameViews[0]=located.views[0];frameViews[1]=located.views[1];
     frameContentViews[0]=frameViews[0];frameContentViews[1]=frameViews[1];
     framePlacement[0]={};framePlacement[1]={};
@@ -1125,6 +1145,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(game.pose.bPoseIsValid)++validGamePoses;
     GeometrySnapshot temporalGeometry{};
     const bool locatedValid=makeGeometrySnapshot(located,temporalGeometry);
+    if(locatedValid)noteProjectionMode(located);
     auto gameGeometry=located;
     // This is the geometry exposed to Elite and the temporal provider. Keep
     // runtime `located` dimensions raw for XR accounting, but make every
@@ -2524,6 +2545,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       renderSettingsCaptured=false;
     }
     std::memset(runtimeLabel,0,sizeof(runtimeLabel));std::memset(systemLabel,0,sizeof(systemLabel));
+    projectionModeNoted=false;projectionVerdict=edvr::ppn::Verdict::NotApplicable;
     const auto menuClosed=menu.close(); // no producer admission or GPU work required
     if(FAILED(menuClosed))return clean=false;
     timingInvalidate();

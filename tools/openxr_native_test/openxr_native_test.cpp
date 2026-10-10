@@ -16,6 +16,7 @@
 #include "steam_identity_cases.h"
 #include "comfort_fade_cases.h"
 #include "canted_display_cases.h"
+#include "parallel_projection_notice_cases.h"
 #include "head_pose_cases.h"
 #include <cstdio>
 #include <cstring>
@@ -685,6 +686,7 @@ int selfTest() {
   edvr::openxr::test::runSteamIdentityCases(check);
   edvr::openxr::test::runComfortFadeCases(check);
   edvr::openxr::test::runCantedDisplayCases(check);
+  edvr::openxr::test::runParallelProjectionNoticeCases(check);
   edvr::openxr::test::runHeadPoseCases(check);
   Options o;
   check(parse({L"--loader",L"C:\\runtime\\loader.dll"},o)&&o.seconds==10,"default duration");

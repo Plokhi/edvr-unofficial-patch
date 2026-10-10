@@ -146,6 +146,12 @@ HRESULT WINAPI close(void* context) {
 bool nativeMenuAvailable() { return available.load(std::memory_order_acquire); }
 bool nativeMenuActive() { return active.load(std::memory_order_acquire); }
 uint64_t nativeMenuRevision() { return revision.load(std::memory_order_acquire); }
+bool nativeMenuEyePoses(float out[2][12]) {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!out || !current || !current->active || !current->pose) return false;
+  std::memcpy(out, current->eyes, sizeof(current->eyes));
+  return true;
+}
 extern "C" HRESULT WINAPI edvrAcquireNativeMenu(const EdvrNativeMenuRequest* request, EdvrNativeMenuTable* table) {
   if (!table || table->size != sizeof(*table) || table->version != EDVR_NATIVE_MENU_VERSION_1) return E_INVALIDARG;
   *table = {sizeof(*table), EDVR_NATIVE_MENU_VERSION_1};
