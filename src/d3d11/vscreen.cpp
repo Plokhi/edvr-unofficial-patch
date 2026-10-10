@@ -1681,6 +1681,7 @@ bool drawGateSubscribed(State* s) {
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
         introPanelWants() ||
         wakePulseWantsDraws() || nightVisionWantsDraws() ||
+        spaceDustHidden() ||
         witchspaceStarsHidden() || depthProbeWanted() ||
         vscreenFootprintWanted() ||   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite
         introCurveWants();            // the splash's surface strip (intro_curve.h): it acts in the eye branch, below this gate -- and panelCurveWants()
@@ -2007,6 +2008,15 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // fix.witchspace_stars at its default (on), the call only returned false.
     if (witchspaceStarsHidden() && witchspaceStarsSkip(self, kind, count, instances)) {
         if (drawCensusArmed()) drawCensusNoteUnseen('w');
+        return DrawVerdict::kSkip;
+    }
+    // The space dust (supercruise streaks and normal-space specks), withheld by fix.supercruise_dust or fix.normal_space_dust = off. The same
+    // place and the same reasons as the starfield above: before the eye gate.
+    // The UI layer's routing is decided later, in forwardWithVerdict, whose kSkip
+    // return comes before uiLayerFamilyOf / uiLayerDecide / uiLayerNoteOther, so a
+    // skipped dust draw is neither drawn in the scene nor taken into the layer.
+    if (spaceDustHidden() && spaceDustSkip(self, kind, count, instances)) {
+        if (drawCensusArmed()) drawCensusNoteUnseen('d');
         return DrawVerdict::kSkip;
     }
     const uint32_t rtvGen = bindingGeneration(BindSlot::Rtv0);
