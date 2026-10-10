@@ -2012,9 +2012,9 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     }
     // The supercruise space dust, withheld with fix.space_dust = off. The same
     // place and the same reasons as the starfield above: before the eye gate.
-    // The UI layer's routing is decided later, in forwardWithVerdict (line
-    // ~3874: kSkip returns before uiLayerFamilyOf / uiLayerDecide / uiLayerNoteOther),
-    // so a skipped dust draw is neither drawn in the scene nor taken into the layer.
+    // The UI layer's routing is decided later, in forwardWithVerdict, whose kSkip
+    // return comes before uiLayerFamilyOf / uiLayerDecide / uiLayerNoteOther, so a
+    // skipped dust draw is neither drawn in the scene nor taken into the layer.
     if (spaceDustHidden() && spaceDustSkip(self, kind, count, instances)) {
         if (drawCensusArmed()) drawCensusNoteUnseen('d');
         return DrawVerdict::kSkip;
