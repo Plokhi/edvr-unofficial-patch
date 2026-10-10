@@ -54,14 +54,9 @@ Elite as +10.00° with the fix on, -10.00° with it off). The caller census saw
   it. The fix needs no engine patch.
 
 **SHIPPED as behaviour (2026-10-09).** `GetEyeToHeadTransform` always answers
-`S*E*S`. On parallel panels that is the located matrix to the bit (the identity),
-so there is no key: both temporary keys, `advanced.canted_eye_fix` and
-`advanced.simulate_cant`, and the synthetic-cant instrument are removed (they
-never reached main or a release). The synthetic-cant flight above is the
-evidence; `canted_display.h` keeps `gameHandedness` with its cells. The frame
-ABI's version 6 carried only the two keys and never left the branch, so it is
-deleted (a half built from the test build steps down to version 5 through the
-ladder).
+`S*E*S` (`canted_display.h`, `gameHandedness`); on parallel panels that is the
+identity to the bit, so there is no key. The temporary keys and the synthetic-cant
+instrument never left the branch, nor did frame ABI version 6.
 
 **REAL CANTED FLIGHT PASSED 2026-10-09 (issue 24, Houndmux):** Pimax 8KX via
 PimaxXR, FOV Wide, default panel resolution, HMD Quality 0.5, test build
@@ -75,6 +70,18 @@ the 8268-wide eye is refused by DLSS (0xBAD00005, all-zero mode ranges) and
 EDVR falls back to its own history at half size -- a blurry image; PP off (5016
 wide) runs DLSS normally. A DLSS output ceiling is a separate task. Open side
 question: EDVR's temporal AA and FSS under a real cant (FSS guards itself off).
+
+**PP left on (2026-10-10, logs + source read, not flown).** The runtime applies
+PP, not EDVR: Houndmux's PP-on log locates eye 0 at 0° with L/R/up 80.1/41.6/57.8°
+(70.1/51.6/51.8° at -10° with PP off). PimaxXR latches PP at `xrGetSystem` from the
+machine-global pvr `steamvr_use_native_fov`, overridable only by the equally global
+`HKLM\SOFTWARE\PimaxXR\force_parallel_projection_state` (system.cpp:326-331); no
+per-app path, no extension. Pimax Play's own runtime reads neither (disassembly of
+PiOpenXR_64.dll, unverified) and looks to apply PP to every canted headset.
+- **Ruled out:** EDVR undoing PP itself, because under PP the native cant and
+  vertical FOV are not exposed, and both overrides change every other game.
+- **Next:** a notice when a canted Pimax model reports parallel views; a README
+  line; ask Houndmux which runtime his other canted games run on.
 
 ## What OpenVR says about a canted headset
 
