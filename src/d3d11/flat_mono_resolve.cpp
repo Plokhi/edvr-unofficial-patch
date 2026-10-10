@@ -1239,6 +1239,9 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
             ID3D11UnorderedAccessView* bounded=g.easuTmpUav.Get();
             context->CSSetShaderResources(1,1,&raw);
             context->CSSetUnorderedAccessViews(0,1,&bounded,nullptr);
+            // mapCompress reads its bounds (mapSize.zw) from b0: it must be the constants buffer, not whatever the last pass left there. Unbound,
+            // the bounds read zero, every thread returned, the bounded texture stayed empty, and EASU expanded black (6899f14b's flight).
+            context->CSSetConstantBuffers(0,1,&easuCb);
             context->CSSetShader(g.easuCompress.Get(),nullptr,0);
             context->Dispatch((f.renderWidth+7)/8,(f.renderHeight+7)/8,1);
             context->CSSetShaderResources(1,1,&nullSrv);
