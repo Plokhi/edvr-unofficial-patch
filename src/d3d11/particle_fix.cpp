@@ -18,6 +18,7 @@
 #include "../common/timing.h"
 #include "binding_shadow.h"   // bindingShaderHash: the bound vertex shader's hash, set with the shader
 #include "exposure_fix.h"   // lookupShaderHash
+#include "supercruise_lines.h"   // kUiVsSpaceDust, kUiPsSpaceDust: the dust's shader pair
 // flare_vs.h is compiled by the build shader generator.
 // particle_vs.h is compiled by the build shader generator.
 #include "shader_swap.h"
@@ -33,7 +34,10 @@ ParticleMode g_particleMode = ParticleMode::kStock;
 // Published for the draw path's inline first tests (particle_fix.h); the
 // file-local names below are references to these.
 bool g_particleHideStars = false;
+// fix.space_dust = off, published for spaceDustHidden() (particle_fix.h).
+bool g_spaceDustHidden = false;
 }  // namespace detail
+using detail::g_spaceDustHidden;   // the configure and skip code below reads it by its plain name
 
 namespace {
 using Mode = detail::ParticleMode;
@@ -302,6 +306,8 @@ bool shapeOk(const float* f, uint32_t floats) {
 
 uint64_t g_starsSkipped = 0;
 uint64_t g_starsNoteMs = 0;
+uint64_t g_dustSkipped = 0;   // spaceDustSkip's count and its note's clock
+uint64_t g_dustNoteMs = 0;
 
 bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances) {
@@ -320,6 +326,43 @@ bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
             "to have them back.",
             static_cast<unsigned long long>(g_starsSkipped),
             static_cast<unsigned long long>(kWitchspaceStarsVs));
+    }
+    return true;
+}
+
+namespace {
+// The space dust's bound pixel shader hash: the binding shadow's when it has
+// one, the context's otherwise (boundVsHashFast's pattern).
+uint64_t boundPsHashFast(ID3D11DeviceContext* ctx) {
+    if (bindingGet(BindSlot::Ps)) {
+        const uint64_t held = bindingShaderHash(BindSlot::Ps);
+        if (held) return held;
+    }
+    ID3D11PixelShader* ps = nullptr;
+    ctx->PSGetShader(&ps, nullptr, nullptr);
+    if (!ps) return 0;
+    const uint64_t h = lookupShaderHash(ps);
+    ps->Release();
+    return h;
+}
+}  // namespace
+
+bool spaceDustSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
+                   uint32_t instances) {
+    (void)kind; (void)count; (void)instances;
+    if (!g_spaceDustHidden || !ctx) return false;
+    if (boundVsHashFast(ctx) != kUiVsSpaceDust) return false;
+    if (boundPsHashFast(ctx) != kUiPsSpaceDust) return false;
+    ++g_dustSkipped;
+    const uint64_t now = nowMs();
+    if (now - g_dustNoteMs >= 30000) {
+        g_dustNoteMs = now;
+        Log::get().note(
+            "supercruise space dust: OFF -- %llu draw(s) withheld so far, "
+            "vs %016llX ps %016llX. Set space_dust = on to have them back.",
+            static_cast<unsigned long long>(g_dustSkipped),
+            static_cast<unsigned long long>(kUiVsSpaceDust),
+            static_cast<unsigned long long>(kUiPsSpaceDust));
     }
     return true;
 }
@@ -505,6 +548,31 @@ void particleConfigure(Config& cfg) {
                   "nothing else about the jump changes."
                 : "witchspace stars: ON. The hyperspace tunnel keeps its "
                   "starfield, which is the game's own behaviour.");
+    }
+
+    // The supercruise space dust switch, the same shape as the one above.
+    // Read through the same VR-profile gate, so flat never sees "off" from
+    // a key its allow-list does not carry (runtime_profile.h).
+    const std::string sd = runtimeVrProfile() ?
+        cfg.getString("fix.space_dust", "on") : "on";
+    const bool dustWasHidden = g_spaceDustHidden;
+    if (sd == "off") {
+        g_spaceDustHidden = true;
+    } else {
+        if (sd != "on") {
+            Log::get().note("space dust: that is not on or off; leaving it on.");
+        }
+        g_spaceDustHidden = false;
+    }
+    if (g_spaceDustHidden != dustWasHidden) {
+        g_dustSkipped = 0;
+        g_dustNoteMs = 0;
+        Log::get().note(
+            g_spaceDustHidden
+                ? "supercruise space dust: OFF. The streaks are not drawn -- "
+                  "the draw is withheld, nothing else about supercruise changes."
+                : "supercruise space dust: ON. The streaks are drawn, as the "
+                  "game draws them.");
     }
 
     const Mode wasMode = detail::g_particleMode;

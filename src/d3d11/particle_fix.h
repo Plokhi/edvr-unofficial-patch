@@ -41,6 +41,8 @@ extern ParticleMode g_particleMode;
 // the draw path's per-draw calls can be skipped inline when they would
 // return at their first line (the .cpp binds its old name to this).
 extern bool g_particleHideStars;
+// The flag spaceDustHidden() reads: fix.space_dust = off (particle_fix.cpp).
+extern bool g_spaceDustHidden;
 // The billboard transcriptions' vertex shader hashes, in kVariants order
 // (particle_fix.cpp static_asserts the two lists agree).
 inline constexpr uint64_t kParticleVariantVs[2] = {0xEB787F983BC1F5A3ull,
@@ -58,6 +60,16 @@ inline bool particleSteady() { return detail::g_particleMode == detail::Particle
 inline bool witchspaceStarsHidden() { return detail::g_particleHideStars; }
 bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances);
+
+// Is this draw the supercruise space dust, with fix.space_dust = off? The
+// same shape as the witchspace pair above: the inline flag is the one bool
+// read per draw when the key is on, and spaceDustSkip matches the vertex AND
+// pixel shader pair (supercruise_lines.h: the dust's vertex shader is also
+// seen with another pixel shader). True means the draw is not forwarded, so
+// it neither reaches the scene nor the UI layer.
+inline bool spaceDustHidden() { return detail::g_spaceDustHidden; }
+bool spaceDustSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
+                   uint32_t instances);
 
 // The matched draw, for the verdict chain: this draw is a particle
 // billboard AND a substitute is ready to bind.
