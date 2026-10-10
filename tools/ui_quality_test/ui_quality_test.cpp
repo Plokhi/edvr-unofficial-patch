@@ -1280,6 +1280,19 @@ void testFlatLayerRules() {
         e.copy(false, true);
         check(e.spatial == 2 && e.spatialEasu == 1 && e.spatialRefused == 1,
               "map spatial: an EASU copy counts in spatial and spatial-easu; a bilinear one in spatial only; a refused one in spatial-refused");
+        // SMAA 1x ahead of EASU (2026-10-10): an EASU copy that ran SMAA counts in spatial-smaa too; an EASU copy without it does not, and a
+        // bilinear copy never does, whatever its smaa flag says.
+        FlatUiMapAaTally s;
+        s.frame(true, true);
+        s.copy(true, true, true);
+        s.frame(true, true);
+        s.copy(true, true, false);
+        s.frame(true, true);
+        s.copy(true, false, true);
+        check(s.spatial == 3 && s.spatialEasu == 2 && s.spatialSmaa == 1,
+              "map spatial: spatial-smaa counts only the EASU copies that ran SMAA; a bilinear copy never counts there");
+        s.clearCounts();
+        check(s.spatialSmaa == 0 && s.spatialEasu == 0 && s.spatial == 0, "map spatial: clearCounts zeroes spatial-smaa");
     }
     // The map families take no cancel (2026-10-10, the cursor's pulse): whatever their rows measured, zero; the HUD families keep it.
     {

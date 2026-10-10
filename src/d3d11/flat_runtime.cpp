@@ -5729,10 +5729,11 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         const char* spatialReason=nullptr;
         if (flatMonoResolveSpatialFallback(s.device.Get(),ctx,mapFrame,&outputView,&spatialReason)) {
             const bool easu=flatMonoResolveLastSpatialWasEasu();
+            const bool smaa=easu&&flatMonoResolveLastSpatialWasSmaa();
             ID3D11ShaderResourceView* spatial=easu?outputView.Get():flatSharpenView(ctx,outputView.Get());
             ctx->PSSetShaderResources(0,1,&spatial);replaced=true;
             s.treated=true;s.temporalAccepted=false;s.havePrevious=false;s.reason="map-temporal-off";
-            flatUiLayerMapAaCopy(true,easu);
+            flatUiLayerMapAaCopy(true,easu,smaa);
         } else {
             s.reason=spatialReason?spatialReason:"map-temporal-off-refused";
             refuse(s);

@@ -87,6 +87,45 @@ inline bool readRgba(ID3D11Device* d, ID3D11DeviceContext* c, ID3D11ShaderResour
 
 }  // namespace mapeasugpu
 
+// The maintainer's test content (axis-aligned lines, a circle, a tilted ring, the slope edges) through EASU alone and SMAA ahead of EASU
+// (2026-10-10), with the jaggedness gates (flat_map_shapes_gpu_tests.h).
+#include "flat_map_shapes_gpu_tests.h"
+
+// SMAA is below native only (2026-10-10): a native frame runs EASU alone, with the smaa flag on.
+inline void mapSmaaNativeTest(ID3D11Device* device, ID3D11DeviceContext* context) {
+    const UINT nW = 1920, nH = 1080;
+    std::vector<uint8_t> np(size_t(nW) * nH * 4);
+    for (UINT y = 0; y < nH; ++y)
+        for (UINT x = 0; x < nW; ++x) {
+            uint8_t* p = &np[(size_t(y) * nW + x) * 4];
+            p[0] = uint8_t(x * 255u / (nW - 1));
+            p[1] = uint8_t(y * 255u / (nH - 1));
+            p[2] = 128;
+            p[3] = 255;
+        }
+    auto nativeIn = texture(device, nW, nH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, np.data(), nW * 4);
+    if (!nativeIn) { check(false, "map SMAA native: the input texture is made"); return; }
+    auto nativeView = view(device, nativeIn.Get());
+    edvr::FlatMonoResolveFrame n{};
+    n.color = nativeView.Get();
+    n.renderWidth = nW;
+    n.renderHeight = nH;
+    n.outputWidth = nW;
+    n.outputHeight = nH;
+    n.mode = edvr::FlatMonoResolveMode::Dlss;
+    n.hdr = false;
+    n.reset = true;
+    n.frame = 1;
+    n.easu = true;
+    n.smaa = true;
+    ComPtr<ID3D11ShaderResourceView> nativeOut;
+    const char* why = nullptr;
+    const bool ok = edvr::flatMonoResolveSpatialFallback(device, context, n, nativeOut.GetAddressOf(), &why);
+    check(ok && nativeOut && edvr::flatMonoResolveLastSpatialWasEasu() && !edvr::flatMonoResolveLastSpatialWasSmaa(),
+          "map SMAA native: a native frame runs EASU alone (SMAA is below native only)");
+    if (!ok) std::printf("  (native reason: %s)\n", why ? why : "none");
+}
+
 // The rig's own calls: check() and failures are the main file's. The input is built here, then the bilinear reference and the EASU
 // recovery run through the real spatial recovery of this file's resolver.
 inline void mapEasuGpuTests(ID3D11Device* device, ID3D11DeviceContext* context) {
@@ -179,4 +218,6 @@ inline void mapEasuGpuTests(ID3D11Device* device, ID3D11DeviceContext* context) 
     check(meanA > 0.05 && meanA > 0.5 * meanB,
           "map EASU rig: the EASU output is not black (its mean is at least half the bilinear reference's)");
     check(maeRgb < 0.04, "map EASU rig: the EASU output stays close to the bilinear reference (mean abs error under 0.04 of full scale)");
+    mapSmaaNativeTest(device, context);
+    mapShapesGpuTests(device, context);
 }

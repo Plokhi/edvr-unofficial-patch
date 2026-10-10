@@ -94,7 +94,7 @@ inline const char* flatUiMapTemporalName(uint32_t focus) {
 // not reach is visible, not silent). `resets` counts each exit from the mechanism (history restarts once there).
 struct FlatUiMapAaTally {
     bool engaged = false, pending = false;
-    uint64_t temporalOff = 0, jitterZeroed = 0, spatial = 0, spatialEasu = 0, spatialRefused = 0, noCopy = 0, resets = 0;
+    uint64_t temporalOff = 0, jitterZeroed = 0, spatial = 0, spatialEasu = 0, spatialSmaa = 0, spatialRefused = 0, noCopy = 0, resets = 0;
     void frame(bool on, bool jitterWanted) {
         if (pending) ++noCopy;
         pending = on;
@@ -106,18 +106,20 @@ struct FlatUiMapAaTally {
         }
         engaged = on;
     }
-    // `easu`: the spatial recovery ran AMD's EASU (flatMonoResolveLastSpatialWasEasu), counted in spatial as well.
-    void copy(bool ok, bool easu = false) {
+    // `easu`: the spatial recovery ran AMD's EASU (flatMonoResolveLastSpatialWasEasu), counted in spatial as well. `smaa`: it ran SMAA 1x
+    // ahead of that EASU (flatMonoResolveLastSpatialWasSmaa), counted in spatial-easu as well.
+    void copy(bool ok, bool easu = false, bool smaa = false) {
         if (!pending) return;
         pending = false;
         if (ok) {
             ++spatial;
             if (easu) ++spatialEasu;
+            if (easu && smaa) ++spatialSmaa;
         } else {
             ++spatialRefused;
         }
     }
-    void clearCounts() { temporalOff = jitterZeroed = spatial = spatialEasu = spatialRefused = noCopy = resets = 0; }
+    void clearCounts() { temporalOff = jitterZeroed = spatial = spatialEasu = spatialSmaa = spatialRefused = noCopy = resets = 0; }
 };
 
 // The families the flat layer asks the shared decision for: the cockpit HUD families the 2026-10-09 09:36 census found

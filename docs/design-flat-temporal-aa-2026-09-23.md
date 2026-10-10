@@ -24,7 +24,7 @@
 - **Recommendation:** two installers, one graphics implementation, one temporal pipeline, separate VR/mono adapters; flat enables only temporal AA + support.
 - **10-10 map arcs (section below):** temporal AA OFF, no jitter, while any map is open (GuiFocus 6, 7, 8; built, not flown). The
   plane-motion and per-pixel star-choice work is REMOVED (the stars' parallax, section below). Kept: the map UI families and their zero cancel.
-  Map frames run AMD's FSR1 EASU in place of the bilinear tap (built, not flown; section below).
+  Map frames below native run SMAA 1x, then AMD's FSR1 EASU, in place of the bilinear tap (shipped for an A/B flight 2026-10-10; section below).
 - **106 (10-09):** fixed exposure 1.0 SHIPS on the flat HDR route (flown by eye:
   brighter, stars back); temporary key and luma probe REMOVED. VR keeps auto.
 - **Open:** station/on-foot projection coverage and mixed-camera HDR ownership,
@@ -14790,3 +14790,79 @@ into the test); the shader's output (the flight); the spatial recovery's image o
 
 Flight: the SS 0.5 DLSS session again, the System Map and the Galaxy Map: spatial-easu equal to spatial on every window; the planets and
 stars sharper than the bilinear flight; no blank or black map frames.
+
+### 2026-10-10: the map frames below native: SMAA 1x ahead of EASU, shipped for an A/B flight (built, not flown)
+
+Flight on f401ef00 (Epic, SS 0.5, R 1920x1080 to D 3840x2160, DLSS): EASU works, the maps are no longer black. The planets' silhouettes are
+still aliased: EASU upscales the stair-steps of the half-res image. The maintainer's decision: SMAA 1x on the map temporal-off frames below
+native, at the render size, before EASU; native frames and every other path unchanged. The FXAA-style and RCAS passes evaluated below are not
+shipped.
+
+Source and licence. src\d3d11\smaa\ holds the official SMAA reference (Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro,
+Diego Gutierrez; MIT): SMAA.hlsl, Textures\AreaTex.h, Textures\SearchTex.h, LICENSE.txt, all byte-for-byte from
+https://github.com/iryoku/smaa at commit 71c806a838bdd7d517df19192a20f0c61b3ca29d. The SHA-256 of each file and the upstream commit are in
+src\d3d11\smaa\README.md, next to the licence (the repo keeps no combined notices file; the FSR notice sits beside its sources the same way).
+
+How it is built: tools\gen_smaa_hlsl.py embeds SMAA.hlsl byte-exact as string chunks (pinned by SHA-256; self-test in build.bat).
+src\d3d11\map_smaa_shader.h is a prologue (SMAA_CUSTOM_SL, SMAA_PRESET_HIGH at the reference's thresholds, samplers at s0/s1, the metrics
+constant at b0) and three compute entries: smaaEdges (colour edges, RG8), smaaWeights (blend weights, RGBA8, AreaTex at t1 and SearchTex at
+t2), smaaBlend (neighbourhood blend, half float). Each entry compiles from its own source (they reuse register names). Two source changes
+keep the vendored text unmodified: discard is a return of zero edges (compute has no discard; the colour-edge test returns zero edges for
+the pixels it would discard), and the implicit-LOD Sample calls become SampleLevel at mip 0 (compute has no derivatives; the textures have
+one mip). map_smaa.cpp holds AreaTex (R8G8 160x560) and SearchTex (R8 64x16), uploaded once.
+
+Wiring: flat_mono_resolve.cpp runs the three passes between the bounded colour (mapCompress) and EASU, when FlatMonoResolveFrame::smaa is set
+(default) and the render size is below the output in either axis. EASU reads the blended colour. Counter: spatial-smaa=N on the map line
+(a copy that ran SMAA ahead of EASU, counted within spatial-easu).
+
+The order (2026-10-10, measured). SMAA after EASU (EASU's bounded output at the evaluation size, SMAA on it, then the expand) passes the
+vertical and horizontal step bars (ratio 0.79 and 0.78 against EASU alone) and fails the diagonal (1.12). Cross-sections show why: SMAA's
+blend model assumes an aliased binary edge, and EASU's edge pixel already carries sub-pixel coverage and rings on the dark side, so the blend
+moves the edge pixel away from the reference (0.56 to 0.44 where the reference is 0.65). Shipped: SMAA before EASU.
+
+Metrics (2026-10-10, two kinds, both kept). The coverage metric is the mean absolute display error over partly covered pixels. It does not
+measure stair-stepping: a binary edge and a smooth ramp score alike when they sit at the same coverage, and EASU's own ringing counts against
+it. The jaggedness metric is the 0.5-level crossing's deviation from the true curve (row or column scan for slopes; rays for the circle and
+ring), with the row-to-row step RMS (the visible staircase). Validation: the nearest-neighbour upscale of the binary input scores jagged (circle
+outer RMS 0.53 px, diagonal step 0.92 px); the analytic coverage image scores about 0.05 to 0.06 px RMS, with a diagonal step of 0.12 px.
+The step RMS is the honest wobble measure: the RMS of the curve deviations includes a bias of about 1.2 px from the binary input's discrete
+threshold on the 45 degree edge.
+
+Evaluation (960x540 to 1920x1080; EASU alone, FXAA then EASU, SMAA then EASU, SMAA then EASU then RCAS at strength 0.7; output of shapes1.log):
+
+| Edge | EASU | FXAA>EASU | SMAA>EASU | SMAA>EASU>RCAS |
+|---|---|---|---|---|
+| 1 px line, energy / peak | 0.922 / 0.834 | 0.483 / 0.390 | 0.922 / 0.834 | 0.922 / 0.863 |
+| 2 px line, energy / peak | 0.934 / 1.000 | 0.876 / 0.912 | 0.934 / 1.000 | 0.932 / 1.015 |
+| circle outer RMS / max (px) | 0.390 / 0.991 | 0.348 / 0.773 | 0.419 / 1.440 | 0.419 / 1.454 |
+| circle coverage error | 0.185 | 0.151 | 0.158 | 0.161 |
+| ring outer RMS / max | 0.399 / 1.064 | 0.352 / 0.884 | 0.363 / 0.997 | 0.365 / 1.001 |
+| ring inner RMS / max | 0.400 / 0.971 | 0.300 / 0.739 | 0.263 / 0.648 | 0.265 / 0.652 |
+| ring coverage error | 0.190 | 0.151 | 0.142 | 0.144 |
+| near-vertical 0.03, RMS / step | 0.564 / 0.136 | 0.348 / 0.024 | 0.314 / 0.018 | 0.321 / 0.019 |
+| near-horizontal 0.03, RMS / step | 0.567 / 0.137 | 0.350 / 0.026 | 0.317 / 0.018 | 0.324 / 0.019 |
+| diagonal 0.6, RMS / step | 0.496 / 0.253 | 0.460 / 0.187 | 0.466 / 0.173 | 0.468 / 0.177 |
+
+Findings from the table. FXAA is rejected: it erases 1 px lines (energy 0.48, peak 0.39) and softens 2 px lines (peak 0.91), so the
+axis-aligned grid and route lines are lost. SMAA preserves every line case exactly (identical to EASU); it lowers the staircase on the slopes
+(step 0.136 to 0.018) and the diagonal (0.253 to 0.173), and lowers the coverage error on every curve; the ring's inner edge improves most
+(RMS 0.400 to 0.263). The circle's outer edge gets worse: RMS 0.390 to 0.419 and max 0.99 to 1.44 px. That is the open point. RCAS (strength
+0.7) gives no measurable gain on jaggedness or coverage and adds a 1.5 % overshoot on 2 px lines; it is not shipped. The 45 degree edge's RMS
+(about 1.2 px) is the input's threshold bias; its step (0.036 to 0.008 with SMAA) is the wobble measure.
+
+Rig gates (flat_mono_resolve_test; flat_map_shapes_gpu_tests.h): axis-aligned lines, energy and peak within 1 % of EASU alone (hard
+requirement); slope edges (near-vertical, near-horizontal, diagonal), SMAA>EASU step RMS at most 0.8 of EASU alone (the 45 degree edge is run
+through the same gate and passes at 0.22); validation of the metric (nearest-neighbour jagged, analytic near zero); fail-if-skipped (EASU
+alone, SMAA forced off, fails the slope gate). The circle and ring are reported, not gated; the circle's outer-edge max is the open point:
+1.44 px against EASU's 0.99 px. The coverage bar of the earlier gate was retired: it does not measure stair-stepping.
+
+Gate run (full build, build\full_build_receipt.json cac39fb9...): line energy and peak x1.0000 on all eight line cases; step RMS over EASU
+alone: diagonal x0.684, near-vertical x0.133, near-horizontal x0.132 (gate 0.8), and the 45 degree edge x0.211 (the same gate, not a bar in the
+brief); fail-if-skipped: the EASU-alone step ratio x1.000, rejected by the gate. The metric validation holds (nearest-neighbour circle outer RMS
+0.53, diagonal step 0.92; analytic 0.05 and 0.12). FXAA and RCAS are not in the production path or the build; the rig keeps only the shapes
+and the two variants above.
+
+Cost (not timed; WARP timing is not representative): three compute passes at render size (960x540) and three render-size textures (edges
+RG8 about 0.5 MB, weights RGBA8 about 2 MB, blended RGBA16F about 4 MB), plus AreaTex and SearchTex (about 0.2 MB).
+
+Open: the circle's outer-edge max (1.44 px, from 0.99 px). Check on a flight before deciding whether it matters on the planet discs.
