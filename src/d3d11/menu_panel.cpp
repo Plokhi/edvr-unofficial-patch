@@ -621,6 +621,18 @@ void layout(const MenuContent& c, std::vector<Op>& ops, std::vector<LineRect>& l
                 ++n;
                 line = nl ? nl + 1 : nullptr;
             }
+            // The version tag: right-aligned on the footer's second line, the
+            // same dim face and slot, so it sits where the status words are.
+            if (c.footerTag[0] && n == kFooterLines) {
+                Op v;
+                v.text = true;
+                v.str = widen(c.footerTag);
+                v.rect = {pad, y + lineH, cardW - pad, y + 2 * lineH};
+                v.align = DT_RIGHT;
+                v.font = Font::Small;
+                v.rgb = kFooter;
+                ops.push_back(v);
+            }
             if (outFootRect) *outFootRect = {pad, y, cardW - pad, y + footH};
             if (outFootLines) *outFootLines = n;
         }

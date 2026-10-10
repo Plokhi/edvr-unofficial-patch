@@ -2301,6 +2301,9 @@ void buildContent(MenuContent& c) {
         else if (!s.lastWrite.empty()) status = " | saved";
         snprintf(c.footer, sizeof(c.footer), "Up/Down row  Left/Right change\n%s/Esc close%s",
                  s.summonName.c_str(), status);
+        // The installed version, on every page, drawn at the right end of this same
+        // footer line (menu_panel.cpp). Flat only: VR's footer does not carry it.
+        snprintf(c.footerTag, sizeof(c.footerTag), "EDVR %s", EDVR_VERSION_STRING);
         return;
     }
     {
