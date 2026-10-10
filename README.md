@@ -47,6 +47,15 @@ that runtime is available and your headset connected. EDVR needs no SteamVR
 loader; do not install OpenComposite or a vendor OpenXR loader to make it work.
 Then launch Elite as you normally would.
 
+Canted Pimax headsets (Vision 8K X, 8K Plus, 8K, 5K Super, 5K Plus, 5K XR and
+Artisan) should turn "Enable Parallel Projection" off in Pimax Play and restart
+the game. EDVR renders canted displays correctly without it. With it on, the
+headset renders much larger frames (8268x3948 instead of 5016x3160 per eye on
+an 8K X at FOV Wide), and turning it off cut GPU time by up to about 30% in
+testing. This works with PimaxXR as the OpenXR runtime; with Pimax Play's own
+OpenXR runtime the toggle may have no effect. When EDVR sees the setting on
+with PimaxXR, it shows a notice in the headset.
+
 ## Install
 
 **Download `edvr-installer-<version>.zip` from the release, unzip it, and run

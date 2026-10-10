@@ -22,33 +22,22 @@ code is touched at any point.
 
 ## Status
 
-**State (2026-10-09): REOPENED on new evidence.** Offline disassembly of Elite
-build 332841 (`analysis\decomp\verify_20261009_cant_*`) finds the eye rotation
-is **not** dropped:
+**State (2026-10-10): the handedness fix is SHIPPED and FLOWN on a real canted
+headset; the parallel-projection notice is BUILT on `claude/canted-pp-notice`,
+NOT FLOWN.** Offline disassembly of Elite build 332841
+(`analysis\decomp\verify_20261009_cant_*`) found the eye rotation is **not**
+dropped: the wrapper (slots 16 and 26) multiplies the eye matrix, taken raw, with
+a head pose first converted into the game's z-negated space (`S*H*S`,
+S = diag(1,1,-1)). The correct eye matrix is `S*E*S`; raw E inverts the cant's
+yaw and pitch (2 theta per eye), which is invisible on parallel panels, where
+the rotation is identity and tz = 0. The 2026-09-12 closure assumed a dropped
+rotation and the field symptoms fit an inverted one equally well; the fold
+experiment and the remap arithmetic below still stand.
 
-- Wrapper slots 16 (RVA 0x4E25A0) and 26 (RVA 0x4E2350) call
-  `GetEyeToHeadTransform` and build a full 4x4 from the 3x4 via 0x4E4EF0.
-- That 4x4 is multiplied with the head pose, which 0x4E3690 first converts into
-  the game's z-negated space (`S*H*S`, S = diag(1,1,-1)).
-- The eye matrix goes in raw. The correct game-space matrix is `S*E*S`. Raw E
-  inverts the cant's yaw and pitch (2 theta per eye), which is invisible on
-  parallel panels, where the rotation is identity and tz = 0.
-
-The 2026-09-12 closure assumed a dropped rotation. The field symptoms fit an
-inverted rotation equally well. The fold experiment and the remap arithmetic
-below still stand.
-
-**H-inv CONFIRMED 2026-10-09 by the synthetic-cant flight.** Pimax Crystal
-Super via Pimax OpenXR, EDVR native runtime v0.18.3-90-gbbca39a6, per-eye
-4032x3898, true tangents l=-1.2543 r=+0.8746 t/b=±1.0293, simulated 10° outward
-cant per eye (told l=-0.8828 r=+1.2425 t/b=±1.2358 for the left eye). With
-`canted_eye_fix` on the canted pair fused; off, it split (runtime log
-`edvr_openxr_20261009_115451_577_19872.log`: on 17:54:54, off 17:56:45, on
-17:56:50 UTC; the log shows the left eye located at -10.00° and handed to
-Elite as +10.00° with the fix on, -10.00° with it off). The caller census saw
-`GetEyeToHeadTransform` called from exactly the three disassembled sites
-(exe+0x4E25FE, 0x4E23B2, 0x4E2A5F).
-
+**H-inv CONFIRMED 2026-10-09** by the synthetic-cant flight (Pimax Crystal Super
+via Pimax OpenXR, v0.18.3-90-gbbca39a6, simulated 10° outward cant): with
+`canted_eye_fix` on the canted pair fused, off it split (runtime log
+`edvr_openxr_20261009_115451_577_19872.log`; numbers in the last entry below).
 - **Ruled out:** H-drop (the rotation lost somewhere the disassembly missed),
   because handing Elite `S*E*S` fused the canted pair and the raw matrix split
   it. The fix needs no engine patch.
@@ -60,28 +49,36 @@ instrument never left the branch, nor did frame ABI version 6.
 
 **REAL CANTED FLIGHT PASSED 2026-10-09 (issue 24, Houndmux):** Pimax 8KX via
 PimaxXR, FOV Wide, default panel resolution, HMD Quality 0.5, test build
-v0.18.3-90-gbbca39a6 (the fix on, as now shipped). Parallel projection OFF: "It
-works! No projection issues." His log shows the eyes located at ±10.00° and
-handed to Elite in its handedness; recommended size 5016x3160 (8268x3948 with
-PP on). FSR, PP on -> off: station 55.5 -> 81.4 fps (GPU 15.9 -> 11.0 ms, -31%),
+v0.18.3-90-gbbca39a6 (the fix on, as now shipped). Parallel projection (PP) OFF:
+"It works! No projection issues." His log locates the eyes at ±10.00° and hands
+them to Elite in its handedness; recommended size 5016x3160 (8268x3948 with PP
+on). FSR, PP on -> off: station 55.5 -> 81.4 fps (GPU 15.9 -> 11.0 ms, -31%),
 space near a star 77.0 -> 89.1 fps (GPU 10.8 -> 9.6 ms), planet 62.5 -> 84.9 fps
 (GPU 13.7 -> 10.0 ms, -27%). Side finding, not this fix: with PP ON at FOV Wide
-the 8268-wide eye is refused by DLSS (0xBAD00005, all-zero mode ranges) and
-EDVR falls back to its own history at half size -- a blurry image; PP off (5016
-wide) runs DLSS normally. A DLSS output ceiling is a separate task. Open side
+the 8268-wide eye is refused by DLSS (0xBAD00005, all-zero mode ranges) and EDVR
+falls back to its own history at half size, a blurry image; PP off (5016 wide)
+runs DLSS normally. A DLSS output ceiling is a separate task. Open side
 question: EDVR's temporal AA and FSS under a real cant (FSS guards itself off).
 
-**PP left on (2026-10-10, logs + source read, not flown).** The runtime applies
-PP, not EDVR: Houndmux's PP-on log locates eye 0 at 0° with L/R/up 80.1/41.6/57.8°
-(70.1/51.6/51.8° at -10° with PP off). PimaxXR latches PP at `xrGetSystem` from the
-machine-global pvr `steamvr_use_native_fov`, overridable only by the equally global
+**PP left on (2026-10-10, logs + source read).** The runtime applies PP, not EDVR:
+the PP-on log locates eye 0 at 0° with L/R/up 80.1/41.6/57.8° (70.1/51.6/51.8° at
+-10° with PP off). PimaxXR latches PP at `xrGetSystem` from the machine-global pvr
+`steamvr_use_native_fov`, overridable only by the equally global
 `HKLM\SOFTWARE\PimaxXR\force_parallel_projection_state` (system.cpp:326-331); no
 per-app path, no extension. Pimax Play's own runtime reads neither (disassembly of
 PiOpenXR_64.dll, unverified) and looks to apply PP to every canted headset.
 - **Ruled out:** EDVR undoing PP itself, because under PP the native cant and
   vertical FOV are not exposed, and both overrides change every other game.
-- **Next:** a notice when a canted Pimax model reports parallel views; a README
-  line; ask Houndmux which runtime his other canted games run on.
+- **Notice BUILT, NOT FLOWN** (`parallel_projection_notice.h`; behaviour, no key):
+  a canted Pimax model (system name: 8K X, 8K Plus, 8K, 5K Super, 5K Plus, 5K XR,
+  Artisan) whose located eyes are under 0.5° apart. The openxr log says so once a
+  session (`canted eyes: parallel projection is on: ...`; `... is off: ...` is the
+  good state, so a silent log means the feature never ran). On PimaxXR, which
+  honours the toggle, a toast and the Status page's hint say it too; on any other
+  runtime the log line says the toggle is unverified and the user is told nothing.
+  The README says it in the headset setup. To fly: one PP-on and one PP-off session.
+- **Next:** ask Houndmux which runtime his other canted games run on; find out
+  whether Pimax Play's runtime honours the toggle (if so, it gets the notice too).
 
 ## What OpenVR says about a canted headset
 
@@ -476,3 +473,37 @@ handedness. The section above describes the test build: `advanced.simulate_cant`
 `advanced.canted_eye_fix`, the `canted test:` and `canted eyes:` log lines and
 `EdvrNativeFrameOutput` version 6 no longer exist. What a real canted headset
 does with it is not yet flown.
+
+
+The synthetic-cant flight's numbers (moved out of the Status block 2026-10-10):
+Pimax Crystal Super via Pimax OpenXR, EDVR native runtime v0.18.3-90-gbbca39a6,
+per-eye 4032x3898, true tangents l=-1.2543 r=+0.8746 t/b=±1.0293, simulated 10°
+outward cant per eye (told l=-0.8828 r=+1.2425 t/b=±1.2358 for the left eye).
+Runtime log `edvr_openxr_20261009_115451_577_19872.log`: fix on 17:54:54, off
+17:56:45, on 17:56:50 UTC; it shows the left eye located at -10.00° and handed to
+Elite as +10.00° with the fix on, -10.00° with it off. The caller census saw
+`GetEyeToHeadTransform` called from exactly the three disassembled sites
+(exe+0x4E25FE, 0x4E23B2, 0x4E2A5F).
+
+## 2026-10-10 — the parallel-projection notice
+
+`canted eyes:` lines are back in the openxr log, as a different instrument from the
+test build's (which are gone, above). `parallel_projection_notice.h` decides from
+three things: the system name (a canted P2 model), the angle between the two located
+eye orientations (under 0.5° is parallel; 20° apart is a canted 8K X), and the runtime
+name (PimaxXR is proven to honour Pimax Play's toggle). The openxr half decides once a
+session in `NativeRuntimeHost::noteProjectionMode`, from the first pair that passed
+`makeGeometrySnapshot`. The graphics half decides again in the menu tick from the eye
+poses the native menu already holds (`nativeMenuEyePoses`) and the names the
+render-settings query already carried, so no frame ABI field was added. The three
+lines the openxr log can carry: `parallel projection is on` (PimaxXR; names the fix),
+the same with `whether this runtime honours Pimax Play's toggle is unverified` (any
+other runtime; the user is not sent to a setting that may do nothing), and
+`parallel projection is off` (a canted model with canted views). A headset that is
+not a canted model logs nothing. The toast and the Status hint use the existing
+notice surface (`menu.toasts`; the hint slot is shared with the supersampling and
+checkerboard hints, each of the three taking its turn). Rig:
+`tools/openxr_native_test/parallel_projection_notice_cases.h` (names, angles at
+0/0.4/0.49/0.51/0.6/20 degrees, invalid input, the verdict table, the words, the hint
+slot, the host on a fixture, the wiring as source pins) and `native_menu_test` (the
+eye-pose accessor).
