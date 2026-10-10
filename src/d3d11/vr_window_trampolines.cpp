@@ -1,7 +1,8 @@
-// The game-code trampolines (vr_window_trampolines.h says what and why): the mode request's window rewrite, and the settings copy's hold.
+// The game-code trampolines (vr_window_trampolines.h says what and why): the mode request's window rewrite, the DisplayConfig writer's hold,
+// and the settings copy's hold.
 #include "vr_window_trampolines.h"
 
-#include "device_hook.h"     // deviceHookPanelSettings: DisplaySettings.xml's window size, for the log
+#include "device_hook.h"     // deviceHookPanelSettings: DisplaySettings.xml's window size
 #include "vr_ssaa_gate.h"    // vrSsaaGateFrame: the frame number the log carries
 #include "vr_ssaa_hold.h"    // vrSsaaHoldVrLive, vrSsaaHoldAfterCopy, vrSsaaHoldReadSettings
 
@@ -19,11 +20,19 @@ namespace edvr {
 namespace {
 
 // The mode request (0x7E9D50). Its first eleven bytes, read from build 332841: mov rax,rsp; mov [rax+0x10],rbx; mov [rax+0x18],rsi.
-// The request is rdx on entry; kind is [request+0x20] (a dword), the mode-table index is [request+0x18] (a qword). [request] is a
-// locked compare-exchange target in that function, so it is never written here.
+// The request is rdx on entry. The function reads these request fields: [+0x08] (a table selector), [+0x10], [+0x18] (a table index),
+// [+0x20] (the kind, a dword), and [+0x24], [+0x25] (flags). [+0x00] is a locked compare-exchange target and is never written here.
 constexpr uint32_t kRequestRva = 0x7E9D50;
 constexpr uint8_t kRequestBytes[11] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18};
-constexpr uintptr_t kReqKindOff = 0x20, kReqIndexOff = 0x18;
+constexpr uintptr_t kReqBlockOff = 0x08;   // the remembered block: request +0x08 .. +0x27 (four qwords)
+constexpr uintptr_t kReqKindOff = 0x20;
+
+// The DisplayConfig writer (0x7F9F00): it takes the display config object (rdi) and writes DisplaySettings.xml from its fields: ScreenWidth
+// [+0x08], ScreenHeight [+0x0C], FullScreen [+0x10], PresentInterval [+0x14], Adapter [+0x18], Monitor [+0x1C], and the refresh and frame
+// limit fields. Its first nine bytes, from build 332841: push rdi; sub rsp,0x1D0.
+constexpr uint32_t kWriterRva = 0x7F9F00;
+constexpr uint8_t kWriterBytes[9] = {0x40, 0x57, 0x48, 0x81, 0xEC, 0xD0, 0x01, 0x00, 0x00};
+constexpr uintptr_t kCfgWidthOff = 0x08, kCfgHeightOff = 0x0C, kCfgFullScreenOff = 0x10;
 
 // The settings copy W (0x281C0D0): the block copy into the render context at ctx+0x3428 (ctx = the first argument's +0x1180). Its first
 // eleven bytes: mov r11,rsp; push rbx; sub rsp,0x4D0.
@@ -31,19 +40,25 @@ constexpr uint32_t kCopyRva = 0x281C0D0;
 constexpr uint8_t kCopyBytes[11] = {0x4C, 0x8B, 0xDC, 0x53, 0x48, 0x81, 0xEC, 0xD0, 0x04, 0x00, 0x00};
 
 constexpr uint32_t kRewriteCap = 64;
+constexpr uint32_t kHoldCap = 64;
 
 using Fn8 = uint64_t (*)(void*, void*, void*, void*, void*, void*, void*, void*);
 Fn8 g_requestOrig = nullptr;
+Fn8 g_writerOrig = nullptr;
 Fn8 g_copyOrig = nullptr;
 CodeHook g_requestHook;
+CodeHook g_writerHook;
 CodeHook g_copyHook;
 
-// The last non-windowed request accepted while VR was inactive: the display mode the user had (kind 1 or 2 and its mode index).
+// The last non-windowed request accepted while VR was inactive: the whole request block (+0x08 .. +0x27) and its kind.
 std::atomic<bool> g_remembered{false};
+std::atomic<uint64_t> g_block[4] = {};
 std::atomic<uint32_t> g_rememberedKind{0};
-std::atomic<uint64_t> g_rememberedIndex{0};
 std::atomic<uint32_t> g_rewrites{0};
 std::atomic<bool> g_noneLogged{false};
+// The user's size: DisplaySettings.xml's ScreenWidth and ScreenHeight, kept when the file is not the 1280x768 windowed signature.
+std::atomic<uint32_t> g_userW{0}, g_userH{0};
+std::atomic<uint32_t> g_holds{0};
 
 // Guarded reads and writes: a fault in the game's memory must not become the game's crash. No objects inside the guards.
 bool readU32(uintptr_t at, uint32_t* out) {
@@ -87,16 +102,24 @@ bool readGuardedBytes(const uint8_t* at, uint8_t* out, size_t n) {
     }
 }
 
-// The mode request's window rewrite (H6, the maintainer's decision: keep the user's display mode when 3D is on). VR inactive: a
-// non-windowed request is remembered and passes unchanged. VR active (or the settings file's mode is on at a windowed request): a
-// windowed request (kind 0) is rewritten to the remembered kind and mode index before the original runs, so the apply builds the
-// remembered mode. Nothing is changed while VR is inactive.
+// DisplaySettings.xml's window size, kept as the user's unless it is the 1280x768 windowed signature (the value a windowed apply saved).
+void refreshUserSize() {
+    float hmd = 0.0f, ssaa = 0.0f;
+    uint32_t w = 0, h = 0;
+    if (!deviceHookPanelSettings(&hmd, &ssaa, &w, &h) || !w || !h) return;
+    if (w == 1280 && h == 768) return;
+    g_userW.store(w, std::memory_order_release);
+    g_userH.store(h, std::memory_order_release);
+}
+
+// The mode request's window rewrite (H6; the maintainer's decision: keep the user's display mode when 3D is on). VR inactive: a
+// non-windowed request is remembered whole (its block) and passes unchanged. VR active (or the settings file's mode is on at a windowed
+// request): a windowed request (kind 0) gets the remembered block restored before the original runs, so the apply builds the remembered
+// mode. Nothing is changed while VR is inactive.
 uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
     const uintptr_t req = reinterpret_cast<uintptr_t>(b);
     uint32_t kind = 0;
-    uint64_t index = 0;
     const bool haveKind = readU32(req + kReqKindOff, &kind);
-    const bool haveIndex = readU64(req + kReqIndexOff, &index);
     bool vrOn = vrSsaaHoldVrLive();
     if (!vrOn && haveKind && kind == 0) {
         int mode = 0;
@@ -104,30 +127,74 @@ uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f
         vrOn = vrSsaaHoldReadSettings(&mode, raw, sizeof(raw)) && mode != 0;  // the request at the switch, before the live session is up
     }
     if (!vrOn) {
-        if (haveKind && haveIndex && kind != 0) {
-            g_rememberedKind.store(kind, std::memory_order_release);
-            g_rememberedIndex.store(index, std::memory_order_release);
-            g_remembered.store(true, std::memory_order_release);
+        if (haveKind && kind != 0) {
+            uint64_t q[4] = {};
+            bool ok = true;
+            for (int i = 0; i < 4 && ok; ++i) ok = readU64(req + kReqBlockOff + 8u * i, &q[i]);
+            if (ok) {
+                for (int i = 0; i < 4; ++i) g_block[i].store(q[i], std::memory_order_release);
+                g_rememberedKind.store(kind, std::memory_order_release);
+                g_remembered.store(true, std::memory_order_release);
+            }
         }
     } else if (haveKind && kind == 0) {
-        uint32_t dw = 0, dh = 0;
-        float hmd = 0.0f, ssaa = 0.0f;
-        deviceHookPanelSettings(&hmd, &ssaa, &dw, &dh);
+        refreshUserSize();
+        const uint32_t dw = g_userW.load(std::memory_order_acquire), dh = g_userH.load(std::memory_order_acquire);
         if (g_remembered.load(std::memory_order_acquire)) {
-            const uint32_t rk = g_rememberedKind.load(std::memory_order_acquire);
-            const uint64_t ri = g_rememberedIndex.load(std::memory_order_acquire);
-            if (writeU32(req + kReqKindOff, rk) && writeU64(req + kReqIndexOff, ri) &&
-                g_rewrites.fetch_add(1, std::memory_order_relaxed) < kRewriteCap) {
-                Log::get().note("vr window: kept the display mode at 3D on: requested kind 0 %ux%u (windowed), applied kind %u "
-                                "%ux%u (remembered; mode index %llu; DisplaySettings size); frame %u",
-                                dw, dh, rk, dw, dh, static_cast<unsigned long long>(ri), vrSsaaGateFrame());
-            }
+            // Before: the request's block as the game made it; after: the remembered block, written whole (verified fields only).
+            uint64_t before[4] = {}, after[4] = {};
+            bool ok = true;
+            for (int i = 0; i < 4 && ok; ++i) ok = readU64(req + kReqBlockOff + 8u * i, &before[i]);
+            for (int i = 0; i < 4; ++i) after[i] = g_block[i].load(std::memory_order_acquire);
+            for (int i = 0; ok && i < 4; ++i) ok = writeU64(req + kReqBlockOff + 8u * i, after[i]);
+            if (ok && g_rewrites.fetch_add(1, std::memory_order_relaxed) < kRewriteCap)
+                Log::get().note("vr window: 3D on: the game asked for kind 0 (windowed); the request block was set to the one remembered "
+                                "while VR was inactive: kind 0 -> %u; +0x08 %llX -> %llX; +0x10 %llX -> %llX; +0x18 %llX -> %llX; "
+                                "+0x20 %llX -> %llX; DisplaySettings ScreenWidth %u ScreenHeight %u (the saved size is held by the "
+                                "DisplayConfig writer); frame %u",
+                                g_rememberedKind.load(std::memory_order_acquire),
+                                static_cast<unsigned long long>(before[0]), static_cast<unsigned long long>(after[0]),
+                                static_cast<unsigned long long>(before[1]), static_cast<unsigned long long>(after[1]),
+                                static_cast<unsigned long long>(before[2]), static_cast<unsigned long long>(after[2]),
+                                static_cast<unsigned long long>(before[3]), static_cast<unsigned long long>(after[3]), dw, dh,
+                                vrSsaaGateFrame());
         } else if (!g_noneLogged.exchange(true, std::memory_order_acq_rel)) {
-            Log::get().note("vr window: 3D on requested kind 0 and no non-windowed mode was remembered; the request is left as the "
-                            "game made it (DisplaySettings %ux%u)", dw, dh);
+            Log::get().note("vr window: 3D on asked for kind 0 and no non-windowed request was remembered since start; the request is "
+                            "left as the game made it (DisplaySettings %ux%u; a size alone does not name a mode, so it is not used)",
+                            dw, dh);
         }
     }
     return g_requestOrig(a, b, c, d, e, f, g, h);
+}
+
+// The DisplayConfig writer (0x7F9F00): while VR is live, the object's ScreenWidth, ScreenHeight and FullScreen are the user's (the
+// remembered kind as FullScreen) for the save, and the game's own values are put back after the write. Nothing is written beyond the
+// original's own save.
+uint64_t writerReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
+    const uintptr_t cfg = reinterpret_cast<uintptr_t>(a);
+    if (!cfg || !vrSsaaHoldVrLive()) return g_writerOrig(a, b, c, d, e, f, g, h);
+    refreshUserSize();
+    const uint32_t uw = g_userW.load(std::memory_order_acquire), uh = g_userH.load(std::memory_order_acquire);
+    if (!uw || !uh) return g_writerOrig(a, b, c, d, e, f, g, h);
+    uint32_t gw = 0, gh = 0, gfs = 0;
+    const bool haveW = readU32(cfg + kCfgWidthOff, &gw);
+    const bool haveH = readU32(cfg + kCfgHeightOff, &gh);
+    const bool haveFs = readU32(cfg + kCfgFullScreenOff, &gfs);
+    const bool remembered = g_remembered.load(std::memory_order_acquire);
+    const uint32_t kind = remembered ? g_rememberedKind.load(std::memory_order_acquire) : 0;
+    if (!haveW || !haveH || !haveFs) return g_writerOrig(a, b, c, d, e, f, g, h);
+    writeU32(cfg + kCfgWidthOff, uw);
+    writeU32(cfg + kCfgHeightOff, uh);
+    if (remembered && kind != 0) writeU32(cfg + kCfgFullScreenOff, kind);
+    const uint64_t r = g_writerOrig(a, b, c, d, e, f, g, h);
+    writeU32(cfg + kCfgWidthOff, gw);
+    writeU32(cfg + kCfgHeightOff, gh);
+    writeU32(cfg + kCfgFullScreenOff, gfs);
+    if (g_holds.fetch_add(1, std::memory_order_relaxed) < kHoldCap)
+        Log::get().note("vr window: 3D on: the display config save was held to the user's size: ScreenWidth %u ScreenHeight %u "
+                        "FullScreen %u (the game's object had %ux%u FullScreen %u; put back after the save); frame %u",
+                        uw, uh, (remembered && kind != 0) ? kind : gfs, gw, gh, gfs, vrSsaaGateFrame());
+    return r;
 }
 
 // The settings copy (W): the original copies the settings block into the render context; then the hold (vrSsaaHoldAfterCopy) reads
@@ -225,12 +292,17 @@ void vrWindowTrampolinesInstall() {
         Log::get().note("vr window: trampolines off: the game module could not be found");
         return;
     }
+    refreshUserSize();
     const bool req = installOne(base, kRequestRva, kRequestBytes, sizeof(kRequestBytes), reinterpret_cast<void*>(&requestReplacement),
                                 reinterpret_cast<void**>(&g_requestOrig), &g_requestHook, "0x7E9D50 (mode request)");
+    const bool writer = installOne(base, kWriterRva, kWriterBytes, sizeof(kWriterBytes), reinterpret_cast<void*>(&writerReplacement),
+                                   reinterpret_cast<void**>(&g_writerOrig), &g_writerHook, "0x7F9F00 (display config writer)");
     const bool copy = installOne(base, kCopyRva, kCopyBytes, sizeof(kCopyBytes), reinterpret_cast<void*>(&copyReplacement),
                                  reinterpret_cast<void**>(&g_copyOrig), &g_copyHook, "0x281C0D0 (settings copy)");
-    Log::get().note("vr window: trampolines: 0x7E9D50 (mode request, window rewrite) %s; 0x281C0D0 (settings copy, hold) %s",
-                    req ? "installed" : "not installed", copy ? "installed" : "not installed");
+    Log::get().note("vr window: trampolines: 0x7E9D50 (mode request, window rewrite) %s; 0x7F9F00 (display config save, hold) %s; "
+                    "0x281C0D0 (settings copy, hold) %s; DisplaySettings %ux%u",
+                    req ? "installed" : "not installed", writer ? "installed" : "not installed", copy ? "installed" : "not installed",
+                    g_userW.load(), g_userH.load());
 }
 
 }  // namespace edvr
