@@ -156,6 +156,16 @@ Lines:
 - NOT VERIFIED: whether restoring the request block alone selects the remembered mode in the apply (the table depends on the object fields above); the writer hold covers the saved file only. The flight decides: DisplaySettings.xml after 3D on and off, and the flat start.
 - The wording of the rewrite line is corrected: the request block was set to the remembered one; the size in that line is DisplaySettings', not the applied state's.
 
+## The save corruption (flight 55c0fe3d, 13:58; the save hold is OFF from this commit)
+
+- SYMPTOM: DisplaySettings.xml diff against the pre-flight backup: VSync false -> true, FullScreen 2 -> 3840, PresentInterval 1 -> 2. ScreenWidth 3840 and ScreenHeight 2160 unchanged. The window stayed 4K borderless, so the request-block restore worked.
+- CAUSE: the hold wrote 3840 to object +0x08, 2160 to +0x0C and 2 to +0x10, and took them to be ScreenWidth, ScreenHeight and FullScreen at +0x00..? My field pairing was misaligned: I named +0x08 ScreenWidth and +0x0C ScreenHeight, and both pairings came from the name-lea order. The flight shows +0x08 is FullScreen, +0x0C is VSync, +0x10 is PresentInterval.
+- ORDERED LAYOUT OF THE WRITER (0x7F9F00, read-only; every name and its field access in order): ScreenWidth (value from [rdi+0x08] at 0x7F9FF3, name at 0x7F9FF6; the pairing is contested by the flight), then `lea r8,[rdi+0x04]` -> ScreenHeight (name at 0x7FA016), `lea r8,[rdi+0x0C]` -> VSync (name at 0x7FA029), FullScreen (name at 0x7FA040; its value source is NOT identified by this listing), `lea r8,[rdi+0x10]` -> PresentInterval (name at 0x7FA053), then Adapter +0x14, Monitor +0x18, DX11_RefreshRateNumerator +0x1C, DX11_RefreshRateDenominator +0x20, LimitFrameRate +0x24, MaxFramesPerSecond +0x28. The writer's name order matches the saved XML order (ScreenWidth, ScreenHeight, VSync, FullScreen, PresentInterval, ...).
+- CONTRADICTION: the 55c0fe3d log read the object as +0x0C = 1064042496 (a float's bits, not a VSync bool) and +0x08 = 2 (the saved FullScreen). So the layout of the object the save reads is not what the listing gives for VSync, and the value for FullScreen is at +0x08 by the flight, not by the listing. NOT PROVEN.
+- GUARD: src\d3d11\vr_display_config_guard.h (pure): a side must be 640..16384, FullScreen 0..2, VSync 0..1, PresentInterval 0..4. Rig cases are in tools\vr_ssaa_hold_test (they refuse the values that corrupted the save).
+- ACTION: the 0x7F9F00 hold is removed from the trampolines (no install, no write). The request-block restore stays. The corrupted DisplaySettings.xml is NOT touched by EDVR; the maintainer fixes VSync and FullScreen in-game before the next flight.
+- NEXT (to re-enable the save hold): prove the object's field offsets for ScreenWidth, ScreenHeight and FullScreen (trace the value source of each name's call in 0x7F9F00, and the object's writers at its callers 0x7F8E78 and 0x7FA7C6), and write only those three, guarded by displaycfg::plausibleObject.
+
 ## Verified in the build
 
 (filled in from the build and install output of this commit)

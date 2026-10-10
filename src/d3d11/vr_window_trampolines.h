@@ -8,6 +8,8 @@
 //   0x281C0D0 the settings copy W (rcx = the first argument whose +0x1180 is the render context). After the copy, the hold
 //             (vrSsaaHoldAfterCopy) sets the copied Supersampling field to 1.0 while VR is live.
 //
+// The DisplayConfig save (0x7F9F00) is NOT held: its object's field layout is not proven (see the doc, "The save corruption").
+//
 // Build-gated: the caller checks the PE stamp and image size first (vrSsaaGateStartup); each target's first bytes must be the ones read
 // from build 332841, and CodeHook refuses any prologue it cannot relocate. A refusal is one line and the entry is not patched.
 #pragma once

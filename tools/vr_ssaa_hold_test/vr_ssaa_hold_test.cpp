@@ -2,6 +2,7 @@
 // held value for each (profile, mode known, mode, requested), and the toast text. Drives the very functions the DLL calls.
 // Built from the repo root by build.bat's :rig_vr_ssaa_hold_test. --dry-run writes nothing; --self-test runs the checks.
 #include "../../src/d3d11/vr_ssaa_hold_math.h"
+#include "../../src/d3d11/vr_display_config_guard.h"
 
 #include <cmath>
 #include <cstdio>
@@ -71,6 +72,19 @@ void toastCases() {
     check(std::strlen(buf) < 120, "the toast fits its buffer");
 }
 
+// The DisplayConfig plausibility guard (vr_display_config_guard.h): the values of a real object pass, the layout that corrupted the save
+// (3840 read as FullScreen, 2160 as VSync, 2 as PresentInterval) is refused.
+void displayConfigCases() {
+    using namespace edvr::displaycfg;
+    check(plausibleObject(3840, 2160, 2, 0, 1), "a 4K borderless object (FullScreen 2, VSync 0, PresentInterval 1) is plausible");
+    check(plausibleObject(1280, 768, 0, 1, 1), "a windowed 1280x768 object is plausible");
+    check(!plausibleFullScreen(3840), "FullScreen 3840 (the corrupting write) is refused");
+    check(!plausibleVSync(2160), "VSync 2160 (the corrupting write) is refused");
+    check(!plausiblePresentInterval(2160), "PresentInterval 2160 is refused");
+    check(!plausibleSide(0) && !plausibleSide(100) && !plausibleSide(20000), "a side of 0, 100 or 20000 is refused");
+    check(!plausibleObject(3840, 2160, 2, 1064042496u, 1), "a float-bit VSync (1064042496) is refused: the object is not what the guard names");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -86,6 +100,7 @@ int main(int argc, char** argv) {
     parseCases();
     decideCases();
     toastCases();
+    displayConfigCases();
     if (g_fails) {
         std::printf("vr_ssaa_hold_test: %d of %d checks FAILED\n", g_fails, g_checks);
         return 1;

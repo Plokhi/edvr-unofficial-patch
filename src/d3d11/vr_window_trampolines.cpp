@@ -27,27 +27,17 @@ constexpr uint8_t kRequestBytes[11] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10,
 constexpr uintptr_t kReqBlockOff = 0x08;   // the remembered block: request +0x08 .. +0x27 (four qwords)
 constexpr uintptr_t kReqKindOff = 0x20;
 
-// The DisplayConfig writer (0x7F9F00): it takes the display config object (rdi) and writes DisplaySettings.xml from its fields: ScreenWidth
-// [+0x08], ScreenHeight [+0x0C], FullScreen [+0x10], PresentInterval [+0x14], Adapter [+0x18], Monitor [+0x1C], and the refresh and frame
-// limit fields. Its first nine bytes, from build 332841: push rdi; sub rsp,0x1D0.
-constexpr uint32_t kWriterRva = 0x7F9F00;
-constexpr uint8_t kWriterBytes[9] = {0x40, 0x57, 0x48, 0x81, 0xEC, 0xD0, 0x01, 0x00, 0x00};
-constexpr uintptr_t kCfgWidthOff = 0x08, kCfgHeightOff = 0x0C, kCfgFullScreenOff = 0x10;
-
 // The settings copy W (0x281C0D0): the block copy into the render context at ctx+0x3428 (ctx = the first argument's +0x1180). Its first
 // eleven bytes: mov r11,rsp; push rbx; sub rsp,0x4D0.
 constexpr uint32_t kCopyRva = 0x281C0D0;
 constexpr uint8_t kCopyBytes[11] = {0x4C, 0x8B, 0xDC, 0x53, 0x48, 0x81, 0xEC, 0xD0, 0x04, 0x00, 0x00};
 
 constexpr uint32_t kRewriteCap = 64;
-constexpr uint32_t kHoldCap = 64;
 
 using Fn8 = uint64_t (*)(void*, void*, void*, void*, void*, void*, void*, void*);
 Fn8 g_requestOrig = nullptr;
-Fn8 g_writerOrig = nullptr;
 Fn8 g_copyOrig = nullptr;
 CodeHook g_requestHook;
-CodeHook g_writerHook;
 CodeHook g_copyHook;
 
 // The last non-windowed request accepted while VR was inactive: the whole request block (+0x08 .. +0x27) and its kind.
@@ -58,7 +48,6 @@ std::atomic<uint32_t> g_rewrites{0};
 std::atomic<bool> g_noneLogged{false};
 // The user's size: DisplaySettings.xml's ScreenWidth and ScreenHeight, kept when the file is not the 1280x768 windowed signature.
 std::atomic<uint32_t> g_userW{0}, g_userH{0};
-std::atomic<uint32_t> g_holds{0};
 
 // Guarded reads and writes: a fault in the game's memory must not become the game's crash. No objects inside the guards.
 bool readU32(uintptr_t at, uint32_t* out) {
@@ -150,8 +139,7 @@ uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f
             if (ok && g_rewrites.fetch_add(1, std::memory_order_relaxed) < kRewriteCap)
                 Log::get().note("vr window: 3D on: the game asked for kind 0 (windowed); the request block was set to the one remembered "
                                 "while VR was inactive: kind 0 -> %u; +0x08 %llX -> %llX; +0x10 %llX -> %llX; +0x18 %llX -> %llX; "
-                                "+0x20 %llX -> %llX; DisplaySettings ScreenWidth %u ScreenHeight %u (the saved size is held by the "
-                                "DisplayConfig writer); frame %u",
+                                "+0x20 %llX -> %llX; DisplaySettings ScreenWidth %u ScreenHeight %u (the save is not held); frame %u",
                                 g_rememberedKind.load(std::memory_order_acquire),
                                 static_cast<unsigned long long>(before[0]), static_cast<unsigned long long>(after[0]),
                                 static_cast<unsigned long long>(before[1]), static_cast<unsigned long long>(after[1]),
@@ -165,36 +153,6 @@ uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f
         }
     }
     return g_requestOrig(a, b, c, d, e, f, g, h);
-}
-
-// The DisplayConfig writer (0x7F9F00): while VR is live, the object's ScreenWidth, ScreenHeight and FullScreen are the user's (the
-// remembered kind as FullScreen) for the save, and the game's own values are put back after the write. Nothing is written beyond the
-// original's own save.
-uint64_t writerReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
-    const uintptr_t cfg = reinterpret_cast<uintptr_t>(a);
-    if (!cfg || !vrSsaaHoldVrLive()) return g_writerOrig(a, b, c, d, e, f, g, h);
-    refreshUserSize();
-    const uint32_t uw = g_userW.load(std::memory_order_acquire), uh = g_userH.load(std::memory_order_acquire);
-    if (!uw || !uh) return g_writerOrig(a, b, c, d, e, f, g, h);
-    uint32_t gw = 0, gh = 0, gfs = 0;
-    const bool haveW = readU32(cfg + kCfgWidthOff, &gw);
-    const bool haveH = readU32(cfg + kCfgHeightOff, &gh);
-    const bool haveFs = readU32(cfg + kCfgFullScreenOff, &gfs);
-    const bool remembered = g_remembered.load(std::memory_order_acquire);
-    const uint32_t kind = remembered ? g_rememberedKind.load(std::memory_order_acquire) : 0;
-    if (!haveW || !haveH || !haveFs) return g_writerOrig(a, b, c, d, e, f, g, h);
-    writeU32(cfg + kCfgWidthOff, uw);
-    writeU32(cfg + kCfgHeightOff, uh);
-    if (remembered && kind != 0) writeU32(cfg + kCfgFullScreenOff, kind);
-    const uint64_t r = g_writerOrig(a, b, c, d, e, f, g, h);
-    writeU32(cfg + kCfgWidthOff, gw);
-    writeU32(cfg + kCfgHeightOff, gh);
-    writeU32(cfg + kCfgFullScreenOff, gfs);
-    if (g_holds.fetch_add(1, std::memory_order_relaxed) < kHoldCap)
-        Log::get().note("vr window: 3D on: the display config save was held to the user's size: ScreenWidth %u ScreenHeight %u "
-                        "FullScreen %u (the game's object had %ux%u FullScreen %u; put back after the save); frame %u",
-                        uw, uh, (remembered && kind != 0) ? kind : gfs, gw, gh, gfs, vrSsaaGateFrame());
-    return r;
 }
 
 // The settings copy (W): the original copies the settings block into the render context; then the hold (vrSsaaHoldAfterCopy) reads
@@ -295,14 +253,10 @@ void vrWindowTrampolinesInstall() {
     refreshUserSize();
     const bool req = installOne(base, kRequestRva, kRequestBytes, sizeof(kRequestBytes), reinterpret_cast<void*>(&requestReplacement),
                                 reinterpret_cast<void**>(&g_requestOrig), &g_requestHook, "0x7E9D50 (mode request)");
-    const bool writer = installOne(base, kWriterRva, kWriterBytes, sizeof(kWriterBytes), reinterpret_cast<void*>(&writerReplacement),
-                                   reinterpret_cast<void**>(&g_writerOrig), &g_writerHook, "0x7F9F00 (display config writer)");
     const bool copy = installOne(base, kCopyRva, kCopyBytes, sizeof(kCopyBytes), reinterpret_cast<void*>(&copyReplacement),
                                  reinterpret_cast<void**>(&g_copyOrig), &g_copyHook, "0x281C0D0 (settings copy)");
-    Log::get().note("vr window: trampolines: 0x7E9D50 (mode request, window rewrite) %s; 0x7F9F00 (display config save, hold) %s; "
-                    "0x281C0D0 (settings copy, hold) %s; DisplaySettings %ux%u",
-                    req ? "installed" : "not installed", writer ? "installed" : "not installed", copy ? "installed" : "not installed",
-                    g_userW.load(), g_userH.load());
+    Log::get().note("vr window: trampolines: 0x7E9D50 (mode request, window rewrite) %s; 0x281C0D0 (settings copy, hold) %s; DisplaySettings %ux%u; the display config save is not held (its field layout is not proven)",
+                    req ? "installed" : "not installed", copy ? "installed" : "not installed", g_userW.load(), g_userH.load());
 }
 
 }  // namespace edvr
