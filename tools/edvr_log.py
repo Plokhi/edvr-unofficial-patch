@@ -5068,7 +5068,8 @@ def vr_supersampling_verdict(f):
 # --vr-supersampling's hold lines: the VR Supersampling hold (src/d3d11/vr_ssaa_hold.cpp; docs/vr-supersampling-gate-2026-10-10.md). The
 # hold keeps the game's Supersampling at 1.0 in VR while the 3D mode is on, so these lines say what was held, when, and whether the
 # menu's notice followed a requested value other than 1.0.
-SSAA_HOLD_RE = re.compile(FLATU_TS + r"vr ssaa gate: holding Supersampling at 1\.0 \(requested (?P<req>-?[0-9.]+), 3D mode (?P<mode>-?\d+), at (?P<at>startup|menu|mode change)\)")
+SSAA_HOLD_RE = re.compile(FLATU_TS + r"vr ssaa gate: holding Supersampling at 1\.0 \(requested (?P<req>-?[0-9.]+), (?:3D mode|VR live) (?P<mode>-?\d+), at (?P<at>startup|menu)\)")
+SSAA_TRANSITION_RE = re.compile(FLATU_TS + r"vr ssaa gate: VR (?P<dir>active|inactive) -> (?P<what>holding at 1\.0|released)")
 SSAA_MODE_RE = re.compile(FLATU_TS + r"vr ssaa gate: 3D mode (?P<old>\S+) -> (?P<new>\S+) \(Settings\.xml")
 SSAA_NOT_CHASED_RE = re.compile(FLATU_TS + r"vr ssaa gate: 3D mode is now 0; the held Supersampling stays at 1\.0")
 SSAA_NOTICE_RE = re.compile(FLATU_TS + r"vr ssaa gate: notice queued as a toast \(\"Supersampling (?P<x>[0-9.]+) is held at 1\.0 in VR")
@@ -5079,7 +5080,7 @@ SSAA_NOT_HELD_RE = re.compile(FLATU_TS + r"vr ssaa gate: startup not held \((?P<
 
 def parse_ssaa_hold(text):
     """{holds: [{ts, req, mode, at}], modes: [(ts, old, new)], not_chased: bool, notices: [ts], refused: [ts], installed: bool, not_held: str or None}."""
-    h = {"holds": [], "modes": [], "not_chased": False, "notices": [], "refused": [], "installed": False, "not_held": None}
+    h = {"holds": [], "modes": [], "transitions": [], "not_chased": False, "notices": [], "refused": [], "installed": False, "not_held": None}
     for raw in text.splitlines():
         try:
             m = SSAA_HOLD_RE.match(raw)
@@ -5089,6 +5090,10 @@ def parse_ssaa_hold(text):
             m = SSAA_MODE_RE.match(raw)
             if m:
                 h["modes"].append((m.group("ts") or "?", m.group("old"), m.group("new")))
+                continue
+            m = SSAA_TRANSITION_RE.match(raw)
+            if m:
+                h["transitions"].append((m.group("ts") or "?", m.group("dir"), m.group("what")))
                 continue
             if SSAA_NOT_CHASED_RE.match(raw):
                 h["not_chased"] = True
@@ -5128,6 +5133,9 @@ def ssaa_hold_verdict(h):
             out.append(("HOLD-NOTICE", "PASS", "%d notice(s) queued for requested values held at 1.0" % len(h["notices"])))
     elif h["installed"] or h["not_held"]:
         out.append(("HOLD", "n/a", "the hold is installed and nothing was held (%s)" % (h["not_held"] or "no hold was asked for")))
+    if h["transitions"]:
+        out.append(("HOLD-VR", "PASS", "%d VR transition(s) seen: the hold follows the runtime's live VR session (the last: %s %s at %s)"
+                    % (len(h["transitions"]), h["transitions"][-1][1], h["transitions"][-1][2], h["transitions"][-1][0])))
     if h["not_chased"]:
         out.append(("HOLD-MODE", "n/a", "the 3D mode went to 0 mid-session: the held Supersampling stays at 1.0 until the next apply or restart (not chased, by design)"))
     return out
@@ -5138,11 +5146,13 @@ def print_vr_supersampling(text):
     f = parse_vr_supersampling(text)
     h = parse_ssaa_hold(text)
     has_notice = bool(f["notice"] or f["adopt"] or f["queued"])
-    has_hold = bool(h["holds"] or h["refused"] or h["installed"] or h["not_held"] or h["modes"] or h["notices"] or h["not_chased"])
+    has_hold = bool(h["holds"] or h["refused"] or h["installed"] or h["not_held"] or h["modes"] or h["notices"] or h["not_chased"] or h["transitions"])
     if not (has_notice or has_hold):
         print("[edvr] no `vr supersampling:` or vScreen render-size line in this log (the world may be drawn at the eye's own size, or vScreen's guards held the "
               "adoption back, or this is a build that predates section 83: Supersampling below 1 cannot be ruled out from it).")
         return 1
+    for ts, d, w in h["transitions"]:
+        print("VR transition %s: %s %s" % (ts, d, w))
     for ts, old, new in h["modes"]:
         print("3D mode %s: %s -> %s" % (ts, old, new))
     for x in h["holds"]:
@@ -10749,9 +10759,7 @@ def self_test_flat_upscale():
     hold_src = os.path.join(os.path.dirname(here), "src", "d3d11", "vr_ssaa_hold.cpp")
     menu_src = os.path.join(os.path.dirname(here), "src", "d3d11", "menu.cpp")
     for path, needles in ((hold_src, ("vr ssaa gate: holding Supersampling at 1.0 (requested %.4f, 3D mode %d, at startup",
-                                       "vr ssaa gate: holding Supersampling at 1.0 (requested %.4f, 3D mode %d, at menu)",
-                                       "vr ssaa gate: 3D mode %s -> %s (Settings.xml, re-read",
-                                       "vr ssaa gate: 3D mode is now 0; the held Supersampling stays at 1.0",
+                                       "vr ssaa gate: holding Supersampling at 1.0 (requested %.4f, VR live 1, at menu)",
                                        "vr ssaa gate: hold installed at DLL load",
                                        "vr ssaa gate: hold refused, nothing written",
                                        "vr ssaa gate: startup not held (")),
@@ -10764,19 +10772,19 @@ def self_test_flat_upscale():
                 fail("%s no longer writes the hold line %r; this reader does not parse it" % (os.path.basename(path), needle))
     hold = ("[09:23:44.988] vr ssaa gate: hold installed at DLL load: loader wrapper 0x2862780 (slot 0x52E8368) and the Supersampling setter, build 332841 checked\n"
             "[09:23:44.990] vr ssaa gate: holding Supersampling at 1.0 (requested 0.5000, 3D mode 3, at startup); loader object 0x1234, field 0x1370\n"
-            "[09:24:30.100] vr ssaa gate: holding Supersampling at 1.0 (requested 0.8500, 3D mode 3, at menu)\n"
+            "[09:24:30.100] vr ssaa gate: holding Supersampling at 1.0 (requested 0.8500, VR live 1, at menu)\n"
             "[09:24:30.300] vr ssaa gate: notice queued as a toast (\"Supersampling 0.85 is held at 1.0 in VR: use HMD Image Quality to set resolution\")\n"
-            "[09:25:00.000] vr ssaa gate: 3D mode 3 -> 0 (Settings.xml, re-read 1.5 s after a Supersampling call)\n"
-            "[09:25:00.001] vr ssaa gate: 3D mode is now 0; the held Supersampling stays at 1.0 until the next apply or restart (not chased)\n")
+            "[09:25:00.000] vr ssaa gate: VR inactive -> released: the game's 0.8500 restored\n"
+            "[09:25:00.001] vr ssaa gate: VR active -> holding at 1.0 (game's 0.8500)\n")
     hp = parse_ssaa_hold(hold)
-    if len(hp["holds"]) != 2 or hp["holds"][1]["req"] != 0.85 or hp["holds"][1]["at"] != "menu" or not hp["notices"] or not hp["not_chased"] or not hp["installed"] or hp["modes"] != [("09:25:00.000", "3", "0")]:
+    if len(hp["holds"]) != 2 or hp["holds"][1]["req"] != 0.85 or hp["holds"][1]["at"] != "menu" or not hp["notices"] or len(hp["transitions"]) != 2 or not hp["installed"]:
         fail("the hold lines parsed as %r" % (hp,))
-    want_statuses_vr(hold, {"HOLD": "PASS", "HOLD-NOTICE": "PASS", "HOLD-MODE": "n/a"}, "a held menu change with its notice")
+    want_statuses_vr(hold, {"HOLD": "PASS", "HOLD-NOTICE": "PASS", "HOLD-VR": "PASS"}, "a held menu change with its notice")
     want_statuses_vr(hold.replace(hold.splitlines(True)[3], ""), {"HOLD-NOTICE": "WARN"}, "a held value other than 1.0 with no notice")
     want_statuses_vr("[09:23:44.990] vr ssaa gate: hold refused, nothing written: game build not checked (PE stamp 1, image 2, build 332841's are 3, 4); the game's Supersampling is not held\n",
                      {"HOLD": "WARN"}, "a refused hold")
     _, hout = statuses(hold, print_vr_supersampling)
-    if "3D mode 09:25:00.000: 3 -> 0" not in hout or "vr supersampling verdict:" not in hout:
+    if "VR transition 09:25:00.000" not in hout or "vr supersampling verdict:" not in hout:
         fail("the hold report lacks its mode line or its verdict:\n%s" % hout)
     return ok
 

@@ -1,24 +1,18 @@
-// The VR Supersampling hold (step 2 of the arc in docs/vr-supersampling-gate-2026-10-10.md). While Elite's 3D mode is on
-// (Settings.xml's <StereoscopicMode> is not 0) and the graphics profile is VR, the game's own Supersampling field
-// (render context +0x3564, the value every sizing and shader consumer reads) is held at 1.0, so HMD Image Quality is the only
-// render control in VR. The flat profile and 3D mode 0 are untouched.
+// The VR Supersampling hold (docs/vr-supersampling-gate-2026-10-10.md). While the runtime's VR session is live, the game's Supersampling
+// field (render context +0x3564, the value every sizing and shader consumer reads) is held at 1.0, so HMD Image Quality is the only
+// render control in VR. When the session ends, the game's own value is restored, so flat uses the user's Supersampling.
+//
+// THE LIVE DECISION. "VR active" is the runtime's published render sizing (edvrQueryNativeRenderSizing, valid == 1), set when an OpenXR
+// session has its eye sizes and cleared at teardown (native_runtime_host.h). Settings.xml's <StereoscopicMode> is read only at startup,
+// for the loader's hold; it lagged the game's own apply, so it does not decide.
 //
 // HOW IT IS HELD.
-//   * At startup: the game's fxcfg loader (RVA 0x2855A50, reached through the wrapper at RVA 0x2862780, a virtual slot in .rdata
-//     at RVA 0x52E8368) writes the .fxcfg's SSAAMultiplier into the loader's object. EDVR swaps that slot for its own thunk when
-//     the DLL is attached (DllMain, pure memory: no config, no file, no log under the loader lock). The thunk calls the original,
-//     then writes 1.0 to the object's SS field (+0x13C, which is render context +0x3564 offset by 0x3428 -- verified by the log
-//     line that gives both pointers) when the decision says held.
-//   * In the menu: the game's setter (ui_panel_scale.cpp's hookedSetter, installed the same way) passes 1.0 instead of the value
-//     the menu asked for, when held. The requested value is remembered for the log and the toast.
-//   * The mode is read from Settings.xml at the loader and re-read ~1.5 s after each setter call, on the render thread at a frame
-//     boundary (one small read). A change is logged. A 3 -> 0 change is not chased: the field stays at 1.0 until the next apply or
-//     restart, and the log says so. 0 -> on is held at the next apply.
-//   * The panel factor (ui_panel_scale.cpp's chooseSupersampling) takes 1.0 while held, so the panels and the size budget match
-//     the field.
-//
-// WHAT IS REFUSED. A build other than 332841 (PE stamp and image size), a wrapper or loader prologue that is not build 332841's,
-// or a slot that does not hold the wrapper: nothing is written, and one line says why (vrSsaaHoldReport, at device creation).
+//   * The copy trampoline (vr_window_trampolines.cpp, the game's settings copy W): after the copy, while VR is live, the field is set to
+//     1.0. The size writer reads it next, so the sizes use 1.0. The source block is not written.
+//   * The setter (ui_panel_scale.cpp hookedSetter): while VR is live, the value passed on is 1.0 and the game's value is remembered.
+//   * The frame boundary: a VR transition sets the field to 1.0 (on) or restores the game's remembered value (off).
+//   * The panel factor (ui_panel_scale.cpp chooseSupersampling) takes 1.0 while held, so the panels follow the same decision.
+//   * At startup, the loader's temporary is written before the game copies it (the startup write reaches the copy, not the field).
 #pragma once
 
 #include <cstddef>
@@ -36,42 +30,34 @@ void vrSsaaHoldReport();
 // DLL unload: the loader's slot is put back. Idempotent.
 void vrSsaaHoldShutdown();
 
-// The setter's value: 1.0 while held, the requested value otherwise. Called first in ui_panel_scale.cpp's hookedSetter.
+// The setter's value: 1.0 while VR is live (and the game's value is remembered), the requested value otherwise.
 float vrSsaaHoldSetterValue(float requested);
 
 // Whether the field is held at 1.0 right now (the panel factor reads 1.0 then). Lock-free.
 bool vrSsaaHoldActive();
 
-// The render thread, once a frame (from vrSsaaGateNotePresent): re-reads Settings.xml when a setter call asked for it.
+// Whether the runtime's VR session is live (the render thread's last read). Lock-free.
+bool vrSsaaHoldVrLive();
+
+// The render thread, once a frame: reads the live VR decision and applies a transition (see the .cpp).
 void vrSsaaHoldFrameBoundary();
+
+// The settings copy's hold (called from the W relay with the render context, after the copy). Writes nothing when VR is not live.
+void vrSsaaHoldAfterCopy(uintptr_t ctx);
+
+// ui_panel_scale.cpp's setter and getter thunks: the render context the call was made on.
+void vrSsaaHoldNoteContext(uintptr_t ctx);
 
 // The menu, once per change of the requested value while held and not 1.0: true with the value to say.
 bool vrSsaaHoldNoticeDue(float* requested);
 
-// Settings.xml's <StereoscopicMode>: true with *mode when it reads; raw gets "0".."6", "absent", "unparsed" or "unreadable".
+// Settings.xml's <StereoscopicMode>: true with *mode when it reads; raw gets "0".."6", "absent", "unparsed" or "unreadable". Startup only.
 bool vrSsaaHoldReadSettings(int* mode, char* raw, size_t rawLen);
 
-// The loader object the startup hold wrote to (its SS field at +0x13C), or 0 before the loader ran. The step-1 setter line prints
-// the render context beside it, so a flight can check context = object + 0x3428.
+// The loader object the startup hold wrote to (its SS field at +0x13C), or 0 before the loader ran. Logged only.
 unsigned long long vrSsaaHoldLoaderObject();
 
-// The Settings.xml mode as the hold last read it (*known false when unread or unparsed); the display observer's lines carry it.
+// The Settings.xml mode read at startup (*known false when unread or unparsed).
 int vrSsaaHoldLastMode(bool* known);
-
-// The settings copy's trampoline (option B, vr_window_trampolines.cpp): after the game copies its settings into the render context
-// (ctx given), the Supersampling field is held at 1.0 while the 3D mode is on. The source block is not written. Writes nothing when
-// not held.
-void vrSsaaHoldAfterCopy(uintptr_t ctx);
-
-// ui_panel_scale.cpp's setter thunks: the render context the setter was called on. The hold re-applies to it on a 0 -> on change.
-void vrSsaaHoldNoteContext(uintptr_t ctx);
-
-// The sizing watch (H7): called from the game's texture creates (device_hook.cpp). For 3 s after a setter call or a mode change, a
-// game render or depth-stencil target is logged with its size, format, bind flags and the callers. One flag test when not armed.
-void vrSizingWatchTexture(uint32_t w, uint32_t h, uint32_t format, uint32_t bind);
-
-// The settings watch (H8): once per Present, read-only. Logs a change of the loader object's SS field (+0x13C) or the render
-// context's (+0x3564) with the time since the last setter call. Writes nothing. Does nothing until the hooks are in.
-void vrSsaaHoldWatchSettings(uint32_t frame);
 
 }  // namespace edvr

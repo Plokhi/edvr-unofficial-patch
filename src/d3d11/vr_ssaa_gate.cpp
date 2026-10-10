@@ -7,8 +7,7 @@
 #include "ui_surfaces.h"     // uiSurfacesHmdQuality: lock-free
 #include "vr_ssaa_hold.h"    // the hold's report, mode re-read and loader object (the hold changes values; this file only logs)
 #include "vr_display_observer.h"  // the game window's frame check (read-only)
-#include "vr_window_trampolines.h"  // the game's mode request and window apply, observed (H6)
-#include "vr_context_watch.h"       // the write watch's per-frame disarm
+#include "vr_window_trampolines.h"  // the game's mode request (the window rewrite) and settings copy (the hold)
 
 #include "../common/elite_graphics_folder.h"  // the Options\Graphics folder under %LOCALAPPDATA%
 #include "../common/log.h"
@@ -161,11 +160,9 @@ void vrSsaaGateStartup() {
 uint32_t vrSsaaGateFrame() { return g_presents.load(std::memory_order_relaxed); }
 
 void vrSsaaGateNotePresent() {
-    vrSsaaHoldFrameBoundary();  // the Supersampling hold's mode re-read (a small read, only when a setter call asked for one)
     vrDisplayObserveFrame();    // the game window's style and client size, one line when they change (read-only)
     const uint32_t frame = g_presents.fetch_add(1, std::memory_order_relaxed) + 1;
-    vrSsaaHoldWatchSettings(frame);  // H8: the render context's field, read-only, logged on change
-    vrContextWatchFrame();           // the write watch's disarm, when the handler asked for one at its cap
+    vrSsaaHoldFrameBoundary();  // the live VR decision (the runtime's render sizing) and its transitions
     if (!g_on.load(std::memory_order_acquire)) return;
     bool expected = false;
     if (!g_presentLogged.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;

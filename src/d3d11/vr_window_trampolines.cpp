@@ -1,9 +1,9 @@
-// The window-mode trampolines (vr_window_trampolines.h says what and why). Observe only.
+// The game-code trampolines (vr_window_trampolines.h says what and why): the mode request's window rewrite, and the settings copy's hold.
 #include "vr_window_trampolines.h"
 
-#include "vr_display_observer.h"  // vrDisplayGameWindow: the game's window, to compare with the foreground
-#include "vr_ssaa_gate.h"         // vrSsaaGateFrame: the frame number
-#include "vr_ssaa_hold.h"         // vrSsaaHoldLastMode: the StereoscopicMode the hold last read
+#include "device_hook.h"     // deviceHookPanelSettings: DisplaySettings.xml's window size, for the log
+#include "vr_ssaa_gate.h"    // vrSsaaGateFrame: the frame number the log carries
+#include "vr_ssaa_hold.h"    // vrSsaaHoldVrLive, vrSsaaHoldAfterCopy, vrSsaaHoldReadSettings
 
 #include "../common/code_hook.h"
 #include "../common/log.h"
@@ -14,33 +14,38 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <string>
 
 namespace edvr {
 namespace {
 
-constexpr uint32_t kRequestRva = 0x7E9D50;  // the mode request
-constexpr uint32_t kApplyRva = 0x5589B0;    // the window apply
-// The first eleven bytes of each, read from build 332841 (the build gate is the PE stamp; these pin the function itself).
+// The mode request (0x7E9D50). Its first eleven bytes, read from build 332841: mov rax,rsp; mov [rax+0x10],rbx; mov [rax+0x18],rsi.
+// The request is rdx on entry; kind is [request+0x20] (a dword), the mode-table index is [request+0x18] (a qword). [request] is a
+// locked compare-exchange target in that function, so it is never written here.
+constexpr uint32_t kRequestRva = 0x7E9D50;
 constexpr uint8_t kRequestBytes[11] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18};
-constexpr uint8_t kApplyBytes[11] = {0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x57};
-// The settings copy W (H7/H8, docs/vr-supersampling-gate-2026-10-10.md): the block copy into the render context at ctx+0x3428 (ctx = the
-// first argument's +0x1180). The first eleven bytes: mov r11,rsp; push rbx; sub rsp,0x4D0.
+constexpr uintptr_t kReqKindOff = 0x20, kReqIndexOff = 0x18;
+
+// The settings copy W (0x281C0D0): the block copy into the render context at ctx+0x3428 (ctx = the first argument's +0x1180). Its first
+// eleven bytes: mov r11,rsp; push rbx; sub rsp,0x4D0.
 constexpr uint32_t kCopyRva = 0x281C0D0;
 constexpr uint8_t kCopyBytes[11] = {0x4C, 0x8B, 0xDC, 0x53, 0x48, 0x81, 0xEC, 0xD0, 0x04, 0x00, 0x00};
-constexpr uint32_t kCap = 64;
+
+constexpr uint32_t kRewriteCap = 64;
 
 using Fn8 = uint64_t (*)(void*, void*, void*, void*, void*, void*, void*, void*);
 Fn8 g_requestOrig = nullptr;
-Fn8 g_applyOrig = nullptr;
 Fn8 g_copyOrig = nullptr;
 CodeHook g_requestHook;
-CodeHook g_applyHook;
 CodeHook g_copyHook;
-std::atomic<uint32_t> g_requestLines{0};
-std::atomic<uint32_t> g_applyLines{0};
 
-// Guarded reads: a fault in the game's memory must not become the game's crash. No objects inside the guards.
+// The last non-windowed request accepted while VR was inactive: the display mode the user had (kind 1 or 2 and its mode index).
+std::atomic<bool> g_remembered{false};
+std::atomic<uint32_t> g_rememberedKind{0};
+std::atomic<uint64_t> g_rememberedIndex{0};
+std::atomic<uint32_t> g_rewrites{0};
+std::atomic<bool> g_noneLogged{false};
+
+// Guarded reads and writes: a fault in the game's memory must not become the game's crash. No objects inside the guards.
 bool readU32(uintptr_t at, uint32_t* out) {
     __try {
         *out = *reinterpret_cast<const volatile uint32_t*>(at);
@@ -57,6 +62,22 @@ bool readU64(uintptr_t at, uint64_t* out) {
         return false;
     }
 }
+bool writeU32(uintptr_t at, uint32_t v) {
+    __try {
+        *reinterpret_cast<volatile uint32_t*>(at) = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool writeU64(uintptr_t at, uint64_t v) {
+    __try {
+        *reinterpret_cast<volatile uint64_t*>(at) = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 bool readGuardedBytes(const uint8_t* at, uint8_t* out, size_t n) {
     __try {
         for (size_t i = 0; i < n; ++i) out[i] = at[i];
@@ -66,66 +87,51 @@ bool readGuardedBytes(const uint8_t* at, uint8_t* out, size_t n) {
     }
 }
 
-void modeText(char* out, size_t n) {
-    bool known = false;
-    const int mode = vrSsaaHoldLastMode(&known);
-    if (known) std::snprintf(out, n, "%d", mode);
-    else std::snprintf(out, n, "unknown");
-}
-
-const char* foregroundText() {
-    const HWND game = static_cast<HWND>(vrDisplayGameWindow());
-    if (!game) return "no game window yet";
-    return GetForegroundWindow() == game ? "yes" : "no";
-}
-
-void observeRequest(void* window, void* request) {
-    if (g_requestLines.fetch_add(1, std::memory_order_relaxed) >= kCap) return;
-    uint32_t mode = 0, kind = 0;
-    const bool haveMode = readU32(reinterpret_cast<uintptr_t>(request), &mode);
-    const bool haveKind = readU32(reinterpret_cast<uintptr_t>(request) + 0x20, &kind);
-    char stereo[16];
-    modeText(stereo, sizeof(stereo));
-    Log::get().note("vr window: mode request (0x7E9D50): window %p, mode index %s, kind %s; StereoscopicMode %s; game window "
-                    "foreground %s; frame %u",
-                    window, haveMode ? std::to_string(mode).c_str() : "unreadable",
-                    haveKind ? std::to_string(kind).c_str() : "unreadable", stereo, foregroundText(), vrSsaaGateFrame());
-}
-
-void observeApply(void* window, void* state) {
-    if (g_applyLines.fetch_add(1, std::memory_order_relaxed) >= kCap) return;
-    const uintptr_t s = reinterpret_cast<uintptr_t>(state);
-    uint32_t kind = 0, w = 0, h = 0;
-    uint64_t monitor = 0;
-    const bool haveKind = readU32(s + 0x20, &kind);
-    const bool haveW = readU32(s + 0x18, &w);
-    const bool haveH = readU32(s + 0x1C, &h);
-    const bool haveMonitor = readU64(s + 0x28, &monitor);
-    char stereo[16];
-    modeText(stereo, sizeof(stereo));
-    Log::get().note("vr window: apply (0x5589B0): window %p, kind %s, client %s x %s, monitor entry %s; StereoscopicMode %s; game "
-                    "window foreground %s; frame %u",
-                    window, haveKind ? std::to_string(kind).c_str() : "unreadable", haveW ? std::to_string(w).c_str() : "unreadable",
-                    haveH ? std::to_string(h).c_str() : "unreadable",
-                    haveMonitor ? (std::string("0x") + std::to_string(monitor)).c_str() : "unreadable", stereo, foregroundText(),
-                    vrSsaaGateFrame());
-}
-
-// The replacements take all eight integer argument slots, so the original receives exactly what the caller passed: the first four in
-// registers and the rest from the caller's stack, as the calling convention lays them out. Nothing is changed.
+// The mode request's window rewrite (H6, the maintainer's decision: keep the user's display mode when 3D is on). VR inactive: a
+// non-windowed request is remembered and passes unchanged. VR active (or the settings file's mode is on at a windowed request): a
+// windowed request (kind 0) is rewritten to the remembered kind and mode index before the original runs, so the apply builds the
+// remembered mode. Nothing is changed while VR is inactive.
 uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
-    observeRequest(a, b);
+    const uintptr_t req = reinterpret_cast<uintptr_t>(b);
+    uint32_t kind = 0;
+    uint64_t index = 0;
+    const bool haveKind = readU32(req + kReqKindOff, &kind);
+    const bool haveIndex = readU64(req + kReqIndexOff, &index);
+    bool vrOn = vrSsaaHoldVrLive();
+    if (!vrOn && haveKind && kind == 0) {
+        int mode = 0;
+        char raw[24] = {};
+        vrOn = vrSsaaHoldReadSettings(&mode, raw, sizeof(raw)) && mode != 0;  // the request at the switch, before the live session is up
+    }
+    if (!vrOn) {
+        if (haveKind && haveIndex && kind != 0) {
+            g_rememberedKind.store(kind, std::memory_order_release);
+            g_rememberedIndex.store(index, std::memory_order_release);
+            g_remembered.store(true, std::memory_order_release);
+        }
+    } else if (haveKind && kind == 0) {
+        uint32_t dw = 0, dh = 0;
+        float hmd = 0.0f, ssaa = 0.0f;
+        deviceHookPanelSettings(&hmd, &ssaa, &dw, &dh);
+        if (g_remembered.load(std::memory_order_acquire)) {
+            const uint32_t rk = g_rememberedKind.load(std::memory_order_acquire);
+            const uint64_t ri = g_rememberedIndex.load(std::memory_order_acquire);
+            if (writeU32(req + kReqKindOff, rk) && writeU64(req + kReqIndexOff, ri) &&
+                g_rewrites.fetch_add(1, std::memory_order_relaxed) < kRewriteCap) {
+                Log::get().note("vr window: kept the display mode at 3D on: requested kind 0 %ux%u (windowed), applied kind %u "
+                                "%ux%u (remembered; mode index %llu; DisplaySettings size); frame %u",
+                                dw, dh, rk, dw, dh, static_cast<unsigned long long>(ri), vrSsaaGateFrame());
+            }
+        } else if (!g_noneLogged.exchange(true, std::memory_order_acq_rel)) {
+            Log::get().note("vr window: 3D on requested kind 0 and no non-windowed mode was remembered; the request is left as the "
+                            "game made it (DisplaySettings %ux%u)", dw, dh);
+        }
+    }
     return g_requestOrig(a, b, c, d, e, f, g, h);
 }
 
-uint64_t applyReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
-    observeApply(a, b);
-    return g_applyOrig(a, b, c, d, e, f, g, h);
-}
-
-// The settings copy (option B): the original copies the settings block into the render context; while held (3D mode on), the
-// copied Supersampling field at ctx+0x3564 is then set to 1.0, so the size writer that reads it right after the copy sizes at 1.0. The
-// source block is not written. ctx is the first argument's +0x1180, read before the copy (the destination is that same pointer).
+// The settings copy (W): the original copies the settings block into the render context; then the hold (vrSsaaHoldAfterCopy) reads
+// the copied value and, while VR is live, sets the field to 1.0. ctx is the first argument's +0x1180, read before the copy.
 uint64_t copyReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
     uint64_t ctx = 0;
     readU64(reinterpret_cast<uintptr_t>(a) + 0x1180, &ctx);
@@ -201,8 +207,8 @@ bool installOne(const uint8_t* base, uint32_t rva, const uint8_t* want, size_t l
         return false;
     }
     if (!hook->install(reinterpret_cast<void*>(target), relay, origOut, name)) {
-        Log::get().note("vr window: trampoline %s refused by CodeHook (the prologue cannot be relocated; the reason is in the "
-                        "line above); nothing patched", name);
+        Log::get().note("vr window: trampoline %s refused by CodeHook (the prologue cannot be relocated; the reason is in the line "
+                        "above); nothing patched", name);
         return false;
     }
     return true;
@@ -221,13 +227,10 @@ void vrWindowTrampolinesInstall() {
     }
     const bool req = installOne(base, kRequestRva, kRequestBytes, sizeof(kRequestBytes), reinterpret_cast<void*>(&requestReplacement),
                                 reinterpret_cast<void**>(&g_requestOrig), &g_requestHook, "0x7E9D50 (mode request)");
-    const bool app = installOne(base, kApplyRva, kApplyBytes, sizeof(kApplyBytes), reinterpret_cast<void*>(&applyReplacement),
-                                reinterpret_cast<void**>(&g_applyOrig), &g_applyHook, "0x5589B0 (window apply)");
     const bool copy = installOne(base, kCopyRva, kCopyBytes, sizeof(kCopyBytes), reinterpret_cast<void*>(&copyReplacement),
                                  reinterpret_cast<void**>(&g_copyOrig), &g_copyHook, "0x281C0D0 (settings copy)");
-    Log::get().note("vr window: trampolines: 0x7E9D50 (mode request) %s; 0x5589B0 (window apply) %s; 0x281C0D0 (settings copy) %s; "
-                    "the window two observe only; the copy holds the field while the 3D mode is on",
-                    req ? "installed" : "not installed", app ? "installed" : "not installed", copy ? "installed" : "not installed");
+    Log::get().note("vr window: trampolines: 0x7E9D50 (mode request, window rewrite) %s; 0x281C0D0 (settings copy, hold) %s",
+                    req ? "installed" : "not installed", copy ? "installed" : "not installed");
 }
 
 }  // namespace edvr
