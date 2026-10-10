@@ -61,12 +61,13 @@ inline bool witchspaceStarsHidden() { return detail::g_particleHideStars; }
 bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances);
 
-// Is this draw the supercruise space dust, with fix.space_dust = off? The
-// same shape as the witchspace pair above: the inline flag is the one bool
-// read per draw when the key is on, and spaceDustSkip matches the vertex AND
-// pixel shader pair (supercruise_lines.h: the dust's vertex shader is also
-// seen with another pixel shader). True means the draw is not forwarded, so
-// it neither reaches the scene nor the UI layer.
+// Is this draw space dust, with fix.space_dust = off? Two pairs, both in
+// supercruise_lines.h: the supercruise streaks, and the normal-space specks
+// near a planet (a candidate, unproved until a flight). The same shape as the
+// witchspace pair above: the inline flag is the one bool read per draw when
+// the key is on, and spaceDustSkip matches each pair's vertex AND pixel
+// shader. True means the draw is not forwarded, so it neither reaches the
+// scene nor the UI layer.
 inline bool spaceDustHidden() { return detail::g_spaceDustHidden; }
 bool spaceDustSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                    uint32_t instances);

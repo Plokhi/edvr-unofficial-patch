@@ -306,8 +306,9 @@ bool shapeOk(const float* f, uint32_t floats) {
 
 uint64_t g_starsSkipped = 0;
 uint64_t g_starsNoteMs = 0;
-uint64_t g_dustSkipped = 0;   // spaceDustSkip's count and its note's clock
-uint64_t g_dustNoteMs = 0;
+uint64_t g_dustSkipped = 0;        // spaceDustSkip's counts, one per pair: supercruise, normal space
+uint64_t g_dustNormalSkipped = 0;
+uint64_t g_dustNoteMs = 0;         // and the note's clock
 
 bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances) {
@@ -351,18 +352,26 @@ bool spaceDustSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                    uint32_t instances) {
     (void)kind; (void)count; (void)instances;
     if (!g_spaceDustHidden || !ctx) return false;
-    if (boundVsHashFast(ctx) != kUiVsSpaceDust) return false;
-    if (boundPsHashFast(ctx) != kUiPsSpaceDust) return false;
-    ++g_dustSkipped;
+    // The vertex shader first; the pixel shader is asked only for a vertex
+    // shader that is one of the two dust pairs' (the pair is the key).
+    const uint64_t vs = boundVsHashFast(ctx);
+    if (vs == kUiVsSpaceDust) {
+        if (boundPsHashFast(ctx) != kUiPsSpaceDust) return false;
+        ++g_dustSkipped;
+    } else if (vs == kVsNormalSpaceDust) {
+        if (boundPsHashFast(ctx) != kPsNormalSpaceDust) return false;
+        ++g_dustNormalSkipped;
+    } else {
+        return false;
+    }
     const uint64_t now = nowMs();
     if (now - g_dustNoteMs >= 30000) {
         g_dustNoteMs = now;
         Log::get().note(
-            "supercruise space dust: OFF -- %llu draw(s) withheld so far, "
-            "vs %016llX ps %016llX. Set space_dust = on to have them back.",
+            "space dust: OFF -- supercruise %llu, normal space %llu draw(s) "
+            "withheld so far. Set space_dust = on to have them back.",
             static_cast<unsigned long long>(g_dustSkipped),
-            static_cast<unsigned long long>(kUiVsSpaceDust),
-            static_cast<unsigned long long>(kUiPsSpaceDust));
+            static_cast<unsigned long long>(g_dustNormalSkipped));
     }
     return true;
 }
@@ -550,7 +559,7 @@ void particleConfigure(Config& cfg) {
                   "starfield, which is the game's own behaviour.");
     }
 
-    // The supercruise space dust switch, the same shape as the one above.
+    // The space dust switch, the same shape as the one above.
     // Read through the same VR-profile gate, so flat never sees "off" from
     // a key its allow-list does not carry (runtime_profile.h).
     const std::string sd = runtimeVrProfile() ?
@@ -566,13 +575,14 @@ void particleConfigure(Config& cfg) {
     }
     if (g_spaceDustHidden != dustWasHidden) {
         g_dustSkipped = 0;
+        g_dustNormalSkipped = 0;
         g_dustNoteMs = 0;
         Log::get().note(
             g_spaceDustHidden
-                ? "supercruise space dust: OFF. The streaks are not drawn -- "
-                  "the draw is withheld, nothing else about supercruise changes."
-                : "supercruise space dust: ON. The streaks are drawn, as the "
-                  "game draws them.");
+                ? "space dust: OFF. The supercruise streaks and the normal-space "
+                  "specks are not drawn -- the draw is withheld, nothing else "
+                  "about the flight changes."
+                : "space dust: ON. The space dust is drawn, as the game draws it.");
     }
 
     const Mode wasMode = detail::g_particleMode;

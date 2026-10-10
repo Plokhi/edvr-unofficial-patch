@@ -39,4 +39,13 @@ constexpr uint64_t kUiPsSupercruiseBars = 0x869FFF43E875906Eull;
 constexpr uint64_t kUiVsSpaceDust = 0x9BFC7FD232328391ull;
 constexpr uint64_t kUiPsSpaceDust = 0xDBF1725726018F52ull;
 
+// NORMAL-SPACE DUST: a CANDIDATE, not yet proved. vs E904D334BC8B11EA / ps 095030F27D2C362A. Steam census 2026-10-10
+// 16:40:44, frame 0: a non-indexed Draw of 3072 vertices (512 quads), one instance, a triangle list, stride 16, into the
+// lit HDR scene target, additive (SRC_ALPHA / ONE), depth tested with no write. Its slot-0 texture is the far-plane star
+// billboards' (68DDDEF0). Drawn every frame near the eye; the flight had fix.space_dust = off with no supercruise skips,
+// and the dust near a planet stayed. The next flight confirms it. Used only by spaceDustSkip (particle_fix.cpp): NOT in
+// the UI-layer family rule (ui_layer_math.h).
+constexpr uint64_t kVsNormalSpaceDust = 0xE904D334BC8B11EAull;
+constexpr uint64_t kPsNormalSpaceDust = 0x095030F27D2C362Aull;
+
 }  // namespace edvr

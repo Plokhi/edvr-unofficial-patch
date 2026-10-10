@@ -2010,7 +2010,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         if (drawCensusArmed()) drawCensusNoteUnseen('w');
         return DrawVerdict::kSkip;
     }
-    // The supercruise space dust, withheld with fix.space_dust = off. The same
+    // The space dust (supercruise streaks and normal-space specks), withheld with fix.space_dust = off. The same
     // place and the same reasons as the starfield above: before the eye gate.
     // The UI layer's routing is decided later, in forwardWithVerdict, whose kSkip
     // return comes before uiLayerFamilyOf / uiLayerDecide / uiLayerNoteOther, so a
