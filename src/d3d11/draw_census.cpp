@@ -710,7 +710,7 @@ void finish() {
             "before either census call could record them -- %u substituted "
             "particle billboards (fix.particle_billboard = steady), %u "
             "witchspace-star skips (fix.witchspace_stars = off), %u FSS chrome "
-            "skips, %u space-dust skips (fix.space_dust = off). They are in no "
+            "skips, %u space-dust skips (fix.supercruise_dust / fix.normal_space_dust = off). They are in no "
             "DC line above. Enable the withheld effects for a census of their draws.",
             g_unseen, g_unseenBy[0], g_unseenBy[1], g_unseenBy[2], g_unseenBy[3]);
     }

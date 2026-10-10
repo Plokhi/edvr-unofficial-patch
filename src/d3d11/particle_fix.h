@@ -41,8 +41,10 @@ extern ParticleMode g_particleMode;
 // the draw path's per-draw calls can be skipped inline when they would
 // return at their first line (the .cpp binds its old name to this).
 extern bool g_particleHideStars;
-// The flag spaceDustHidden() reads: fix.space_dust = off (particle_fix.cpp).
-extern bool g_spaceDustHidden;
+// The flags spaceDustHidden() reads: fix.supercruise_dust = off and
+// fix.normal_space_dust = off (particle_fix.cpp).
+extern bool g_supercruiseDustHidden;
+extern bool g_normalSpaceDustHidden;
 // The billboard transcriptions' vertex shader hashes, in kVariants order
 // (particle_fix.cpp static_asserts the two lists agree).
 inline constexpr uint64_t kParticleVariantVs[2] = {0xEB787F983BC1F5A3ull,
@@ -61,14 +63,16 @@ inline bool witchspaceStarsHidden() { return detail::g_particleHideStars; }
 bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances);
 
-// Is this draw space dust, with fix.space_dust = off? Two pairs, both in
-// supercruise_lines.h: the supercruise streaks, and the normal-space specks
-// near a planet (a candidate, unproved until a flight). The same shape as the
-// witchspace pair above: the inline flag is the one bool read per draw when
-// the key is on, and spaceDustSkip matches each pair's vertex AND pixel
-// shader. True means the draw is not forwarded, so it neither reaches the
-// scene nor the UI layer.
-inline bool spaceDustHidden() { return detail::g_spaceDustHidden; }
+// Is this draw space dust that a key has withheld? Two pairs, both in
+// supercruise_lines.h, each with its own key: the supercruise streaks
+// (fix.supercruise_dust) and the normal-space specks (fix.normal_space_dust).
+// The same shape as the witchspace pair above: the inline test is two bool
+// reads per draw, and spaceDustSkip matches each pair's vertex AND pixel
+// shader against its own flag. True means the draw is not forwarded, so it
+// neither reaches the scene nor the UI layer.
+inline bool spaceDustHidden() {
+    return detail::g_supercruiseDustHidden || detail::g_normalSpaceDustHidden;
+}
 bool spaceDustSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                    uint32_t instances);
 
