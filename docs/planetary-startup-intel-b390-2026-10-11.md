@@ -6,9 +6,10 @@
   user report describes eventual generation completion and a pre-menu exit.
 - Device: ONEXPLAYER 3, Intel Arc B390 PTL 8086:b080, xe driver, CachyOS,
   kernel 7.2.9-1-cachyos-deckify, Mesa 26.2.4-arch3.1.
-- Game: Steam 359320, installed build 25433925, Proton 11.0-100, DXVK
-  v2.7.1-498-ga6764047e587178, flat 1280x720. No headset or VR runtime
-  involved; EDVR and DLSS are not loaded. No internal table limit identified.
+- Game: Steam 359320, installed build 25433925, Proton Experimental
+  experimental-11.0-20261001-x86_64, DXVK v3.1.1-47-g685301564ea3486, flat
+  1280x720. No headset or VR runtime involved; EDVR and DLSS are not loaded. No
+  internal table limit identified.
 - Ruled out: an older-than-25.2.4 Mesa installation as the sole explanation,
   because the fresh October 11 game log reports Intel Mesa 26.2.4 and crashes.
 - Ruled out: EDVR is required to reproduce, because the game has no local
@@ -21,24 +22,24 @@
   crashes at zero percent after discarding the old DXVK cache.
 - Ruled out: user_settings-only private ICD selection, because Steam already
   sets the driver variables and Proton keeps existing environment values.
+- Ruled out: the private Mesa main build alone provides a usable menu, because
+  verified game PID 44975 loaded it, finished generation, then exited pre-menu.
 - Evidence: one shader worker uses a full CPU core inside libvulkan_intel.so
   for over 73 seconds, while the other workers wait. The watchdog captures
   vkCreateComputePipelines. This supports prolonged CPU-side Intel pipeline
   compilation or processing, rather than a GPU or mutex wait at that moment.
+- Latest comparison: Mesa 26.3.0-devel (git-37bf953a58), selected in Proton
+  Experimental. Shader CPU work is finite and flat for about 90 seconds; native
+  stacks show jay_schedule, jay_compile_simd and anv_shader_compile. WatchDog
+  records target exit code 0, with no new dump or device loss. The warmed cache
+  has 224 shaders / 5.3 MB versus an earlier 1,283 MB cache; this does not
+  prove Mesa alone removed the original stall.
 - Open hypotheses: expensive Intel shader register allocation exceeding the
   game's watchdog; a compiler defect producing excessive allocation work.
   Binary/source matching identifies setup_live_interference's overlap scan.
-- Latest attempt: invalid as a Mesa-main comparison. DXVK reports 26.2.4 and
-  native maps contain the system ICD, despite the requested private ICD. The
-  user reports generation eventually finished, then a pre-menu exit.
-- Evidence of exit: a watchdog dump at about 96 seconds, then game activity
-  until orderly shutdown at about 263 seconds. No later exception dump or fatal
-  game SEH identified. Do not infer a second crash mechanism yet.
-- Next step: select the private Intel ICD before the Steam container starts;
-  Wine dxdiag and the real launcher now verify the private library. The user
-  set the temporary launch wrapper and was asked to press Play. Capture actual
-  game identity, compiler work and the later exit before choosing another test.
-  No system driver replacement.
+- Open question: what initiates the pre-menu exit after generation completes.
+  Read sanitized logs for the trigger; HTTP 419 is under examination and is not
+  established as causal.
 - Temporary settings: Elite-only Proton user_settings.py enables PROTON_LOG,
   PROTON_LOG_DIR, DXVK_LOG_LEVEL and DXVK_LOG_PATH. Experimental's ineffective
   VK_DRIVER_FILES request was removed and logging-only settings restored.
@@ -195,9 +196,9 @@ variables before Steam's command, keeps logs in mesa-main-verified-37bf953a,
 and enables passive SPIR-V capture without disabling Mesa's cache. It verifies
 the private library's SHA256 before execution. Dry-run wrote nothing; an
 argument-forwarding/environment check passed. The user set /usr/bin/python3
-/tmp/elite_mesa_main_launch.py %command% in Elite's Steam Launch Options and
-opened the launcher. Launcher PID 44297 maps the private Intel library; its
-DXVK log reports 26.2.99. The user was then asked to press Play. The observer
+/tmp/elite_mesa_main_launch.py %command% in Elite's Steam Launch Options.
+Launcher PID 44297 mapped the private Intel library; its DXVK log reports
+26.2.99. The current game run and its outcome are recorded below. The observer
 allows ten minutes after game detection, records selected graphics environment
 values, and takes native stacks at 15, 45 and 120 seconds.
 
@@ -210,6 +211,29 @@ was not changed. Fossilize normally records after successful compilation, so
 the original in-flight pipeline may be absent; this is not a refutation of the
 observed Intel compiler bottleneck. The larger archive's 1,954 compute
 pipelines have not been replayed.
+
+## Private Mesa game comparison
+
+The user's private Mesa run loaded
+/tmp/edvr-mesa-main-20261011/install/lib/libvulkan_intel.so in game PID 44975.
+Proton Experimental used DXVK v3.1.1-47-g685301564ea3486. DXVK reports driver
+26.2.99, while Vulkan driverInfo identifies Mesa 26.3.0-devel (git-37bf953a58).
+Generation completed, then the game automatically exited before the menu.
+
+One shader worker's CPU activity was finite and nearly flat for about 90
+seconds. Native stacks sampled jay_schedule, jay_compile_simd and
+anv_shader_compile. WatchDog reported the target exited with code 0; there was
+no new crash dump or device loss. The cache contained 224 shaders (5.3 MB),
+compared with an earlier cache of 1,283 MB. This result does not show that Mesa
+alone removed the original stall; the original system-driver compiler
+hypothesis remains supported for that earlier run. The cause of the latest
+pre-menu exit is unresolved.
+
+Passive SPIR-V capture recorded compute shader
+`cs.40d340de45f947098a595336f8e1520a` as a candidate, but no pipeline link to
+the observed work is established. No Float64 use was found. The sanitized game
+and HTTP logs are being checked for the exit trigger; HTTP 419 is not yet
+causal evidence.
 
 ## Sources
 
