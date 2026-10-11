@@ -316,6 +316,76 @@ bool watchedEntry(const void* self, DeviceEntry* out) {
     return found;
 }
 
+// The keyboards the game created, by device pointer, recorded at CreateDevice. A keyboard on
+// a table the keyboard door already holds is known from here, with no call on it: the door's
+// own dummy and the game keyboards it captured are not the only keyboards on that table. An
+// address created again is forgotten (factoryCreateDevice). When the registry is full the
+// oldest entry goes, and that keyboard is then not gated (noted once).
+struct KeyboardEntry {
+    void*    device = nullptr;
+    uint64_t seq = 0;          // registration order: the oldest is the one evicted
+};
+constexpr size_t kKeyboardDevices = 32;
+KeyboardEntry g_keyboards[kKeyboardDevices];
+uint64_t      g_keyboardSeq = 0;
+SRWLOCK       g_keyboardsLock = SRWLOCK_INIT;
+std::atomic<bool> g_keyboardFullNoted{false};
+
+void keyboardForget(void* device) {
+    AcquireSRWLockExclusive(&g_keyboardsLock);
+    for (KeyboardEntry& k : g_keyboards) {
+        if (k.device == device) k = KeyboardEntry();
+    }
+    ReleaseSRWLockExclusive(&g_keyboardsLock);
+}
+
+void keyboardRemember(void* device) {
+    bool evicted = false;
+    AcquireSRWLockExclusive(&g_keyboardsLock);
+    KeyboardEntry* slot = nullptr;
+    for (KeyboardEntry& k : g_keyboards) {
+        if (k.device == device) {
+            slot = &k;
+            break;
+        }
+    }
+    if (!slot) {
+        for (KeyboardEntry& k : g_keyboards) {
+            if (!k.device) {
+                slot = &k;
+                break;
+            }
+        }
+    }
+    if (!slot) {
+        slot = &g_keyboards[0];
+        for (KeyboardEntry& k : g_keyboards) {
+            if (k.seq < slot->seq) slot = &k;
+        }
+        evicted = true;
+    }
+    slot->device = device;
+    slot->seq = ++g_keyboardSeq;
+    ReleaseSRWLockExclusive(&g_keyboardsLock);
+    if (evicted && !g_keyboardFullNoted.exchange(true)) {
+        Log::get().note("keyboard gate: the keyboard registry is full; the oldest keyboard is no longer "
+                        "gated. Please report this log.");
+    }
+}
+
+bool keyboardRegistered(const void* self) {
+    AcquireSRWLockShared(&g_keyboardsLock);
+    bool found = false;
+    for (const KeyboardEntry& k : g_keyboards) {
+        if (k.device == self) {
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_keyboardsLock);
+    return found;
+}
+
 // An observer-only door on a joystick's own table: the private-table case, where
 // the overlay hands each device a table of its own and the keyboard's door never
 // sees the stick (the same reason the keyboard is captured at CreateDevice).
@@ -351,9 +421,10 @@ uint32_t modsNow() {
 bool summonModsHeldNow(uint32_t mods) { return (mods & ~modsNow()) == 0; }
 
 // GET_DIDEVICE_TYPE of what GetCapabilities says, 0 when the device would not say.
-// Only the keyboard door asks, and only for a device that is neither its dummy nor a
-// controller the game enumerated (see deviceTypeOf): the one call EDVR still makes on
-// a non-keyboard device, and it predates the joystick watch.
+// Asked at one place only: CreateDevice, for a device the game creates under a keyboard
+// GUID (captureKeyboard). The read paths never ask a device anything. A controller that
+// shares the keyboard's table reaches them too, and was asked on every read before the
+// 0.19.1 review of issue 45 (see classifyDevice).
 uint32_t capsTypeOf(void* self) {
     void** vt = *reinterpret_cast<void***>(self);
     if (!vt || !vt[3]) return 0;
@@ -364,19 +435,24 @@ uint32_t capsTypeOf(void* self) {
     return GET_DIDEVICE_TYPE(caps.dwDevType);
 }
 
-// The type the keyboard door reads a device as. Its dummy is the keyboard; a controller
-// the game enumerated is answered from the registry, with no call on it.
-template <bool Wide>
-uint32_t deviceTypeOf(DiDoor& d, void* self) {
-    if (self == d.dummy) return DI8DEVTYPE_KEYBOARD;
-    DeviceEntry e;
-    if (watchedEntry(self, &e)) return e.type;
-    return capsTypeOf(self);
-}
+// What a keyboard door's read paths make of a device. Classification is positive and
+// makes no call on the device:
+//   Keyboard   a door's dummy, a game keyboard a door captured, or a keyboard recorded at
+//              CreateDevice (keyboardRemember): gated as before;
+//   Controller a device the game enumerated and then created (registerCreated): observed;
+//   Unknown    anything else, e.g. a controller that shares this table without a record:
+//              neither gated nor observed, and nothing is called on it.
+enum class DeviceClass { Unknown, Keyboard, Controller };
 
-template <bool Wide>
-bool isKeyboard(DiDoor& d, void* self) {
-    return deviceTypeOf<Wide>(d, self) == DI8DEVTYPE_KEYBOARD;
+DeviceClass classifyDevice(const void* self) {
+    if (self == g_diW.dummy || self == g_diA.dummy) return DeviceClass::Keyboard;
+    for (const DiDoor& g : g_gameDi) {
+        if (g.dummy && self == g.dummy) return DeviceClass::Keyboard;
+    }
+    if (keyboardRegistered(self)) return DeviceClass::Keyboard;
+    DeviceEntry e;
+    if (watchedEntry(self, &e)) return DeviceClass::Controller;
+    return DeviceClass::Unknown;
 }
 
 // ---- the joystick watch ---------------------------------------------------
@@ -548,10 +624,11 @@ HRESULT filterDeviceState(DiDoor& d, void* self, DWORD cb, LPVOID data) {
     d.stateCalls.fetch_add(1, std::memory_order_relaxed);
     if (self != d.dummy) d.stateForeign.fetch_add(1, std::memory_order_relaxed);
     if (d.retired || FAILED(hr) || !data) return hr;
-    bool other = false;   // a device that is not the keyboard
+    bool other = false;   // a game controller: observed below, never gated; an unknown device is neither
     guardedBudget(g_budgetDi, [&] {
-        if (deviceTypeOf<Wide>(d, self) != DI8DEVTYPE_KEYBOARD) {
-            other = true;
+        const DeviceClass cls = classifyDevice(self);
+        if (cls != DeviceClass::Keyboard) {
+            other = cls == DeviceClass::Controller;
             return;
         }
         d.stateKeyboard.fetch_add(1, std::memory_order_relaxed);
@@ -603,11 +680,12 @@ HRESULT filterDeviceData(DiDoor& d, void* self, DWORD cbObj, LPDIDEVICEOBJECTDAT
     d.dataCalls.fetch_add(1, std::memory_order_relaxed);
     if (d.retired || FAILED(hr) || !rgdod || !inOut) return hr;
     if (cbObj != sizeof(DIDEVICEOBJECTDATA)) return hr;   // a layout this was not written for
-    bool other = false;   // a device that is not the keyboard
+    bool other = false;   // a game controller: observed below, never gated; an unknown device is neither
     const DWORD returned = *inOut;
     guardedBudget(g_budgetDi, [&] {
-        if (deviceTypeOf<Wide>(d, self) != DI8DEVTYPE_KEYBOARD) {
-            other = true;
+        const DeviceClass cls = classifyDevice(self);
+        if (cls != DeviceClass::Keyboard) {
+            other = cls == DeviceClass::Controller;
             return;
         }
         // An empty read is nothing to filter (the check that used to sit above
@@ -821,8 +899,11 @@ struct CaptureLock {
 
 template <size_t... I>
 void captureKeyboard(void* device, std::index_sequence<I...>) {
-    DiDoor unknown;
-    if (!isKeyboard<false>(unknown, device)) return;
+    // The one driver call a keyboard GUID earns, and only here at CreateDevice: a device made
+    // under it is a keyboard only if GetCapabilities says so, as before. It is remembered before
+    // the table is looked at, so a keyboard on a shared table is classified as one too.
+    if (capsTypeOf(device) != DI8DEVTYPE_KEYBOARD) return;
+    keyboardRemember(device);
     static const PFN_GetDeviceState stateHooks[] = {&gameDeviceState<I>...};
     static const PFN_GetDeviceData dataHooks[] = {&gameDeviceData<I>...};
     CaptureLock lock;
@@ -1002,11 +1083,20 @@ HRESULT STDMETHODCALLTYPE factoryCreateDevice(void* self, REFGUID guid, void** d
     const HRESULT hr = g_factories[Index].original(self, guid, device, outer);
     if (SUCCEEDED(hr) && device && *device && !outer) {
         watchForget(*device);   // whatever this object is, an old controller at its address is not its identity
+        keyboardForget(*device);   // and an old keyboard at its address is not its identity either
         if (isKeyboardGuid(guid)) {
             guardedBudget(g_budgetDi, [&] {
                 captureKeyboard(*device, std::make_index_sequence<kGameDeviceDoors>{});
             });
         } else if (!isMouseGuid(guid)) {
+            // A keyboard the game enumerated under an instance GUID: the game's own record says
+            // so, and no driver is asked.
+            guardedBudget(g_budgetDi, [&] {
+                EnumRecord rec;
+                if (enumeratedRecord(guid, &rec) && GET_DIDEVICE_TYPE(rec.devType) == DI8DEVTYPE_KEYBOARD) {
+                    keyboardRemember(*device);
+                }
+            });
             // A controller the game enumerated is registered BEFORE the table is looked at:
             // a shared table that is already patched returns early in captureController,
             // and the device must be registered either way.
