@@ -25,6 +25,7 @@ std::mutex mutex;
 std::atomic<bool> available{false};
 std::atomic<bool> active{false};
 std::atomic<uint64_t> revision{0};
+std::atomic<uint64_t> sessionId{0};   // bumped at every acquire and every close of an active session
 State* identify(void* context) {
   for (unsigned i = 0; i < used; ++i) if (context == &pool[i]) return &pool[i];
   return nullptr;
@@ -138,6 +139,7 @@ HRESULT WINAPI close(void* context) {
   if (!s->active) return S_FALSE;
   invalidate(*s); s->active = false; s->device = nullptr;
   active.store(false, std::memory_order_release);
+  sessionId.fetch_add(1, std::memory_order_release);
   if (current == s) current = nullptr;
   return S_OK;
 }
@@ -146,6 +148,7 @@ HRESULT WINAPI close(void* context) {
 bool nativeMenuAvailable() { return available.load(std::memory_order_acquire); }
 bool nativeMenuActive() { return active.load(std::memory_order_acquire); }
 uint64_t nativeMenuRevision() { return revision.load(std::memory_order_acquire); }
+uint64_t nativeMenuSessionId() { return sessionId.load(std::memory_order_acquire); }
 bool nativeMenuEyePoses(float out[2][12]) {
   std::lock_guard<std::mutex> lock(mutex);
   if (!out || !current || !current->active || !current->pose) return false;
@@ -162,6 +165,7 @@ extern "C" HRESULT WINAPI edvrAcquireNativeMenu(const EdvrNativeMenuRequest* req
   auto& s = pool[used++]; s.device = request->gameDevice; s.thread = GetCurrentThreadId();
   s.generation = request->generation; s.active = true; current = &s;
   active.store(true, std::memory_order_release);
+  sessionId.fetch_add(1, std::memory_order_release);
   table->context = &s; table->publishPose = publish; table->treatEye = treat; table->close = close;
   return S_OK;
 }

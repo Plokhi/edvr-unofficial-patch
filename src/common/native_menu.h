@@ -35,6 +35,9 @@ HRESULT WINAPI edvrAcquireNativeMenu(const EdvrNativeMenuRequest*, EdvrNativeMen
 bool nativeMenuAvailable();
 bool nativeMenuActive(); // graphics-local session presence, independent of pose validity
 uint64_t nativeMenuRevision(); // graphics-local menu model retirement epoch
+// graphics-local: the identity of the menu session. It changes at every acquire and at every close of an active session, and not for
+// publishes or CPU invalidations, so a verdict latched for one session cannot outlive it. Zero before the first acquire.
+uint64_t nativeMenuSessionId();
 // graphics-local: copies the two eye poses (row-major 3x4, the layout publishPose carries) of the last valid publish. False, and out
 // untouched, when no pose is held: before the first publish and after an invalidation or a close.
 bool nativeMenuEyePoses(float out[2][12]);

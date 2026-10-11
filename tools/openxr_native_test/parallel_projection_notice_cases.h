@@ -289,21 +289,25 @@ template<class Check> void runParallelProjectionNoticeCases(Check&& check) {
           "wiring: a closed session forgets the decision with the labels it was made from, and the line goes to the openxr log through the one trace");
     // The menu: the VR branch only, after the flat profile's branch returned; one check, decided once; only Notice raises anything.
     const size_t vrBranch=menu.find("guardedBudget(g_budget, [&] {\n        static uint64_t lastNativeRevision = 0;");
-    const size_t block=menu.find("if (!s.parallelProjectionChecked) {");
-    const size_t eyes=menu.find("nativeMenuEyePoses(eyes) && nativeRenderLabels(&labels) && labels.valid");
-    const size_t latch=menu.find("s.parallelProjectionChecked = true;");
-    const size_t verdict=menu.find("ppn::decide(labels.systemName, labels.runtimeName, views) == ppn::Verdict::Notice");
-    const size_t toasts=menu.find("if (s.toasts) {\n                            s.toastQueue.push_back(parallelToast);");
-    check(vrBranch!=std::string::npos&&block!=std::string::npos&&eyes!=std::string::npos&&latch!=std::string::npos&&verdict!=std::string::npos&&toasts!=std::string::npos&&
-              vrBranch<block&&block<eyes&&eyes<latch&&latch<verdict&&verdict<toasts&&count(menu,"ppn::decide(")==1&&count(menu,"ppn::formatToast(")==1&&count(menu,"ppn::classifyRotations(")==1,
-          "wiring: the menu tick decides once, in the VR branch, from the eye poses and names the graphics half holds, latches on a known pair, and toasts only the Notice, gated on menu.toasts");
-    check(has(menu,"if (views != ppn::Views::Unknown) {")&&has(menu,"parallel projection: the headset notice is queued as a toast")&&has(menu,"parallel projection: menu.toasts is off, so no toast"),
-          "wiring: views that are not a pair of orientations wait for the next tick, and the toast is logged either way");
-    check(count(menu,"ppn::formatStatusHint(c.hint, sizeof(c.hint));")==1&&has(menu,"if (s.parallelProjectionNotice &&\n                ppn::statusHintTurn(vrss::below(rw, rh, ew, eh) || terrainCheckerboardOn(), s.tickMs, tcn::kHintAlternateMs))")&&
+    const size_t block=menu.find("const uint64_t parallelSession = nativeMenuSessionId();");
+    const size_t eyes=menu.find("const bool named = nativeMenuEyePoses(eyes) && nativeRenderLabels(&labels) && labels.valid;");
+    const size_t latch=menu.find("ppn::latchTick(s.parallelProjection, parallelSession, named ? eyes : nullptr, labels.systemName, labels.runtimeName)");
+    const size_t toasts=menu.find("if (s.toasts) {\n                    s.toastQueue.push_back(parallelToast);");
+    check(vrBranch!=std::string::npos&&block!=std::string::npos&&eyes!=std::string::npos&&latch!=std::string::npos&&toasts!=std::string::npos&&
+              vrBranch<block&&block<eyes&&eyes<latch&&latch<toasts&&count(menu,"ppn::latchTick(")==1&&count(menu,"ppn::formatToast(")==1&&
+              count(menu,"ppn::decide(")==0&&count(menu,"ppn::classifyRotations(")==0&&count(menu,"nativeMenuSessionId()")==1,
+          "wiring: the menu tick reads the session identity before the held poses, decides through the latch in the VR branch, and toasts only the Notice, gated on menu.toasts");
+    check(has(header,"if (views == Views::Unknown) return false;")&&has(header,"latch = SessionLatch{};")&&
+              has(menu,"parallel projection: the headset notice is queued as a toast")&&has(menu,"parallel projection: menu.toasts is off, so no toast"),
+          "wiring: views that are not a pair of orientations wait for the next tick (the latch), a new session starts the latch again, and the toast is logged either way");
+    check(count(menu,"ppn::formatStatusHint(c.hint, sizeof(c.hint));")==1&&has(menu,"if (s.parallelProjection.notice &&\n                ppn::statusHintTurn(vrss::below(rw, rh, ew, eh) || terrainCheckerboardOn(), s.tickMs, tcn::kHintAlternateMs))")&&
               !has(menu,"statusLine(c, \"Parallel projection")&&!has(menu,"statusLine(c, \"Parallel Projection"),
           "wiring: the Status page's hint says it in the page's one slot, in its turn, and no page gains a line or a note");
     check(!has(flat,"ppn::")&&!has(flat,"parallel_projection_notice")&&!has(flat,"nativeMenuEyePoses"),"wiring: the flat runtime never touches it");
     check(has(menuHeader,"bool nativeMenuEyePoses(float out[2][12]);"),"wiring: the accessor is declared once, graphics-local, in the menu's own header");
+    check(has(menuHeader,"uint64_t nativeMenuSessionId();")&&has(menuHeader,"#define EDVR_NATIVE_MENU_VERSION_1 1u")&&
+              has(menuHeader,"struct EdvrNativeMenuTable {\n  uint32_t size, version;"),
+          "wiring: the session identity is declared graphics-local beside the accessors, and the ABI version and table layout are unchanged");
     // The header stays dependency-free (the two halves and this rig include it): no OpenXR, no Windows, no logging.
     check(!has(header,"#include <openxr")&&!has(header,"#include <windows.h>")&&!has(header,"#include \"")&&!has(header,"Log::"),"wiring: the header includes nothing of the project");
   }
