@@ -217,6 +217,7 @@ bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned slot,ID3D11Texture2D* colour,I
 #include "flat_taa_history_depth_gpu_tests.h"
 #include "flat_context_isolation_gpu_tests.h"
 #include "flat_map_easu_gpu_tests.h"   // the map temporal-off frames' EASU, against the bilinear tap (2026-10-10)
+#include "flat_map_smaa_lookup_gpu_tests.h"   // the map SMAA lookup textures: no leak after a failed view, retry, reset (review 0.19.1 finding 2)
 #include "flat_sdk_foreground_gpu_tests.h"
 #include "flat_copy_refusal_view_gpu_tests.h"
 #include "flat_copy_foreground_gpu_tests.h"
@@ -834,6 +835,7 @@ int main(int argc,char** argv) {
     hdrRouteGpuTests(device.Get(),context.Get());
     sdkForegroundGpuTests(device.Get(),context.Get());
     mapEasuGpuTests(device.Get(),context.Get());
+    mapSmaaLookupLeakTests(device.Get(),context.Get());
     // The same SDK foreground contract above the output (the supersampled on-foot frame), and the untrusted-coverage clause's other two sides.
     sdkForegroundSupersampleGpuTests(device.Get(),context.Get());
     // The VR world route's seams (section 82): the third upscaler slot, the first-person map and stencil in the prep, and the phase term
