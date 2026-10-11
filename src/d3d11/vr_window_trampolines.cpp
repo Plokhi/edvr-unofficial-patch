@@ -8,6 +8,7 @@
 
 #include "../common/code_hook.h"
 #include "../common/log.h"
+#include "../common/runtime_profile.h"  // runtimeVrProfile: the flat profile's requests pass unchanged
 
 #include <windows.h>
 
@@ -101,11 +102,13 @@ void refreshUserSize() {
     g_userH.store(h, std::memory_order_release);
 }
 
-// The mode request's window rewrite (H6; the maintainer's decision: keep the user's display mode when 3D is on). VR inactive: a
-// non-windowed request is remembered whole (its block) and passes unchanged. VR active (or the settings file's mode is on at a windowed
-// request): a windowed request (kind 0) gets the remembered block restored before the original runs, so the apply builds the remembered
-// mode. Nothing is changed while VR is inactive.
+// The mode request's window rewrite (H6; the maintainer's decision: keep the user's display mode when 3D is on). VR profile only: the
+// flat profile's requests pass byte for byte, and the saved mode is not read for them. VR inactive: a non-windowed request is remembered
+// whole (its block) and passes unchanged. VR active (or the settings file's mode is on at a windowed request): a windowed request
+// (kind 0) gets the remembered block restored before the original runs, so the apply builds the remembered mode. Nothing is changed
+// while VR is inactive.
 uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
+    if (!runtimeVrProfile()) return g_requestOrig(a, b, c, d, e, f, g, h);  // before any read of the saved mode
     const uintptr_t req = reinterpret_cast<uintptr_t>(b);
     uint32_t kind = 0;
     const bool haveKind = readU32(req + kReqKindOff, &kind);
@@ -216,8 +219,16 @@ uint8_t* buildRelayNear(uintptr_t target, void* replacement) {
     return relay;  // kept for the process lifetime: the installed patch jumps here
 }
 
+// CodeHook's Prepare: the replacement's original-function forward (the context) is published before the entry patch becomes visible.
+// The replacements call the forward unconditionally, so it must be set before any call can arrive.
+bool prepareForward(void* trampoline, void* context) noexcept {
+    if (!trampoline || !context) return false;
+    *static_cast<void**>(context) = trampoline;
+    return true;
+}
+
 // Pins the function's first bytes, then installs the entry through a near relay. False (and no patch) when the bytes differ, no
-// relay can be placed, or CodeHook refuses.
+// relay can be placed, or CodeHook refuses. The forward is published through Prepare, and cleared again when CodeHook refuses.
 bool installOne(const uint8_t* base, uint32_t rva, const uint8_t* want, size_t len, void* replacement, void** origOut,
                 CodeHook* hook, const char* name) {
     uint8_t got[11] = {};
@@ -231,7 +242,8 @@ bool installOne(const uint8_t* base, uint32_t rva, const uint8_t* want, size_t l
         Log::get().note("vr window: trampoline %s refused: no page within +/-2 GB of the target for its relay; nothing patched", name);
         return false;
     }
-    if (!hook->install(reinterpret_cast<void*>(target), relay, origOut, name)) {
+    if (!hook->install(reinterpret_cast<void*>(target), relay, origOut, name, &prepareForward, origOut)) {
+        *origOut = nullptr;  // CodeHook's rule: a prepared forward is valid only if the install succeeds
         Log::get().note("vr window: trampoline %s refused by CodeHook (the prologue cannot be relocated; the reason is in the line "
                         "above); nothing patched", name);
         return false;

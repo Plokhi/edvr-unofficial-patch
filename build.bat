@@ -3471,12 +3471,14 @@ exit /b 0
 :rig_vr_ssaa_hold_test
 echo [edvr] === vr_ssaa_hold_test.exe ===
 REM The VR Supersampling hold's pure decision (src\d3d11\vr_ssaa_hold_math.h, docs\vr-supersampling-gate-2026-10-10.md): the Settings.xml
-REM mode parse, the held value by profile and mode, the toast. The DLL calls the same functions; the hooks are not in this rig.
+REM mode parse, the held value by profile and mode, the toast, and the game's mode-request window rewrite by profile (the production
+REM requestReplacement and installOne, vr_window_trampolines.cpp included whole; the DLL state is stubbed, nothing is hooked).
 if not exist "%OBJ%\vrssaahold" mkdir "%OBJ%\vrssaahold"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 ^
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\vrssaahold\\" /Fe"%OBJ%\vrssaahold\vr_ssaa_hold_test.exe" ^
     "tools\vr_ssaa_hold_test\vr_ssaa_hold_test.cpp" ^
-    /link /INCREMENTAL:NO
+    "src\common\log.cpp" "src\common\config.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib
 if errorlevel 1 ( echo [edvr] ERROR: vr_ssaa_hold_test build failed & exit /b 1 )
 "%OBJ%\vrssaahold\vr_ssaa_hold_test.exe" --dry-run || exit /b 1
 "%OBJ%\vrssaahold\vr_ssaa_hold_test.exe" --self-test || exit /b 1
