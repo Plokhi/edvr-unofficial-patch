@@ -4283,23 +4283,26 @@ void menuTick(ID3D11Device* dev) {
         // apply the toggle gets the openxr log line alone. Nothing is said when the views are not a pair of orientations yet: the check waits.
         {
             // The identity is read before the poses. A close between the two reads leaves this tick's answer for the old session, which the
-            // next tick resets; it cannot put a new session's poses under the old identity for a whole session.
+            // next tick resets; it cannot put a new session's poses under the old identity for a whole session. Once this session is decided
+            // the tick does nothing more: the poses (a mutex and a copy) and the names are fetched only while a decision is still due.
             const uint64_t parallelSession = nativeMenuSessionId();
-            float eyes[2][12]{};
-            NativeRenderLabels labels{};
-            const bool named = nativeMenuEyePoses(eyes) && nativeRenderLabels(&labels) && labels.valid;
-            if (ppn::latchTick(s.parallelProjection, parallelSession, named ? eyes : nullptr, labels.systemName, labels.runtimeName)) {
-                char parallelToast[96];
-                ppn::formatToast(parallelToast, sizeof(parallelToast));
-                if (s.toasts) {
-                    s.toastQueue.push_back(parallelToast);
-                    Log::get().note("parallel projection: the headset notice is queued as a toast (\"%s\"); the Status page shows the "
-                                    "advice as its hint while the menu is open.", parallelToast);
-                } else {
-                    Log::get().note("parallel projection: menu.toasts is off, so no toast; the Status page shows the advice as its "
-                                    "hint while the menu is open.");
+            if (parallelSession != s.parallelProjection.session || !s.parallelProjection.checked) {
+                float eyes[2][12]{};
+                NativeRenderLabels labels{};
+                const bool named = nativeMenuEyePoses(eyes) && nativeRenderLabels(&labels) && labels.valid;
+                if (ppn::latchTick(s.parallelProjection, parallelSession, named ? eyes : nullptr, labels.systemName, labels.runtimeName)) {
+                    char parallelToast[96];
+                    ppn::formatToast(parallelToast, sizeof(parallelToast));
+                    if (s.toasts) {
+                        s.toastQueue.push_back(parallelToast);
+                        Log::get().note("parallel projection: the headset notice is queued as a toast (\"%s\"); the Status page shows the "
+                                        "advice as its hint while the menu is open.", parallelToast);
+                    } else {
+                        Log::get().note("parallel projection: menu.toasts is off, so no toast; the Status page shows the advice as its "
+                                        "hint while the menu is open.");
+                    }
+                    s.contentDirty = true;
                 }
-                s.contentDirty = true;
             }
         }
 

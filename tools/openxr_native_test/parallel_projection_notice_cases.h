@@ -292,11 +292,14 @@ template<class Check> void runParallelProjectionNoticeCases(Check&& check) {
     const size_t block=menu.find("const uint64_t parallelSession = nativeMenuSessionId();");
     const size_t eyes=menu.find("const bool named = nativeMenuEyePoses(eyes) && nativeRenderLabels(&labels) && labels.valid;");
     const size_t latch=menu.find("ppn::latchTick(s.parallelProjection, parallelSession, named ? eyes : nullptr, labels.systemName, labels.runtimeName)");
-    const size_t toasts=menu.find("if (s.toasts) {\n                    s.toastQueue.push_back(parallelToast);");
+    const size_t toasts=menu.find("if (s.toasts) {\n                        s.toastQueue.push_back(parallelToast);");
     check(vrBranch!=std::string::npos&&block!=std::string::npos&&eyes!=std::string::npos&&latch!=std::string::npos&&toasts!=std::string::npos&&
               vrBranch<block&&block<eyes&&eyes<latch&&latch<toasts&&count(menu,"ppn::latchTick(")==1&&count(menu,"ppn::formatToast(")==1&&
               count(menu,"ppn::decide(")==0&&count(menu,"ppn::classifyRotations(")==0&&count(menu,"nativeMenuSessionId()")==1,
           "wiring: the menu tick reads the session identity before the held poses, decides through the latch in the VR branch, and toasts only the Notice, gated on menu.toasts");
+    check(has(menu,"if (parallelSession != s.parallelProjection.session || !s.parallelProjection.checked) {")&&
+              has(menu,"const bool named = nativeMenuEyePoses(eyes) && nativeRenderLabels(&labels) && labels.valid;"),
+          "wiring: once a session is decided the tick fetches no poses and no names; the fetch sits behind the session and checked test");
     check(has(header,"if (views == Views::Unknown) return false;")&&has(header,"latch = SessionLatch{};")&&
               has(menu,"parallel projection: the headset notice is queued as a toast")&&has(menu,"parallel projection: menu.toasts is off, so no toast"),
           "wiring: views that are not a pair of orientations wait for the next tick (the latch), a new session starts the latch again, and the toast is logged either way");
