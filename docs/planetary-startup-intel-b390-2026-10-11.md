@@ -2,8 +2,8 @@
 
 ## Status
 
-- State: open. Elite crashes at zero percent startup planetary generation
-  without EDVR; the user confirmed the percentage on October 11.
+- State: open. Repeated zero-percent startup stalls without EDVR. The latest
+  user report describes eventual generation completion and a pre-menu exit.
 - Device: ONEXPLAYER 3, Intel Arc B390 PTL 8086:b080, xe driver, CachyOS,
   kernel 7.2.9-1-cachyos-deckify, Mesa 26.2.4-arch3.1.
 - Game: Steam 359320, installed build 25433925, Proton 11.0-100, DXVK
@@ -19,6 +19,8 @@
 - Ruled out: Proton Experimental alone fixes startup, because
   experimental-11.0-20261001-x86_64 with DXVK v3.1.1-47-g685301564ea3486 still
   crashes at zero percent after discarding the old DXVK cache.
+- Ruled out: user_settings-only private ICD selection, because Steam already
+  sets the driver variables and Proton keeps existing environment values.
 - Evidence: one shader worker uses a full CPU core inside libvulkan_intel.so
   for over 73 seconds, while the other workers wait. The watchdog captures
   vkCreateComputePipelines. This supports prolonged CPU-side Intel pipeline
@@ -26,18 +28,25 @@
 - Open hypotheses: expensive Intel shader register allocation exceeding the
   game's watchdog; a compiler defect producing excessive allocation work.
   Binary/source matching identifies setup_live_interference's overlap scan.
-- Next startup: prepared; awaiting the user's Play and outcome. Keep Proton
-  Experimental and DXVK fixed; compare a private Intel Vulkan build from Mesa
-  main, pinned at 37bf953a58d8baa6c29142c714f46418d4d596a4. Verify the selected
-  driver before requesting Play, then capture native CPU timing and stacks
-  during startup. No system driver replacement. No specific upstream fix
-  verified yet.
+- Latest attempt: invalid as a Mesa-main comparison. DXVK reports 26.2.4 and
+  native maps contain the system ICD, despite the requested private ICD. The
+  user reports generation eventually finished, then a pre-menu exit.
+- Evidence of exit: a watchdog dump at about 96 seconds, then game activity
+  until orderly shutdown at about 263 seconds. No later exception dump or fatal
+  game SEH identified. Do not infer a second crash mechanism yet.
+- Next step: select the private Intel ICD before the Steam container starts;
+  Wine dxdiag and the real launcher now verify the private library. The user
+  set the temporary launch wrapper and was asked to press Play. Capture actual
+  game identity, compiler work and the later exit before choosing another test.
+  No system driver replacement.
 - Temporary settings: Elite-only Proton user_settings.py enables PROTON_LOG,
-  PROTON_LOG_DIR, DXVK_LOG_LEVEL and DXVK_LOG_PATH. Experimental also selects
-  the private Intel ICD through VK_DRIVER_FILES.
-  /tmp/prepare_elite_mesa_main.py --restore [--dry-run] restores its
-  logging-only settings. Remove both owned temporary settings files after the
-  investigation. No EDVR INI changes.
+  PROTON_LOG_DIR, DXVK_LOG_LEVEL and DXVK_LOG_PATH. Experimental's ineffective
+  VK_DRIVER_FILES request was removed and logging-only settings restored.
+  Remove both owned temporary settings files after the investigation. No EDVR
+  INI changes.
+- Temporary Steam option, confirmed by the user: /usr/bin/python3
+  /tmp/elite_mesa_main_launch.py %command%. Clear it after the comparison; it
+  references a private build under /tmp.
 - Evidence directory: /home/deck/.cache/elite-startup-diagnostics/2026-10-11.
 
 ## October 11 evidence
@@ -144,6 +153,64 @@ Upstream main changes register-selection and spill logic, but the hot overlap
 scan's body remains unchanged; a fix is not established by building
 successfully.
 
+## Invalid driver comparison and eventual generation completion
+
+The user first reported another zero-percent crash, then reported generation
+eventually finished after leaving the game running and an exit before the main
+menu. This attempt used system Mesa 26.2.4: the game DXVK log identifies that
+version, and both native map snapshots identify
+/run/host/usr/lib/libvulkan_intel.so inode 109170. No private Mesa-main library
+is mapped. The result does not refute or confirm the proposed Mesa-main
+comparison.
+
+SteamLinuxRuntime_4 supplies both VK_DRIVER_FILES and VK_ICD_FILENAMES before
+Proton starts. Proton's init_session only takes a user_settings value if its
+key is absent from the existing environment. Therefore the private ICD request
+in user_settings.py was ineffective. A new container check passed the private
+ICD before container startup and selected Mesa 26.3.0-devel. Validate this
+route through Wine dxdiag before another Elite attempt. The ineffective setting
+has been removed and the owned logging-only settings restored.
+
+The latest watchdog dump, Frontier.CrashReport.11.10.2026-06.59.34.dmp, again
+has no exception stream; its main thread is in win32u.dll+0x150b4. WatchDog
+reports heartbeat reset failure around 96 seconds after game launch. Network
+activity continues afterward, and the game logs Shutdown and cleanup around 263
+seconds. No second dump, later fatal game SEH or device loss was identified.
+The user's later observed exit remains unexplained; do not assume an additional
+access violation or GPU fault. The newest Proton header reports kernel
+7.2.9-2-cachyos-deckify, unlike the earlier baseline header.
+
+## Corrected Wine preflight and offline replay
+
+Two Wine DXDiag runs in disposable Proton prefixes under
+/tmp/edvr-mesa-wine-preflight-20261011 passed with the private ICD selected
+before SteamLinuxRuntime_4 started. Native Wine maps identify
+/tmp/edvr-mesa-main-20261011/install/lib/libvulkan_intel.so. DXVK labels its
+driver 26.2.99, the encoded development driver version; Vulkan driverInfo
+reports Mesa 26.3.0-devel (git-37bf953a58). Both are expected for this build.
+The real game prefix and Steam configuration were not edited by this check.
+
+The temporary /tmp/elite_mesa_main_launch.py wrapper sets both Vulkan driver
+variables before Steam's command, keeps logs in mesa-main-verified-37bf953a,
+and enables passive SPIR-V capture without disabling Mesa's cache. It verifies
+the private library's SHA256 before execution. Dry-run wrote nothing; an
+argument-forwarding/environment check passed. The user set /usr/bin/python3
+/tmp/elite_mesa_main_launch.py %command% in Elite's Steam Launch Options and
+opened the launcher. Launcher PID 44297 maps the private Intel library; its
+DXVK log reports 26.2.99. The user was then asked to press Play. The observer
+allows ten minutes after game detection, records selected graphics environment
+values, and takes native stacks at 15, 45 and 120 seconds.
+
+Steam's first-run Fossilize archive, modified at 06:18, contains 86 compute
+pipelines. A SHA256-verified copy was replayed compute-only on system Mesa
+26.2.4 with one worker, a ten-second pipeline timeout, a 120-second overall
+limit and a separate Mesa cache under /tmp/edvr-elite-offline-replay-20261011.
+All 86 compiled in about 27 seconds, with no timeout or crash. Steam's cache
+was not changed. Fossilize normally records after successful compilation, so
+the original in-flight pipeline may be absent; this is not a refutation of the
+observed Intel compiler bottleneck. The larger archive's 1,954 compute
+pipelines have not been replayed.
+
 ## Sources
 
 - [Mesa 25.2.4 release notes](https://docs.mesa3d.org/relnotes/25.2.4.html)
@@ -159,3 +226,6 @@ successfully.
   schedules the 26.3 release candidates.
 - [Mesa local-build guide](https://docs.mesa3d.org/install.html) documents a
   private prefix and Vulkan ICD selection.
+- [Fossilize capture
+  source](https://github.com/ValveSoftware/Fossilize/blob/master/layer/dispatch.cpp#L893)
+  records ordinary compute pipelines after successful driver compilation.
