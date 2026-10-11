@@ -215,10 +215,10 @@ struct State {
     // Elite's terrain checkerboard rendering in VR (terrain_checkerboard_notice.h, design section 84): the published version that
     // last toasted, 0 for never. The toast is said once per RAISE of the option, so it follows the file and can be said again.
     uint32_t    terrainCheckerboardToasted = 0;
-    // Parallel projection left on for a canted Pimax (parallel_projection_notice.h, docs/canted-projection.md): decided once a session, at
-    // the first tick that holds the eye poses and the headset's names. The notice is the toast (said then) and the Status page's hint.
-    bool        parallelProjectionChecked = false;
-    bool        parallelProjectionNotice = false;
+    // Parallel projection left on for a canted Pimax (parallel_projection_notice.h, docs/canted-projection.md): decided once a menu session,
+    // at the first tick that holds the eye poses and the headset's names. The notice is the toast (said then) and the Status page's hint.
+    // The latch belongs to the session nativeMenuSessionId names, so a close or a new session starts it again.
+    ppn::SessionLatch parallelProjection;
     float alpha = 0.0f;
     uint64_t openedMs = 0;
     uint64_t lastInputMs = 0;
@@ -1997,7 +1997,7 @@ void buildContent(MenuContent& c) {
                 tcn::formatStatusHint(c.hint, sizeof(c.hint));
             // Parallel projection left on for a canted Pimax (parallel_projection_notice.h) shares the same slot: alone when neither of the
             // two above applies, otherwise every third 6 s turn, so none of the three is hidden. Decided once a session (the tick above).
-            if (s.parallelProjectionNotice &&
+            if (s.parallelProjection.notice &&
                 ppn::statusHintTurn(vrss::below(rw, rh, ew, eh) || terrainCheckerboardOn(), s.tickMs, tcn::kHintAlternateMs))
                 ppn::formatStatusHint(c.hint, sizeof(c.hint));
         }
@@ -4276,31 +4276,32 @@ void menuTick(ID3D11Device* dev) {
         }
 
         // Parallel projection left on for a canted Pimax (parallel_projection_notice.h, docs/canted-projection.md), VR only like the rest of
-        // this branch. Decided once a session, from the first tick that holds the eye poses the native menu was given and the headset's
-        // names: ppn::decide, the same call the openxr half logs from. Only Notice (PimaxXR, which applies Pimax Play's toggle) reaches the
-        // user: a toast now, gated on menu.toasts like every toast, and the Status page's hint while the menu is open. A runtime not known to
+        // this branch. Decided once a menu session (ppn::SessionLatch), from the first tick that holds the eye poses the native menu was given
+        // and the headset's names: ppn::decide, the same call the openxr half logs from. A close or a new session starts the decision again,
+        // so an earlier session's verdict is neither kept nor said twice. Only Notice (PimaxXR, which applies Pimax Play's toggle) reaches the
+        // user: a toast, gated on menu.toasts like every toast, and the Status page's hint while the menu is open. A runtime not known to
         // apply the toggle gets the openxr log line alone. Nothing is said when the views are not a pair of orientations yet: the check waits.
-        if (!s.parallelProjectionChecked) {
-            float eyes[2][12];
-            NativeRenderLabels labels{};
-            if (nativeMenuEyePoses(eyes) && nativeRenderLabels(&labels) && labels.valid) {
-                const ppn::Views views = ppn::classifyRotations(eyes[0], eyes[1]);
-                if (views != ppn::Views::Unknown) {
-                    s.parallelProjectionChecked = true;
-                    if (ppn::decide(labels.systemName, labels.runtimeName, views) == ppn::Verdict::Notice) {
-                        s.parallelProjectionNotice = true;
-                        char parallelToast[96];
-                        ppn::formatToast(parallelToast, sizeof(parallelToast));
-                        if (s.toasts) {
-                            s.toastQueue.push_back(parallelToast);
-                            Log::get().note("parallel projection: the headset notice is queued as a toast (\"%s\"); the Status page shows the "
-                                            "advice as its hint while the menu is open.", parallelToast);
-                        } else {
-                            Log::get().note("parallel projection: menu.toasts is off, so no toast; the Status page shows the advice as its "
-                                            "hint while the menu is open.");
-                        }
-                        s.contentDirty = true;
+        {
+            // The identity is read before the poses. A close between the two reads leaves this tick's answer for the old session, which the
+            // next tick resets; it cannot put a new session's poses under the old identity for a whole session. Once this session is decided
+            // the tick does nothing more: the poses (a mutex and a copy) and the names are fetched only while a decision is still due.
+            const uint64_t parallelSession = nativeMenuSessionId();
+            if (parallelSession != s.parallelProjection.session || !s.parallelProjection.checked) {
+                float eyes[2][12]{};
+                NativeRenderLabels labels{};
+                const bool named = nativeMenuEyePoses(eyes) && nativeRenderLabels(&labels) && labels.valid;
+                if (ppn::latchTick(s.parallelProjection, parallelSession, named ? eyes : nullptr, labels.systemName, labels.runtimeName)) {
+                    char parallelToast[96];
+                    ppn::formatToast(parallelToast, sizeof(parallelToast));
+                    if (s.toasts) {
+                        s.toastQueue.push_back(parallelToast);
+                        Log::get().note("parallel projection: the headset notice is queued as a toast (\"%s\"); the Status page shows the "
+                                        "advice as its hint while the menu is open.", parallelToast);
+                    } else {
+                        Log::get().note("parallel projection: menu.toasts is off, so no toast; the Status page shows the advice as its "
+                                        "hint while the menu is open.");
                     }
+                    s.contentDirty = true;
                 }
             }
         }

@@ -164,6 +164,33 @@ inline Verdict decide(const char* systemName, const char* runtimeName, Views vie
     return honoursToggle(runtimeName) ? Verdict::Notice : Verdict::LogOnly;
 }
 
+// ---- the graphics half's latch ---------------------------------------------------------------------------------------------------
+// The graphics half decides once per menu session and never again inside it. `session` is the identity the native menu gives its session
+// (nativeMenuSessionId): it changes at every acquire and at every close, so a new session, and a close that leaves none, start the decision
+// again. Nothing from the last session carries over: neither a checked verdict that would suppress the next session's notice, nor a notice
+// that outlives the session it was raised in.
+struct SessionLatch {
+    uint64_t session = 0;   // the identity the flags belong to; 0 before any session
+    bool checked = false;   // decided for `session`
+    bool notice = false;    // that decision is Notice: the toast was raised for it, and the Status page shows the hint
+};
+// One tick. `eyes` is the held pair of 3x4 eye poses once the names are known too, and nullptr when there is nothing to decide on yet (no
+// pose, or no names). Returns true on the one tick a session's verdict is Notice, so the caller raises the toast then: a session says it once,
+// and a close followed by a publish of the same verdict says it again, because that is a new session.
+inline bool latchTick(SessionLatch& latch, uint64_t session, const float (*eyes)[12], const char* systemName, const char* runtimeName) {
+    if (session != latch.session) {
+        latch = SessionLatch{};
+        latch.session = session;
+    }
+    if (latch.checked || !eyes) return false;
+    const Views views = classifyRotations(eyes[0], eyes[1]);
+    if (views == Views::Unknown) return false;   // not a pair of orientations yet: the check waits
+    latch.checked = true;
+    if (decide(systemName, runtimeName, views) != Verdict::Notice) return false;
+    latch.notice = true;
+    return true;
+}
+
 // ---- the words ---------------------------------------------------------------------------------------------------------------
 // The openxr log's line, once a session: one line (the trace line buffer is 4096 bytes). `width` x `height` is the runtime's recommended
 // eye size, `angleDegrees` the angle between the located eyes. NotApplicable writes an empty string and returns 0.
