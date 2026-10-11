@@ -1184,6 +1184,17 @@ static bool ensureEasu(ID3D11Device* device,uint32_t renderW,uint32_t renderH) {
     return true;
 }
 
+// Test-only (flatMonoResolveTestSmaaFault, at the foot of this file): the next `area` AreaTex and `search` SearchTex view creations fail after
+// their texture is made. Each failing texture goes to `observe` first, so a rig can hold a reference and count it. Zeros are production.
+struct SmaaLookupFault { int area=0, search=0; void (*observe)(ID3D11Texture2D*)=nullptr; };
+static SmaaLookupFault g_testSmaaFault;
+static bool testSmaaLookupFault(int& remaining,ID3D11Texture2D* texture) {
+    if(remaining<=0)return false;
+    --remaining;
+    if(g_testSmaaFault.observe)g_testSmaaFault.observe(texture);
+    return true;
+}
+
 // The map's SMAA 1x resources (2026-10-10, map_smaa_shader.h): the three passes, the metrics constant, the two samplers, SMAA's lookup
 // textures (uploaded once from map_smaa.cpp, unmodified), and the render-size edges, weights and blended colour. False leaves the frame on
 // EASU alone.
@@ -1207,23 +1218,22 @@ static bool ensureSmaa(ID3D11Device* device,uint32_t renderW,uint32_t renderH) {
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
         if(FAILED(device->CreateSamplerState(&sd,g.smaaPoint.GetAddressOf())))return false;
     }
-    // The two lookup textures, immutable, uploaded once from SMAA's own tables (AreaTex R8G8 160x560, SearchTex R8 64x16).
-    if(!g.smaaAreaSrv) {
-        const MapSmaaTable area=mapSmaaAreaTable();
-        D3D11_TEXTURE2D_DESC td{};td.Width=area.width;td.Height=area.height;td.MipLevels=1;td.ArraySize=1;td.Format=DXGI_FORMAT_R8G8_UNORM;
+    // The two lookup textures, immutable, uploaded once from SMAA's own tables (AreaTex R8G8 160x560, SearchTex R8 64x16). Each texture and
+    // its view are made into locals and published to g only when both succeed: a failed view releases its texture with the locals, so a
+    // retry never overwrites a live pointer and nothing is left behind (EASU runs meanwhile).
+    auto makeLookup=[&](const MapSmaaTable& table,DXGI_FORMAT format,int& faults,ComPtr<ID3D11Texture2D>& tex,
+                        ComPtr<ID3D11ShaderResourceView>& srv)->bool {
+        D3D11_TEXTURE2D_DESC td{};td.Width=table.width;td.Height=table.height;td.MipLevels=1;td.ArraySize=1;td.Format=format;
         td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_IMMUTABLE;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-        D3D11_SUBRESOURCE_DATA init{};init.pSysMem=area.bytes;init.SysMemPitch=area.pitch;
-        if(FAILED(device->CreateTexture2D(&td,&init,g.smaaArea.GetAddressOf())))return false;
-        if(FAILED(device->CreateShaderResourceView(g.smaaArea.Get(),nullptr,g.smaaAreaSrv.GetAddressOf())))return false;
-    }
-    if(!g.smaaSearchSrv) {
-        const MapSmaaTable search=mapSmaaSearchTable();
-        D3D11_TEXTURE2D_DESC td{};td.Width=search.width;td.Height=search.height;td.MipLevels=1;td.ArraySize=1;td.Format=DXGI_FORMAT_R8_UNORM;
-        td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_IMMUTABLE;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-        D3D11_SUBRESOURCE_DATA init{};init.pSysMem=search.bytes;init.SysMemPitch=search.pitch;
-        if(FAILED(device->CreateTexture2D(&td,&init,g.smaaSearch.GetAddressOf())))return false;
-        if(FAILED(device->CreateShaderResourceView(g.smaaSearch.Get(),nullptr,g.smaaSearchSrv.GetAddressOf())))return false;
-    }
+        D3D11_SUBRESOURCE_DATA init{};init.pSysMem=table.bytes;init.SysMemPitch=table.pitch;
+        ComPtr<ID3D11Texture2D> made;ComPtr<ID3D11ShaderResourceView> view;
+        if(FAILED(device->CreateTexture2D(&td,&init,made.GetAddressOf())))return false;
+        if(testSmaaLookupFault(faults,made.Get()) || FAILED(device->CreateShaderResourceView(made.Get(),nullptr,view.GetAddressOf())))return false;
+        tex=made;srv=view;
+        return true;
+    };
+    if(!g.smaaAreaSrv && !makeLookup(mapSmaaAreaTable(),DXGI_FORMAT_R8G8_UNORM,g_testSmaaFault.area,g.smaaArea,g.smaaAreaSrv))return false;
+    if(!g.smaaSearchSrv && !makeLookup(mapSmaaSearchTable(),DXGI_FORMAT_R8_UNORM,g_testSmaaFault.search,g.smaaSearch,g.smaaSearchSrv))return false;
     // The render-size targets: edges (RG8), blend weights (RGBA8, SMAA's own layout), blended colour (half float, the bounded range EASU reads).
     if(!g.smaaEdgesSrv || !g.smaaEdgesUav || !g.smaaWeightsSrv || !g.smaaWeightsUav || !g.smaaBlendedSrv || !g.smaaBlendedUav ||
        g.smaaW!=renderW || g.smaaH!=renderH) {
@@ -1440,4 +1450,11 @@ bool flatMonoResolveTestRefusalResources() {
 bool flatMonoResolveTestSecondDepth() {
     return g.mode!=FlatMonoResolveMode::Taa && g.depth[1].texture;
 }
+// Test-only, likewise: the SMAA lookup failure seam (see g_testSmaaFault above). Each call replaces the counts; zeros restore production.
+void flatMonoResolveTestSmaaFault(int areaFaults,int searchFaults,void (*observe)(ID3D11Texture2D*)) {
+    g_testSmaaFault=SmaaLookupFault{areaFaults,searchFaults,observe};
+}
+// Test-only: the published AreaTex or SearchTex and its view, raw and unreferenced (a caller that keeps one must AddRef it). Null when unpublished.
+ID3D11Texture2D* flatMonoResolveTestSmaaTexture(bool area) { return area ? g.smaaArea.Get() : g.smaaSearch.Get(); }
+ID3D11ShaderResourceView* flatMonoResolveTestSmaaView(bool area) { return area ? g.smaaAreaSrv.Get() : g.smaaSearchSrv.Get(); }
 } // namespace edvr
