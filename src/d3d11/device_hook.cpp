@@ -45,6 +45,11 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "ui_surfaces.h"   // the glyph atlas and sizing chain instruments
 #include "ui_panel_scale.h" // uiPanelScaleShutdown: the panel operands put back
 #include "ui_sizing_math.h" // uiDisplaySizeFromXml: DisplaySettings.xml, for the panel budget
+#include "vr_ssaa_gate.h"   // the step-1 Supersampling gate instruments (log only)
+#include "vr_ssaa_hold.h"   // the Supersampling hold's shutdown (the loader slot goes back)
+#include "vr_display_observer.h"  // the game window's state (read only) and its handle
+
+#include <intrin.h>         // _ReturnAddress: the caller of each observed call
 #include "orbital_width.h" // orbitalWidthRememberVs: the orbit lines' shader, captured at its creation
 #include "xinput_watch.h"
 #include "joy_watch.h"
@@ -75,6 +80,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "stall_watch.h"     // stallWatchBeat: the stall sampler's heartbeat, once per owned Present
 #include "vram_tick.h"       // vramWatchTick: the graphics memory watch, once per owned Present
 #include "vertex_resync_hook.h"   // vertexResyncInstall at startup, vertexResyncPoll once a second: the f3d vertex-buffer cache repair (both profiles)
+#include "terrain_cull_cover_hook.h"   // terrainCullCoverInstall at startup, terrainCullCoverPoll once a second: the terrain cull frustum cover (VR)
 #include "frame_ticks.h"     // g_frameTicks: what the Present hook's own work cost, by name
 #include "boundary_tick.h"   // one fault budget per frame-boundary tick
 #include "vscreen.h"
@@ -1153,6 +1159,7 @@ HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers(IDXGISwapChain* self, UINT cou
     if (ours) flatResizeNote("ResizeBuffers", count, width, height, format, flags, hr, refs);
     return hr;
 }
+
 HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers1(IDXGISwapChain3* self, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags, const UINT* masks, IUnknown* const* queues) {
     const bool ours = static_cast<IDXGISwapChain*>(self) == g_state->swapChain;
     long refs = -1;
@@ -1281,6 +1288,8 @@ void tickHotkeys() {
     if (g_state->censusKey.pressed()) {
         if (runtimeFlatProfile()) {
             flatTemporalArm((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+            // The flat profile's draw census, both tiers: every draw, offscreen included, for two frames (draw_census.h).
+            drawCensusFlatRequest();
         } else {
             drawCensusRequest();
             // Same key: the census says WHAT was drawn, the quad probe says
@@ -1611,11 +1620,13 @@ void presentFrameBoundary() {
             vScreenRefreshConfig();
             // The vertex-buffer resync's 60 s count and its ten-minute heartbeat: it needs no vScreen State, so it is asked here, after the reload, in both profiles.
             vertexResyncPoll(stampMs());
+            // The terrain cull cover's ten-minute heartbeat (written while its hook is live, zero counts included).
+            terrainCullCoverPoll(stampMs());
             // The four diagnostic keys follow the file too (the menu's Hotkeys page).
             configureDiagnosticHotkeys();
             g_state->fssModeLatchWanted =
                 eyeSyncFromConfig(Config::get()).any();
-            journalWatchSetEagerStatus(g_state->fssModeLatchWanted);
+            journalWatchSetEagerStatus(g_state->fssModeLatchWanted || runtimeFlatProfile());
         });
         tkFrameFlagPeer.run(tickFrameFlagPeer);
         // The liveness pass, on the same once-a-second cadence. In-place
@@ -1687,6 +1698,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     if (self != g_state->swapChain) {
         return g_state->realPresent(self, syncInterval, flags);
     }
+    vrSsaaGateNotePresent();  // log only: the first Present's place in the order of the Supersampling lines
     // The frame-tick chain starts here (frame_ticks.h): what follows, to this
     // hook's return, is EDVR's or the driver's; what came before it is the game's.
     g_frameTicks.enter(hookEnter);
@@ -2104,7 +2116,8 @@ State& ensureState() {
         journalWatchConfigure();
         g_state->fssModeLatchWanted =
             eyeSyncFromConfig(Config::get()).any();
-        journalWatchSetEagerStatus(g_state->fssModeLatchWanted);
+        // Flat reads the GuiFocus of the open map (temporal AA off on the Galaxy Map, the System Map and the Orrery) from Status.json, at the same 100 ms the FSS latch wants.
+        journalWatchSetEagerStatus(g_state->fssModeLatchWanted || runtimeFlatProfile());
     }
     return *g_state;
 }
@@ -2263,6 +2276,10 @@ bool eliteHmdMultiplier(float* mult, float* ssaa, char* fileOut, size_t fileLen)
         if (fl.out == mult) gotMult = true;
     }
     return gotMult;
+}
+
+bool deviceHookFxcfgMultipliers(float* mult, float* ssaa, char* fileOut, size_t fileLen) {
+    return eliteHmdMultiplier(mult, ssaa, fileOut, fileLen);
 }
 
 // The reduction type lives in bits 7-8 of a D3D11_FILTER: 0 standard,
@@ -2584,6 +2601,7 @@ void hookDevice(ID3D11Device* device) {
     EDVR_HOOK_DEV_CREATE(kDevCreateRtv, true);
     EDVR_HOOK_DEV_CREATE(kDevCreateDsv, true);
 #undef EDVR_HOOK_DEV_CREATE
+    vrSsaaGateStartup();  // log only: the 3D mode file, the .fxcfg's Supersampling and HMD Quality, once per process
     {
         const int aniso = sentinelCfg.getIntInRange("advanced.texture_anisotropy", 0, 0, 16);
         const bool temporal = temporalModeEnabled(sentinelCfg.getString("fix.temporal_aa", "off"));
@@ -2828,6 +2846,9 @@ void hookDevice(ID3D11Device* device) {
             // The game's own vertex-buffer cache repair (vertex_resync_hook.cpp): a CodeHook on Frontier's input-assembler flush, once, in BOTH profiles -- the stale
             // cache is the game's, not VR's. A build that is not 332841 is one log line and nothing patched.
             vertexResyncInstall();
+            // The terrain cull cover (terrain_cull_cover_hook.cpp; docs/terrain-culling.md): a CodeHook on the game's cull-plane builder, always on, VR only (a flat session says
+            // it is inert). A build that is not 332841 is scanned for the call site; anything short of one match is one log line and nothing patched.
+            terrainCullCoverInstall(runtimeFlatProfile());
 
             // AFTER BOTH INSTALLERS, and the order is the whole point. EDVR's
             // own commit writes two dozen entries of this table in the shared
@@ -2940,7 +2961,10 @@ void hookSwapChain(IDXGISwapChain* swapChain) {
             third->Release();
         }
         Log::get().note("flat runtime resize hooks: ResizeBuffers=%u ResizeBuffers1=%u; release owned backbuffer references before forwarding", resize?1u:0u, resize1?1u:0u);
-        if (!resize) { s.swapChainHook.uninstall(); return; }
+        if (!resize) {
+            s.swapChainHook.uninstall();
+            return;
+        }
     }
     if (!s.swapChainHook.commit()) {
         s.swapChainHook.uninstall();
@@ -2948,6 +2972,10 @@ void hookSwapChain(IDXGISwapChain* swapChain) {
     }
     s.swapChain = swapChain;
     Log::get().note("Present hook installed");
+    {
+        DXGI_SWAP_CHAIN_DESC windowDesc{};
+        if (SUCCEEDED(swapChain->GetDesc(&windowDesc))) vrDisplayObserveWindow(windowDesc.OutputWindow);
+    }
 
     if (Config::get().getBool("d3d11.focus_on_launch", true)) {
         DXGI_SWAP_CHAIN_DESC desc{};
@@ -3142,6 +3170,7 @@ void shutdownDeviceHooks() {
     // exposure fix's, so it comes off first.
     revertVScreenModeResolution();
     uiPanelScaleShutdown();  // fix.ui_quality's four operands, back to the game's
+    vrSsaaHoldShutdown();    // the Supersampling hold's loader slot, back to the game's
     vertexResyncShutdown();  // the vertex-buffer resync's session line (the hook itself stays; the game's process exit says the line through Log::setExitLine)
     shutdownGlitchFrameFix();
     transitionFlashEyeBaseShutdown();

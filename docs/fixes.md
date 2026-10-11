@@ -157,7 +157,17 @@ view were not drawn while you moved your head — black tiles popping in and out
 as you looked around (Frontier issue
 [72609](https://issues.frontierstore.net/issue-detail/72609)). EDVR now answers
 the game's own request for the head pose "now" at the display time of the frame
-being drawn, which stopped the squares in the flight that tested it. An
+being drawn, which stopped the squares in the flight that tested it. A second
+defect remained on headsets whose eyes are not symmetric: Elite culls terrain
+against a centred frustum built from one vertical field of view and one aspect,
+and an eye that reaches further out (or down) than that, as the Quest 3 and a
+cropped Pimax do, loses patches of ground in the band between. EDVR widens those
+two numbers, when the game builds the frustum, to the largest tangents of the
+frusta it hands the game. On a Quest 3 via Virtual Desktop at 90 Hz the pilot
+counted 20 flashes in 5.7 minutes without it and none in 3.5 with it; the frame
+rate did not move. It runs in VR only, needs no setting, and leaves the game
+alone unless it can find the one function it widens (the log says
+`terrain cull cover: inert` when it cannot). An
 earlier build tried to cover them instead, with a setting that told the game
 your headset shows more than it does (about 6% GPU at the values tested on a
 Quest 3); that setting and its five siblings are gone, and a line for one in an

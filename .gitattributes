@@ -30,3 +30,7 @@ tools/*fixture*.log text eol=lf
 
 # The loader notice is hashed byte-for-byte by the dependency fetcher.
 third_party/openxr/LOADER-NOTICES.txt text eol=lf
+
+# The vendored SMAA sources (MIT, iryoku/smaa at commit 71c806a8) are stored and checked out byte-for-byte, as upstream ships them (CRLF):
+# tools/gen_smaa_hlsl.py pins SMAA.hlsl's SHA-256 and the build refuses any other bytes.
+src/d3d11/smaa/** -text

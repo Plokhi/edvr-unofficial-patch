@@ -268,6 +268,10 @@ REM vendored headers stay byte-identical to upstream (src\d3d11\fsr\).
 python "tools\gen_fsr_hlsl.py" --self-test || exit /b 1
 python "tools\gen_fsr_hlsl.py" --root "%ROOT%" --out "%GEN%"
 if errorlevel 1 ( echo [edvr] ERROR: FSR shader embedding failed & exit /b 1 )
+REM SMAA 1x (MIT, src\d3d11\smaa\, pinned to upstream commit 71c806a8) as embeddable HLSL, the same way: the map temporal-off frames below native.
+python "tools\gen_smaa_hlsl.py" --self-test || exit /b 1
+python "tools\gen_smaa_hlsl.py" --root "%ROOT%" --out "%GEN%"
+if errorlevel 1 ( echo [edvr] ERROR: SMAA shader embedding failed & exit /b 1 )
 
 if not exist "%OBJ%\temporalshader" mkdir "%OBJ%\temporalshader"
 cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
@@ -509,7 +513,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\stall_watch.cpp" "src\d3d11\vram_tick.cpp" ^
     "src\d3d11\native_menu.cpp" ^
     "src\d3d11\native_temporal.cpp" "src\d3d11\flat_temporal.cpp" "src\d3d11\flat_compute_capture.cpp" "src\d3d11\flat_compute_readback.cpp" ^
-    "src\d3d11\flat_runtime.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
+    "src\d3d11\flat_runtime.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\map_easu.cpp" "src\d3d11\map_smaa.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
     "src\d3d11\flat_camera_producer_probe.cpp" "src\d3d11\flat_camera_inject.cpp" ^
     "src\d3d11\vr_world_route.cpp" "src\d3d11\vr_world_mips.cpp" "src\d3d11\vr_camera_census.cpp" ^
     "src\d3d11\native_sharpen.cpp" ^
@@ -551,7 +555,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\panel_curve.cpp" "src\d3d11\screen_motion.cpp" "src\d3d11\weapon_motion.cpp" ^
     "src\d3d11\remlok_fix.cpp" "src\d3d11\holo_fix.cpp" ^
     "src\d3d11\target_sharp.cpp" "src\d3d11\night_vision.cpp" ^
-    "src\d3d11\wake_pulse.cpp" ^
+    "src\d3d11\wake_pulse.cpp" "src\d3d11\vr_ssaa_gate.cpp" "src\d3d11\vr_ssaa_hold.cpp" "src\d3d11\vr_display_observer.cpp" "src\d3d11\vr_window_trampolines.cpp" ^
     "src\d3d11\ui_depth.cpp" ^
     "src\d3d11\ui_layer.cpp" "src\d3d11\ui_surfaces.cpp" "src\d3d11\ui_panel_scale.cpp" "src\d3d11\orbital_width.cpp" "src\d3d11\supercruise_bars.cpp" ^
     "third_party\dxbc_hash\DxilHash.cpp" ^
@@ -565,6 +569,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\temporal_pass.cpp" ^
     "src\d3d11\depth_probe.cpp" ^
     "src\d3d11\luma_probe.cpp" ^
+    "src\d3d11\terrain_cull_cover_hook.cpp" ^
     "src\d3d11\dlaa.cpp" ^
     "src\d3d11\fsr3_engine.cpp" ^
     "src\d3d11\sharpen_pass.cpp" ^
@@ -1428,7 +1433,7 @@ if not exist "%OBJ%\vrworldroutegpu" mkdir "%OBJ%\vrworldroutegpu"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /Fo"%OBJ%\vrworldroutegpu\\" ^
     /Fe"%BUILD%\vr_world_route_gpu_test.exe" "tools\vr_world_route_gpu_test\vr_world_route_gpu_test.cpp" ^
-    "src\d3d11\vr_world_route.cpp" "src\d3d11\binding_shadow.cpp" "src\d3d11\flat_mono_resolve.cpp" ^
+    "src\d3d11\vr_world_route.cpp" "src\d3d11\binding_shadow.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\map_easu.cpp" "src\d3d11\map_smaa.cpp" ^
     "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
     "src\common\config.cpp" "src\common\proxy.cpp" "src\common\guard.cpp" ^
     /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib version.lib
@@ -1456,7 +1461,7 @@ if not exist "%OBJ%\flat_mono_resolve_test" mkdir "%OBJ%\flat_mono_resolve_test"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /Fo"%OBJ%\flat_mono_resolve_test\\" ^
     /Fe"%BUILD%\flat_mono_resolve_test.exe" "tools\flat_mono_resolve_test\flat_mono_resolve_test.cpp" ^
-    "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
+    "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\map_easu.cpp" "src\d3d11\map_smaa.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
     "third_party\dxbc_hash\DxilHash.cpp" /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: flat mono resolve test build failed & exit /b 1 )
 "%BUILD%\flat_mono_resolve_test.exe" --dry-run || exit /b 1
@@ -1786,6 +1791,26 @@ if errorlevel 1 ( echo [edvr] ERROR: ui_holo_pass_test build failed & exit /b 1 
     echo [edvr] ERROR: the UI and hologram passes no longer match their recorded output
     exit /b 1
 )
+exit /b 0
+
+:rig_terrain_cover_test
+echo [edvr] === terrain cull cover: the rule, the signature scan, the module gate, the hook on a synthetic builder ===
+REM Build gate for the terrain cull cover (src\d3d11\terrain_cull_cover_core.h and terrain_cull_cover_hook.cpp, EDVR_TERRAIN_COVER_TEST; docs\terrain-culling.md): the game builds its
+REM terrain cull planes from a CENTRED frustum (vFOV/2 vertically, atan(aspect * tan) horizontally), so an eye with an asymmetric frustum is under-covered on its wide sides. The rule
+REM widens arguments 5 and 6 of that builder to the largest tangents handed to the game (the three rigs' predicted values, a symmetric headset, an input already wider, bad input).
+REM The production hook is compiled in with the real CodeHook and patches a synthetic builder of the same six-argument shape inside synthetic modules (the known build's stamp and
+REM layout, and another build's for the signature scan): only arguments 5 and 6 change; the first call and the ten-minute heartbeat are what the log says; tools\terrain_cover_fixture.log
+REM is held byte for byte; device_hook.cpp's and native_temporal.cpp's wiring are read as text.
+if not exist "%OBJ%\terraincover" mkdir "%OBJ%\terraincover"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /DEDVR_TERRAIN_COVER_TEST /I"src\d3d11" /I"src\common" ^
+    /Fo"%OBJ%\terraincover"\ /Fe"%OBJ%\terraincover\terrain_cover_test.exe" ^
+    "tools\terrain_cover_test\terrain_cover_test.cpp" "src\d3d11\terrain_cull_cover_hook.cpp" ^
+    "src\common\code_hook.cpp" "src\common\guard.cpp" "src\common\log.cpp" "src\common\config.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib user32.lib
+if errorlevel 1 ( echo [edvr] ERROR: terrain_cover_test build failed & exit /b 1 )
+"%OBJ%\terraincover\terrain_cover_test.exe" --dry-run || exit /b 1
+"%OBJ%\terraincover\terrain_cover_test.exe" --self-test "%ROOT%" || exit /b 1
 exit /b 0
 
 :rig_luma_probe_test
@@ -3441,6 +3466,20 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
 if errorlevel 1 ( echo [edvr] ERROR: UI hologram test build failed & exit /b 1 )
 "%OBJ%\uiholo\ui_holo_test.exe" --dry-run || exit /b 1
 "%OBJ%\uiholo\ui_holo_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_vr_ssaa_hold_test
+echo [edvr] === vr_ssaa_hold_test.exe ===
+REM The VR Supersampling hold's pure decision (src\d3d11\vr_ssaa_hold_math.h, docs\vr-supersampling-gate-2026-10-10.md): the Settings.xml
+REM mode parse, the held value by profile and mode, the toast. The DLL calls the same functions; the hooks are not in this rig.
+if not exist "%OBJ%\vrssaahold" mkdir "%OBJ%\vrssaahold"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 ^
+    /Fo"%OBJ%\vrssaahold\\" /Fe"%OBJ%\vrssaahold\vr_ssaa_hold_test.exe" ^
+    "tools\vr_ssaa_hold_test\vr_ssaa_hold_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: vr_ssaa_hold_test build failed & exit /b 1 )
+"%OBJ%\vrssaahold\vr_ssaa_hold_test.exe" --dry-run || exit /b 1
+"%OBJ%\vrssaahold\vr_ssaa_hold_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_orbital_width_test

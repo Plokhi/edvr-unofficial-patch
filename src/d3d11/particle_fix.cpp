@@ -18,6 +18,7 @@
 #include "../common/timing.h"
 #include "binding_shadow.h"   // bindingShaderHash: the bound vertex shader's hash, set with the shader
 #include "exposure_fix.h"   // lookupShaderHash
+#include "supercruise_lines.h"   // kUiVsSpaceDust, kUiPsSpaceDust: the dust's shader pair
 // flare_vs.h is compiled by the build shader generator.
 // particle_vs.h is compiled by the build shader generator.
 #include "shader_swap.h"
@@ -33,7 +34,13 @@ ParticleMode g_particleMode = ParticleMode::kStock;
 // Published for the draw path's inline first tests (particle_fix.h); the
 // file-local names below are references to these.
 bool g_particleHideStars = false;
+// fix.supercruise_dust = off and fix.normal_space_dust = off, published for
+// spaceDustHidden() (particle_fix.h).
+bool g_supercruiseDustHidden = false;
+bool g_normalSpaceDustHidden = false;
 }  // namespace detail
+using detail::g_supercruiseDustHidden;   // the configure and skip code below reads them by their plain names
+using detail::g_normalSpaceDustHidden;
 
 namespace {
 using Mode = detail::ParticleMode;
@@ -302,6 +309,9 @@ bool shapeOk(const float* f, uint32_t floats) {
 
 uint64_t g_starsSkipped = 0;
 uint64_t g_starsNoteMs = 0;
+uint64_t g_dustSkipped = 0;        // spaceDustSkip's counts, one per pair: supercruise, normal space
+uint64_t g_dustNormalSkipped = 0;
+uint64_t g_dustNoteMs = 0;         // and the note's clock
 
 bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances) {
@@ -320,6 +330,55 @@ bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
             "to have them back.",
             static_cast<unsigned long long>(g_starsSkipped),
             static_cast<unsigned long long>(kWitchspaceStarsVs));
+    }
+    return true;
+}
+
+namespace {
+// The space dust's bound pixel shader hash: the binding shadow's when it has
+// one, the context's otherwise (boundVsHashFast's pattern).
+uint64_t boundPsHashFast(ID3D11DeviceContext* ctx) {
+    if (bindingGet(BindSlot::Ps)) {
+        const uint64_t held = bindingShaderHash(BindSlot::Ps);
+        if (held) return held;
+    }
+    ID3D11PixelShader* ps = nullptr;
+    ctx->PSGetShader(&ps, nullptr, nullptr);
+    if (!ps) return 0;
+    const uint64_t h = lookupShaderHash(ps);
+    ps->Release();
+    return h;
+}
+}  // namespace
+
+bool spaceDustSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
+                   uint32_t instances) {
+    (void)kind; (void)count; (void)instances;
+    if (!ctx) return false;
+    // The vertex shader first; the pixel shader is asked only for a vertex
+    // shader that is one of the two dust pairs' (the pair is the key). Each
+    // pair is withheld only by its own flag.
+    const uint64_t vs = boundVsHashFast(ctx);
+    if (vs == kUiVsSpaceDust) {
+        if (!g_supercruiseDustHidden) return false;
+        if (boundPsHashFast(ctx) != kUiPsSpaceDust) return false;
+        ++g_dustSkipped;
+    } else if (vs == kVsNormalSpaceDust) {
+        if (!g_normalSpaceDustHidden) return false;
+        if (boundPsHashFast(ctx) != kPsNormalSpaceDust) return false;
+        ++g_dustNormalSkipped;
+    } else {
+        return false;
+    }
+    const uint64_t now = nowMs();
+    if (now - g_dustNoteMs >= 30000) {
+        g_dustNoteMs = now;
+        Log::get().note(
+            "space dust withheld so far: supercruise %llu, normal space %llu "
+            "draw(s). Set fix.supercruise_dust or fix.normal_space_dust = on "
+            "to have them back.",
+            static_cast<unsigned long long>(g_dustSkipped),
+            static_cast<unsigned long long>(g_dustNormalSkipped));
     }
     return true;
 }
@@ -506,6 +565,48 @@ void particleConfigure(Config& cfg) {
                 : "witchspace stars: ON. The hyperspace tunnel keeps its "
                   "starfield, which is the game's own behaviour.");
     }
+
+    // The two space dust switches, the same shape as the one above, each with
+    // its own flag, counter and change note. Read through the same VR-profile
+    // gate, so flat never sees "off" from a key its allow-list does not carry
+    // (runtime_profile.h).
+    auto applyDustKey = [](const std::string& v, const char* name, bool& hidden,
+                           uint64_t& skipped, const char* offText,
+                           const char* onText) {
+        const bool wasHidden = hidden;
+        if (v == "off") {
+            hidden = true;
+        } else {
+            if (v != "on") {
+                Log::get().note("%s: that is not on or off; leaving it on.", name);
+            }
+            hidden = false;
+        }
+        if (hidden != wasHidden) {
+            skipped = 0;
+            g_dustNoteMs = 0;
+            Log::get().note("%s", hidden ? offText : onText);
+        }
+    };
+    // The keys are read by their literal names, which the settings-schema
+    // generator needs to see (tools/gen_settings_schema.py).
+    const std::string sdv = runtimeVrProfile() ?
+        cfg.getString("fix.supercruise_dust", "on") : "on";
+    const std::string ndv = runtimeVrProfile() ?
+        cfg.getString("fix.normal_space_dust", "on") : "on";
+    applyDustKey(sdv, "supercruise space dust",
+                g_supercruiseDustHidden, g_dustSkipped,
+                "supercruise space dust: OFF. The supercruise streaks are not "
+                "drawn -- the draw is withheld, nothing else about supercruise "
+                "changes.",
+                "supercruise space dust: ON. The supercruise streaks are drawn, "
+                "as the game draws them.");
+    applyDustKey(ndv, "normal-space dust",
+                g_normalSpaceDustHidden, g_dustNormalSkipped,
+                "normal-space dust: OFF. The normal-space specks are not drawn "
+                "-- the draw is withheld, nothing else about the flight changes.",
+                "normal-space dust: ON. The normal-space specks are drawn, as "
+                "the game draws them.");
 
     const Mode wasMode = detail::g_particleMode;
     const std::string m = runtimeVrProfile() ?

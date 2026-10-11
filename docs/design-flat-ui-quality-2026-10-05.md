@@ -39,9 +39,13 @@
 - **0.19.0 review (10-09), finding 3:** the Supersampling setter's panel factor is
   held until the scene's size follows it, its epoch check and write one operation
   under the floats' lock (last entry; built, not flown).
+- **System Map families (10-10, built, not flown):** `kMapCanvas` and `kMapSprite`
+  (flat only; asked while GuiFocus 6, 7 or 8 is open, on the HDR target) go into the
+  flat UI layer like the HUD families, so they are drawn at D x T after the upscale.
+  The "flat ui layer map:" 30 s line counts them and names each refusal. Entry at the end.
 - **Temporary config keys:** none.
 - **Next:** fly SS 0.5 on the shipped build (the copy route under eced5813's
-  admission change) and 100% at SS 1.0.
+  admission change) and 100% at SS 1.0; then an Epic flight opening all three maps.
 
 Bring VR's source-panel quality and separate UI composition to flat Elite:
 retain fine text below display-resolution world rendering; avoid UI history
@@ -455,3 +459,81 @@ for the right factor. The review's scratch check shows the reversed factor; it d
   arrival unsettled, no timeout, timeout off by one, no restart, hold publishes, forget keeps the hold, keep tolerance zero, refused frame does not unsettle, arrival
   ignores the size, and three glue edits).
 - 2026-10-09, follow-up review of dbbbcf03, finding 2 (built, not flown): a setter that landed between the boundary's epoch read and its write was overwritten (epoch 0 read, setter 0.400 and epoch 1, 0.800 written back, then a hold on it). The boundary's epoch read, decision, publish and write (`uiFlatPanelBoundarySection`) and the setter's published-plan read, factor write and epoch (`uiPanelSetterSection`) are now each ONE operation under `g_floatLock`, the floats' lock; under it only atomics, `UiFlatPanelSettle::step`, the move arithmetic, the floats' write (`writeFloatsUnlocked`) and one load of the scene's size; the live Supersampling is read before it and the log written after. Tests: `testRace` injects a setter at each point of the boundary's section (including a boundary that writes 0.533), before its lock, and a boundary into the setter's; mutants that drop either lock, read the epoch outside it, or lock only the write fail them.
+
+## 2026-10-10: the System Map's draws into the flat UI layer (built, not flown)
+
+Census (flat draw census, flight 081437): every draw is a TRISTRIP quad into the HDR scene (R11G11B10F, 3840x2160), depth off, alpha over (SRC_ALPHA, INV_SRC_ALPHA),
+VS SRVs t1/t6 from the instanced pool, CB c=@46.
+- `kMapCanvas`: VS 12382D2EA45E9632, PS 855C469156AB997F, n=6. PS slot 0 is a GUI canvas (RGBA8), or on the System Map a 1024x1024 BC3. 45 a frame on the
+  Galaxy Map, 10 on the System Map, 8 on the Orrery; absent in the cockpit.
+- `kMapSprite`: VS C31238331D8AC3D4 with PS BD0FEB3276C8B2D7 (n=6, a 64x64 or 128x128 BC3/BC7 icon) and with PS 539A4858CE3A3477 (n=12, System Map). 172 a frame
+  on the Galaxy Map, 14 on the Orrery, 5 on the System Map.
+- Stays in the scene: the additive star and dust fields (41C518.., 7D26BC.., 39D858..).
+
+The canvas VS was seen before. The 2026-09-23 VR session logged it as an always-on composite the ui depth rule left alone, as "samples a learned surface"
+(docs\ui-layer-2026-09-23.md, around line 1055). The VR classifier does not name it on the HDR target (uiLayerFamilyFor's HDR branch names only the pairs it
+named before), so the new families are flat-only by construction and also gated on the map being open.
+
+What was built:
+- Families: `kMapCanvas` and `kMapSprite`, appended before `kCount` (ui_layer_math.h), named "map canvas" and "map sprite", in `uiLayerFamilyTakesHdr`.
+  No VR classifier returns them; the two enum loops that walk `1..kCount` print only engaged or decided families, and the arrays sized `kCount` grow with them.
+- Classification: `flatUiMapFamilyOf(vs, ps, mapOpen, hdrTarget)` (flat_ui_layer_math.h) names the pairs only when a map is open and the target is the HDR class
+  (flatUiTargetClass). `flatUiFamilyFor` asks it first and falls back to `flatUiFamilyOf`. `flatUiLayerTakesFamily` lists both families.
+- Gate: GuiFocus is read ONCE per frame, at the frame boundary (`flatRuntimeMapFocusFrame`, flat_runtime.cpp). The map plane (focus 7) and the map families (6, 7, 8,
+  `flatRuntimeMapOpenFrame`) answer from that read, so a frame's answer does not change mid-frame. The map plane's behaviour is as before; it now reads at the frame
+  boundary rather than at the resolve, within the same frame.
+- Draws: `FlatUiLayerDraw.mapOpen` is filled where the draw is classified. A taken draw goes through the existing begin, issue, tone re-issue and composite path,
+  as the HUD families do. The issue count reads the family the decision stored, not a second classification.
+- Logs: the 30 s "flat ui layer families" line gains map-canvas and map-sprite. A new 30 s line, "flat ui layer map: open-frames=N; canvas asked=A taken=T refused=R
+  (reasons); sprite asked=... (reasons)", prints zeros too. The first take of each family is said once: "flat ui layer: the first map canvas taken -- frame N, vs ...".
+- Tests: ui_quality_test `testFlatLayerRules` (the takes list, the names, the gate on mapOpen and on the HDR class, the mixed and unrelated pairs, `flatUiFamilyFor`,
+  the VR classifier on both target kinds), the `SC3a` takes-HDR set, and the HDR decision for each family (kOver redirects).
+
+Mechanism, not yet shown in a flight:
+- Raster size. A taken draw rasterises into the layer at D x T, as the HUD families do. The canvas is a 4800x2700 texture at ui_quality 125, which is 3840x2160 x 1.25.
+  So the game may already draw the canvas at the panel factor, and the layer would then resample it rather than enlarge it. Unproven: a texel check needs a flight.
+- Sprites are fixed-size atlases (64 or 128 px). At 125 the layer magnifies them, where the game drew them at a fixed size. Unproven: what they look like at D x T.
+
+Risks, in order of how likely they are to make the take a no-op:
+1. The map draws may carry no camera rows, or no upstream camera owner. Then every draw refuses ("no-camera-rows" or "not-upstream") and nothing is taken. The map line
+   says which refusal it was.
+2. The map draws are straight-alpha over. The HUD families were measured premultiplied-over; the HDR take's straight over has not been flown.
+3. Draw order. The star and dust fields stay in the scene. If the game draws stars after a canvas, they now sit under the map's canvas (the layer composites last).
+   Not checked.
+
+Ruled out: none (new arc).
+
+Next: an Epic flat flight with all three maps opened (Galaxy, System, Orrery), at SS 1.0 and UI 125. Read the "flat ui layer map:" line in each window: the
+canvas and sprite asked counts show the gate; the reasons show what refused. Then look at a star field crossing a map.
+
+### Follow-up: the map frames' tonemap (9cc6b8ba flight, log 091943)
+
+The flight refuted the first reading. Every map ask was refused "tone-unproven" before the shared decision (flat_ui_layer.cpp: recorded at the proof
+hud step, refused at the proven check), because no proof was ever recorded for a map frame. The census (every map census: Galaxy twice, System,
+Orrery) shows the cause: the map draws write the scene, and VS CFA91824129ECBBC with PS C89DD4ED362D743F reads that scene in slot 0 and writes a
+3840x2160 RGBA8 target, 3-5 draws after the last map draw. That PS is in no tone list (flat_mono_frame.h tonePsHdrSlot), so flatUiLayerToneCandidate never
+saw it, and no proof was recorded.
+- Caller audit before the change. `toneHdrSlot` and `tonePsHdrSlot` have these callers: the resolve's tone selection (flat_mono_frame.h ~310-318,
+  NoTonePass / AmbiguousTonePass), the target's tone record (flat_runtime_model.h ~533, which the resolve model reads), the HDR route's input
+  (flat_runtime_model.h ~247, ~300), the draw scope's tone flag (flat_runtime.cpp ~4738, ~4760), the packet capture's representative (~4591), two
+  diagnostic logs (~1636, ~5500), the UI layer's candidate branch (~5437), and tests. Registering the pair in the registry would change the resolve and
+  the target record on map frames, so it is NOT registered there.
+- What was built: `kFlatUiMapToneVs` / `kFlatUiMapTonePs` and `flatUiMapToneSlotOf` (flat_ui_layer_math.h, with the census comment). The flat
+  runtime's candidate branch (flat_runtime.cpp, the `else if (tone || ...)` near the UI layer decision) accepts the pair for the UI layer alone, with slot 0.
+  The first proof from a map frame is said once: "flat ui layer: map-frame tone proven by VS ... PS ... reading slot 0, frame N (the proof holds for frame N+1);
+  said once."
+- Not covered: the bloom composite CFA918 / FA01CD writes the scene and stays out. Its full hash is not in the repo, so the rig pins a neighbouring PS on the
+  same VS instead.
+- Next: the Epic flat flight with the three maps open, reading that line and the map line's tone-unproven count.
+
+### Follow-up 2: the candidate read a null input (1d8d8212 flight, log 094919)
+
+The candidate branch did run on the map tonemap (candidate lines 2685-2692: "vs CFA918 ps C89DD4, HDR slot t0 reads 0000000000000000"). Its input
+was null because the runtime captured SRV slots only for registry tones and copies (flat_runtime.cpp, the capture gate before the UI block). Now
+the capture also runs for the map tonemap. Its readers were audited: the copy-pair branches (flat_runtime_model.h), the menu and image copies, the
+mono selector (keyed on the registry), flat_copy_structure.h, and flatContractMatches (fed only by the temporal observation, which already fills
+every draw). The frame-contract hash (flat_frame_contract.h) mixes the slots into a trace header for the F10 dump, not a decision.
+- The first map-tone candidate is said once, proved or not: "flat ui layer: first map-tone candidate -- frame N, input <ptr>, recorded targets
+  <list or none>, match yes|no (reason), map asks this frame n; said once." The reason is flatUiToneMatchWhy (flat_ui_layer_math.h, rig-pinned).
+- The map line gains tone-candidates-map and tone-matched-map (zeros print).
+- No rig drives the runtime's candidate branch (it needs the D3D draw scope); the pure reason function is pinned instead.

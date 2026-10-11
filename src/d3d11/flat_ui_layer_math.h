@@ -38,10 +38,95 @@ inline UiLayerFamily flatUiFamilyOf(uint64_t vs, uint64_t ps) {
     return uiLayerFamilyFor(f);
 }
 
+// THE SYSTEM MAP'S DRAWS (flat draw census, flight 081437, 2026-10-10): the GUI canvas composite and the icon sprites the
+// Galaxy Map (GuiFocus 6), the System Map (7) and the Orrery (8) draw into the scene's HDR target. Named only while one of
+// those maps is open AND the target is the HDR class: the same pairs with no map open, or on another target, are not the
+// family. The canvas is the always-on composite the 2026-09-23 VR session also saw (docs\ui-layer-2026-09-23.md), which is
+// why no VR classifier names it: this rule is flat's, and GuiFocus-gated.
+constexpr uint64_t kFlatUiMapCanvasVs = 0x12382D2EA45E9632ull;
+constexpr uint64_t kFlatUiMapCanvasPs = 0x855C469156AB997Full;
+constexpr uint64_t kFlatUiMapSpriteVs = 0xC31238331D8AC3D4ull;
+constexpr uint64_t kFlatUiMapSpritePsA = 0xBD0FEB3276C8B2D7ull;  // the 64x64 / 128x128 BC3 / BC7 icons (Galaxy, Orrery)
+constexpr uint64_t kFlatUiMapSpritePsB = 0x539A4858CE3A3477ull;  // the System Map's sprites (n=12)
+inline UiLayerFamily flatUiMapFamilyOf(uint64_t vs, uint64_t ps, bool mapOpen, bool hdrTarget) {
+    if (!mapOpen || !hdrTarget) return UiLayerFamily::kNone;
+    if (vs == kFlatUiMapCanvasVs && ps == kFlatUiMapCanvasPs) return UiLayerFamily::kMapCanvas;
+    if (vs == kFlatUiMapSpriteVs && (ps == kFlatUiMapSpritePsA || ps == kFlatUiMapSpritePsB)) return UiLayerFamily::kMapSprite;
+    return UiLayerFamily::kNone;
+}
+
+// A draw's family in the flat layer: the map families first (only with a map open, on the HDR target), then the shared rule.
+inline UiLayerFamily flatUiFamilyFor(uint64_t vs, uint64_t ps, bool mapOpen, bool hdrTarget) {
+    const UiLayerFamily map = flatUiMapFamilyOf(vs, ps, mapOpen, hdrTarget);
+    return map != UiLayerFamily::kNone ? map : flatUiFamilyOf(vs, ps);
+}
+
+// THE MAP FRAMES' TONEMAP, FOR THE UI LAYER ONLY (census, 2026-10-10, every map census of log 091943's build 9cc6b8ba): VS
+// CFA91824129ECBBC with PS C89DD4ED362D743F reads the scene in SRV slot 0 and writes a 3840x2160 RGBA8 target, issued 3-5
+// draws after the last map draw. The map draws write the same scene (R11G11B10F 3840x2160). None of the registry's tone PS
+// (flat_mono_frame.h tonePsHdrSlot: FEE777, EAA5F1, DE65BF, 9270C3) appear in a map census, so flatUiLayerToneCandidate never
+// ran on a map frame and no target was ever proven there (tone-unproven on every map and HUD ask).
+// NOT in the registry. The registry also drives the resolve's tone selection (flat_mono_frame.h ~310-318), the target's tone
+// record (flat_runtime_model.h ~533) and the HDR route's trigger, and a map frame's pass must not change those. The UI layer
+// alone asks this table (flat_runtime.cpp's tone candidate branch). CFA918 with PS FA01CD writes the scene (the bloom
+// composite) and stays out: only the exact pair is named.
+constexpr uint64_t kFlatUiMapToneVs = 0xCFA91824129ECBBCull;
+constexpr uint64_t kFlatUiMapTonePs = 0xC89DD4ED362D743Full;
+inline uint32_t flatUiMapToneSlotOf(uint64_t vs, uint64_t ps) {
+    return vs == kFlatUiMapToneVs && ps == kFlatUiMapTonePs ? 0u : ~0u;  // the scene is SRV slot 0
+}
+
+// TEMPORAL AA OFF WHILE A MAP IS OPEN (maintainer's decisions, 2026-10-10: the Galaxy Map and the Orrery first, then the System
+// Map). The map scenes' grid, line and star draws are not taken by the UI layer, and their temporal history smears (the
+// System Map's stars pan with the plane in one capture and sit near still in another, so no motion rule fits both: the
+// plane-motion and star-choice work is removed). While GuiFocus is 6, 7 or 8 the frame runs no temporal resolve and no jitter
+// (the copy route's spatial recovery stands in, flat_runtime.cpp); the UI layer keeps the map's text and markers. GuiFocus
+// unknown, and every other screen, keep temporal AA as before.
+inline bool flatUiMapTemporalOff(bool known, uint32_t focus) { return known && (focus == 6 || focus == 7 || focus == 8); }
+inline const char* flatUiMapTemporalName(uint32_t focus) {
+    return focus == 8 ? "the Orrery" : focus == 7 ? "the System Map" : "the Galaxy Map";
+}
+
+// The map line's temporal-AA counts (2026-10-10), as pure state so the rig pins them. A frame is `temporalOff` when the
+// mechanism is armed at the frame boundary; `jitterZeroed` when that frame would otherwise have jittered. A frame whose copy
+// ran the spatial recovery counts `spatial`, one whose copy refused it counts `spatialRefused`, and one that armed the
+// mechanism but never reached its copy counts `noCopy` (counted at the NEXT frame's boundary, so a frame the mechanism did
+// not reach is visible, not silent). `resets` counts each exit from the mechanism (history restarts once there).
+struct FlatUiMapAaTally {
+    bool engaged = false, pending = false;
+    uint64_t temporalOff = 0, jitterZeroed = 0, spatial = 0, spatialEasu = 0, spatialSmaa = 0, spatialRefused = 0, noCopy = 0, resets = 0;
+    void frame(bool on, bool jitterWanted) {
+        if (pending) ++noCopy;
+        pending = on;
+        if (on) {
+            ++temporalOff;
+            if (jitterWanted) ++jitterZeroed;
+        } else if (engaged) {
+            ++resets;
+        }
+        engaged = on;
+    }
+    // `easu`: the spatial recovery ran AMD's EASU (flatMonoResolveLastSpatialWasEasu), counted in spatial as well. `smaa`: it ran SMAA 1x
+    // ahead of that EASU (flatMonoResolveLastSpatialWasSmaa), counted in spatial-easu as well.
+    void copy(bool ok, bool easu = false, bool smaa = false) {
+        if (!pending) return;
+        pending = false;
+        if (ok) {
+            ++spatial;
+            if (easu) ++spatialEasu;
+            if (easu && smaa) ++spatialSmaa;
+        } else {
+            ++spatialRefused;
+        }
+    }
+    void clearCounts() { temporalOff = jitterZeroed = spatial = spatialEasu = spatialSmaa = spatialRefused = noCopy = resets = 0; }
+};
+
 // The families the flat layer asks the shared decision for: the cockpit HUD families the 2026-10-09 09:36 census found
-// drawn into the scene's HDR target before the resolve, jittered (the holo panels, the flight HUD, the target sprite).
-// The scene lines the VR layer also takes for density (the orbit lines, the supercruise bars, the space dust) are not
-// asked: they are scene geometry, upscaled with the world in flat as they always were.
+// drawn into the scene's HDR target before the resolve, jittered (the holo panels, the flight HUD, the target sprite),
+// and since 2026-10-10 the System Map's two (the map canvas and the map sprites, flatUiMapFamilyOf: asked only while a map
+// is open). The scene lines the VR layer also takes for density (the orbit lines, the supercruise bars, the space dust)
+// are not asked: they are scene geometry, upscaled with the world in flat as they always were.
 //
 // NOR THE HOLOGRAMS (2026-10-09 13:51 flight, the loading screen's ghost). A hologram is several pairs drawn together;
 // in flat only one of them (94D5C556DFD6D705 / 912477AEF6958379) carries camera rows the jitter can be read from, the
@@ -49,7 +134,8 @@ inline UiLayerFamily flatUiFamilyOf(uint64_t vs, uint64_t ps) {
 // upscale, the rest jittered through it, and the taken part flipping in and out of the layer as the route treated or
 // refused each frame. A family is taken whole or not at all, so the holograms stay in the game's frame, as before the port.
 inline bool flatUiLayerTakesFamily(UiLayerFamily f) {
-    return f == UiLayerFamily::kHolo || f == UiLayerFamily::kFlightHud || f == UiLayerFamily::kSprite;
+    return f == UiLayerFamily::kHolo || f == UiLayerFamily::kFlightHud || f == UiLayerFamily::kSprite ||
+           f == UiLayerFamily::kMapCanvas || f == UiLayerFamily::kMapSprite;
 }
 
 // The adapter's own refusals, before the shared decision is asked. Each leaves the draw in the game's frame as stock.
@@ -106,6 +192,25 @@ inline FlatUiJitterRead flatUiLayerJitterOf(bool measured, double ndcX, double n
         r.kind = FlatUiJitter::kOther;
     }
     return r;
+}
+
+// THE MAP FAMILIES TAKE NO CANCEL (2026-10-10, the map cursor's pulse). The cursor is a screen-centred reticle whose vertex
+// shader does not read the camera rows the frame's jitter rides in (the cursor pulses only with temporal AA on, and it is
+// absent from the scene), so cancelling the rows' phase moves it by -phase each frame. The rows are still measured for the
+// 30 s line's per-family counts; the draw is taken with zero cancel and is never refused for its rows. The HUD families keep
+// the measured cancel (kPhase: the phase; kZero: none).
+inline bool flatUiLayerNoCancel(UiLayerFamily f) { return f == UiLayerFamily::kMapCanvas || f == UiLayerFamily::kMapSprite; }
+inline FlatUiJitterRead flatUiLayerCancelOf(UiLayerFamily f, const FlatUiJitterRead& j) {
+    if (!flatUiLayerNoCancel(f)) return j;
+    FlatUiJitterRead z = j;
+    z.kind = FlatUiJitter::kZero;
+    z.jx = 0.0f;
+    z.jy = 0.0f;
+    return z;
+}
+// The per-family counts' slot for a measured kind: 0 phase, 1 zero, 2 other, 3 no rows.
+inline int flatUiJitterSlot(FlatUiJitter k) {
+    return k == FlatUiJitter::kPhase ? 0 : k == FlatUiJitter::kZero ? 1 : k == FlatUiJitter::kOther ? 2 : 3;
 }
 
 // The take's certainty (2026-10-09). A HUD draw of frame N is taken only when (a) frame N-1's tone pass was seen
@@ -179,6 +284,15 @@ inline const void* flatUiToneProofTone(FlatUiToneProof& p, uint64_t frame, const
         }
     }
     return matched;
+}
+// Why a tone read does or does not prove this frame's targets: the same test flatUiToneProofTone applies, named (the
+// first map-tone candidate's log line, flat_ui_layer.cpp). A pure reading of the proof state; it changes nothing.
+inline const char* flatUiToneMatchWhy(const FlatUiToneProof& p, uint64_t frame, const void* input) {
+    if (!input) return "no (null input)";
+    if (p.frame != frame || p.count == 0) return "no (no recorded target this frame)";
+    for (uint32_t i = 0; i < p.count; ++i)
+        if (input == p.hud[i] || input == p.alias[i]) return "yes";
+    return "no (pointer mismatch)";
 }
 inline bool flatUiToneProven(const FlatUiToneProof& p, uint64_t frame, const void* target) {
     if (frame <= 1 || p.provenFrame + 1 != frame || !target) return false;

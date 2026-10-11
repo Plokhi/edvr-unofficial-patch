@@ -21,8 +21,10 @@
   Mixed cameras must not downgrade DLAA/FSR to TAA. Share math/backends where
   cheap; separate scheduling/capture when it saves copies/sync/per-draw work.
   Defer broad core extraction until flat capture establishes the boundary.
-- **Recommendation:** two installers, one graphics implementation, one temporal
-  pipeline, separate VR/mono adapters; flat enables only temporal AA + support.
+- **Recommendation:** two installers, one graphics implementation, one temporal pipeline, separate VR/mono adapters; flat enables only temporal AA + support.
+- **10-10 map arcs (section below):** temporal AA OFF, no jitter, while any map is open (GuiFocus 6, 7, 8; built, not flown). The
+  plane-motion and per-pixel star-choice work is REMOVED (the stars' parallax, section below). Kept: the map UI families and their zero cancel.
+  Map frames below native run SMAA 1x, then AMD's FSR1 EASU, in place of the bilinear tap (shipped for an A/B flight 2026-10-10; section below).
 - **106 (10-09):** fixed exposure 1.0 SHIPS on the flat HDR route (flown by eye:
   brighter, stars back); temporary key and luma probe REMOVED. VR keeps auto.
 - **Open:** station/on-foot projection coverage and mixed-camera HDR ownership,
@@ -42,7 +44,6 @@
   87's native FSR comparison, 83's open items and high-G motion; do not repeat
   qualified PS91/BFE or stale-resize hypotheses.
   Menu hangar-floor P1 open; VR tests, `d9f86b09`: main/openxr-perf-gaps.
-- **Test target (Sean):** in-game tests on the Epic install; keep its INI.
 - **Field reports (79-83):** users 1-2 refused every frame, 3 at 7-13 fps, 4
   lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix FLOWN, DEFAULT ON.
   10-01 BUILT, NOT FLOWN: the vscreen auto-fit (3504 on Sean's rig: m 0.70 on
@@ -57,10 +58,12 @@
   identical). ROOT CAUSE of the VR hills shimmer, ruled in: Elite's terrain
   checkerboard rendering (halves distant terrain's horizontal samples; turning
   it off fixed it). EDVR now says so in VR (BUILT, NOT FLOWN).
-- **Compatibility:** detail below. **PR72 A/B switches:** retired with `on`
-  fixed (section 86). Landing-time building shimmer is unqualified (section 88).
 
 ## Status detail (moved out of Status 2026-09-29)
+
+- **Test target (Sean), moved 2026-10-10:** in-game tests on the Epic install; keep its INI.
+- **Compatibility (moved 2026-10-10):** detail below. **PR72 A/B switches:** retired with `on`
+  fixed (section 86). Landing-time building shimmer is unqualified (section 88).
 
 *Note: the section 75 sentence below ("awaiting the confirming flight") is
 superseded by section 75's own same-day addendum (the 13:00 flight ran
@@ -14541,3 +14544,325 @@ fixed, against what Sean saw.
 - Temporary debt closed: `advanced.flat_dlss_exposure` and the
   `flat hdr luma:` probe (flat_hdr_luma.*, its shader and hooks) are removed.
 
+### 2026-10-10: System Map smear under DLAA (code on branch, NOT built, NOT flown)
+
+Symptom: flat profile, fix.temporal_aa = dlaa or dlss. While the System Map pans,
+the route lines, grid and backdrop smear and leave trails. EDVR's own TAA and
+FSR do not.
+
+Capture evidence (one pixel capture during a pan):
+- The map's route lines, grid and backdrop write no depth: depth is exactly 0
+  on 84-94% of the frame (reversed-Z, 0 = far).
+- The prep's kind-0 camera term treats depth 0 as infinitely far and reprojects
+  it rotation-only (flat_mono_shader_source.h, prep). The map camera only
+  translates, so those pixels get motion 0 while the map content moves rigidly
+  by the same amount: 30 and 77 px per frame in the capture.
+- Map bodies do write depth (0.00113-0.00119). Their camera-term motion matches
+  the content motion within 1-4%.
+- The rejection texture was 0 everywhere in the smear, so these pixels take the
+  "slot unwritten" branch (engineBefore returns 0, kind 0), not the "slot
+  written, depth 0" sentinel.
+- ruled out: DLSS ignoring EDVR's rejection mask, because the refusal census read
+  refused=0 (0.0000%) and the rejection texture was 0 everywhere during the smear.
+- ruled out: map bodies drawn with a camera that moves differently, because all
+  content moved rigidly by one horizontal shift and body motion matched it within
+  1-4%.
+
+Cause: depth-0 kind-0 pixels get a rotation-only camera term, so the map plane's
+translation is missing from their motion. DLSS trusts motion 0 and keeps stale
+history: trails behind the route lines, and on the background a planet uncovers.
+
+Fix (decided by the maintainer; no config key):
+- While GuiFocus is 7, a flat resolve whose frame is not a reset reduces the
+  frame's depth to its nearest and farthest value in (0, 1] (mapPlaneDepth, one
+  dispatch before the prep, two words written by one InterlockedMin and one
+  InterlockedMax per group).
+- The prep gives a kind-0 pixel with depth 0 the camera term evaluated at the
+  midpoint of that range. Only the motion comes from that call. Expected depth
+  and every history depth test still come from the call at depth 0, so TAA's
+  history check and all outputs are unchanged.
+- Every other frame and pixel: the same arithmetic as before (debug.w bit 3 is
+  clear and t18 is not read).
+- Journal: flat now runs the watcher for GuiFocus only. The accessors in
+  journal_watch.cpp answer flat with the no-journal values, so the flat
+  consumers (vscreen FSS and gameplay reads, Explorer Cam, ui_layer world gate,
+  backdrop_fix, temporal_pass foot split, native_frame) see no change. The one
+  new reader is journalFlatGuiFocus. Eager Status polling (100 ms) is on in flat.
+
+New log lines:
+- "journal: flat profile -- Status.json is read for the System Map's GuiFocus..."
+  once, at configure.
+- "flat map motion: the System Map is open (Status.json GuiFocus 7); ..." and
+  "flat map motion: the System Map is closed (GuiFocus N); ..." on each change
+  (at most 64).
+- "flat map motion 5s: focus=<last known or unknown> map-frames=<n>
+  reductions=<n> plane=<min>..<max> (midpoint <m>) empty=<n>", every 5 s, zeros
+  included. The plane is the last read-back; "none" means no read-back had a
+  non-zero range yet.
+- "flat resolve: the System Map plane's resources could not be made" once, if
+  creation fails (the map frames then run as if the map were closed).
+
+Next: Epic flight, DLAA and DLSS, System Map pan; Shift+NumLock during a pan.
+Expect depth-0 motion close to body motion in the capture, and "flat map motion
+5s" with map-frames above 0 and a plane between 0.0011 and 0.0012. Galaxy map
+(GuiFocus 6) and Orrery (8) are unmeasured.
+
+Flight 073159 (build 375e6ba3, log edvr_gfx_20261010_073159.log):
+- GuiFocus arrives: "journal: Status.json GuiFocus present=1 value=6/7/8", and
+  "flat map motion: the System Map is open (Status.json GuiFocus 7)" 15 ms after
+  the read. map-frames=240 and 391 with reductions equal.
+- DEFECT, NaN range: the read-back showed "plane=0.001131..-nan". The reduction
+  stored the far depth as a max. The reading that fits the NaN: the clear value
+  was {0xFFFFFFFF,0,0,0}, and the raw UAV clear wrote its first element to both
+  words, so the far max started at 0xFFFFFFFF (not verified on the GPU; the
+  all-ones clear and the decode make the case moot). A max of 0xFFFFFFFF is NaN,
+  and the prep's test passed it, so
+  depth-0 kind-0 pixels on the map took NaN motion. Fix: the far word stores
+  ~asuint and both words reduce by InterlockedMin (flat_map_plane_range.h); the
+  clear is all 0xFFFFFFFF; the prep takes the plane only when the decoded pair is
+  finite, 0 < lo <= hi <= 1, with a finite midpoint. The 5 s line prints the raw
+  words beside the decoded range.
+- DEFECT, census drew nothing: "DC begin ... offscreen=yes", then "DC end ...
+  draws=0 off=0 copies=144". The flat draw thunks (vscreen.cpp hookedDraw,
+  hookedDrawIndexed, hookedDrawInstanced, hookedDrawIndexedInstanced) take their
+  flat branch first, and beginPanelOverride, where the census's draw record
+  lives, is not on that path. Copies were counted: the copy hooks are not behind
+  that branch. Fix: the flat branch records each draw as a DCO line before the
+  flat scope substitutes bindings (flatCensusDraw, vscreen.cpp). Indirect and
+  auto draws are not recorded.
+- open: the 065817 flight's focus=unknown is not explained. The same reader logic
+  was in place; it was not reproduced on 073159.
+
+### 2026-10-10: Galaxy Map and Orrery: temporal AA off, the UI layer keeps the text (built, not flown)
+
+Flight on build 5347652c (Epic flat) proved the map tone on the first Galaxy frame and took
+the map canvas (108562 of 108636) and sprites (424553 of 424571) into the UI layer. The grid and the lines still blur. They are other scene
+draws, not taken: depth off, additive or multiply, drawn before the map composites and, on the System Map, interleaved with the planets.
+Their identity is uncertain. Census (every map census): the Galaxy grid candidate 3028E7C6E0E097F9 / E53096E7D424FB2B; the Galaxy line and
+star candidates 41C518698DAAC9F4 and 7D26BC16E55F3107 with PS 50A57473E63190D0; the Orrery 94BE4AC45C140CEE / C4FEA43814407472; the System
+Map selector candidates E79BF32685B4E888 / 4724A8C9973F51CB, 9FFA5D5E79F04873 / 8134D09E3462E904, 3530A6FD15EDE145 / 5517EF92E0FDAB71.
+The Galaxy Map and the Orrery have no non-zero depth, so the temporal history has no motion to reproject, and accumulation smears those
+draws. The System Map has depth and is handled by its plane motion (GuiFocus 7, above) and DLAA: it is unchanged here.
+
+Decision (maintainer, 2026-10-10): while GuiFocus is 6 (Galaxy Map) or 8 (Orrery), temporal AA is off for the scene: no accumulation and no
+jitter. The UI layer keeps taking and compositing the map's text and markers at the UI-quality scale.
+- Alternative (B), rejected: decline the temporal resolve and still arm the UI door. The door arms only from a treated frame whose picture
+  is the display size (flat_ui_layer.cpp flatUiLayerDoorArms). With DLSS below native the untreated picture is the render size, so the door
+  would refuse and the map would be lost in that mode. (B) also needs a composite path for untreated frames.
+- Chosen (A), built: the frame stays treated, but its output is the spatial recovery's, with zero phase and no history.
+
+How (A) is built (src\d3d11\flat_runtime.cpp unless noted):
+- The one GuiFocus read (flatRuntimeMapFocusFrame) moved to the frame boundary, before the phase begins. temporalOff =
+  flatUiMapTemporalOff(known, focus) (flat_ui_layer_math.h): 6 or 8 only.
+- Phase: `s.phase.beginFrame(phaseWanted && !temporalOff, ...)`. A disabled phase is zero and restarts the history (flat_live_phase.h).
+- HDR route: treatHdr is not called on a temporal-off frame, so the frame goes to the copy route.
+- Copy route: the temporal resolve is replaced by flatMonoResolveSpatialFallback (flat_mono_resolve.cpp:1263): no history, output on the
+  route's evaluation grid. That grid is D for TAA, DLSS below native and FSR below native, and R for the supersample routes (flat_mono_resolve.h
+  flatResolveRoute), the same size the temporal resolve writes, so the door behaves as on a temporal frame. The frame is treated and the door arms.
+  s.havePrevious and s.temporalAccepted are cleared, so the first frame after the map resets the temporal history once.
+- A refused spatial recovery leaves the frame to the game (refuse), as a refused resolve does: the frame is not black.
+- Other GuiFocus values, the System Map (7) included, take the code path they took before. The new branches test flatRuntimeMapTemporalOff only.
+
+Logs and counts. Once per change: "flat map aa: temporal AA off on the Galaxy Map (GuiFocus 6): no accumulation, no jitter; the UI layer
+keeps the map's text and markers" (the Orrery for 8), and "flat map aa: temporal AA on again (GuiFocus N)". Up to 8 refusals of the spatial
+recovery are named: "flat map aa: the spatial recovery refused on the map (reason); the frame stays the game's". The 30 s "flat ui layer map:"
+line gains: temporal-off (frames armed), jitter-zeroed (armed frames that would have jittered), spatial (copies that ran the recovery),
+spatial-refused, no-copy (armed frames whose copy never came, counted at the next boundary), resets (exits, one each). A frame the mechanism
+did not reach shows as no-copy, not as silence (FlatUiMapAaTally, flat_ui_layer_math.h).
+
+Checks for the flight: the grid and lines blur less; the text and markers unchanged; spatial equals temporal-off frames on the map line with
+no-copy and spatial-refused at zero; resets 1 per exit; door-refused-size stays 0 on a DLSS-below-native map, which is what the E = D rule
+predicts. Not checked: the spatial recovery's image quality against the temporal resolve on the map.
+
+Rig: ui_quality_test pins flatUiMapTemporalOff (6 and 8 on; 7, another screen and an unknown GuiFocus off), the two screen names, and the
+FlatUiMapAaTally counts (armed and spatial, no-copy at the next boundary, refused spatial, exits as resets, a copy with no armed frame).
+Not covered: the runtime wiring (the boundary order, the phase gate, the HDR guard and the copy branch), which needs the D3D draw scope, and
+the spatial recovery's output on the map. Those are the flight's.
+
+Next: an Epic flat flight on the Galaxy Map, the Orrery and the System Map in one session, reading the map line and the grid.
+
+### 2026-10-10: System Map cursor and stars: two fixes in one build (built, not flown)
+
+Evidence (one Epic flat capture on 327f62dd, the coordinator's measurements):
+- Stars: depth 0 but nearly static, <= 1.6 px a frame measured. The grid and route lines (also depth 0) pan with the plane, and the plane's
+  motion vectors are right within 1-2 px. Giving the stars the plane motion as well (the GuiFocus 7 plane fix) gives them the full pan: 75 px
+  and 14 px of error, which is the star ghosting. Lines within 1.9 px and 0.9 px.
+- Cursor: a screen-centred reticle. It pulses under TAA and DLAA and not with AA off, and it is absent from the HDR scene in captures, so the
+  UI layer takes it (a map canvas or sprite draw). Its vertex shader does not read the camera rows the jitter rides in; the layer cancels
+  the rows' phase from it, so it moves by -phase every frame. (The first-draw line of 112303 printed a cancel of (-0.000, -0.000) on a
+  zero-phase frame, so it does not decide the question.)
+
+FIX 1, the cursor (flat_ui_layer_math.h flatUiLayerNoCancel, flatUiLayerCancelOf; flat_ui_layer.cpp decide): the map families are taken
+with zero cancel, whatever their rows measured, and are never refused for their rows. The rows are still measured: the map line counts each
+family's measured kind (phase, zero, other, no rows). The HUD families keep the measured cancel. Rig: flatUiLayerCancelOf pins the map pair
+(phase, zero and no rows all cancel to zero) and the HUD families (the holo and flight HUD keep the phase, the target sprite keeps zero).
+
+FIX 2, the stars (flat_mono_shader_source.h, prep; flat_mono_resolve.cpp; src\d3d11\flat_map_star_choice.h): per pixel, on a map-plane frame
+whose previous resolve call copied its input (the consecutive map frames). The depth-0, kind-0 pixel has two candidates: A, the plane motion
+(as today), and B, the rotation-only term it had before the plane (the pre-fix motion). Each names the surface's previous UV. The previous
+frame's input colour (an EDVR-owned copy of g.color, made after the prep on each map frame, bound at t19) is sampled bilinearly there, with the
+same 3x3 as the current input, in log luminance (log(Rec.709 + 1e-4)). The lower sum of absolute differences wins; a tie (both under 0.05, a
+flat sky) keeps A. Motion only: the expected depth, the history depth tests, the depth writes and every non-map frame are unchanged. A
+candidate whose previous UV is not finite, or whose B lies outside the raster, is not a candidate. The counts are per group: one add per
+group and counter (no per-pixel atomics), on the choice frames only, into four words at u6 (the census and the map-range reduction bind u6
+elsewhere). The flat map motion 5s line gains chose-plane, chose-still, ties (kept at A), not-chosen (no still term) and no-previous (map
+frames with no usable previous colour: the first map frame, the one after a reset, a size change or a call that did not copy).
+
+Rig: flat_map_star_choice.h's flatStarPick and flatStarSad are pinned in ui_quality_test (still, plane, equal, tie, one-under-epsilon,
+non-finite, identical flat sky, black log luminance finite). Not covered: the shader itself (the bilinear taps, the candidate tests and the
+group reduction) and the copy/bind/readback in flat_mono_resolve.cpp. Those need the D3D dispatch and the flight.
+
+Flight checks: the stars hold still on the System Map (the ghosting gone); the lines still pan; the cursor does not pulse under TAA or DLAA; the
+5s line's chose-still share is high where the sky is and low on the lines; no-previous is one per map start and per reset.
+
+### 2026-10-10: the stars' parallax; temporal AA off on all three maps; the plane and star-choice work removed (built, not flown)
+
+The star evidence disagrees between captures. In the capture of 33034 to 33035 (plane motion 10.2 px, a uniform pan), every luminance
+band of the depth-0 content, the stars included, matches best at the plane motion: the input and the resolved output both pan with it.
+In the earlier capture the stars were near still (about 2% of the plane pan). The stars sit on a parallax layer whose rate varies, so
+no single rule that picks between the plane motion and the rotation-only motion is right for both. Offline, the best rule for one
+capture sent 15% of the stars to still in the other, where they pan. The plane-motion path (FIX 2 of 60735460 and the map-plane
+reduction before it) is dropped for that reason.
+
+Decision (maintainer, 2026-10-10): temporal AA is off while any map is open: the Galaxy Map (GuiFocus 6), the System Map (7) and
+the Orrery (8). The frame runs no temporal resolve and no jitter; the copy route's spatial recovery stands in (327f62dd); the
+UI layer keeps the map's text, markers and cursor. The System Map loses DLAA on the planets too, as the maintainer accepted.
+Flight: all three maps at native (DLAA), expecting the game's own image with no ghosting; then one session with an upscaling
+mode below native (DLSS Quality or game SS below 1) to check the maps are not black or blank and the text is intact.
+
+Removed (the code that only served the System Map's motion and the star choice):
+- Shader (flat_mono_shader_source.h, reverted to 322271d9^): the mapPlaneDepth entry, the t18 map range, the debug.w bit 8 path in the
+  prep, the star choice (starLog, starChoice, the t19 previous colour, gChoice, the group reduction) and debug.w bit 16. The prep is back to
+  its early return and its single parameter.
+- Resolver (flat_mono_resolve.cpp/.h, reverted to 322271d9^): FlatMonoResolveFrame::mapPlane, the plane reduction and its readback ring,
+  the previous-colour copy, the choice binds and counts, FlatMonoMapPlane, flatMonoResolveTakeMapPlane.
+- Headers and rig: flat_map_plane_range.h, flat_map_star_choice.h, gate_test section 9 (the plane's range words), the ui_quality_test
+  star pins; the shader build's mapPlaneDepth entry and self-test name; the hdr crumb pin's post-dispatch unbind is back to six UAVs.
+- Runtime (flat_runtime.cpp): the plane flag on both resolve sites, the "flat map motion" transition lines, and the 5 s plane line.
+
+Kept:
+- The flat Status.json reader and GuiFocus plumbing (journalFlatGuiFocus, the allow-list keys, eager polling in device_hook.cpp,
+  flatRuntimeMapFocusFrame, the one per-frame read at the boundary), and the journal's flat log text (now "for the map's GuiFocus").
+- The map UI families (kMapCanvas, kMapSprite), the C89DD4 tone candidate and its SRV capture, the map families' zero cancel
+  (flatUiLayerCancelOf), and the map line's counts. They serve frames that are treated (below native, the copy route's recovery).
+- The temporal-off counters (temporal-off, jitter-zeroed, spatial, spatial-refused, no-copy, resets) and the logs "flat map aa: temporal
+  AA off on the Galaxy Map | the System Map | the Orrery" and "temporal AA on again".
+- A new 5 s line: "flat map focus 5s: focus=N temporal-aa-off=0|1 watcher=... status-samples=N gui-known=0|1 gui=N" (every window, zeros included).
+- The draw census (d7df341c's DCO recording and 375e6ba3's NumLock census) and the journal diagnostics (455854ff's gate_test section 8).
+
+Rig: ui_quality_test pins flatUiMapTemporalOff for 6, 7 and 8 (on), another screen and an unknown GuiFocus (off), and the three names.
+gate_test section 8 still runs the GuiFocus rig case. Not covered: the spatial recovery's image on a map, and the flight.
+
+### 2026-10-10: the map frames below native: AMD's FSR1 EASU instead of the bilinear tap (built, not flown)
+
+Flight on 849ed10d at game SS 0.5 (R 1920x1080, D 3840x2160, DLSS): the map path ran as designed (temporal-off 2699, jitter-zeroed 2699,
+spatial 2699, spatial-refused 0, no-copy 0; canvas 26956 of 26956 taken, sprites 13757 of 13757). The Galaxy Map looked good; the System Map
+was soft, planets and stars especially. The cause is the spatial recovery's filter, one bilinear LinearClamp tap per output pixel.
+
+Decision (maintainer, 2026-10-10): on the map temporal-off frames only, upscale with AMD's FidelityFX FSR1 EASU (edge-adaptive), with no
+RCAS or other sharpening pass. Every other spatial recovery (a frame the temporal resolve refuses) stays bilinear, byte for byte.
+
+Source and licence. Nothing new is brought in. src\d3d11\fsr\ffx_a.h and ffx_fsr1.h are AMD's own FSR 1.0 sources (v1.20210629),
+unmodified, MIT licensed, Copyright (c) 2021 Advanced Micro Devices, Inc., with the notice in each file and in src\d3d11\fsr\README.md. They
+were already vendored and already used by the intro movie's resampler (intro_upscale.cpp), the flat sharpen (sharpen_pass.cpp) and the
+target indicator (target_sharp.cpp). The notice stays with the files; nothing in them is edited.
+
+How it is built:
+- Shader (src\d3d11\map_easu_shader.h): two compute entries over the vendored FSR text, which tools\temporal_shader_build prepends at build
+  time (the runtime carries no HLSL compiler, shader_swap.h). mapCompress bounds the copy route's colour at render size, c / (1 + max c)
+  (hdrCompress's form), so EASU's edge test sees a bounded signal and not HDR radiance. mapEasu runs FsrEasuF at the evaluation size on that
+  texture, then inverts the compression (hdrExpand's form), clamped to [0, 0.9999] before the expand so ringing stays finite and inside the
+  half-float range, and a non-finite value falls to zero.
+- Constants (src\d3d11\map_easu.cpp): FsrEasuCon, the same AMD call intro_upscale.cpp makes, with the render size as the input and the
+  evaluation size as the output (mapEasuConstants).
+- Wiring: flat_mono_resolve.cpp's spatial recovery takes the EASU path only when FlatMonoResolveFrame::easu is set and the frame is not HDR.
+  flat_runtime.cpp's map temporal-off branch sets it. The HDR route does not reach this path on map frames: treatHdr is skipped there
+  (327f62dd), so the HDR pixel variant is not used for maps. The EASU output is the frame's output: the RCAS pass (flatSharpenView) is not
+  applied to it.
+- The output is the same surface the bilinear path writes (g.output[1]), at the same size (the evaluation grid: the display size for
+  DLSS and FSR below native), so the UI layer's door arms as before.
+- Counters: the map line gains spatial-easu=N, the copies that ran EASU (spatial counts all spatial copies, EASU or bilinear). A frame
+  that armed the mechanism but fell back to bilinear shows as spatial without spatial-easu.
+
+Rig: ui_quality_test pins the counter rule (an EASU copy counts in spatial and spatial-easu; bilinear in spatial only; refused in
+spatial-refused). Not covered: the FsrEasuCon constants themselves (the CPU call is AMD's, and a rig would have to load the FSR headers
+into the test); the shader's output (the flight); the spatial recovery's image on the three maps; the EASU result against the bilinear one.
+
+Flight: the SS 0.5 DLSS session again, the System Map and the Galaxy Map: spatial-easu equal to spatial on every window; the planets and
+stars sharper than the bilinear flight; no blank or black map frames.
+
+### 2026-10-10: the map frames below native: SMAA 1x ahead of EASU, shipped for an A/B flight (built, not flown)
+
+Flight on f401ef00 (Epic, SS 0.5, R 1920x1080 to D 3840x2160, DLSS): EASU works, the maps are no longer black. The planets' silhouettes are
+still aliased: EASU upscales the stair-steps of the half-res image. The maintainer's decision: SMAA 1x on the map temporal-off frames below
+native, at the render size, before EASU; native frames and every other path unchanged. The FXAA-style and RCAS passes evaluated below are not
+shipped.
+
+Source and licence. src\d3d11\smaa\ holds the official SMAA reference (Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro,
+Diego Gutierrez; MIT): SMAA.hlsl, Textures\AreaTex.h, Textures\SearchTex.h, LICENSE.txt, all byte-for-byte from
+https://github.com/iryoku/smaa at commit 71c806a838bdd7d517df19192a20f0c61b3ca29d. The SHA-256 of each file and the upstream commit are in
+src\d3d11\smaa\README.md, next to the licence (the repo keeps no combined notices file; the FSR notice sits beside its sources the same way).
+
+How it is built: tools\gen_smaa_hlsl.py embeds SMAA.hlsl byte-exact as string chunks (pinned by SHA-256; self-test in build.bat).
+src\d3d11\map_smaa_shader.h is a prologue (SMAA_CUSTOM_SL, SMAA_PRESET_HIGH at the reference's thresholds, samplers at s0/s1, the metrics
+constant at b0) and three compute entries: smaaEdges (colour edges, RG8), smaaWeights (blend weights, RGBA8, AreaTex at t1 and SearchTex at
+t2), smaaBlend (neighbourhood blend, half float). Each entry compiles from its own source (they reuse register names). Two source changes
+keep the vendored text unmodified: discard is a return of zero edges (compute has no discard; the colour-edge test returns zero edges for
+the pixels it would discard), and the implicit-LOD Sample calls become SampleLevel at mip 0 (compute has no derivatives; the textures have
+one mip). map_smaa.cpp holds AreaTex (R8G8 160x560) and SearchTex (R8 64x16), uploaded once.
+
+Wiring: flat_mono_resolve.cpp runs the three passes between the bounded colour (mapCompress) and EASU, when FlatMonoResolveFrame::smaa is set
+(default) and the render size is below the output in either axis. EASU reads the blended colour. Counter: spatial-smaa=N on the map line
+(a copy that ran SMAA ahead of EASU, counted within spatial-easu).
+
+The order (2026-10-10, measured). SMAA after EASU (EASU's bounded output at the evaluation size, SMAA on it, then the expand) passes the
+vertical and horizontal step bars (ratio 0.79 and 0.78 against EASU alone) and fails the diagonal (1.12). Cross-sections show why: SMAA's
+blend model assumes an aliased binary edge, and EASU's edge pixel already carries sub-pixel coverage and rings on the dark side, so the blend
+moves the edge pixel away from the reference (0.56 to 0.44 where the reference is 0.65). Shipped: SMAA before EASU.
+
+Metrics (2026-10-10, two kinds, both kept). The coverage metric is the mean absolute display error over partly covered pixels. It does not
+measure stair-stepping: a binary edge and a smooth ramp score alike when they sit at the same coverage, and EASU's own ringing counts against
+it. The jaggedness metric is the 0.5-level crossing's deviation from the true curve (row or column scan for slopes; rays for the circle and
+ring), with the row-to-row step RMS (the visible staircase). Validation: the nearest-neighbour upscale of the binary input scores jagged (circle
+outer RMS 0.53 px, diagonal step 0.92 px); the analytic coverage image scores about 0.05 to 0.06 px RMS, with a diagonal step of 0.12 px.
+The step RMS is the honest wobble measure: the RMS of the curve deviations includes a bias of about 1.2 px from the binary input's discrete
+threshold on the 45 degree edge.
+
+Evaluation (960x540 to 1920x1080; EASU alone, FXAA then EASU, SMAA then EASU, SMAA then EASU then RCAS at strength 0.7; output of shapes1.log):
+
+| Edge | EASU | FXAA>EASU | SMAA>EASU | SMAA>EASU>RCAS |
+|---|---|---|---|---|
+| 1 px line, energy / peak | 0.922 / 0.834 | 0.483 / 0.390 | 0.922 / 0.834 | 0.922 / 0.863 |
+| 2 px line, energy / peak | 0.934 / 1.000 | 0.876 / 0.912 | 0.934 / 1.000 | 0.932 / 1.015 |
+| circle outer RMS / max (px) | 0.390 / 0.991 | 0.348 / 0.773 | 0.419 / 1.440 | 0.419 / 1.454 |
+| circle coverage error | 0.185 | 0.151 | 0.158 | 0.161 |
+| ring outer RMS / max | 0.399 / 1.064 | 0.352 / 0.884 | 0.363 / 0.997 | 0.365 / 1.001 |
+| ring inner RMS / max | 0.400 / 0.971 | 0.300 / 0.739 | 0.263 / 0.648 | 0.265 / 0.652 |
+| ring coverage error | 0.190 | 0.151 | 0.142 | 0.144 |
+| near-vertical 0.03, RMS / step | 0.564 / 0.136 | 0.348 / 0.024 | 0.314 / 0.018 | 0.321 / 0.019 |
+| near-horizontal 0.03, RMS / step | 0.567 / 0.137 | 0.350 / 0.026 | 0.317 / 0.018 | 0.324 / 0.019 |
+| diagonal 0.6, RMS / step | 0.496 / 0.253 | 0.460 / 0.187 | 0.466 / 0.173 | 0.468 / 0.177 |
+
+Findings from the table. FXAA is rejected: it erases 1 px lines (energy 0.48, peak 0.39) and softens 2 px lines (peak 0.91), so the
+axis-aligned grid and route lines are lost. SMAA preserves every line case exactly (identical to EASU); it lowers the staircase on the slopes
+(step 0.136 to 0.018) and the diagonal (0.253 to 0.173), and lowers the coverage error on every curve; the ring's inner edge improves most
+(RMS 0.400 to 0.263). The circle's outer edge gets worse: RMS 0.390 to 0.419 and max 0.99 to 1.44 px. That is the open point. RCAS (strength
+0.7) gives no measurable gain on jaggedness or coverage and adds a 1.5 % overshoot on 2 px lines; it is not shipped. The 45 degree edge's RMS
+(about 1.2 px) is the input's threshold bias; its step (0.036 to 0.008 with SMAA) is the wobble measure.
+
+Rig gates (flat_mono_resolve_test; flat_map_shapes_gpu_tests.h): axis-aligned lines, energy and peak within 1 % of EASU alone (hard
+requirement); slope edges (near-vertical, near-horizontal, diagonal), SMAA>EASU step RMS at most 0.8 of EASU alone (the 45 degree edge is run
+through the same gate and passes at 0.22); validation of the metric (nearest-neighbour jagged, analytic near zero); fail-if-skipped (EASU
+alone, SMAA forced off, fails the slope gate). The circle and ring are reported, not gated; the circle's outer-edge max is the open point:
+1.44 px against EASU's 0.99 px. The coverage bar of the earlier gate was retired: it does not measure stair-stepping.
+
+Gate run (full build, build\full_build_receipt.json cac39fb9...): line energy and peak x1.0000 on all eight line cases; step RMS over EASU
+alone: diagonal x0.684, near-vertical x0.133, near-horizontal x0.132 (gate 0.8), and the 45 degree edge x0.211 (the same gate, not a bar in the
+brief); fail-if-skipped: the EASU-alone step ratio x1.000, rejected by the gate. The metric validation holds (nearest-neighbour circle outer RMS
+0.53, diagonal step 0.92; analytic 0.05 and 0.12). FXAA and RCAS are not in the production path or the build; the rig keeps only the shapes
+and the two variants above.
+
+Cost (not timed; WARP timing is not representative): three compute passes at render size (960x540) and three render-size textures (edges
+RG8 about 0.5 MB, weights RGBA8 about 2 MB, blended RGBA16F about 4 MB), plus AreaTex and SearchTex (about 0.2 MB).
+
+Open: the circle's outer-edge max (1.44 px, from 0.99 px). Check on a flight before deciding whether it matters on the planet discs.

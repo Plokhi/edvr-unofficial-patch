@@ -133,6 +133,9 @@ struct MenuContent {
     int      tileColumns = 0;
     char     hint[200];     // an explanation under the rows (information pages)
     char     footer[160];   // keys, pending-restart count, warnings
+    // The flat profile's EDVR version, drawn dim at the right end of the
+    // footer's second line on every page. Empty elsewhere (VR draws none).
+    char     footerTag[48];
     // The tooltip: a title line and a wrapped body, drawn in the STRIP
     // beside the card (from `cardPx` to `widthPx`), level with line
     // `popupLine`; -1 for none. Its card is sized to the measured height of

@@ -475,6 +475,12 @@ void testGate() {
     check(hdrWith(UiLayerFamily::kHolo, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kPremulOver; }) ==
               UiLayerDecision::kRedirect,
           "the holo panels' premultiplied-over is taken into the HDR layer");
+    // The map families draw SRC_ALPHA over (flight 081437): the shared HDR take accepts it as the HUD's over, not refused.
+    check(hdrWith(UiLayerFamily::kMapCanvas, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kOver; }) ==
+                  UiLayerDecision::kRedirect &&
+              hdrWith(UiLayerFamily::kMapSprite, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kOver; }) ==
+                  UiLayerDecision::kRedirect,
+          "the map canvas and the map sprites (SRC_ALPHA over) are taken into the HDR layer");
     check(hdrWith(UiLayerFamily::kHolo, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kOpaque; }) ==
               UiLayerDecision::kRedirect,
           "an opaque holo draw is taken into the HDR layer");
@@ -1148,8 +1154,173 @@ void testFlatLayerRules() {
               !flatUiLayerTakesFamily(UiLayerFamily::kPanel) && !flatUiLayerTakesFamily(UiLayerFamily::kGuiDirect) &&
               !flatUiLayerTakesFamily(UiLayerFamily::kNone) && !flatUiLayerTakesFamily(UiLayerFamily::kAfterUi),
           "flat layer: the scene lines, the 2D screen, the menus, the panels' rasterisation and the after-UI take are not");
-    for (UiLayerFamily f : {UiLayerFamily::kHolo, UiLayerFamily::kFlightHud, UiLayerFamily::kSprite})
+    for (UiLayerFamily f : {UiLayerFamily::kHolo, UiLayerFamily::kFlightHud, UiLayerFamily::kSprite, UiLayerFamily::kMapCanvas,
+                            UiLayerFamily::kMapSprite})
         check(uiLayerFamilyTakesHdr(f), "flat layer: every family it asks for is one the shared HDR take draws");
+    // The System Map's two families (2026-10-10, flat draw census flight 081437): asked only while a map is open (GuiFocus 6,
+    // 7 or 8) and only on the HDR target (flatUiMapFamilyOf); no VR classifier names them.
+    check(flatUiLayerTakesFamily(UiLayerFamily::kMapCanvas) && flatUiLayerTakesFamily(UiLayerFamily::kMapSprite),
+          "map families: the canvas and the sprites are asked for");
+    check(std::strcmp(uiLayerFamilyName(UiLayerFamily::kMapCanvas), "map canvas") == 0 &&
+              std::strcmp(uiLayerFamilyName(UiLayerFamily::kMapSprite), "map sprite") == 0,
+          "map families: named \"map canvas\" and \"map sprite\" in the 30 s line");
+    {
+        static const uint64_t kCanvasVs = 0x12382D2EA45E9632ull, kCanvasPs = 0x855C469156AB997Full;
+        static const uint64_t kSpriteVs = 0xC31238331D8AC3D4ull, kSpritePsA = 0xBD0FEB3276C8B2D7ull,
+                              kSpritePsB = 0x539A4858CE3A3477ull;
+        static const uint64_t kUnrelatedVs = 0x1111222233334444ull, kUnrelatedPs = 0x5555666677778888ull;
+        // With a map open on the HDR target, the canvas pair is the canvas and both sprite pairs are sprites.
+        check(flatUiMapFamilyOf(kCanvasVs, kCanvasPs, true, true) == UiLayerFamily::kMapCanvas,
+              "map families: the canvas pair, with a map open on the HDR target, is the canvas");
+        check(flatUiMapFamilyOf(kSpriteVs, kSpritePsA, true, true) == UiLayerFamily::kMapSprite &&
+                  flatUiMapFamilyOf(kSpriteVs, kSpritePsB, true, true) == UiLayerFamily::kMapSprite,
+              "map families: both sprite pairs (BD0F on the Galaxy and the Orrery, 539A on the System Map) are sprites");
+        // The gate: with no map open, or on any target that is not the HDR class, neither family is named.
+        check(flatUiMapFamilyOf(kCanvasVs, kCanvasPs, false, true) == UiLayerFamily::kNone &&
+                  flatUiMapFamilyOf(kSpriteVs, kSpritePsB, false, true) == UiLayerFamily::kNone,
+              "map families: with no map open (GuiFocus not 6, 7 or 8) neither is named");
+        check(flatUiMapFamilyOf(kCanvasVs, kCanvasPs, true, false) == UiLayerFamily::kNone &&
+                  flatUiMapFamilyOf(kSpriteVs, kSpritePsA, true, false) == UiLayerFamily::kNone,
+              "map families: and neither on a target that is not the HDR class");
+        // Only the pairs: a shader mixed across the two families, or an unrelated pair, stays kNone.
+        check(flatUiMapFamilyOf(kCanvasVs, kSpritePsA, true, true) == UiLayerFamily::kNone &&
+                  flatUiMapFamilyOf(kSpriteVs, kCanvasPs, true, true) == UiLayerFamily::kNone &&
+                  flatUiMapFamilyOf(kUnrelatedVs, kUnrelatedPs, true, true) == UiLayerFamily::kNone,
+              "map families: a canvas or sprite vertex shader with another pixel shader, and an unrelated pair, stay kNone");
+        // The flat draw's family: the map families first, the shared rule otherwise (which names none of these pairs).
+        check(flatUiFamilyFor(kCanvasVs, kCanvasPs, true, true) == UiLayerFamily::kMapCanvas &&
+                  flatUiFamilyFor(kSpriteVs, kSpritePsB, true, true) == UiLayerFamily::kMapSprite,
+              "flatUiFamilyFor: the map families with a map open on the HDR target");
+        check(flatUiFamilyOf(kCanvasVs, kCanvasPs) == UiLayerFamily::kNone &&
+                  flatUiFamilyFor(kCanvasVs, kCanvasPs, false, true) == UiLayerFamily::kNone &&
+                  flatUiFamilyFor(kSpriteVs, kSpritePsA, false, true) == UiLayerFamily::kNone &&
+                  flatUiFamilyFor(kUnrelatedVs, kUnrelatedPs, true, true) == UiLayerFamily::kNone,
+              "flatUiFamilyFor: with no map open the pairs are kNone, as the shared rule has them");
+        // VR: the classifier names neither pair, on the HDR target (kind 1) or the post-tonemap one (kind 2).
+        for (int kind = 1; kind <= 2; ++kind) {
+            UiFamilyFacts vf;
+            vf.targetKind = kind;
+            vf.vs = kCanvasVs;
+            vf.ps = kCanvasPs;
+            UiFamilyFacts sf = vf;
+            sf.vs = kSpriteVs;
+            sf.ps = kSpritePsA;
+            UiFamilyFacts sf2 = sf;
+            sf2.ps = kSpritePsB;
+            check(uiLayerFamilyFor(vf) == UiLayerFamily::kNone && uiLayerFamilyFor(sf) == UiLayerFamily::kNone &&
+                      uiLayerFamilyFor(sf2) == UiLayerFamily::kNone,
+                  kind == 1 ? "map families, VR: uiLayerFamilyFor names neither pair on the HDR target"
+                            : "map families, VR: uiLayerFamilyFor names neither pair on the post-tonemap target");
+        }
+    }
+    // The map frames' tonemap (census 2026-10-10): the UI layer's own table names the exact pair, reading the scene in slot 0.
+    // Registered for the UI layer only (flat_ui_layer_math.h); the registry's tonePsHdrSlot is not changed, so the resolve's
+    // tone selection and the target's tone record see no new pass.
+    check(flatUiMapToneSlotOf(0xCFA91824129ECBBCull, 0xC89DD4ED362D743Full) == 0u,
+          "map tone: VS CFA918 with PS C89DD4 is the map frames' tonemap, reading the scene in slot 0");
+    check(flatUiMapToneSlotOf(0xCFA91824129ECBBCull, 0xC89DD4ED362D743Eull) == ~0u &&
+              flatUiMapToneSlotOf(0x43CA9F1C0AD2ACFEull, 0xC89DD4ED362D743Full) == ~0u &&
+              flatUiMapToneSlotOf(0xF9CFC798F21E9AEAull, 0xFEE777E92850B390ull) == ~0u,
+          "map tone: a neighbouring PS on CFA918, the same PS on another VS, and the registry's own pair are not this table's "
+          "(the bloom composite FA01CD writes the scene and is named by neither: its exact hash is not in the repo)");
+    // The first map-tone candidate's log reason (flatUiToneMatchWhy): what a tone read proves, and the three ways it does not.
+    {
+        static int kTargetA = 0, kTargetB = 0;
+        const void* h = &kTargetA;
+        const void* other = &kTargetB;
+        FlatUiToneProof p;
+        check(std::strcmp(flatUiToneMatchWhy(p, 5, h), "no (no recorded target this frame)") == 0,
+              "map tone reason: nothing recorded yet names no recorded target");
+        flatUiToneProofHud(p, 5, h);
+        check(std::strcmp(flatUiToneMatchWhy(p, 5, h), "yes") == 0 && flatUiToneProofTone(p, 5, h) == h,
+              "map tone reason: the recorded target read by the tone matches, and the proof function agrees");
+        check(std::strcmp(flatUiToneMatchWhy(p, 5, nullptr), "no (null input)") == 0,
+              "map tone reason: a null tone input (the 1d8d8212 flight's slot 0 read) is named as null");
+        check(std::strcmp(flatUiToneMatchWhy(p, 5, other), "no (pointer mismatch)") == 0,
+              "map tone reason: a tone reading another target is a pointer mismatch");
+        check(std::strcmp(flatUiToneMatchWhy(p, 6, h), "no (no recorded target this frame)") == 0,
+              "map tone reason: a proof state from another frame names no recorded target");
+    }
+    // Temporal AA off while a map is open (2026-10-10, maintainer's decisions): the Galaxy Map (6), the System Map (7) and the
+    // Orrery (8). Another screen and an unknown GuiFocus keep temporal AA on.
+    check(flatUiMapTemporalOff(true, 6) && flatUiMapTemporalOff(true, 7) && flatUiMapTemporalOff(true, 8) &&
+              !flatUiMapTemporalOff(true, 1) && !flatUiMapTemporalOff(false, 6) && !flatUiMapTemporalOff(false, 7) &&
+              !flatUiMapTemporalOff(false, 8),
+          "temporal AA off: exactly GuiFocus 6, 7 and 8 while the focus is known (not another screen, not unknown)");
+    check(std::strcmp(flatUiMapTemporalName(6), "the Galaxy Map") == 0 && std::strcmp(flatUiMapTemporalName(7), "the System Map") == 0 &&
+              std::strcmp(flatUiMapTemporalName(8), "the Orrery") == 0,
+          "temporal AA off: the log names the Galaxy Map (6), the System Map (7) and the Orrery (8)");
+    // The map line's temporal counts: a frame that armed the mechanism and never reached its copy is counted, not silent.
+    {
+        FlatUiMapAaTally t;
+        t.frame(true, true);   // armed, would have jittered
+        t.copy(true);          // the spatial recovery ran
+        check(t.temporalOff == 1 && t.jitterZeroed == 1 && t.spatial == 1 && t.noCopy == 0 && t.resets == 0 && !t.pending,
+              "temporal AA tally: an armed frame whose copy ran the spatial recovery counts as temporal-off, jitter-zeroed and spatial");
+        t.frame(true, false);  // armed, no jitter wanted, and its copy never came
+        t.frame(false, true);  // the exit: the no-copy frame is counted at the next boundary, and the exit is one reset
+        check(t.temporalOff == 2 && t.jitterZeroed == 1 && t.noCopy == 1 && t.resets == 1 && !t.engaged,
+              "temporal AA tally: a frame armed without a copy is counted as no-copy at the next boundary; the exit is one reset");
+        t.frame(true, true);
+        t.copy(false);         // the copy ran but the spatial recovery refused
+        t.frame(false, false);
+        check(t.spatialRefused == 1 && t.resets == 2 && t.temporalOff == 3,
+              "temporal AA tally: a refused spatial recovery counts as spatial-refused, and each exit is one reset");
+        t.copy(true);          // no frame pending: nothing counted
+        check(t.spatial == 1 && t.spatialRefused == 1, "temporal AA tally: a copy with no armed frame counts nothing");
+    }
+    // The map temporal-off frames' spatial recovery (2026-10-10): an EASU copy counts in spatial and spatial-easu, a bilinear one in spatial only.
+    {
+        FlatUiMapAaTally e;
+        e.frame(true, true);
+        e.copy(true, true);
+        e.frame(true, true);
+        e.copy(true, false);
+        e.frame(true, true);
+        e.copy(false, true);
+        check(e.spatial == 2 && e.spatialEasu == 1 && e.spatialRefused == 1,
+              "map spatial: an EASU copy counts in spatial and spatial-easu; a bilinear one in spatial only; a refused one in spatial-refused");
+        // SMAA 1x ahead of EASU (2026-10-10): an EASU copy that ran SMAA counts in spatial-smaa too; an EASU copy without it does not, and a
+        // bilinear copy never does, whatever its smaa flag says.
+        FlatUiMapAaTally s;
+        s.frame(true, true);
+        s.copy(true, true, true);
+        s.frame(true, true);
+        s.copy(true, true, false);
+        s.frame(true, true);
+        s.copy(true, false, true);
+        check(s.spatial == 3 && s.spatialEasu == 2 && s.spatialSmaa == 1,
+              "map spatial: spatial-smaa counts only the EASU copies that ran SMAA; a bilinear copy never counts there");
+        s.clearCounts();
+        check(s.spatialSmaa == 0 && s.spatialEasu == 0 && s.spatial == 0, "map spatial: clearCounts zeroes spatial-smaa");
+    }
+    // The map families take no cancel (2026-10-10, the cursor's pulse): whatever their rows measured, zero; the HUD families keep it.
+    {
+        const FlatUiJitterRead phaseRead = flatUiLayerJitterOf(true, 2.0 * 0.25 / 1920.0, -2.0 * -0.375 / 1080.0, 1920, 1080, 0.25f, -0.375f);
+        const FlatUiJitterRead zeroRead = flatUiLayerJitterOf(true, 0.0, 0.0, 1920, 1080, 0.25f, -0.375f);
+        const FlatUiJitterRead noRows = flatUiLayerJitterOf(false, 0.0, 0.0, 1920, 1080, 0.25f, -0.375f);
+        check(phaseRead.kind == FlatUiJitter::kPhase && flatUiLayerNoCancel(UiLayerFamily::kMapCanvas) &&
+                  flatUiLayerNoCancel(UiLayerFamily::kMapSprite) && !flatUiLayerNoCancel(UiLayerFamily::kHolo) &&
+                  !flatUiLayerNoCancel(UiLayerFamily::kFlightHud) && !flatUiLayerNoCancel(UiLayerFamily::kSprite),
+              "map cancel: the map families are the no-cancel pair; the holo, flight HUD and target sprite are not");
+        for (UiLayerFamily f : {UiLayerFamily::kMapCanvas, UiLayerFamily::kMapSprite}) {
+            const FlatUiJitterRead a = flatUiLayerCancelOf(f, phaseRead);
+            const FlatUiJitterRead b = flatUiLayerCancelOf(f, zeroRead);
+            const FlatUiJitterRead c = flatUiLayerCancelOf(f, noRows);
+            check(a.jx == 0.0f && a.jy == 0.0f && a.kind == FlatUiJitter::kZero && b.jx == 0.0f && b.jy == 0.0f &&
+                      c.jx == 0.0f && c.jy == 0.0f && c.kind == FlatUiJitter::kZero,
+                  "map cancel: a map family's draw is cancelled by nothing, whatever its rows measured (phase, zero or no rows)");
+        }
+        const FlatUiJitterRead hudA = flatUiLayerCancelOf(UiLayerFamily::kHolo, phaseRead);
+        const FlatUiJitterRead hudB = flatUiLayerCancelOf(UiLayerFamily::kFlightHud, phaseRead);
+        const FlatUiJitterRead hudC = flatUiLayerCancelOf(UiLayerFamily::kSprite, zeroRead);
+        check(hudA.kind == FlatUiJitter::kPhase && hudA.jx == phaseRead.jx && hudA.jy == phaseRead.jy &&
+                  hudB.jx == 0.25f && hudB.jy == -0.375f && hudC.kind == FlatUiJitter::kZero && hudC.jx == 0.0f,
+              "map cancel: the HUD families keep the measured phase (the holo panels, the flight HUD) and the measured zero");
+        check(flatUiJitterSlot(FlatUiJitter::kPhase) == 0 && flatUiJitterSlot(FlatUiJitter::kZero) == 1 &&
+                  flatUiJitterSlot(FlatUiJitter::kOther) == 2 && flatUiJitterSlot(FlatUiJitter::kNoRows) == 3,
+              "map cancel: the per-family counts' slots are phase, zero, other, no rows, in the order the log prints them");
+    }
     // The jitter: rows that carry the phase (0.25, -0.375) px at 1920x1080 measure ndc (2 x 0.25 / 1920, -2 x -0.375 / 1080).
     const uint32_t w = 1920, h = 1080;
     const float px = 0.25f, py = -0.375f;
@@ -1463,11 +1634,12 @@ void testSupercruiseLines() {
         const UiLayerFamily fam = static_cast<UiLayerFamily>(i);
         const bool expectHdr = fam == UiLayerFamily::kHolo || fam == UiLayerFamily::kFlightHud || fam == UiLayerFamily::kSprite ||
                                fam == UiLayerFamily::kHoloGeneric || fam == UiLayerFamily::kOrbitLines ||
-                               fam == UiLayerFamily::kSupercruiseBars || fam == UiLayerFamily::kSpaceDust;
+                               fam == UiLayerFamily::kSupercruiseBars || fam == UiLayerFamily::kSpaceDust ||
+                               fam == UiLayerFamily::kMapCanvas || fam == UiLayerFamily::kMapSprite;
         takesHdr = takesHdr && uiLayerFamilyTakesHdr(fam) == expectHdr;
         sceneLines = sceneLines && uiLayerFamilyIsSceneLines(fam) == (fam == UiLayerFamily::kOrbitLines || fam == UiLayerFamily::kSupercruiseBars);
     }
-    check(takesHdr, "SC3a: uiLayerFamilyTakesHdr is exactly the holo panels, flight HUD, sprite, holograms, orbit lines, bars and space dust");
+    check(takesHdr, "SC3a: uiLayerFamilyTakesHdr is exactly the holo panels, flight HUD, sprite, holograms, orbit lines, bars, space dust and the two map families");
     check(sceneLines, "SC3b: uiLayerFamilyIsSceneLines is exactly the orbit lines and the bars (the space dust has no width to give: it is exempt from the density rule)");
     check(uiLayerWiderThanRender(5040, 4873, 2016, 1949) && uiLayerWiderThanRender(4032, 3898, 2016, 1949) &&
               !uiLayerWiderThanRender(2016, 1949, 2016, 1949) && !uiLayerWiderThanRender(4032, 1949, 4032, 1949) &&

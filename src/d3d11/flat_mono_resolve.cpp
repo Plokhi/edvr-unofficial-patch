@@ -1,6 +1,8 @@
 #include "flat_mono_resolve.h"
 #include "dlaa.h"
 #include "fsr3_engine.h"
+#include "map_easu.h"
+#include "map_smaa.h"
 #include "temporal_shader_bytecode.h"
 #include <d3d11_1.h>
 #include <wrl/client.h>
@@ -66,6 +68,25 @@ struct State {
     ComPtr<ID3D11ComputeShader> prep, taa, finish, spatial;
     ComPtr<ID3D11Buffer> constants;
     ComPtr<ID3D11SamplerState> sampler;
+    // The map temporal-off frames' EASU (2026-10-10, map_easu_shader.h): two precompiled compute passes, their constants, and the bounded colour
+    // texture at the render size. lastSpatialEasu says whether the last spatial recovery ran it.
+    ComPtr<ID3D11ComputeShader> easuCompress, easuResolve;
+    ComPtr<ID3D11Buffer> easuCon;
+    ComPtr<ID3D11Texture2D> easuTmp;
+    ComPtr<ID3D11UnorderedAccessView> easuTmpUav;
+    ComPtr<ID3D11ShaderResourceView> easuTmpSrv;
+    uint32_t easuTmpW=0, easuTmpH=0;
+    bool lastSpatialEasu=false;
+    // SMAA 1x ahead of that EASU (2026-10-10, map_smaa_shader.h), below native only: three compute passes at the render size, SMAA's lookup
+    // textures (made once, map_smaa.cpp), their constants and samplers. lastSpatialSmaa says whether the last spatial recovery ran them.
+    ComPtr<ID3D11ComputeShader> smaaEdgesCs, smaaWeightsCs, smaaBlendCs;
+    ComPtr<ID3D11Buffer> smaaCon;
+    ComPtr<ID3D11SamplerState> smaaLinear, smaaPoint;
+    ComPtr<ID3D11Texture2D> smaaArea, smaaSearch, smaaEdges, smaaWeights, smaaBlended;
+    ComPtr<ID3D11ShaderResourceView> smaaAreaSrv, smaaSearchSrv, smaaEdgesSrv, smaaWeightsSrv, smaaBlendedSrv;
+    ComPtr<ID3D11UnorderedAccessView> smaaEdgesUav, smaaWeightsUav, smaaBlendedUav;
+    uint32_t smaaW=0, smaaH=0;
+    bool lastSpatialSmaa=false;
     // The HDR route's pixel-shader half (section 81), made on first use (initializeHdr): one triangle vertex shader,
     // the finish and the spatial recovery as pixel shaders, and a rasterizer state that culls nothing. The render-target
     // view over the game's H is cached by the texture it was made for and holds a reference to it, so the address
@@ -1141,6 +1162,90 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     return true;
 }
 
+// The map temporal-off frames' EASU objects (2026-10-10): the two precompiled passes (the runtime has no HLSL compiler), the constants buffer,
+// and the bounded colour texture at the render size. Made on first use; a failure returns false and the caller takes the bilinear path.
+static bool ensureEasu(ID3D11Device* device,uint32_t renderW,uint32_t renderH) {
+    if(!device)return false;
+    if(!g.easuCompress && FAILED(device->CreateComputeShader(kFlatMapEasuCompressBytecode,sizeof(kFlatMapEasuCompressBytecode),nullptr,g.easuCompress.GetAddressOf())))return false;
+    if(!g.easuResolve && FAILED(device->CreateComputeShader(kFlatMapEasuBytecode,sizeof(kFlatMapEasuBytecode),nullptr,g.easuResolve.GetAddressOf())))return false;
+    if(!g.easuCon) {
+        D3D11_BUFFER_DESC bd{};bd.ByteWidth=5*16;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        if(FAILED(device->CreateBuffer(&bd,nullptr,g.easuCon.GetAddressOf())))return false;
+    }
+    if(!g.easuTmp || !g.easuTmpUav || !g.easuTmpSrv || g.easuTmpW!=renderW || g.easuTmpH!=renderH) {
+        g.easuTmpUav.Reset();g.easuTmpSrv.Reset();g.easuTmp.Reset();
+        D3D11_TEXTURE2D_DESC td{};td.Width=renderW;td.Height=renderH;td.MipLevels=1;td.ArraySize=1;td.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_DEFAULT;td.BindFlags=D3D11_BIND_UNORDERED_ACCESS|D3D11_BIND_SHADER_RESOURCE;
+        if(FAILED(device->CreateTexture2D(&td,nullptr,g.easuTmp.GetAddressOf())))return false;
+        if(FAILED(device->CreateUnorderedAccessView(g.easuTmp.Get(),nullptr,g.easuTmpUav.GetAddressOf())))return false;
+        if(FAILED(device->CreateShaderResourceView(g.easuTmp.Get(),nullptr,g.easuTmpSrv.GetAddressOf())))return false;
+        g.easuTmpW=renderW;g.easuTmpH=renderH;
+    }
+    return true;
+}
+
+// The map's SMAA 1x resources (2026-10-10, map_smaa_shader.h): the three passes, the metrics constant, the two samplers, SMAA's lookup
+// textures (uploaded once from map_smaa.cpp, unmodified), and the render-size edges, weights and blended colour. False leaves the frame on
+// EASU alone.
+static bool ensureSmaa(ID3D11Device* device,uint32_t renderW,uint32_t renderH) {
+    if(!device)return false;
+    if(!g.smaaEdgesCs && FAILED(device->CreateComputeShader(kFlatMapSmaaEdgesBytecode,sizeof(kFlatMapSmaaEdgesBytecode),nullptr,g.smaaEdgesCs.GetAddressOf())))return false;
+    if(!g.smaaWeightsCs && FAILED(device->CreateComputeShader(kFlatMapSmaaWeightsBytecode,sizeof(kFlatMapSmaaWeightsBytecode),nullptr,g.smaaWeightsCs.GetAddressOf())))return false;
+    if(!g.smaaBlendCs && FAILED(device->CreateComputeShader(kFlatMapSmaaBlendBytecode,sizeof(kFlatMapSmaaBlendBytecode),nullptr,g.smaaBlendCs.GetAddressOf())))return false;
+    if(!g.smaaCon) {
+        D3D11_BUFFER_DESC bd{};bd.ByteWidth=16;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        if(FAILED(device->CreateBuffer(&bd,nullptr,g.smaaCon.GetAddressOf())))return false;
+    }
+    // SMAA's LinearSampler (MIN_MAG_LINEAR_MIP_POINT, clamp) at s0 and PointSampler (MIN_MAG_MIP_POINT, clamp) at s1, as SMAA.hlsl declares them.
+    if(!g.smaaLinear) {
+        D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
+        if(FAILED(device->CreateSamplerState(&sd,g.smaaLinear.GetAddressOf())))return false;
+    }
+    if(!g.smaaPoint) {
+        D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
+        if(FAILED(device->CreateSamplerState(&sd,g.smaaPoint.GetAddressOf())))return false;
+    }
+    // The two lookup textures, immutable, uploaded once from SMAA's own tables (AreaTex R8G8 160x560, SearchTex R8 64x16).
+    if(!g.smaaAreaSrv) {
+        const MapSmaaTable area=mapSmaaAreaTable();
+        D3D11_TEXTURE2D_DESC td{};td.Width=area.width;td.Height=area.height;td.MipLevels=1;td.ArraySize=1;td.Format=DXGI_FORMAT_R8G8_UNORM;
+        td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_IMMUTABLE;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init{};init.pSysMem=area.bytes;init.SysMemPitch=area.pitch;
+        if(FAILED(device->CreateTexture2D(&td,&init,g.smaaArea.GetAddressOf())))return false;
+        if(FAILED(device->CreateShaderResourceView(g.smaaArea.Get(),nullptr,g.smaaAreaSrv.GetAddressOf())))return false;
+    }
+    if(!g.smaaSearchSrv) {
+        const MapSmaaTable search=mapSmaaSearchTable();
+        D3D11_TEXTURE2D_DESC td{};td.Width=search.width;td.Height=search.height;td.MipLevels=1;td.ArraySize=1;td.Format=DXGI_FORMAT_R8_UNORM;
+        td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_IMMUTABLE;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init{};init.pSysMem=search.bytes;init.SysMemPitch=search.pitch;
+        if(FAILED(device->CreateTexture2D(&td,&init,g.smaaSearch.GetAddressOf())))return false;
+        if(FAILED(device->CreateShaderResourceView(g.smaaSearch.Get(),nullptr,g.smaaSearchSrv.GetAddressOf())))return false;
+    }
+    // The render-size targets: edges (RG8), blend weights (RGBA8, SMAA's own layout), blended colour (half float, the bounded range EASU reads).
+    if(!g.smaaEdgesSrv || !g.smaaEdgesUav || !g.smaaWeightsSrv || !g.smaaWeightsUav || !g.smaaBlendedSrv || !g.smaaBlendedUav ||
+       g.smaaW!=renderW || g.smaaH!=renderH) {
+        g.smaaEdgesUav.Reset();g.smaaEdgesSrv.Reset();g.smaaEdges.Reset();
+        g.smaaWeightsUav.Reset();g.smaaWeightsSrv.Reset();g.smaaWeights.Reset();
+        g.smaaBlendedUav.Reset();g.smaaBlendedSrv.Reset();g.smaaBlended.Reset();
+        auto makeTarget=[&](DXGI_FORMAT format,ComPtr<ID3D11Texture2D>& tex,ComPtr<ID3D11UnorderedAccessView>& uav,
+                            ComPtr<ID3D11ShaderResourceView>& srv)->bool {
+            D3D11_TEXTURE2D_DESC td{};td.Width=renderW;td.Height=renderH;td.MipLevels=1;td.ArraySize=1;td.Format=format;
+            td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_DEFAULT;td.BindFlags=D3D11_BIND_UNORDERED_ACCESS|D3D11_BIND_SHADER_RESOURCE;
+            return SUCCEEDED(device->CreateTexture2D(&td,nullptr,tex.GetAddressOf())) &&
+                   SUCCEEDED(device->CreateUnorderedAccessView(tex.Get(),nullptr,uav.GetAddressOf())) &&
+                   SUCCEEDED(device->CreateShaderResourceView(tex.Get(),nullptr,srv.GetAddressOf()));
+        };
+        if(!makeTarget(DXGI_FORMAT_R8G8_UNORM,g.smaaEdges,g.smaaEdgesUav,g.smaaEdgesSrv))return false;
+        if(!makeTarget(DXGI_FORMAT_R8G8B8A8_UNORM,g.smaaWeights,g.smaaWeightsUav,g.smaaWeightsSrv))return false;
+        if(!makeTarget(DXGI_FORMAT_R16G16B16A16_FLOAT,g.smaaBlended,g.smaaBlendedUav,g.smaaBlendedSrv))return false;
+        g.smaaW=renderW;g.smaaH=renderH;
+    }
+    return true;
+}
+
 bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* context,const FlatMonoResolveFrame& f,
                                     ID3D11ShaderResourceView** output,const char** reason) {
     // The HDR route's spatial recovery writes the same crumbs as its resolve (flat_hdr_crumbs.h): capture-state, copy-h,
@@ -1190,6 +1295,102 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
         (f.evalWidth && f.evalHeight) ? f.evalWidth : route.evalWidth;
     const uint32_t evalH = route.refused ? f.outputHeight :
         (f.evalWidth && f.evalHeight) ? f.evalHeight : route.evalHeight;
+    // THE MAP TEMPORAL-OFF FRAMES (2026-10-10, f.easu): AMD's EASU over the bounded colour, in place of the bilinear tap below. Only a
+    // copy-route frame asks (flat_runtime.cpp); an HDR frame and every other caller take the bilinear path, unchanged.
+    g.lastSpatialEasu=false;
+    g.lastSpatialSmaa=false;
+    if(f.easu && !hdr && ensureEasu(device,f.renderWidth,f.renderHeight)) {
+        uint32_t con[20]={};
+        mapEasuConstants(f.renderWidth,f.renderHeight,evalW,evalH,con);
+        context->UpdateSubresource(g.easuCon.Get(),0,nullptr,con,0,0);
+        ID3D11Buffer* easuCb=g.easuCon.Get();
+        ID3D11SamplerState* easuSampler=g.sampler.Get();
+        ID3D11ShaderResourceView* nullSrv=nullptr;
+        ID3D11UnorderedAccessView* nullUav=nullptr;
+        {
+            // Pass 1: the colour, bounded (c / (1 + max c)), at the render size.
+            ID3D11ShaderResourceView* raw=g.color.srv.Get();
+            ID3D11UnorderedAccessView* bounded=g.easuTmpUav.Get();
+            context->CSSetShaderResources(1,1,&raw);
+            context->CSSetUnorderedAccessViews(0,1,&bounded,nullptr);
+            // mapCompress reads its bounds (mapSize.zw) from b0: it must be the constants buffer, not whatever the last pass left there. Unbound,
+            // the bounds read zero, every thread returned, the bounded texture stayed empty, and EASU expanded black (6899f14b's flight).
+            context->CSSetConstantBuffers(0,1,&easuCb);
+            context->CSSetShader(g.easuCompress.Get(),nullptr,0);
+            context->Dispatch((f.renderWidth+7)/8,(f.renderHeight+7)/8,1);
+            context->CSSetShaderResources(1,1,&nullSrv);
+            context->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);
+        }
+        // SMAA 1x (2026-10-10, map_smaa_shader.h), BELOW NATIVE only, on the bounded colour, ahead of EASU: its blended output is what EASU reads,
+        // so the stair-steps of the render-size edges are smoothed before EASU upscales them. A native frame, or a frame that cannot make the
+        // resources, runs EASU on the bounded colour alone.
+        ID3D11ShaderResourceView* easuInput=g.easuTmpSrv.Get();
+        const bool belowNative=f.renderWidth<f.outputWidth||f.renderHeight<f.outputHeight;
+        if(f.smaa && belowNative && ensureSmaa(device,f.renderWidth,f.renderHeight)) {
+            const float metrics[4]={1.0f/float(f.renderWidth),1.0f/float(f.renderHeight),float(f.renderWidth),float(f.renderHeight)};
+            context->UpdateSubresource(g.smaaCon.Get(),0,nullptr,metrics,0,0);
+            ID3D11Buffer* smaaCb=g.smaaCon.Get();
+            ID3D11SamplerState* smaaSamplers[2]={g.smaaLinear.Get(),g.smaaPoint.Get()};
+            const uint32_t groupsX=(f.renderWidth+7)/8,groupsY=(f.renderHeight+7)/8;
+            {
+                // Edges: the bounded colour -> the colour edges (RG8).
+                ID3D11ShaderResourceView* in=g.easuTmpSrv.Get();
+                ID3D11UnorderedAccessView* out=g.smaaEdgesUav.Get();
+                context->CSSetShaderResources(0,1,&in);
+                context->CSSetSamplers(0,2,smaaSamplers);
+                context->CSSetConstantBuffers(0,1,&smaaCb);
+                context->CSSetUnorderedAccessViews(0,1,&out,nullptr);
+                context->CSSetShader(g.smaaEdgesCs.Get(),nullptr,0);
+                context->Dispatch(groupsX,groupsY,1);
+                context->CSSetShaderResources(0,1,&nullSrv);
+                context->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);
+            }
+            {
+                // Weights: the edges, with AreaTex and SearchTex -> the blending weights (RGBA8).
+                ID3D11ShaderResourceView* in[3]={g.smaaEdgesSrv.Get(),g.smaaAreaSrv.Get(),g.smaaSearchSrv.Get()};
+                ID3D11UnorderedAccessView* out=g.smaaWeightsUav.Get();
+                context->CSSetShaderResources(0,3,in);
+                context->CSSetUnorderedAccessViews(0,1,&out,nullptr);
+                context->CSSetShader(g.smaaWeightsCs.Get(),nullptr,0);
+                context->Dispatch(groupsX,groupsY,1);
+                ID3D11ShaderResourceView* nulls3[3]={nullSrv,nullSrv,nullSrv};
+                context->CSSetShaderResources(0,3,nulls3);
+                context->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);
+            }
+            {
+                // Blend: the bounded colour and the weights -> the blended colour (half float), the input EASU reads.
+                ID3D11ShaderResourceView* in[2]={g.easuTmpSrv.Get(),g.smaaWeightsSrv.Get()};
+                ID3D11UnorderedAccessView* out=g.smaaBlendedUav.Get();
+                context->CSSetShaderResources(0,2,in);
+                context->CSSetUnorderedAccessViews(0,1,&out,nullptr);
+                context->CSSetShader(g.smaaBlendCs.Get(),nullptr,0);
+                context->Dispatch(groupsX,groupsY,1);
+                ID3D11ShaderResourceView* nulls2[2]={nullSrv,nullSrv};
+                context->CSSetShaderResources(0,2,nulls2);
+                context->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);
+            }
+            easuInput=g.smaaBlendedSrv.Get();
+            g.lastSpatialSmaa=true;
+        }
+        {
+            // Pass 2: EASU at the evaluation size, expanded back, into the output the bilinear path would have written. Its input is the
+            // bounded colour, or the SMAA output when SMAA ran.
+            ID3D11ShaderResourceView* bounded=easuInput;
+            ID3D11UnorderedAccessView* target=g.output[1].uav.Get();
+            context->CSSetShaderResources(0,1,&bounded);
+            context->CSSetSamplers(0,1,&easuSampler);
+            context->CSSetConstantBuffers(0,1,&easuCb);
+            context->CSSetUnorderedAccessViews(0,1,&target,nullptr);
+            context->CSSetShader(g.easuResolve.Get(),nullptr,0);
+            context->Dispatch((evalW+7)/8,(evalH+7)/8,1);
+            context->CSSetShaderResources(0,1,&nullSrv);
+            context->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);
+        }
+        g.lastSpatialEasu=true;
+        *output=(colorDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?g.output[1].srgb:g.output[1].srv).Get();
+        (*output)->AddRef();
+        return true;
+    }
     Constants constants{};
     constants.size[0]=f.renderWidth;constants.size[1]=f.renderHeight;
     constants.size[2]=evalW;constants.size[3]=evalH;
@@ -1205,6 +1406,9 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
     (*output)->AddRef();
     return true;
 }
+
+bool flatMonoResolveLastSpatialWasEasu() { return g.lastSpatialEasu; }
+bool flatMonoResolveLastSpatialWasSmaa() { return g.lastSpatialSmaa; }
 
 // Test-only, NOT part of flat_mono_resolve.h's contract (the rig forward-declares it, as tools\fsr3_engine_test does for
 // fsr3_engine.cpp's own hooks): the prep kernel the NEXT initialisation makes is this bytecode instead of the shipped one, so

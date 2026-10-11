@@ -86,6 +86,25 @@ bool journalFssFocus();
 // conditions as journalFssFocusKnown.
 bool journalGuiFocus(uint32_t* focus);
 
+// THE FLAT PROFILE'S ONE READER. The watcher runs in flat (d3d11.journal_watch
+// is on there) for the maps: flat_runtime's map focus asks this,
+// and only this, for GuiFocus. Same answer as journalGuiFocus, but it answers
+// only in flat. Every accessor above answers in flat with the value a stopped
+// watcher gives, so the flat consumers written against "no journal" do not see
+// a change. Known is false when the watcher is off or the field is absent.
+bool journalFlatGuiFocus(uint32_t* focus);
+
+// DIAGNOSTIC, ungated by profile: what the watcher holds right now, for the flat map line's 5 s report (flat_runtime.cpp). Not a consumer's
+// answer: the accessors above are the answers. active is the watcher's own state; statusSamples counts Status.json reads that parsed;
+// guiKnown and gui are the last parsed sample's GuiFocus field.
+struct JournalRawStatus {
+    bool active = false;
+    uint32_t statusSamples = 0;
+    bool guiKnown = false;
+    uint32_t gui = 0;
+};
+JournalRawStatus journalRawStatus();
+
 // Flags bit 4: supercruise, where the FSS keys actually do something.
 bool journalSupercruiseKnown();
 bool journalSupercruise();
