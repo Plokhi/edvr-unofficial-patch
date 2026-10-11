@@ -2,8 +2,8 @@
 
 ## Status
 
-- State: open. Repeated zero-percent startup stalls without EDVR. The latest
-  user report describes eventual generation completion and a pre-menu exit.
+- State: open. Latest run completes generation, then exits silently before the
+  menu; the user saw no error dialog.
 - Device: ONEXPLAYER 3, Intel Arc B390 PTL 8086:b080, xe driver, CachyOS,
   kernel 7.2.9-1-cachyos-deckify, Mesa 26.2.4-arch3.1.
 - Game: Steam 359320, installed build 25433925, Proton Experimental
@@ -39,8 +39,9 @@
 - Open hypotheses: expensive Intel shader register allocation exceeding the
   game's watchdog; a compiler defect producing excessive allocation work.
   Binary/source matching identifies setup_live_interference's overlap scan.
-- Open question: what initiates the pre-menu exit after generation completes. A
-  native exit-breakpoint trace is being prepared. No driver switch is planned.
+- Open question: what initiates the pre-menu exit. A WineDbg exit observer is
+  armed for the next launch; debugger timing may differ, so success needs an
+  unobserved confirmation. No driver switch is planned.
 - Temporary settings: Elite-only Proton user_settings.py enables PROTON_LOG,
   PROTON_LOG_DIR, DXVK_LOG_LEVEL and DXVK_LOG_PATH. Experimental's ineffective
   VK_DRIVER_FILES request was removed and logging-only settings restored.
@@ -236,8 +237,23 @@ the observed work is established. No Float64 use was found. NetLog records
 Shutdown_Deactivate at monotonic 115.086 seconds and HTTP 419 at 115.398
 seconds, 0.312 seconds later. With no earlier failure identified, HTTP 419 is
 ruled out as the initiating event. Launcher ProjectFinished occurs after
-shutdown and is logged after the fact. A native exit-breakpoint trace is being
-prepared; no driver switch is planned.
+shutdown and is logged after the fact.
+
+## WineDbg exit capture prepared
+
+WineDbg validated ExitProcess, RtlExitUserProcess and NtTerminateProcess
+breakpoints through wineserver on disposable 64-bit cmd. It captured caller
+cmd+0x217b2 and exit code 7, then detached after five seconds while the target
+lived. The helper's dry-run writes nothing and passes first-chance exceptions
+through. GDB attach hit Yama ptrace_scope=1; eu-stack still captured stacks.
+
+The real prefix resolves EDLaunch.exe. Reopened launcher PID 53315 maps the
+private Mesa library. The WineDbg observer is armed at
+/tmp/edvr-elite-exit-trace-20261011.jsonl; the user's Steam wrapper logs to
+mesa-main-exit-trace-37bf953a, with originals archived under
+/tmp/edvr-elite-verified-run-20261011-0722. The user was asked to Play.
+Debugger timing can change behavior; a successful run needs confirmation
+without it.
 
 ## Sources
 
