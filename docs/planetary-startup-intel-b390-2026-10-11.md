@@ -2,8 +2,8 @@
 
 ## Status
 
-- State: open. First main-menu reach occurred with Proton Experimental, private
-  Mesa and WineDbg attached. A normal launch without debugger is pending.
+- State: device workaround verified; remediation closed. Compiler and earlier
+  exit causes remain unresolved.
 - Device: ONEXPLAYER 3, Intel Arc B390 PTL 8086:b080, xe driver, CachyOS,
   kernel 7.2.9-1-cachyos-deckify, Mesa 26.2.4-arch3.1.
 - Game: Steam 359320, installed build 25433925, Proton Experimental
@@ -22,27 +22,25 @@
   crashes at zero percent after discarding the old DXVK cache.
 - Ruled out: user_settings-only private ICD selection, because Steam already
   sets the driver variables and Proton keeps existing environment values.
-- Ruled out: the private Mesa main build alone provides a usable menu, because
-  verified game PID 44975 loaded it, finished generation, then exited pre-menu.
+- Ruled out: WineDbg is required for a usable menu, because a second fresh
+  launch reached it with the persistent wrapper and no debugger.
 - Ruled out: HTTP 419 initiated the pre-menu exit, because it follows
   Shutdown_Deactivate by 0.312 seconds and no earlier failure is identified.
 - Evidence: one shader worker uses a full CPU core inside libvulkan_intel.so
   for over 73 seconds, while the other workers wait. The watchdog captures
   vkCreateComputePipelines. This supports prolonged CPU-side Intel pipeline
   compilation or processing, rather than a GPU or mutex wait at that moment.
-- Latest run: game PID 55534 maps private Mesa, with no system ICD. Startup
-  DXVK cache has 544 shaders / 11.1 MB versus 224 / 5.3 MB previously. No exit
-  breakpoint fired. Driver, cache warmth and debugger effects remain coupled.
+- Latest run: game PID 61720 maps the installed private ICD, no system ICD;
+  Proton Experimental and DXVK 3.1.1 reach the menu. DXVK cache: 544 shaders /
+  11.1 MB. Private driver, runtime and cache effects are not isolated.
 - Open hypotheses: expensive Intel shader register allocation exceeding the
   game's watchdog; a compiler defect producing excessive allocation work.
   Binary/source matching identifies setup_live_interference's overlap scan.
-- Open question: what caused the earlier pre-menu exit. Repeat with the
-  persistent Mesa install and no debugger before drawing a causal conclusion.
-- Temporary Proton settings were removed after exact-SHA checks; no settings
-  files were present initially. No EDVR INI changes.
-- Temporary Steam option: /usr/bin/python3 /tmp/elite_mesa_main_launch.py
-  %command%. User was asked to close the old launcher and replace it with the
-  permanent wrapper before the next launch.
+- Open question: which compiler behavior caused the earlier stall and what
+  initiated the pre-menu exit. No causal fix is identified; EDVR is uninvolved.
+- Temporary Proton settings were removed after exact-SHA checks. No EDVR INI
+  changes. Steam Launch Options uses the verified persistent wrapper below;
+  clear it to revert.
 - Evidence directory: /home/deck/.cache/elite-startup-diagnostics/2026-10-11.
 
 ## October 11 evidence
@@ -232,25 +230,24 @@ seconds, 0.312 seconds later. With no earlier failure identified, HTTP 419 is
 ruled out as the initiating event. Launcher ProjectFinished occurs after
 shutdown and is logged after the fact.
 
-## First menu reach and normal-launch check
+## Verified normal startup workaround
 
-The user reached the main menu for the first time with the private Mesa ICD and
-WineDbg attached. Game PID 55534 maps the private library, not the system ICD;
-DXVK's startup cache had 544 shaders / 11.1 MB, versus 224 / 5.3 MB previously.
-No exit breakpoint fired, so this does not isolate driver, cache warmth or
-debugger timing. WineDbg's three exit breakpoints passed a disposable 64-bit
-cmd test (exit 7); a five-second timeout detached while the target lived. GDB
-attach hit Yama, though eu-stack still captured native stacks.
+The first menu reach used WineDbg; its game PID 55534 mapped the private ICD,
+and no exit breakpoint fired. The observer detached safely while the game
+remained alive. A second fresh launch without debugger also reached the menu.
+Game PID 61720 maps
+/home/deck/.local/share/elite-mesa-37bf953a58/lib/libvulkan_intel.so, with no
+system ICD. DXVK reports 26.2.99 and 544 cached shaders / 11.1 MB.
 
-Observer PID 53611 was safely detached by SIGINT (trace ends `detached`);
-WineDbg PID 55559 exited while game PID 55534 remained alive. The permanent
-Mesa build is installed at /home/deck/.local/share/elite-mesa-37bf953a58 with
-the verified SHA and no /tmp dependency; native and Runtime 4 Vulkan checks
-report Mesa 26.3.0-devel (git-37bf953a58). Its launcher is
-/home/deck/.local/share/elite-mesa-37bf953a58/launch.py. The user was asked to
-close the old launcher and retry with this wrapper, Proton Experimental and no
-debugger. This is a working combination, not an identified fix; EDVR is not
-involved. Normal startup remains unverified.
+The installed library's SHA matches the private build, has no /tmp dependency,
+and native plus Runtime 4 Vulkan checks report Mesa 26.3.0-devel
+(git-37bf953a58). The verified wrapper is
+/home/deck/.local/share/elite-mesa-37bf953a58/launch.py; Steam Launch Options
+is `/usr/bin/python3 /home/deck/.local/share/elite-mesa-37bf953a58/launch.py
+%command%`. It sets only the two Vulkan ICD variables. Temporary Proton
+settings are removed. Proton Experimental, the private driver and warmed caches
+are a verified working combination; their individual effects and the original
+compiler/exit causes remain unresolved. No EDVR changes were needed.
 
 ## Sources
 
