@@ -11,6 +11,7 @@
 
 #include "../common/elite_graphics_folder.h"  // the Options\Graphics folder under %LOCALAPPDATA%
 #include "../common/log.h"
+#include "../common/runtime_profile.h"  // runtimeVrProfile, runtimeProfileName: the window rewrite is VR-only
 
 #include <windows.h>
 
@@ -129,7 +130,14 @@ void vrSsaaGateStartup() {
     }
     vrSsaaHoldReport();
     g_on.store(true, std::memory_order_release);
-    vrWindowTrampolinesInstall();  // H6: observe-only entries on the game's mode request and window apply (build checked above)
+    // The game's mode request (window rewrite) and settings copy (hold) are VR-only. Flat installs neither: the game's requests pass
+    // untouched there (vr_window_trampolines.cpp checks the profile again on each call).
+    if (runtimeVrProfile()) {
+        vrWindowTrampolinesInstall();
+    } else {
+        Log::get().note("vr window: trampolines not installed: %s profile (the game's mode request and settings copy are not touched)",
+                        runtimeProfileName());
+    }
 
     // Settings.xml names the 3D mode (the live value is not located in this step; see the line below).
     wchar_t appdata[MAX_PATH] = {};

@@ -2,27 +2,23 @@
 
 ## Status
 
-- **State:** steps 1-3 committed on `claude/vr-ssaa-gate` (28edab7b, c5491ab3, cf11d33c), flown in two Frontier sessions on cf11d33c (logs `edvr_gfx_20261010_102911.log`, `..._103029.log`). Step 4 (this commit): the sizing watch (H7), the window IAT observers (H6), GAP 2 fix, startup-line change-only. Not merged.
-- **Goal (decided):** while the 3D mode is not 0, hold the game's Supersampling field at 1.0 so HMD Image Quality is the only VR render control. Flat and 3D mode 0 untouched. No config key. Never write the user's settings files.
-- **Works (flights):** hold installed at DLL load; startup loader hold line (session 2 at 0.85, requested 0.85); menu hold at 0.85 with the toast; re-read saw 3 -> 0 and 0 -> 4; the game saves the menu value to the .fxcfg (0.85), not the held field (H5 answered).
-- **Gap 1, FALSIFIED: "one field covers every consumer".** Session 1, after `holding ... at menu` (10:29:52.278), new depth targets 2227x2153 appeared at 10:29:53.379 (278 and 308 draws). 2227 = trunc(2620 x 0.85). The eye-sized targets stayed 2620x2533 (HMD Quality 0.65 x 4032). The field stayed 1.0, so some consumer sizes from the requested value by another path. H7 names it.
-- **Gap 2, FIXED here:** on a 0 -> on mode change the hold re-applies at once, to the render context the setter last named (`at mode change` line).
-- **Startup loader, UNPROVEN:** session 2's loader ran about 4.4 s after the first Present, and about 12 times (presets, then Custom). So the startup write is not before the first sizing. See H8.
-- **Open hypotheses:**
-  - H1 modes: 3 = VR (startup, both sessions). 0 and 4 seen in re-reads. 4 is not identified; the 0 -> 4 switch is the windowed switch in H6. 5 (HMD Cinema) not seen.
-  - H4 REFUTED: render context and loader object are different allocations. Session 1: ctx 0x1728C199820, loader 0x1C110FF1D0. Session 2: ctx 0x...EC860, loader 0x...F610 (the coordinator's abbreviated values). Neither difference is 0x3428. So the loader write does not touch the field the setter reads.
-  - H5 ANSWERED: the game writes the menu's value to the .fxcfg. The held field is not saved.
-  - H6 PARTIAL: at the 0 -> 4 switch (session 1 and 2), window style 0x94020000 at 3840x2160 became 0x14C80000 at 1280x768 (frame 4572), then ResizeBuffers 1280x768 format 28 flags 0x2 from game RVA 0x521CE5. No ResizeTarget. SetFullscreenState(FALSE, null target) from game RVA 0x50B30B about 10-20 s later in both sessions (likely at quit). So the switch is a window restyle plus a buffer resize, not a DXGI fullscreen change. Who restyles is open: the IAT observers (below) test it.
-  - H7 OPEN: which game code sized the 2227 targets. Test: the sizing watch's `vr sizing:` lines (callers as game RVAs) after a menu change.
-  - H8 OPEN: does the startup hold reach ctx+0x3564? Test: the first setter call's `before` value in a flight that changes nothing in the menu before it. 0.85 means no; 1.0 means yes. The copy from loader table to render context is not located.
-  - H9 mode 4: what it is (the menu's 3D mode name for it).
-- **Flight 58a54aa5 (edvr_gfx_20261010_114456.log):** both window trampolines REFUSED (CodeHook: target more than 2 GB from the replacement). Fixed here with a near relay (the kinematic-eval pattern). The settings watch was INVALID: the "loader object" is a stack temporary (H8, below), so its reads are dead stack; its change test also logged 0.0000 -> 0.0000 every frame. Removed; the watch is now ctx+0x3564 only.
-- **H8 (corrected):** the startup hold works by writing the loader's temporary before the game copies it. The temporary is not the render context's field, and reads of it after the loader returns are dead stack.
-- **H7 test (new, this build):** a hardware write watchpoint on ctx+0x3564 (DR0/DR7 on every thread, a vectored handler, 16 writes at most), which names the writer's instruction. See the dated section.
-- **Current (flight 8a591fba, 12:29-12:30):** the live VR decision replaces the Settings.xml mode (which lagged the game's apply by one switch). H6 ANSWERED: the 3D-on path itself requests kind 0 at 1280x768 (not the kind 1 -> 0 focus override), and the request is saved. The mode request is rewritten while VR is live. The debug instruments are removed (see the dated section).
-- **H6 DECISION (maintainer):** when 3D turns on, Elite keeps the user's display mode (for example borderless 3840x2160 from DisplaySettings.xml) and does not switch to windowed 1280x768, accepting the unmeasured GPU cost of the 4K desktop swapchain in VR. No behaviour change in this build. The fix is designed after the window-apply observer flight shows which path produces kind 0: the kind 1 -> 0 foreground override in 0x7E9D50, or another request writer.
-- **Ruled out:** a static-address read of the 3D mode (step 1: virtual calls on heap objects). H4 (same-object relation), above.
-- **Next flight (VR, Frontier, the step-4 commit):** (a) menu Supersampling change: read `vr sizing:` lines and their callers (H7). (b) 3D Off to HMD: read `vr window:` lines (who restyles, H6) and `vr sizing:` lines. (c) start with the .fxcfg at 0.85, then the first setter call's `before` (H8). Then `python tools\edvr_log.py --target frontier --expect-build HEAD --vr-supersampling`.
+- **State:** the Supersampling hold and the game's window request rewrite are MERGED to main (4f626825) and flown OK on Frontier. The sections below are the record; this block says what is built now.
+- **Review fix, branch `claude/review-0191-window` (not merged, not installed):** the window request rewrite and its install are VR profile only. A flat request is forwarded byte for byte, and the saved mode is not read for it. The install publishes the original-function forwards through CodeHook's Prepare callback. Rig `tools\vr_ssaa_hold_test` (in build.bat's gate) covers the flat, VR and install-ordering cases.
+- **Goal:** while Settings.xml's StereoscopicMode is not 0, hold the game's Supersampling at 1.0 so HMD Image Quality is the only VR render control. Flat is never held and its requests are never touched. No config key. The user's settings files are never written.
+- **Built (VR profile only; `vrSsaaGateStartup` installs the window hooks only when `runtimeVrProfile()`):**
+  - Startup loader: `afterLoader` writes 1.0 into the fxcfg loader's Supersampling temporary when the mode is not 0. Whether that reaches the sizing is H8, open.
+  - Settings copy hold, W at 0x281C0D0 (`vrSsaaHoldAfterCopy`, entered through a near relay): after the game copies its settings into the render context, the field is set to 1.0 while VR is live.
+  - Setter (`vrSsaaHoldSetterValue`, `ui_panel_scale.cpp`): passes 1.0 while VR is live, and remembers the game's own value for release.
+  - Live VR signal (`vrSsaaHoldFrameBoundary`, once per Present): the runtime's render sizing record (`edvrQueryNativeRenderSizing`, valid while an OpenXR session has published its eye sizes). Live sets the field to 1.0; not live restores the game's value.
+  - Window request rewrite (`requestReplacement`, the mode request at 0x7E9D50): while VR is not live, a non-windowed request is remembered whole (request +0x08 to +0x27). A windowed request (kind 0) gets the remembered block restored before the original runs, when VR is live, or before the live session exists if the saved mode is not 0. This keeps the user's display mode when 3D is on (the maintainer's decision, H6).
+  - Not held: the DisplayConfig save (0x7F9F00). Its object's field layout is not proven.
+- **Settled by flights:** the startup hold, the menu hold with its toast, and the live decision. The game saves the menu value to the .fxcfg, not the held field (H5). The 3D-on path requests kind 0 at 1280x768 and the request is saved (H6 answered). Mode 4 shows in re-reads at the windowed switch.
+- **Open:**
+  - Gap 1 (falsified): the one field does not cover every consumer. New depth targets were sized from the menu value (2227 = trunc(2620 x 0.85)) while the field read 1.0. H7 names the sizing caller and is open.
+  - H8: does the startup write reach the render context's field? The first setter call's `before` value decides it (0.85 means no, 1.0 means yes).
+  - H9: what mode 4 is.
+- **Ruled out:** H4, the loader object and the render context are different allocations, so the startup write does not touch the field the setter reads. A static-address read of the 3D mode: the mode sits behind virtual calls on heap objects.
+- **Retired:** the write watchpoint and the settings and sizing watches of the earlier steps. No watch code is in `vr_ssaa_*.cpp` or `vr_window_trampolines.cpp`; do not reintroduce them. `vr_display_observer` still logs the game window's style and size, read only.
 - **Doc rule:** dated entries below; keep this block current.
 
 ## Investigation: the startup mechanism (2026-10-10, read-only)
