@@ -162,7 +162,11 @@ instead of standing in the world, or sized for a screen you are not looking at.
 - Over planets, Elite culled terrain with a head pose about 42 ms older than
   the one it drew with, so squares of ground at the edges of view went undrawn
   when you moved your head. EDVR answers the game's request for the head pose
-  "now" at the instant of the frame being drawn. There is no setting.
+  "now" at the instant of the frame being drawn. On a headset whose eyes see
+  further out than the centred frustum Elite culls terrain against (a Quest 3,
+  a cropped Pimax), EDVR also widens that frustum to what each eye shows, which
+  stopped the black flashes at the outer corners over flat ground. There is no
+  setting.
 - On foot, the grey surround is made properly black, the screen is moved, bent
   and raised above its forced 1920x1080, and Explorer Cam gives you a real
   stereo view from your commander's head in the free camera.

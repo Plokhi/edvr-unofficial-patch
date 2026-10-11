@@ -8,6 +8,7 @@
     python tools/edvr_log.py --target frontier --tally vh
     python tools/edvr_log.py --target frontier --tally vh --frame 1
     python tools/edvr_log.py --target steam --tally pose
+    python tools/edvr_log.py --target frontier --tally cover
     python tools/edvr_log.py --target frontier --tally periodic --expect-build HEAD
     python tools/edvr_log.py --target frontier --tally periodic --window-ms 250
     python tools/edvr_log.py --target frontier --tally periodic --infer-runs
@@ -63,6 +64,9 @@ rather than printing an empty table.
 --tally pose tables the pose-gap diagnostic: every `pose gap:` line in the RUNTIME log (it reads --tag openxr unless you name a tag or a file) by
 caller (thread, return address): how far a head pose is located from the drawn frame's display time, how far it is turned from the drawn pose, and the
 correlation of that angle with head speed across the windows (docs\terrain-culling.md). Exit 1 when the log has no such line.
+
+--tally cover tables the terrain cull cover: the `terrain cull cover:` lines in the GRAPHICS log (the hook live or inert, the first call that had the frusta with its in and out
+aspect and vFOV, and the ten-minute heartbeat: N of M calls widened). A heartbeat says the hook was live; 0 of 0 is a window with no planet in view. Exit 1 when the log has no such line.
 
 --tally periodic answers one question about one flight: which periodic work
 coincides with long frames. It reads the graphics log and the runtime log
@@ -741,6 +745,84 @@ def print_pose_tally(text):
           "acting (or is the earlier display-time answer); +40 ms or more is the lag it replaced. A caller with a real prediction, or outside the "
           "game's image, shows the true lag (before the fix Elite's was 41-44 ms and up to 4.1 degrees, r = +0.98).")
     return 0
+
+# --tally cover: the terrain cull cover (src/d3d11/terrain_cull_cover_core.h writes every line; tools\terrain_cover_test holds tools\terrain_cover_fixture.log, which this script's
+# --self-test reads, to exactly what the production hook writes; docs\terrain-culling.md). Always on in VR, no key. In the GRAPHICS log:
+#
+#   terrain cull cover: hook live at exe+0x443E800 (<how found>)        or    terrain cull cover: inert: <why>
+#   terrain cull cover: first call: in aspect A vfov V deg -> out aspect A' vfov V' deg (widened|unchanged); T=t H=h      the first call that had the frusta
+#   terrain cull cover: armed; N of M calls widened in the last 10 min (last in aspect .. vfov .. deg -> out aspect .. vfov .. deg | no call yet)      every ten minutes, zeros included
+
+COVER_LIVE_RE = re.compile(r"terrain cull cover: hook live at exe\+0x(?P<rva>[0-9A-F]+) \((?P<how>.*)\)\s*$")
+COVER_INERT_RE = re.compile(r"terrain cull cover: inert: (?P<why>.*?)\s*$")
+_COVER_INOUT = (r"in aspect (?P<ia>[0-9.]+) vfov (?P<iv>[0-9.]+) deg -> out aspect (?P<oa>[0-9.]+) vfov (?P<ov>[0-9.]+) deg")
+COVER_FIRST_RE = re.compile(r"terrain cull cover: first call: " + _COVER_INOUT + r" \((?P<what>widened|unchanged)\); T=(?P<t>[0-9.]+) H=(?P<h>[0-9.]+)\s*$")
+COVER_BEAT_RE = re.compile(r"terrain cull cover: armed; (?P<widened>\d+) of (?P<calls>\d+) calls widened in the last 10 min \((?:last " + _COVER_INOUT + r"|no call yet)\)\s*$")
+
+
+def parse_cover(text):
+    """Every `terrain cull cover:` line, in order. Returns a dict: live (rva, how) or None, inert (the reason) or None, first (a dict: in (aspect, vfov deg), out, widened, tanV,
+    tanH) or None, beats (dicts: ms (the line's wall clock or None), widened, calls, last ((in aspect, in vfov, out aspect, out vfov) or None))."""
+    out = {"live": None, "inert": None, "first": None, "beats": []}
+    for line in text.splitlines():
+        if "terrain cull cover:" not in line:
+            continue
+        m = GFX_STAMP_RE.match(line)
+        ms = ((int(m.group(1)) * 60 + int(m.group(2))) * 60 + int(m.group(3))) * 1000 + int(m.group(4)) if m else None
+        m = COVER_BEAT_RE.search(line)
+        if m:
+            out["beats"].append({"ms": ms, "widened": int(m.group("widened")), "calls": int(m.group("calls")),
+                                 "last": (float(m.group("ia")), float(m.group("iv")), float(m.group("oa")), float(m.group("ov"))) if m.group("ia") else None})
+            continue
+        m = COVER_FIRST_RE.search(line)
+        if m:
+            out["first"] = {"in": (float(m.group("ia")), float(m.group("iv"))), "out": (float(m.group("oa")), float(m.group("ov"))), "widened": m.group("what") == "widened",
+                            "tanV": float(m.group("t")), "tanH": float(m.group("h"))}
+            continue
+        m = COVER_LIVE_RE.search(line)
+        if m:
+            out["live"] = (m.group("rva"), m.group("how"))
+            continue
+        m = COVER_INERT_RE.search(line)
+        if m:
+            out["inert"] = m.group("why")
+    return out
+
+
+def print_cover_tally(parsed):
+    """The --tally cover report. Returns the process exit code: 1 when the log has no `terrain cull cover:` line."""
+    if parsed["live"] is None and parsed["inert"] is None and parsed["first"] is None and not parsed["beats"]:
+        print("[edvr] no `terrain cull cover:` lines in this log: a build without the terrain cull cover (the hook says it is live or inert at startup), or the graphics log of "
+              "another run -- this tally reads --tag gfx.")
+        return 1
+    if parsed["live"] is not None:
+        print("[edvr] terrain cull cover: hook live at exe+0x%s (%s)" % parsed["live"])
+    if parsed["inert"] is not None:
+        print("[edvr] terrain cull cover: inert: %s" % parsed["inert"])
+    if parsed["live"] is None and parsed["inert"] is None:
+        print("[edvr] no `hook live` or `inert` line in this log (a log cut at the front?).")
+    f = parsed["first"]
+    if f is not None:
+        print("[edvr] first call with the frusta known: in aspect %.4f vfov %.2f deg -> out aspect %.4f vfov %.2f deg (%s); T=%.4f H=%.4f" % (
+            f["in"][0], f["in"][1], f["out"][0], f["out"][1], "widened" if f["widened"] else "unchanged: the centred cull already covered this headset", f["tanV"], f["tanH"]))
+    elif parsed["live"] is not None:
+        print("[edvr] no first-call line: no planet terrain was culled in VR since the hook went in (or no VR frame had said the frusta).")
+    beats = parsed["beats"]
+    if beats:
+        print("%-14s %9s %9s %7s  %s" % ("clock", "widened", "calls", "share", "last call, in -> out"))
+        for b in beats:
+            clock = "n/a" if b["ms"] is None else "%02d:%02d:%02d" % (b["ms"] // 3600000 % 24, b["ms"] // 60000 % 60, b["ms"] // 1000 % 60)
+            last = "no call yet" if b["last"] is None else "aspect %.4f vfov %.2f -> aspect %.4f vfov %.2f" % (b["last"][0], b["last"][1], b["last"][2], b["last"][3])
+            print("%-14s %9d %9d %7s  %s" % (clock, b["widened"], b["calls"], ("%.0f%%" % (100.0 * b["widened"] / b["calls"])) if b["calls"] else "n/a", last))
+        widened, calls = sum(b["widened"] for b in beats), sum(b["calls"] for b in beats)
+        print("[edvr] %d heartbeat(s), %d of %d calls widened (%d min)." % (len(beats), widened, calls, 10 * len(beats)))
+    elif parsed["live"] is not None:
+        print("[edvr] no heartbeat yet: one is written every ten minutes while the hook is live, so a log shorter than that has none.")
+    print("[edvr] How to read it: a heartbeat says the hook was live. On a headset whose eye reaches further out (or down) than the centred frustum the game culls terrain against "
+          "(a Quest 3, a cropped Crystal Super) every call over a planet is widened, and the call count is about 20 a frame; 0 of 0 is a window with no planet in view (loading, a "
+          "station, supercruise); 0 of M with M above 0 is a headset the cull already covers. No heartbeat after ten minutes means the hook is not live: see the `hook live` or `inert` line.")
+    return 0
+
 
 # --camera-census: the VR camera census (advanced.vr_camera_census), one flight
 # in the VR profile with the key on. The question it answers (design doc section
@@ -9644,9 +9726,11 @@ def main(argv=None):
                     help="print only lines matching this regular expression")
     ap.add_argument("--tail", type=int, default=None,
                     help="print only the last N lines (after --grep)")
-    ap.add_argument("--tally", choices=["vh", "periodic", "pose"], default=None,
+    ap.add_argument("--tally", choices=["vh", "periodic", "pose", "cover"], default=None,
                     help="aggregate instead of dumping: pose tables the `pose gap:` "
                          "lines of the runtime log by caller; "
+                         "cover tables the `terrain cull cover:` lines of the graphics log "
+                         "(the hook, its first call, its ten-minute heartbeat); "
                          "vh counts eye-texture "
                          "DC lines per vh= hash, split by r= render-target "
                          "token, with the DC frame summaries as totals; "
@@ -9874,6 +9958,8 @@ def main(argv=None):
         return print_periodic_report(path, text, ver, want, args, native_dirs)
     if args.tally == "pose":
         return print_pose_tally(text)
+    if args.tally == "cover":
+        return print_cover_tally(parse_cover(text))
     if args.tally:
         return print_vh_tally(text, args.frame)
 
@@ -10324,6 +10410,8 @@ def self_test():
         ok = False
     if not self_test_pose():
         ok = False
+    if not self_test_cover():
+        ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))
     return 0 if ok else 1
@@ -10499,6 +10587,107 @@ def self_test_pose():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return ok
+
+COVER_FIXTURE = "terrain_cover_fixture.log"
+
+
+def self_test_cover():
+    """--tally cover on tools\\terrain_cover_fixture.log (which tools\\terrain_cover_test holds to exactly what the production hook writes for the scripted session: the hook live at
+    the known build's address, the first call that had the frusta on the cropped Crystal Super (aspect 1.0344 -> 1.2186, vFOV 91.65 unchanged), then three heartbeats: 60000 of 60001
+    calls widened, 0 of 0 (a loading screen), 0 of 60000 (a frustum the cull already covers)), then on lines altered to break each thing the report depends on. Returns ok."""
+    ok = True
+
+    def fail(message):
+        nonlocal ok
+        print("self_test_cover: %s" % message)
+        ok = False
+
+    import contextlib
+    import io
+    import shutil
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), COVER_FIXTURE)
+    if not os.path.isfile(fixture):
+        fail("the fixture %s is missing beside this script" % COVER_FIXTURE)
+        return False
+    text = read_text(fixture)
+    p = parse_cover(text)
+    if p["live"] != ("443E800", "PE stamp 1788384820 and image size 104894464 are build 332841's; the callee's head and the call site at exe+0x4455FDD verified") or p["inert"] is not None:
+        fail("the hook-live line parsed to %r (inert %r)" % (p["live"], p["inert"]))
+    if p["first"] != {"in": (1.0344, 91.65), "out": (1.2186, 91.65), "widened": True, "tanV": 1.0293, "tanH": 1.2543}:
+        fail("the first-call line parsed to %r" % (p["first"],))
+    b = p["beats"]
+    if [(x["ms"], x["widened"], x["calls"]) for x in b] != [(36603000, 60000, 60001), (37203000, 0, 0), (37803000, 0, 60000)] \
+            or b[0]["last"] != (1.0344, 91.65, 1.2186, 91.65) or b[2]["last"] != (1.0344, 91.65, 1.0344, 91.65):
+        fail("the heartbeats parsed to %r" % (b,))
+    # No call yet; a first call the cull already covered; a line with no clock.
+    q = parse_cover("[10:10:03.000] terrain cull cover: armed; 0 of 0 calls widened in the last 10 min (no call yet)\n"
+                    "[10:10:04.000] terrain cull cover: first call: in aspect 1.0344 vfov 91.65 deg -> out aspect 1.0344 vfov 91.65 deg (unchanged); T=0.9000 H=0.9000\n"
+                    "terrain cull cover: armed; 1 of 2 calls widened in the last 10 min (last in aspect 1.0000 vfov 90.00 deg -> out aspect 1.1000 vfov 90.00 deg)\n")
+    if len(q["beats"]) != 2 or q["beats"][0]["last"] is not None or q["beats"][1]["ms"] is not None or q["beats"][1]["widened"] != 1 or q["first"] is None or q["first"]["widened"]:
+        fail("a no-call heartbeat, an unchanged first call or a clockless heartbeat parsed to %r" % (q,))
+    if parse_cover("[00:00:00.001] vertex resync: armed; 0 stale vertex-buffer bindings repaired in the last 10 min (5 flushes seen)\n") != {"live": None, "inert": None, "first": None, "beats": []}:
+        fail("a line of another instrument parsed as a cover line")
+    inert = parse_cover("[10:00:00.100] terrain cull cover: inert: the flat profile has no stereo frustum to cover; nothing was patched\n")
+    if inert["inert"] != "the flat profile has no stereo frustum to cover; nothing was patched" or inert["live"] is not None:
+        fail("the inert line parsed to %r" % (inert,))
+    # Through main(), on a directory the tool discovers on its own: the graphics log is the default.
+    head = "[00:00:00.001] version 0.19.0-1-gabcdef0 (build 68C0A1F2) -- this DLL was linked 2026-10-10 12:00:00 UTC\n"
+    tmp = tempfile.mkdtemp(prefix="edvr_cover_selftest_")
+    try:
+        logs = os.path.join(tmp, "edvr_logs")
+        os.makedirs(logs)
+
+        def run(argv):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(argv)
+            return rc, buf.getvalue()
+
+        name = os.path.join(logs, "edvr_gfx_20261010_100000.log")
+        with open(name, "wb") as f:
+            f.write((head + text).encode("utf-8"))
+        rc, out = run(["--dir", logs, "--tally", "cover"])
+        for want in ("[edvr] terrain cull cover: hook live at exe+0x443E800 (PE stamp 1788384820 and image size 104894464 are build 332841's; the callee's head and the call site at exe+0x4455FDD verified)",
+                     "[edvr] first call with the frusta known: in aspect 1.0344 vfov 91.65 deg -> out aspect 1.2186 vfov 91.65 deg (widened); T=1.0293 H=1.2543",
+                     "clock            widened     calls   share  last call, in -> out",
+                     "10:10:03           60000     60001    100%  aspect 1.0344 vfov 91.65 -> aspect 1.2186 vfov 91.65",
+                     "10:20:03               0         0     n/a  aspect 1.0344 vfov 91.65 -> aspect 1.2186 vfov 91.65",
+                     "10:30:03               0     60000      0%  aspect 1.0344 vfov 91.65 -> aspect 1.0344 vfov 91.65",
+                     "[edvr] 3 heartbeat(s), 60000 of 120001 calls widened (30 min).",
+                     "[edvr] How to read it: a heartbeat says the hook was live."):
+            if want not in out:
+                fail("--tally cover output lacks %r:\n%s" % (want, out))
+        if rc != 0:
+            fail("--tally cover exited %d" % rc)
+        # Live, no heartbeat yet, no first call: said.
+        with open(name, "wb") as f:
+            f.write((head + text.splitlines()[0] + "\n").encode("utf-8"))
+        rc, out = run(["--dir", logs, "--tally", "cover"])
+        if rc != 0 or "no first-call line: no planet terrain was culled in VR since the hook went in" not in out or "no heartbeat yet: one is written every ten minutes" not in out:
+            fail("a log with the hook live and nothing else -> rc %d:\n%s" % (rc, out))
+        # Inert: the reason is the report.
+        with open(name, "wb") as f:
+            f.write((head + "[10:00:00.100] terrain cull cover: inert: the PE stamp 5 is not build 332841's and the signature scan of the 99 KB code section found no call site\n").encode("utf-8"))
+        rc, out = run(["--dir", logs, "--tally", "cover"])
+        if rc != 0 or "[edvr] terrain cull cover: inert: the PE stamp 5 is not build 332841's and the signature scan of the 99 KB code section found no call site" not in out \
+                or "no heartbeat yet" in out:
+            fail("an inert log -> rc %d:\n%s" % (rc, out))
+        # A covered first call is said so.
+        with open(name, "wb") as f:
+            f.write((head + text.splitlines()[0] + "\n[10:00:04.000] terrain cull cover: first call: in aspect 1.0344 vfov 91.65 deg -> out aspect 1.0344 vfov 91.65 deg (unchanged); T=0.9000 H=0.9000\n").encode("utf-8"))
+        rc, out = run(["--dir", logs, "--tally", "cover"])
+        if rc != 0 or "(unchanged: the centred cull already covered this headset)" not in out:
+            fail("an unchanged first call -> rc %d:\n%s" % (rc, out))
+        # No cover line at all: exit 1.
+        with open(name, "wb") as f:
+            f.write((head + "[10:00:00.100] pose gap: tid 1 calls 1\n").encode("utf-8"))
+        rc, out = run(["--dir", logs, "--tally", "cover"])
+        if rc != 1 or "no `terrain cull cover:` lines in this log" not in out:
+            fail("a log with no cover line -> rc %d:\n%s" % (rc, out))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
 
 def self_test_flat_upscale():
     """--flat-upscale on the checked-in synthetic flight (tools\\flat_upscale_fixture.log, which tools\\flat_temporal_test holds to exactly what the DLL's
