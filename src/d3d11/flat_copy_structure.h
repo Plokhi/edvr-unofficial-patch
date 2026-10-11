@@ -10,13 +10,16 @@
 //
 // WHAT IT ADMITS. At the final copy (the exact copy pair into the output, unchanged: the reducer's own checks) a frame is
 // admitted when the copy's source S is
-//   - an R8G8B8A8 image rendered this frame by one full-viewport pass with no depth, and not written outside a draw after it
-//     (no Clear, Copy, Update or Map: the prefix model marks such a target bad),
+//   - an LDR image rendered this frame by one full-viewport pass with no depth, and not written outside a draw after it
+//     (no Clear, Copy, Update or Map: the prefix model marks such a target bad): the game's R8G8B8A8 target (27),
+//     or the R16G16B16A16_FLOAT one EDHDR's FP16 presentation leaves behind (typeless 9 or typed 10 -- the resolve
+//     pins the view, so the typeless form is admitted the way the game's own typeless target is),
 //   - the scene's own size R (the size of the R11G11B10F target the scene was drawn into), a uniform scale of the output
 //     D between half and twice, for a mode that has a route at that size (EDVR's `dlaa` has none below the output),
 //   - written after the first pass that read the scene HDR (the HDR detector's trigger, seen this frame), with every
 //     draw into H before it,
-//   - with no other R-sized R8G8B8A8 image written between that first consumer and S,
+//   - with no other R-sized R8G8B8A8 image written between that first consumer and S (the counted family; Elite's
+//     FP16 working passes are invisible to the rule, below),
 // and the rest is the HDR selector's (H's camera, depth and the supported sources, one camera hash, in order). Nothing
 // is said about the passes that make S from H, whatever their shaders (bloom, depth of field, any tone variant, a mod's
 // grade): DLSS, FSR or TAA resolve S at the copy, exactly as they do for a known tone pass, and the game's own copy
@@ -26,7 +29,7 @@
 // THE RISK, AND WHAT IS DONE ABOUT IT. A game anti-aliasing filter between the tone pass and the copy would make S from
 // an image the game has already filtered: FXAA gives a softer double AA, and the game's own temporal AA jitters the
 // camera itself, which fights EDVR's phase. Neither can be told from the structure, but the filter leaves a mark the
-// tone pass does not: it writes an R-sized R8G8B8A8 target (the tone pass's own) and then S. So a frame with one or
+// tone pass does not: it writes an R-sized LDR target (the tone pass's own) and then S. So a frame with one or
 // more such targets between the scene's first consumer and S is declined, refused exactly as it was before this
 // existed, and the F8 panel's Anti-aliasing advice names it. The corpus has 42 frames with a known tone pass (stock and
 // EDHM tone pairs, menu, flight and on foot, R from half of D to 1.5 D) and 3 with Bloom 3 and DoF 2 and an unknown
@@ -116,8 +119,10 @@ inline FlatWeaponRoute flatWeaponRoute(bool keyAuto, bool routeLatched, FlatMono
                                        uint32_t renderW, uint32_t renderH, uint32_t outputW, uint32_t outputH) {
     if (keyAuto && !routeLatched && flatHdrRouteEvaluatesAtRender(mode, renderW, renderH, outputW, outputH))
         return FlatWeaponRoute::Hdr;
-    return mode == FlatMonoResolveMode::Dlss || mode == FlatMonoResolveMode::Fsr ? FlatWeaponRoute::Copy
-                                                                                : FlatWeaponRoute::Unchanged;
+    // MetalFX shares the trained-upscaler route and needs the same upstream foreground contract.
+    return mode == FlatMonoResolveMode::Dlss || mode == FlatMonoResolveMode::Fsr ||
+           mode == FlatMonoResolveMode::Mfx || mode == FlatMonoResolveMode::Mfx4 ? FlatWeaponRoute::Copy
+                                            : FlatWeaponRoute::Unchanged;
 }
 
 // ---- the admission --------------------------------------------------------------------------------------------
@@ -158,13 +163,32 @@ struct FlatCopyDiag {
     uint64_t srcVs = 0, srcPs = 0;
     uint32_t sceneWidth = 0, sceneHeight = 0, outputWidth = 0, outputHeight = 0;
     uint64_t triggerVs = 0, triggerPs = 0;
-    // R-sized R8G8B8A8 targets written after the first consumer of H and before S (0 where S is the first LDR pass),
+    // R-sized LDR targets written after the first consumer of H and before S (0 where S is the first LDR pass),
     // and the draws into them: how long the chain between the scene and the copy was.
     uint32_t ldrTargetsBefore = 0, ldrDrawsBefore = 0;
     bool menu = false;                   // the frame came through the verified menu HDR copy
 };
 
 namespace flat_copy_detail {
+// The copy source's image family (k.format is the texture's own DXGI format,
+// binding_shadow.h): the game's typeless LDR target (27, viewed as UNORM or
+// sRGB), or the FP16 image EDHDR's R16G16B16A16_FLOAT presentation leaves
+// behind -- typeless (9) the way the game's own target is typeless, or typed
+// (10) the way its swapchain is. The resolve pins the bound view, so the
+// typeless forms are admitted exactly as the game's own typeless target is.
+// Anything else is not a tone-mapped image EDVR knows how to resolve, and the
+// refusal keeps the gate's long-standing name (the declined line carries the
+// measured fmt beside it).
+inline bool copySourceFormatOk(uint32_t format) {
+    return format == 27 || format == 9 || format == 10;
+}
+// The admitted source's format in words, for the first-admission line
+// (edvr_log.py reads the word back). Only admitted families reach one.
+inline const char* copySourceFormatName(uint32_t format) {
+    if (format == 27) return "R8G8B8A8";
+    if (format == 9 || format == 10) return "R16G16B16A16_FLOAT";
+    return "unknown-format";
+}
 // The copy draw's own checks, which flatSelectMonoFrame makes only after the reducer has found a tone pass.
 inline bool plainCopy(const FlatRuntimePrefix& p, const FlatContractObservation& k, const FlatContractRecord& copy) {
     using namespace flat_mono_detail;
@@ -237,7 +261,7 @@ inline FlatMonoFrame flatCopyAdmit(FlatRuntimePrefix& p, const FlatHdrFrame& f, 
     g.srcWidth = sk.width; g.srcHeight = sk.height; g.srcFormat = sk.format; g.srcDraws = src->writes.draws;
     g.srcVs = sk.vs; g.srcPs = sk.ps;
     if (!oneDraw(src->writes)) return decline("the-copy-source-is-not-written-by-one-pass");
-    if (sk.format != 27) return decline("the-copy-source-is-not-r8g8b8a8");
+    if (!flat_copy_detail::copySourceFormatOk(sk.format)) return decline("the-copy-source-is-not-r8g8b8a8");
     // An explicit write into S after its pass (a Clear, a Copy, an Update or a Map: the prefix model marks the target bad) is what
     // the whitelist's tone count refuses (flatRuntimeWritten zeroes it); the unknown tone pass has no count to lose, so it is
     // said here. For an R8G8B8A8 target the mark means nothing else (the model's other conflicts are for HDR and image-source
@@ -258,6 +282,10 @@ inline FlatMonoFrame flatCopyAdmit(FlatRuntimePrefix& p, const FlatHdrFrame& f, 
     // game has already filtered (FXAA: softer, double AA) or, for the game's temporal AA, whose camera jitter fights
     // EDVR's; neither can be told from the structure, so a frame with one stays refused exactly as it was, and the
     // Anti-aliasing advice stays (the F8 panel names it). The count rides the decline, so a flight can read the chain.
+    // Only the SDR family is counted: Elite's own HDR working passes (bloom, depth of field) are R-sized FP16-typeless
+    // targets too -- the corpus holds such frames, admitted -- and no structural mark tells a working pass from a
+    // filter in that family. An FP16 game filter under an FP16 presentation is therefore invisible to this rule
+    // (a quality caveat, not a refusal: the frame still resolves); catching it waits for a flight that shows one.
     for (uint32_t i = 0; i < p.targetsUsed; ++i) {
         const auto& t = p.targets[i];
         if (t.resource == k.srvResource[0] || !t.writes.draws || t.writes.key.format != 27 ||
@@ -308,6 +336,7 @@ struct FlatCopyWindow {
     uint64_t admitted = 0, declined = 0, selectorRefused = 0, noScene = 0, renderSize = 0, routeServes = 0, disabled = 0;
     const char* last = "none";      // the last outcome's name
     uint32_t lastSceneW = 0, lastSceneH = 0, lastOutW = 0, lastOutH = 0, lastSrcW = 0, lastSrcH = 0;
+    uint32_t lastSrcFormat = 0;       // the last copy source's own DXGI format (27 SDR, 9/10 EDHDR FP16): which family's frames these were
     uint64_t lastSrcVs = 0, lastSrcPs = 0;
     uint32_t ldrBeforeMax = 0;      // the longest chain of R-sized image passes between the scene and the copy seen this window
     static constexpr uint32_t kWhys = 6;
@@ -339,7 +368,7 @@ struct FlatCopyWindow {
         if (g.ldrTargetsBefore > ldrBeforeMax) ldrBeforeMax = g.ldrTargetsBefore;
         if (g.sceneWidth) { lastSceneW = g.sceneWidth; lastSceneH = g.sceneHeight; }
         lastOutW = g.outputWidth; lastOutH = g.outputHeight;
-        if (g.srcWidth) { lastSrcW = g.srcWidth; lastSrcH = g.srcHeight; lastSrcVs = g.srcVs; lastSrcPs = g.srcPs; }
+        if (g.srcWidth) { lastSrcW = g.srcWidth; lastSrcH = g.srcHeight; lastSrcVs = g.srcVs; lastSrcPs = g.srcPs; lastSrcFormat = g.srcFormat; }
     }
     void reset() { *this = FlatCopyWindow{}; }
 };
@@ -347,13 +376,13 @@ inline int flatCopyFormatWindow(char* out, size_t size, bool structureOn, const 
     int n = std::snprintf(out, size,
         "flat copy structure 5s: key=%s copies=%llu whitelist=%llu admitted=%llu declined=%llu selector-refused=%llu "
         "no-scene=%llu render-size=%llu route-serves=%llu key-off=%llu last=%s scene=%ux%u output=%ux%u "
-        "source=%ux%u VS=%016llX PS=%016llX ldr-passes-before-max=%u declines=",
+        "source=%ux%u source-fmt=%u VS=%016llX PS=%016llX ldr-passes-before-max=%u declines=",
         structureOn ? "auto" : "off", static_cast<unsigned long long>(w.copies),
         static_cast<unsigned long long>(w.whitelist), static_cast<unsigned long long>(w.admitted),
         static_cast<unsigned long long>(w.declined), static_cast<unsigned long long>(w.selectorRefused),
         static_cast<unsigned long long>(w.noScene), static_cast<unsigned long long>(w.renderSize),
         static_cast<unsigned long long>(w.routeServes), static_cast<unsigned long long>(w.disabled), w.last,
-        w.lastSceneW, w.lastSceneH, w.lastOutW, w.lastOutH, w.lastSrcW, w.lastSrcH,
+        w.lastSceneW, w.lastSceneH, w.lastOutW, w.lastOutH, w.lastSrcW, w.lastSrcH, w.lastSrcFormat,
         static_cast<unsigned long long>(w.lastSrcVs), static_cast<unsigned long long>(w.lastSrcPs), w.ldrBeforeMax);
     const auto appendText = [&](const char* text) {
         if (n < 0 || static_cast<size_t>(n) >= size) return;
@@ -382,11 +411,12 @@ inline int flatCopyFormatWindow(char* out, size_t size, bool structureOn, const 
 inline int flatCopyFormatFirstAdmission(char* out, size_t size, uint64_t frame, const FlatCopyDiag& g, const char* routeName) {
     return std::snprintf(out, size,
         "flat copy structure: first admission at frame=%llu (the HDR route is on): the game's final "
-        "copy reads a %ux%u R8G8B8A8 image written by one pass, VS=%016llX PS=%016llX, after the scene HDR's first consumer "
+        "copy reads a %ux%u %s image written by one pass, VS=%016llX PS=%016llX, after the scene HDR's first consumer "
         "(VS=%016llX PS=%016llX), with no other R-sized image pass in between; no whitelisted tone pass wrote it (the "
         "whitelist said %s); the scene is %ux%u on a %ux%u output%s, route=%s; admitted by structure, so bloom, depth of "
         "field and the tone variant do not matter",
-        static_cast<unsigned long long>(frame), g.srcWidth, g.srcHeight, static_cast<unsigned long long>(g.srcVs),
+        static_cast<unsigned long long>(frame), g.srcWidth, g.srcHeight, flat_copy_detail::copySourceFormatName(g.srcFormat),
+        static_cast<unsigned long long>(g.srcVs),
         static_cast<unsigned long long>(g.srcPs), static_cast<unsigned long long>(g.triggerVs),
         static_cast<unsigned long long>(g.triggerPs), flatMonoReasonName(g.whitelist),
         g.sceneWidth, g.sceneHeight, g.outputWidth, g.outputHeight, g.menu ? " (the 3D menu)" : "",

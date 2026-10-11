@@ -4759,7 +4759,7 @@ FLATU_TRIGGER_RE = re.compile(FLATU_TS + r"flat hdr route: first trigger at fram
 FLATU_WINDOW_RE = re.compile(FLATU_TS + r"flat copy structure 5s: (?P<rest>.*)$")
 FLATU_FIRST_RE = re.compile(
     FLATU_TS + r"flat copy structure: first admission at frame=(?P<frame>\d+) \((?:experimental\.temporal_aa_before_post=auto|the HDR route is on)\): the game's final copy reads a "
-    r"(?P<w>\d+)x(?P<h>\d+) R8G8B8A8 image written by one pass, VS=(?P<vs>[0-9A-F]+) PS=(?P<ps>[0-9A-F]+), after the scene HDR's first consumer "
+    r"(?P<w>\d+)x(?P<h>\d+) (?P<fmt>R8G8B8A8|R16G16B16A16_FLOAT) image written by one pass, VS=(?P<vs>[0-9A-F]+) PS=(?P<ps>[0-9A-F]+), after the scene HDR's first consumer "
     r"\(VS=(?P<tvs>[0-9A-F]+) PS=(?P<tps>[0-9A-F]+)\), .*?\(the whitelist said (?P<wl>[\w-]+)\); the scene is (?P<sw>\d+)x(?P<sh>\d+) on a "
     r"(?P<ow>\d+)x(?P<oh>\d+) output(?P<menu> \(the 3D menu\))?, route=(?P<route>[\w-]+);")
 FLATU_DECLINED_RE = re.compile(
@@ -4805,6 +4805,7 @@ def parse_flat_upscale(text):
             if m:
                 if f["first"] is None:
                     f["first"] = {"ts": m.group("ts") or "", "frame": int(m.group("frame")), "src": (int(m.group("w")), int(m.group("h"))),
+                                  "format": m.group("fmt"),
                                   "scene": (int(m.group("sw")), int(m.group("sh"))), "output": (int(m.group("ow")), int(m.group("oh"))),
                                   "whitelist": m.group("wl"), "route": m.group("route"), "menu": bool(m.group("menu")), "index": index}
                 continue
@@ -5036,8 +5037,8 @@ def print_flat_upscale(text):
         print("route %s: %s R=%dx%d E=%dx%d D=%dx%d" % (r["ts"] or "?", r["name"], r["r"][0], r["r"][1], r["e"][0], r["e"][1], r["d"][0], r["d"][1]))
     if f["first"]:
         fi = f["first"]
-        print("first admission %s at frame %d: a %dx%d image, scene %dx%d on a %dx%d output, route %s%s; the whitelist said %s"
-              % (fi["ts"] or "?", fi["frame"], fi["src"][0], fi["src"][1], fi["scene"][0], fi["scene"][1], fi["output"][0], fi["output"][1], fi["route"],
+        print("first admission %s at frame %d: a %dx%d %s image, scene %dx%d on a %dx%d output, route %s%s; the whitelist said %s"
+              % (fi["ts"] or "?", fi["frame"], fi["src"][0], fi["src"][1], fi["format"], fi["scene"][0], fi["scene"][1], fi["output"][0], fi["output"][1], fi["route"],
                  " (the 3D menu)" if fi["menu"] else "", fi["whitelist"]))
     for d in f["declines"]:
         print("declined %s: %s (the whitelist said %s; a %dx%d image, %d R-sized pass(es) between)" % (d["ts"] or "?", d["why"], d["wl"], d["src"][0], d["src"][1], d["passes"]))
@@ -10760,8 +10761,8 @@ def self_test_flat_upscale():
             f["routes"][0]["r"] != (2880, 1620) or f["routes"][0]["d"] != (3840, 2160) or f["routes"][0]["name"] != "trained-upscale" or len(f["runtime"]) != 5:
         fail("the fixture's key, windows, route and runtime lines parsed as %r" % ({k: (v if k in ("keys", "routes") else len(v) if isinstance(v, list) else v) for k, v in f.items()},))
     fi = f["first"]
-    if not fi or (fi["frame"], fi["src"], fi["scene"], fi["output"], fi["whitelist"], fi["route"], fi["menu"]) != \
-            (1919, (2880, 1620), (2880, 1620), (3840, 2160), "no-known-tone-pass", "trained-upscale", False):
+    if not fi or (fi["frame"], fi["src"], fi["format"], fi["scene"], fi["output"], fi["whitelist"], fi["route"], fi["menu"]) != \
+            (1919, (2880, 1620), "R8G8B8A8", (2880, 1620), (3840, 2160), "no-known-tone-pass", "trained-upscale", False):
         fail("the first admission parsed as %r" % (fi,))
     stand = [(s["what"], s["reason"]) for s in f["stand"]]
     if stand != [("entered", "no-3d-scene"), ("resumed", None)] or f["warns"] or f["refusals"] != {"no-3d-scene": 1482} or f["old_advice"]:
@@ -10783,7 +10784,7 @@ def self_test_flat_upscale():
             "[edvr] flat upscale: 1 key line(s), 5 copy-structure window(s), 1 route line(s), 2 stand-down line(s), 0 warning line(s), 0 decline line(s)",
             "key 15:12:02.151: flat hdr route auto (read at startup)",
             "route 15:12:18.913: trained-upscale R=2880x1620 E=3840x2160 D=3840x2160",
-            "first admission 15:12:18.914 at frame 1919: a 2880x1620 image, scene 2880x1620 on a 3840x2160 output, route trained-upscale; the whitelist said no-known-tone-pass",
+            "first admission 15:12:18.914 at frame 1919: a 2880x1620 R8G8B8A8 image, scene 2880x1620 on a 3840x2160 output, route trained-upscale; the whitelist said no-known-tone-pass",
             "window 15:12:21.149: key=auto copies 331 (whitelist 0, admitted 331, declined 0, selector-refused 0, no-3d-scene 0, render-size 0, route-serves 0, key-off 0); last admitted; "
             "scene 2880x1620 output 3840x2160 source 2880x1620; longest chain 0",
             "stand-down 15:12:08.368: entered for no-3d-scene",
