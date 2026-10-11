@@ -2,8 +2,8 @@
 
 ## Status
 
-- State: open. Latest run completes generation, then exits silently before the
-  menu; the user saw no error dialog.
+- State: open. First main-menu reach occurred with Proton Experimental, private
+  Mesa and WineDbg attached. A normal launch without debugger is pending.
 - Device: ONEXPLAYER 3, Intel Arc B390 PTL 8086:b080, xe driver, CachyOS,
   kernel 7.2.9-1-cachyos-deckify, Mesa 26.2.4-arch3.1.
 - Game: Steam 359320, installed build 25433925, Proton Experimental
@@ -30,26 +30,19 @@
   for over 73 seconds, while the other workers wait. The watchdog captures
   vkCreateComputePipelines. This supports prolonged CPU-side Intel pipeline
   compilation or processing, rather than a GPU or mutex wait at that moment.
-- Latest comparison: Mesa 26.3.0-devel (git-37bf953a58), selected in Proton
-  Experimental. Shader CPU work is finite and falls flat by about 90 seconds;
-  native stacks show jay_schedule, jay_compile_simd and anv_shader_compile.
-  WatchDog records target exit code 0, with no new dump or device loss. The
-  warmed cache has 224 shaders / 5.3 MB versus an earlier 128 shaders / 3.0 MB
-  cache; this does not prove Mesa alone removed the original stall.
+- Latest run: game PID 55534 maps private Mesa, with no system ICD. Startup
+  DXVK cache has 544 shaders / 11.1 MB versus 224 / 5.3 MB previously. No exit
+  breakpoint fired. Driver, cache warmth and debugger effects remain coupled.
 - Open hypotheses: expensive Intel shader register allocation exceeding the
   game's watchdog; a compiler defect producing excessive allocation work.
   Binary/source matching identifies setup_live_interference's overlap scan.
-- Open question: what initiates the pre-menu exit. A WineDbg exit observer is
-  armed for the next launch; debugger timing may differ, so success needs an
-  unobserved confirmation. No driver switch is planned.
-- Temporary settings: Elite-only Proton user_settings.py enables PROTON_LOG,
-  PROTON_LOG_DIR, DXVK_LOG_LEVEL and DXVK_LOG_PATH. Experimental's ineffective
-  VK_DRIVER_FILES request was removed and logging-only settings restored.
-  Remove both owned temporary settings files after the investigation. No EDVR
-  INI changes.
-- Temporary Steam option, confirmed by the user: /usr/bin/python3
-  /tmp/elite_mesa_main_launch.py %command%. Clear it after the comparison; it
-  references a private build under /tmp.
+- Open question: what caused the earlier pre-menu exit. Repeat with the
+  persistent Mesa install and no debugger before drawing a causal conclusion.
+- Temporary Proton settings were removed after exact-SHA checks; no settings
+  files were present initially. No EDVR INI changes.
+- Temporary Steam option: /usr/bin/python3 /tmp/elite_mesa_main_launch.py
+  %command%. User was asked to close the old launcher and replace it with the
+  permanent wrapper before the next launch.
 - Evidence directory: /home/deck/.cache/elite-startup-diagnostics/2026-10-11.
 
 ## October 11 evidence
@@ -239,21 +232,25 @@ seconds, 0.312 seconds later. With no earlier failure identified, HTTP 419 is
 ruled out as the initiating event. Launcher ProjectFinished occurs after
 shutdown and is logged after the fact.
 
-## WineDbg exit capture prepared
+## First menu reach and normal-launch check
 
-WineDbg validated ExitProcess, RtlExitUserProcess and NtTerminateProcess
-breakpoints through wineserver on disposable 64-bit cmd. It captured caller
-cmd+0x217b2 and exit code 7, then detached after five seconds while the target
-lived. The helper's dry-run writes nothing and passes first-chance exceptions
-through. GDB attach hit Yama ptrace_scope=1; eu-stack still captured stacks.
+The user reached the main menu for the first time with the private Mesa ICD and
+WineDbg attached. Game PID 55534 maps the private library, not the system ICD;
+DXVK's startup cache had 544 shaders / 11.1 MB, versus 224 / 5.3 MB previously.
+No exit breakpoint fired, so this does not isolate driver, cache warmth or
+debugger timing. WineDbg's three exit breakpoints passed a disposable 64-bit
+cmd test (exit 7); a five-second timeout detached while the target lived. GDB
+attach hit Yama, though eu-stack still captured native stacks.
 
-The real prefix resolves EDLaunch.exe. Reopened launcher PID 53315 maps the
-private Mesa library. The WineDbg observer is armed at
-/tmp/edvr-elite-exit-trace-20261011.jsonl; the user's Steam wrapper logs to
-mesa-main-exit-trace-37bf953a, with originals archived under
-/tmp/edvr-elite-verified-run-20261011-0722. The user was asked to Play.
-Debugger timing can change behavior; a successful run needs confirmation
-without it.
+Observer PID 53611 was safely detached by SIGINT (trace ends `detached`);
+WineDbg PID 55559 exited while game PID 55534 remained alive. The permanent
+Mesa build is installed at /home/deck/.local/share/elite-mesa-37bf953a58 with
+the verified SHA and no /tmp dependency; native and Runtime 4 Vulkan checks
+report Mesa 26.3.0-devel (git-37bf953a58). Its launcher is
+/home/deck/.local/share/elite-mesa-37bf953a58/launch.py. The user was asked to
+close the old launcher and retry with this wrapper, Proton Experimental and no
+debugger. This is a working combination, not an identified fix; EDVR is not
+involved. Normal startup remains unverified.
 
 ## Sources
 
