@@ -24,22 +24,23 @@
   sets the driver variables and Proton keeps existing environment values.
 - Ruled out: the private Mesa main build alone provides a usable menu, because
   verified game PID 44975 loaded it, finished generation, then exited pre-menu.
+- Ruled out: HTTP 419 initiated the pre-menu exit, because it follows
+  Shutdown_Deactivate by 0.312 seconds and no earlier failure is identified.
 - Evidence: one shader worker uses a full CPU core inside libvulkan_intel.so
   for over 73 seconds, while the other workers wait. The watchdog captures
   vkCreateComputePipelines. This supports prolonged CPU-side Intel pipeline
   compilation or processing, rather than a GPU or mutex wait at that moment.
 - Latest comparison: Mesa 26.3.0-devel (git-37bf953a58), selected in Proton
-  Experimental. Shader CPU work is finite and flat for about 90 seconds; native
-  stacks show jay_schedule, jay_compile_simd and anv_shader_compile. WatchDog
-  records target exit code 0, with no new dump or device loss. The warmed cache
-  has 224 shaders / 5.3 MB versus an earlier 1,283 MB cache; this does not
-  prove Mesa alone removed the original stall.
+  Experimental. Shader CPU work is finite and falls flat by about 90 seconds;
+  native stacks show jay_schedule, jay_compile_simd and anv_shader_compile.
+  WatchDog records target exit code 0, with no new dump or device loss. The
+  warmed cache has 224 shaders / 5.3 MB versus an earlier 128 shaders / 3.0 MB
+  cache; this does not prove Mesa alone removed the original stall.
 - Open hypotheses: expensive Intel shader register allocation exceeding the
   game's watchdog; a compiler defect producing excessive allocation work.
   Binary/source matching identifies setup_live_interference's overlap scan.
-- Open question: what initiates the pre-menu exit after generation completes.
-  Read sanitized logs for the trigger; HTTP 419 is under examination and is not
-  established as causal.
+- Open question: what initiates the pre-menu exit after generation completes. A
+  native exit-breakpoint trace is being prepared. No driver switch is planned.
 - Temporary settings: Elite-only Proton user_settings.py enables PROTON_LOG,
   PROTON_LOG_DIR, DXVK_LOG_LEVEL and DXVK_LOG_PATH. Experimental's ineffective
   VK_DRIVER_FILES request was removed and logging-only settings restored.
@@ -220,20 +221,23 @@ Proton Experimental used DXVK v3.1.1-47-g685301564ea3486. DXVK reports driver
 26.2.99, while Vulkan driverInfo identifies Mesa 26.3.0-devel (git-37bf953a58).
 Generation completed, then the game automatically exited before the menu.
 
-One shader worker's CPU activity was finite and nearly flat for about 90
-seconds. Native stacks sampled jay_schedule, jay_compile_simd and
-anv_shader_compile. WatchDog reported the target exited with code 0; there was
-no new crash dump or device loss. The cache contained 224 shaders (5.3 MB),
-compared with an earlier cache of 1,283 MB. This result does not show that Mesa
-alone removed the original stall; the original system-driver compiler
-hypothesis remains supported for that earlier run. The cause of the latest
-pre-menu exit is unresolved.
+One shader worker's CPU activity tapered off and was idle by about 90 seconds.
+Native stacks sampled jay_schedule, jay_compile_simd and anv_shader_compile.
+WatchDog reported the target exited with code 0; there was no new crash dump or
+device loss. The cache contained 224 shaders (5.3 MB), compared with an earlier
+cache of 128 shaders (3.0 MB). This result does not show that Mesa alone
+removed the original stall; the original system-driver compiler hypothesis
+remains supported for that earlier run. The cause of the latest pre-menu exit
+is unresolved.
 
 Passive SPIR-V capture recorded compute shader
 `cs.40d340de45f947098a595336f8e1520a` as a candidate, but no pipeline link to
-the observed work is established. No Float64 use was found. The sanitized game
-and HTTP logs are being checked for the exit trigger; HTTP 419 is not yet
-causal evidence.
+the observed work is established. No Float64 use was found. NetLog records
+Shutdown_Deactivate at monotonic 115.086 seconds and HTTP 419 at 115.398
+seconds, 0.312 seconds later. With no earlier failure identified, HTTP 419 is
+ruled out as the initiating event. Launcher ProjectFinished occurs after
+shutdown and is logged after the fact. A native exit-breakpoint trace is being
+prepared; no driver switch is planned.
 
 ## Sources
 
