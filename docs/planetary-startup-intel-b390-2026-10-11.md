@@ -13,16 +13,19 @@
   because the fresh October 11 game log reports Intel Mesa 26.2.4 and crashes.
 - Ruled out: EDVR is required to reproduce, because the game has no local
   d3d11.dll or EDVR logs and both startup dumps contain Wine's graphics DLLs.
+- Ruled out: OpenGL as a startup workaround, because WineD3D rejects a required
+  CreateTexture3D with E_INVALIDARG and Elite deliberately crashes before the
+  generation stall. This does not test the Vulkan hypothesis.
 - Open hypotheses: a Vulkan compute compilation stall; a problem common to the
   game and Wine startup; a compiler issue common to both Mesa renderers.
-- Next startup: the Elite-only OpenGL comparison is prepared. Compare it with
-  the captured Vulkan run; logs go into the opengl-comparison subdirectory.
-  Reaching the menu narrows the problem to behavior that changes with the
-  renderer; the same failure needs further evidence and proves no CPU cause.
+- Next startup: the user proposed Proton Experimental. Test it with Vulkan,
+  Elite-only logging and native stacks at 15 and 45 seconds. Native stack
+  access succeeded on the idle launcher. Logs go into proton-experimental;
+  compare the loaded DXVK version and generation outcome with Proton 11.
 - Temporary settings: Elite-only Proton user_settings.py enables PROTON_LOG,
-  PROTON_LOG_DIR, DXVK_LOG_LEVEL and DXVK_LOG_PATH. The OpenGL comparison adds
-  PROTON_USE_WINED3D=1. Restore the logging-only settings after the comparison;
-  remove the temporary file after the investigation. No EDVR INI changes.
+  PROTON_LOG_DIR, DXVK_LOG_LEVEL and DXVK_LOG_PATH. PROTON_USE_WINED3D was
+  removed after the failed comparison. Remove the temporary settings file after
+  the investigation. No EDVR INI changes.
 - Evidence directory: /home/deck/.cache/elite-startup-diagnostics/2026-10-11.
 
 ## October 11 evidence
@@ -47,6 +50,20 @@ vkCreateComputePipelines, with DXVK return offsets +0x17cecc, +0x144fa2 and
 This supports investigating a compilation stall, but does not identify an
 offending shader or a Mesa fault. A native worker stack during the stall would
 distinguish compiler work from a Vulkan or synchronization wait.
+
+## OpenGL comparison
+
+The OpenGL run fails about six seconds after launch, before the original stall.
+Its game-authored dump contains an exception stream: thread 0x328, c0000005,
+null write, game+0x34c9322. Disassembly shows an intentional null write trap.
+The F3D crash log records CreateTexture3D returning 0x80070057 (E_INVALIDARG),
+from f3dResource_DX11.cpp(456), with device remove reason S_OK. WineD3D's
+depth-slice warning precedes the failure, but its causal role is unproven. The
+ID3D12 warning prefix is generic; the call is DX11.
+
+This comparison does not distinguish the original causes. Its logs and
+restoration copy are preserved in opengl-comparison. Vulkan was restored before
+another test was requested.
 
 ## Sources
 
