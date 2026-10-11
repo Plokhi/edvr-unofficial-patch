@@ -46,9 +46,10 @@ RT_MANIFEST = 24
 def flat_ini_bytes():
     """The shipped edvr-flat.ini: the flat profile's own default settings."""
     return (b'# Experimental flat temporal profile: visual qualification in progress.\r\n'
-            b'# F8 opens the AA menu: Off / TAA / DLSS / FSR3 / XeSS-SR and DLSS model presets.\r\n'
-            b'# temporal_aa: off, on (TAA), dlaa (native SS), dlss, fsr, xess. Game SS controls render scale.\r\n'
+            b'# F8 opens the AA menu: Off / TAA / DLSS / FSR3 / XeSS-SR / MetalFX 3 / MetalFX 4 and DLSS model presets.\r\n'
+            b'# temporal_aa: off, on (TAA), dlaa (native SS), dlss, fsr, xess, mfx, mfx4. Game SS controls render scale.\r\n'
             b'# XeSS-SR needs libxess.dll beside the game; the flat installer includes it when built with the SDK.\r\n'
+            b'# MetalFX needs Apple silicon through DXMT; mfx selects generation 3, mfx4 generation 4.\r\n'
             b'# Press NumLock while the issue is visible to collect a diagnostic capture.\r\n'
             b'[fix]\r\ntemporal_aa = off\r\ntemporal_aa_model = k\r\nui_quality = 100\r\n\r\n'
             b'[hotkey]\r\nmenu = F8\r\ndump_draws = NUMLOCK\r\n\r\n'
@@ -476,7 +477,7 @@ def self_test():
                 flat_ini = stream.read()
                 assert flat_ini == flat_ini_bytes()
                 assert b'temporal_aa = off' in flat_ini
-                assert b'fsr, xess. Game SS controls render scale.' in flat_ini
+                assert b'fsr, xess, mfx, mfx4. Game SS controls render scale.' in flat_ini
                 assert b'FSR3 / XeSS-SR' in flat_ini
                 assert b'XeSS-SR needs libxess.dll' in flat_ini
                 assert b'temporal_aa_model = k' in flat_ini and b'menu = F8' in flat_ini

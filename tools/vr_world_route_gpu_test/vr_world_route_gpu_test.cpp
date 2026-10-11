@@ -31,6 +31,7 @@
 #include "../../src/d3d11/flat_mono_resolve.h"
 #include "../../src/d3d11/dlaa.h"
 #include "../../src/d3d11/fsr3_engine.h"
+#include "../../src/d3d11/metal_fx_engine.h"
 #include "../../src/d3d11/engine_velocity.h"
 #include "../../src/d3d11/flat_camera_inject.h"
 #include "../../src/d3d11/gpu_census.h"
@@ -232,6 +233,8 @@ void xessShutdown() {}
 bool xessBuiltIn() { return false; }
 bool xessEvaluate(ID3D11DeviceContext*,unsigned,ID3D11Texture2D*,ID3D11Texture2D*,ID3D11Texture2D*,
                   ID3D11Texture2D*,uint32_t,uint32_t,uint32_t,uint32_t,float,float,bool,bool,const char**) { return false; }
+bool mfxAvailableEx(ID3D11DeviceContext*,const char**){return true;}
+bool mfxAvailable(ID3D11DeviceContext*, const char**) { return true; }
 bool dlaaEvaluate(ID3D11DeviceContext* c, int slot, ID3D11Texture2D* colour, ID3D11Texture2D*, ID3D11Texture2D*, ID3D11Texture2D* out,
                   ID3D11Texture2D*, uint32_t w, uint32_t h, uint32_t outW, uint32_t outH, float jx, float jy, bool reset, float,
                   const char**, bool hdr) {
@@ -256,6 +259,13 @@ bool dlaaEvaluate(ID3D11DeviceContext* c, int slot, ID3D11Texture2D* colour, ID3
 bool fsr3Evaluate(ID3D11DeviceContext*, unsigned, ID3D11Texture2D*, ID3D11Texture2D*, ID3D11Texture2D*, ID3D11Texture2D*,
                   ID3D11Texture2D*, uint32_t, uint32_t, uint32_t, uint32_t, float, float, bool, float, float, float, float,
                   const char**, bool, bool) { return false; }
+// MetalFX, stubbed exactly as fsr3Evaluate is: the resolver only needs the two entry points to link, and this rig
+// drives none of the MFX route, so a backend that reports itself available and then declines the call is the same
+// thing it already does for FSR3. src\d3d11\metal_fx_engine.cpp is deliberately not linked here either (build.bat
+// says the same of dlaa.cpp and fsr3_engine.cpp): the stubs and the real engine would
+// be duplicate symbols. What actually exercises the MFX seam is flat_mono_resolve_test.exe.
+bool mfxEvaluate(ID3D11DeviceContext*, ID3D11Texture2D*, ID3D11Texture2D*, ID3D11Texture2D*, ID3D11Texture2D*,
+                   uint32_t, uint32_t, uint32_t, uint32_t, float, float, bool, const char**, bool, edvr::mfx::FxGeneration generation) { return false; }
 }  // namespace edvr
 
 namespace {

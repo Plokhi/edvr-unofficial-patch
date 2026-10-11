@@ -3759,7 +3759,9 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.engine = _stricmp(mode.c_str(), "xess") == 0 ? FlatMonoResolveMode::Xess :
             _stricmp(mode.c_str(), "fsr") == 0 ? FlatMonoResolveMode::Fsr :
             _stricmp(mode.c_str(), "dlss") == 0 ? FlatMonoResolveMode::Dlss :
-            _stricmp(mode.c_str(), "dlaa") == 0 ? FlatMonoResolveMode::Dlaa : FlatMonoResolveMode::Taa;
+            _stricmp(mode.c_str(), "dlaa") == 0 ? FlatMonoResolveMode::Dlaa :
+            _stricmp(mode.c_str(), "mfx") == 0 ? FlatMonoResolveMode::Mfx :
+            _stricmp(mode.c_str(), "mfx4") == 0 ? FlatMonoResolveMode::Mfx4 : FlatMonoResolveMode::Taa;
         if(s.engine==FlatMonoResolveMode::Taa) {
             s.foregroundRoute.clear();for(auto& candidate:s.foregroundCandidates)retireDomainCandidate(s,candidate);
             s.foregroundSelectedDepth=nullptr;s.foregroundLastH={};
@@ -6098,6 +6100,11 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     FlatMonoResolveFrame f{}; f.color = original; f.depth = s.depthView.Get(); f.renderWidth = selected.renderWidth; f.renderHeight = selected.renderHeight;
     f.outputWidth = selected.outputWidth; f.outputHeight = selected.outputHeight; f.frame = s.prefix.frame; f.mode = s.engine;
     f.jitterCycle=s.phase.phaseCount;
+    // The copy source's colour family, from the handoff's own view: an FP16
+    // presentation (EDHDR) hands the resolver an FP16 image and the resolve
+    // stays FP16 end to end (FlatMonoResolveFrame::fp16). SDR is untouched.
+    D3D11_SHADER_RESOURCE_VIEW_DESC originalView{};original->GetDesc(&originalView);
+    f.fp16=originalView.Format==DXGI_FORMAT_R16G16B16A16_FLOAT;
     // The refusal census on the copy route too (render below the output: DLSS or FSR upscaling), as on the HDR route.
     f.refusalView = 0u;
     f.refusalCensus = s.refusalCensusFrames > 0;
@@ -6350,6 +6357,9 @@ bool FlatRuntimeDrawScope::recover(const char* temporalReason) {
         vp.Height==float(s.prefix.height) && vp.MinDepth==0 && vp.MaxDepth==1;
     FlatMonoResolveFrame f{};f.color=original;f.renderWidth=desc.Width;f.renderHeight=desc.Height;
     f.outputWidth=s.prefix.width;f.outputHeight=s.prefix.height;f.mode=s.engine;
+    // The handoff's own colour family, as on the copy route above: an FP16
+    // source recovers through the FP16 spatial path, an SDR one as before.
+    if(original) {D3D11_SHADER_RESOURCE_VIEW_DESC rv{};original->GetDesc(&rv);f.fp16=rv.Format==DXGI_FORMAT_R16G16B16A16_FLOAT;}
     f.jitterX=s.phase.currentX;f.jitterY=s.phase.currentY;
     Ptr<ID3D11ShaderResourceView> outputView;const char* reason="unverified-copy-handoff";
     if(valid && flatMonoResolveSpatialFallback(s.device.Get(),ctx,f,&outputView,&reason)) {

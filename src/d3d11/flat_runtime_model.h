@@ -606,7 +606,14 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         t->imageSourceBad = true;
         bad(*t, FlatRuntimeConflict::ImageCopySource, t->writes);
     }
-    if (k.format == 9) {
+    if (k.format == 9 && (k.depth || k.dsv)) {
+        // An image-source draw claims the shape with its depth: every
+        // consumer of one needs depth and DSV beside the colour. A format-9
+        // draw with no depth at all is not an image source -- under an FP16
+        // presentation that is the game's tone pass writing the FP16 LDR
+        // image -- and marking it would refuse the copy route's frames for a
+        // chain that is actually clean (the-copy-source-was-written-outside-
+        // a-draw on a target no explicit write touched).
         const auto& first = t->writes;
         if (!k.depth || !k.dsv || !k.depthFormat ||
             k.depthWidth != k.width || k.depthHeight != k.height ||

@@ -91,7 +91,7 @@ int main() {
     for (float scale : {0.0f, -1.0f, NAN, INFINITY}) {
         if (strcmp(edvr::temporalNvidiaLabel(scale), "DLSS / DLAA")) { ++g_fails; puts("FAIL: unknown scale label"); }
     }
-    for (const char* mode : {"on", "ON", "dlaa", "DLAA", "dlss", "DLSS", "fsr", "xess", "XeSS"}) {
+    for (const char* mode : {"on", "ON", "dlaa", "DLAA", "dlss", "DLSS", "fsr", "xess", "XeSS", "mfx", "MFX", "mfx4", "MFX4"}) {
         if (!edvr::temporalModeEnabled(mode)) { ++g_fails; printf("FAIL: bundled temporal mode %s\n", mode); }
     }
     for (const char* mode : {"off", "OFF", "", "bogus"}) {

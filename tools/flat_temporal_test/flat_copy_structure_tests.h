@@ -135,7 +135,8 @@ struct Build {
     uint32_t sW = 0, sH = 0;             // S's size (0: the scene's)
     bool sFullViewport = true;
     uint32_t sWriters = 1;               // draws into S
-    uint32_t llmBefore = 0;              // R-sized R8G8B8A8 passes between the first consumer and S (a game AA chain)
+    uint32_t llmBefore = 0;              // R-sized LDR passes between the first consumer and S (a game AA chain)
+    uint32_t llmFormat = 27;             // ...in this image family (27 SDR; 9/10 are the HDR working set and stay invisible to the rule)
     bool consumer = true;                // a pass reads H at all
     bool sBeforeConsumer = false;        // S is written before anything reads H
     const void* copyReads = nullptr;     // what the copy reads (null: S)
@@ -177,9 +178,9 @@ inline Built build(const Build& b) {
     if (b.consumer && !b.consumerWritesS)
         s.draw(s.make(s.sc.half, nullptr, b.sc.hW / 2, b.sc.hH / 2, 26, 0xDF, 0xC1, false, false), s.sc.h);
     for (uint32_t i = 0; i < b.llmBefore; ++i) {
-        // a game AA filter: reads the previous LDR image, writes a new R-sized R8G8B8A8 target
+        // a game AA filter: reads the previous LDR image, writes a new R-sized LDR target
         const void* t = tok(0x7000 + 16 * i);
-        s.draw(s.make(t, nullptr, w, h, 27, 0x03, 0x04 + i, false, false), nullptr, i ? tok(0x7000 + 16 * (i - 1)) : s.sc.h);
+        s.draw(s.make(t, nullptr, w, h, b.llmFormat, 0x03, 0x04 + i, false, false), nullptr, i ? tok(0x7000 + 16 * (i - 1)) : s.sc.h);
     }
     if (!b.sBeforeConsumer)
         for (uint32_t i = 0; i < b.sWriters; ++i) writeS(b.consumer && b.consumerWritesS && i == 0 ? s.sc.h : nullptr);
@@ -273,7 +274,8 @@ inline std::string flatUpscaleFixtureText() {
         window.last = w.admitted ? "admitted" : "no-scene";
         if (w.admitted) {
             window.lastSceneW = 2880; window.lastSceneH = 1620; window.lastOutW = 3840; window.lastOutH = 2160;
-            window.lastSrcW = 2880; window.lastSrcH = 1620; window.lastSrcVs = diag.srcVs; window.lastSrcPs = diag.srcPs;
+            window.lastSrcW = 2880; window.lastSrcH = 1620; window.lastSrcFormat = 27;
+            window.lastSrcVs = diag.srcVs; window.lastSrcPs = diag.srcPs;
         } else {
             window.lastOutW = 3840; window.lastOutH = 2160;
         }
@@ -516,10 +518,56 @@ inline int flatCopyStructureTests() {
                diag.srcWidth == 3840 && diag.srcFormat == 27 && diag.srcDraws == 1 && !diag.menu,
                "the canonical unknown chain: the whitelist refuses (no-known-tone-pass), the structure admits S, H, its depth and camera");
 
+        // ---- the FP16 copy source (EDHDR's presentation): the 0.65x flight's shape ---------------------------------
+        // The failing session's own chain: S is the FP16 image (typeless 9 in the field, typed 10 the swapchain's
+        // shape), the scene below the output. Both are admitted to the same selection the SDR chain gets, in every
+        // backend with a route at the size; a wrong family still declines by name.
+        for (const uint32_t sFormat : {9u, 10u}) {
+            for (const FlatMonoResolveMode mode :
+                 {FlatMonoResolveMode::Dlss, FlatMonoResolveMode::Fsr, FlatMonoResolveMode::Mfx, FlatMonoResolveMode::Mfx4, FlatMonoResolveMode::Taa}) {
+                Build fp16;
+                fp16.sFormat = sFormat;
+                Built fbuilt = build(fp16);
+                FlatCopyDiag fdiag;
+                const FlatMonoFrame fsel = admit(fbuilt, policy(true, mode, true), &fdiag);
+                char what[160];
+                std::snprintf(what, sizeof(what), "an FP16 S (fmt %u) is admitted like the SDR chain in mode %s",
+                              sFormat, edvr::flatMonoResolveModeName(mode));
+                expect(fbuilt.whitelist.reason == FlatMonoReason::NoTonePass && fdiag.outcome == FlatCopyOutcome::Admitted &&
+                       fsel.selected() && fsel.color == fbuilt.stream->sc.tone && fsel.hdr == fbuilt.stream->sc.h &&
+                       fsel.renderWidth == 3840 && fsel.renderHeight == 2160 && fdiag.srcFormat == sFormat, what);
+            }
+        }
+        {
+            // Below the output, the upscaling shape: admitted as the copy route's own (latched, so the route check reads it).
+            Build below;
+            below.sc.hW = 1920; below.sc.hH = 1080; below.sFormat = 9;
+            Built bb = build(below);
+            FlatCopyDiag bd;
+            const FlatMonoFrame out = admit(bb, policy(true, FlatMonoResolveMode::Mfx, true), &bd);
+            expect(bd.outcome == FlatCopyOutcome::Admitted && out.selected() && out.renderWidth == 1920 &&
+                   out.renderHeight == 1080 && bd.srcFormat == 9,
+                   "an FP16 S below the output is admitted for the trained upscale (mfx-trained-upscale's shape)");
+        }
+        {
+            // The HDR working set stays invisible to the AA chain rule: an
+            // R-sized FP16 pass between the trigger and an FP16 S (Elite's own
+            // bloom/depth-of-field shape, as the corpus holds it in SDR) does
+            // not decline the frame; only the SDR family is counted.
+            Build working;
+            working.sFormat = 10; working.llmFormat = 10; working.llmBefore = 1; working.consumerWritesS = false;
+            Built wb = build(working);
+            FlatCopyDiag wd;
+            const FlatMonoFrame wout = admit(wb, policy(true, FlatMonoResolveMode::Mfx, true), &wd);
+            expect(wd.outcome == FlatCopyOutcome::Admitted && wout.selected() && wd.ldrTargetsBefore == 0,
+                   "an FP16 working pass between the trigger and S is not a game AA chain: admitted, nothing counted");
+        }
+
         struct Row { const char* name; Build b; const char* why; };
         std::vector<Row> rows;
         auto add = [&](const char* name, const char* why, void (*edit)(Build&)) { Row r{name, Build{}, why}; edit(r.b); rows.push_back(r); };
-        add("S is not R8G8B8A8", "the-copy-source-is-not-r8g8b8a8", [](Build& b) { b.sFormat = 9; });
+        add("S is a typed UNORM target, neither admitted LDR family", "the-copy-source-is-not-r8g8b8a8",
+            [](Build& b) { b.sFormat = 28; });
         add("S is drawn with a depth buffer", "the-copy-source-was-drawn-with-a-depth-buffer", [](Build& b) { b.sDepth = true; });
         add("S is a different size than the scene", "the-copy-source-is-not-the-scene-size", [](Build& b) { b.sW = 1920; b.sH = 1080; });
         add("S has two writers", "the-copy-source-is-not-written-by-one-pass", [](Build& b) { b.sWriters = 2; });
@@ -837,7 +885,7 @@ inline int flatCopyStructureTests() {
         char line[1300];
         flatCopyFormatWindow(line, sizeof(line), true, window);
         expectText(line, "flat copy structure 5s: key=auto copies=0 whitelist=0 admitted=0 declined=0 selector-refused=0 no-scene=0 "
-                                    "render-size=0 route-serves=0 key-off=0 last=none scene=0x0 output=0x0 source=0x0 VS=0000000000000000 "
+                                    "render-size=0 route-serves=0 key-off=0 last=none scene=0x0 output=0x0 source=0x0 source-fmt=0 VS=0000000000000000 "
                                     "PS=0000000000000000 ldr-passes-before-max=0 declines=none",
                "the window line prints with zeros when nothing ran: an absent line is what the admission never running looks like");
         for (int i = 0; i < 30; ++i) window.noteWhitelist();
@@ -859,7 +907,7 @@ inline int flatCopyStructureTests() {
         flatCopyFormatWindow(line, sizeof(line), true, window);
         expectText(line, "flat copy structure 5s: key=auto copies=39 whitelist=30 admitted=5 declined=3 selector-refused=0 no-scene=0 "
                                     "render-size=1 route-serves=0 key-off=0 last=render-size scene=2176x1224 output=2560x1600 source=3840x2160 "
-                                    "VS=00000000000000F9 PS=00000000000000FE ldr-passes-before-max=2 "
+                                    "source-fmt=27 VS=00000000000000F9 PS=00000000000000FE ldr-passes-before-max=2 "
                                     "declines=r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr:3",
                "a window with traffic: the whitelist's frames, the admissions, the declines by cause and the longest chain seen");
         expect(window.copies == 39, "every ruling is a copy");
@@ -881,6 +929,11 @@ inline int flatCopyStructureTests() {
                                     "3840x2160 output, route=trained-upscale; admitted by structure, so bloom, depth of field and the tone variant do "
                                     "not matter",
                "the first admission line, once a session");
+        FlatCopyDiag fp16diag = diag; fp16diag.srcFormat = 9;
+        flatCopyFormatFirstAdmission(line, sizeof(line), 4711, fp16diag, "mfx-trained-upscale");
+        expect(std::string(line).find("copy reads a 3840x2160 R16G16B16A16_FLOAT image written by one pass") != std::string::npos &&
+                   std::string(line).find("route=mfx-trained-upscale;") != std::string::npos,
+               "the first admission names the FP16 source family under an FP16 presentation");
         flatCopyFormatDeclined(line, sizeof(line), 4712, declined);
         expect(std::string(line).find("flat copy structure: declined at frame=4712: r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr "
                                       "(the whitelist said no-known-tone-pass); the final copy reads a 3840x2160 fmt 27 image with 1 writer(s)") == 0 &&

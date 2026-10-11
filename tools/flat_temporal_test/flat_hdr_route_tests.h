@@ -1568,11 +1568,15 @@ inline int flatHdrRouteTests() {
                "dlaa.cpp keys the feature on the route's bit and stores it when the feature is made, so a flip remakes it");
         expect(count(dlaa, "ensureFeature(ctx, eye, w, h, outW, outH, reason, nullptr, hdr)") == 1,
                "dlaaEvaluate hands the route's bit to the feature it asks for");
-        // The resolver hands the frame's bit down to each engine, with no literal in its place.
+        // The resolver hands the frame's colour bit down to each engine, with no literal in its place: the HDR route's
+        // bit, or the copy route's FP16 source (an FP16 tone-mapped image takes the HDR colour mode, still returned
+        // through *output for the game's own copy).
         const std::string resolve = slurpSource("src/d3d11/flat_mono_resolve.cpp");
-        expect(count(resolve, "f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdr);") == 1 &&
-                   count(resolve, "2*std::atan(1/sy),reason,true,hdr);") == 1,
-               "the resolver's backend calls pass the frame's hdr bit to the DLSS/DLAA evaluate and to the FSR evaluate");
+        expect(count(resolve, "const bool hdrColor=hdr||f.fp16;") == 1 &&
+                   count(resolve, "f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdrColor);") == 1 &&
+                   count(resolve, "2*std::atan(1/sy),reason,true,hdrColor);") == 1 &&
+                   count(resolve, "f.jitterX,f.jitterY,reset,reason,hdrColor,") == 1,
+               "the resolver's backend calls pass the frame's colour bit (HDR route or FP16 copy source) to the DLSS/DLAA, FSR and MetalFX evaluates");
     }
 
     // ---- the wiring no rig can run: the runtime's default, merge and publication, and the panel's use of them ---------
