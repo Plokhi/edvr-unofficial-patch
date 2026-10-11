@@ -14,9 +14,14 @@ issue (26 and 28 September). Read the Status block first.
   `GetCapabilities` (at CreateDevice and on every read) and `GetDeviceInfo` (once a
   second). The v0.19.0 logs show the "captured a game controller at CreateDevice"
   line, then a silent death; plugging the wheel in mid-session also kills it.
-  Fix: EDVR calls nothing on a non-keyboard device beyond holding a reference. A
+  Fix: EDVR calls nothing on a controller beyond holding a reference. A
   controller's type and name come from the game's own `IDirectInput8::EnumDevices`,
   recorded by the factory door.
+- **Residual (2026-10-10, review of 0.19.1, branch `claude/review-0191-input`):** the
+  read paths make no driver call on any device. A device is a keyboard (a door's dummy,
+  or one recorded at CreateDevice), a controller the game enumerated, or unknown (neither
+  gated nor asked anything). `GetCapabilities` remains only at CreateDevice for a keyboard
+  GUID. Not merged, not flown.
 - **Earlier (2026-10-02, v0.18.1, 15a50741):** `factoryCreateDevice` queried
   `GetCapabilities` on every DirectInput device, crashing unconfigured third-party
   force-feedback drivers (G29 / jerry_forcefeedback_x64). Fixed by filtering on system
@@ -424,3 +429,7 @@ green (receipt written). Not merged, not flown.
 8. **Next:** reporter flight on the fix build. Until then, `input_gate = 0` under
    `[advanced]` in `edvr.ini` turns off the keyboard gate and the joystick watch.
 9. Confirmed: the reporter's crash is gone on the test DLL v0.19.0-1-g421ba98f (relayed by the maintainer, 2026-10-10).
+
+## 2026-10-10: residual driver calls (review of 0.19.1)
+
+The review of 0.19.1 (2a0d79e5, the Issue 45 residual bullet in the review file) found one path that still asked a driver. `deviceTypeOf` read a device from the registry only when the game had enumerated it, and sent anything else to `GetCapabilities`. DINPUT8 shares one class table between devices, so a controller the game never enumerated, sitting on the keyboard door's hooked table, reached the keyboard read wrappers and cost a driver call on every read; the scratch extension of the rig saw two calls for two reads. The fix on `claude/review-0191-input` classifies positively in `input_gate.cpp` (`classifyDevice`). A keyboard is a door's dummy, a game keyboard the door captured, or a device recorded by `keyboardRemember`: from a keyboard GUID at `captureKeyboard`, or from the game's own enumeration record for an instance GUID. A controller is one the game enumerated and created. Any other device is unknown: it is neither gated nor observed, and nothing is called on it. `GetCapabilities` now runs only at CreateDevice for a keyboard GUID, as the keyboard capture always did. The rig (`tools\input_gate_test`) adds a never-enumerated controller on the keyboard's shared table, which must make zero capability and info calls over two reads and must not be zeroed with the menu open, and a second keyboard on that table, which is still released and is asked once, at CreateDevice. Both pass in the full build. Residual: a keyboard created under an instance GUID that the game never enumerated was gated through the old fallback and is now unknown, so it is no longer gated; no log here shows the game doing that. Not flown; not merged.

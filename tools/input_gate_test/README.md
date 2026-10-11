@@ -6,5 +6,7 @@ and Unicode DirectInput keyboards through its patched executable import.
 
 The fixtures verify separate device tables, preserved object identity and
 original calls, joystick pass-through, buffered key releases and peek behavior,
-input loss, held closing keys, table restoration, and balanced references.
+input loss, held closing keys, table restoration, and balanced references. A
+device the game never enumerated, on the keyboard's own table, is neither gated
+nor asked anything (no GetCapabilities, no GetDeviceInfo).
 They do not inject keyboard events or require a VR runtime.

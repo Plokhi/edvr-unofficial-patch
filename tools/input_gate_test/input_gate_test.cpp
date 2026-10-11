@@ -252,6 +252,7 @@ std::array<void*, 32> stickTable() {
 }
 const GUID kGuidSomeStick = {0xAAAA0001, 0x1111, 0x2222, {1, 2, 3, 4, 5, 6, 7, 8}};
 const GUID kGuidGhost = {0xAAAA0002, 0x1111, 0x2222, {1, 2, 3, 4, 5, 6, 7, 8}};   // never enumerated
+const GUID kGuidSharedGhost = {0xAAAA0003, 0x1111, 0x2222, {1, 2, 3, 4, 5, 6, 7, 8}};   // never enumerated, on the keyboard's table
 HRESULT createAs(Factory& f, const GUID& guid, void** out) {
     return reinterpret_cast<PFN_CreateDevice>(f.table[3])(&f, guid, out, nullptr);
 }
@@ -412,6 +413,8 @@ int main() {
     Stick kb3{sharedTable.data()};
     Stick js3{sharedTable.data()};
     Stick js4{sharedTable.data()};
+    Stick kb4{sharedTable.data()};        // a second keyboard, made through the factory on that table
+    Stick sharedGhost{sharedTable.data()};   // a controller the game never enumerated, on the same table
     // The factories live at main's scope too: their doors are undone at shutdown, which writes
     // to their tables.
     auto stickFactoryTable = factoryTable();
@@ -624,6 +627,49 @@ int main() {
             check(kbuf[DIK_A] == 0 && g_trapCalls == 0, "...while the keyboard on the same table is still released");
             inputGateSetPrivate(false);
             check(g_trapCalls == 0, "still no call on any device beyond caps and info");
+        }
+
+        // The shared-vtable ghost (the review of 0.19.1): a controller the game never enumerated,
+        // on the keyboard door's own table, with a GUID that is not a keyboard's. The door's read
+        // wrapper reaches it. It is neither a keyboard nor a controller, so the gate does not act on
+        // it, and nothing is asked of it: no GetCapabilities, no GetDeviceInfo, on any read.
+        {
+            stickFactory.next = reinterpret_cast<Device*>(&sharedGhost);
+            void* m8 = nullptr;
+            check(createAs(stickFactory, kGuidSharedGhost, &m8) == DI_OK && m8 == &sharedGhost,
+                  "a never-enumerated controller is created on the keyboard door's shared table");
+            sharedGhost.button(4, true);
+            uint8_t gbuf[kJoyState2Size];
+            readStick(sharedGhost, kJoyState2Size, gbuf);
+            readStick(sharedGhost, kJoyState2Size, gbuf);
+            check(sharedGhost.capsCalls == 0 && sharedGhost.infoCalls == 0,
+                  "two state reads make ZERO capability or info calls on the shared ghost");
+            inputGateSetPrivate(true);
+            readStick(sharedGhost, kJoyState2Size, gbuf);
+            inputGateSetPrivate(false);
+            check(gbuf[kJoyOfsButtons + 4] == 0x80 && memcmp(gbuf, sharedGhost.state, kJoyState2Size) == 0,
+                  "...the gate does not act on it, even with the menu open: its bytes reach the game as they are");
+            check(sharedGhost.capsCalls == 0 && sharedGhost.infoCalls == 0,
+                  "...and still no call on it after the menu closes");
+        }
+
+        // The keyboard case of the same table: a second keyboard made through the keyboard GUID is
+        // still a keyboard. Its one GetCapabilities call is at CreateDevice; its reads make none, and
+        // its state is released while the menu is open.
+        {
+            kb4.type = DI8DEVTYPE_KEYBOARD;
+            stickFactory.next = reinterpret_cast<Device*>(&kb4);
+            void* m9 = nullptr;
+            createThrough(stickFactory, &m9);
+            const unsigned kb4CapsAtCreate = kb4.capsCalls;
+            kb4.state[DIK_A] = 0x80;
+            uint8_t kb4buf[kJoyState2Size];
+            inputGateSetPrivate(true);
+            readStick(kb4, 256, kb4buf);
+            readStick(kb4, 256, kb4buf);
+            inputGateSetPrivate(false);
+            check(kb4buf[DIK_A] == 0 && kb4.capsCalls == kb4CapsAtCreate && kb4CapsAtCreate == 1,
+                  "a second keyboard on the shared table is still released; asked once, at CreateDevice, never on a read");
         }
 
         // Faults: the watch's copy of the game's buffer faults when the buffer's page cannot be read
