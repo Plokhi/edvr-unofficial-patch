@@ -90,8 +90,9 @@ inline void runtimeProfileInitialize(const std::wstring& moduleDir,
     const std::string commandLine = runtimeProfileUtf8(std::wstring(GetCommandLineW()));
     const VrSwitch cmd = parseVrSwitch(commandLine);
     g_gameCommandLineUtf8 = redactCommandLine(commandLine);
-    // /vr overrides Settings.xml in the game (flight 2026-10-12: EDLaunch /Steam /VR with the file at 0); /novr waits for a flight.
-    g_launchDecision = decideLaunch(scope, mode, cmd, /*applyVr=*/true, /*applyNoVr=*/false);
+    // Both switches override Settings.xml in the game (flights 2026-10-12: /steam /vr over a file at 0 went into VR; /steam /novr over
+    // a file at 4 stayed flat, no openvr_api.dll load).
+    g_launchDecision = decideLaunch(scope, mode, cmd, /*applyVr=*/true, /*applyNoVr=*/true);
     g_runtimeProfile = g_launchDecision.active;
 }
 

@@ -203,8 +203,8 @@ inline RuntimeProfile activeProfileFor(InstallScope scope, GameMode mode) {
     return RuntimeProfile::Passthrough;
 }
 
-// Each switch applies only when its own flag is set. Production applies /vr (flight 2026-10-12: EDLaunch /Steam /VR with the file at
-// mode 0 went into VR) and waits for a flight before applying /novr.
+// Each switch applies only when its own flag is set. Production applies both: each overrides Settings.xml in the game (flights
+// 2026-10-12: /steam /vr over a file at 0 went into VR; /steam /novr over a file at 4 stayed flat, with no openvr_api.dll load).
 inline LaunchDecision decideLaunch(const ScopeRead& scope, const ModeRead& mode, VrSwitch cmd, bool applyVr, bool applyNoVr) {
     LaunchDecision d{};
     d.scope = scope;
@@ -245,7 +245,7 @@ inline std::string formatProfileLine(const LaunchDecision& d, const char* active
     }
     if (d.cmd != VrSwitch::None) {
         if (d.cmdApplied) out += " applied";
-        else out += d.cmd == VrSwitch::NoVr ? " not applied, H2 open" : " not applied";
+        else out += " not applied";
     }
     out += ")";
     return out;

@@ -189,6 +189,13 @@ void decisionCases() {
     const LaunchDecision novrOn = decideLaunch(scope, mode4, VrSwitch::NoVr, true, true);
     check(novrOn.effective == GameMode::Flat && novrOn.cmdApplied && novrOn.active == RuntimeProfile::Flat,
         "decision: /novr over mode 4 is Flat when applyNoVr is true");
+    // The production call passes both flags as true (runtime_profile.h): each switch overrides the file.
+    const LaunchDecision production = decideLaunch(scope, mode4, VrSwitch::NoVr, true, true);
+    check(production.effective == GameMode::Flat && production.cmdApplied && production.active == RuntimeProfile::Flat,
+        "production shape (applyVr and applyNoVr both true): /novr over mode 4 is Flat, applied");
+    const LaunchDecision productionVr = decideLaunch(scope, mode0, VrSwitch::Vr, true, true);
+    check(productionVr.effective == GameMode::Vr && productionVr.cmdApplied && productionVr.active == RuntimeProfile::Vr,
+        "production shape: /vr over mode 0 is Vr, applied");
     const LaunchDecision none = decideLaunch(scope, mode4, VrSwitch::None, true, true);
     check(none.effective == GameMode::Vr && !none.cmdApplied && none.active == RuntimeProfile::Vr,
         "decision: no switch leaves mode 4 as Vr");
@@ -222,10 +229,10 @@ void lineCases() {
     checkText("line: /vr not applied over mode 0",
         formatProfileLine(decideLaunch(schema2Both, mode0, VrSwitch::Vr, false, false), "flat", p),
         "profile: flat (scope both; 3D mode 0 from " + p + "; command line /vr not applied)");
-    checkText("line: /novr not applied while H2 is open",
+    checkText("line: /novr not applied when its flag is off",
         formatProfileLine(decideLaunch(schema2Both, mode4, VrSwitch::NoVr, true, false), "vr", p),
-        "profile: vr (scope both; 3D mode 4 from " + p + "; command line /novr not applied, H2 open)");
-    checkText("line: /novr applied",
+        "profile: vr (scope both; 3D mode 4 from " + p + "; command line /novr not applied)");
+    checkText("line: /novr applied (production: both flags on)",
         formatProfileLine(decideLaunch(schema2Both, mode4, VrSwitch::NoVr, true, true), "flat", p),
         "profile: flat (scope both; 3D mode 4 from " + p + "; command line /novr applied)");
     checkText("line: an invalid descriptor",

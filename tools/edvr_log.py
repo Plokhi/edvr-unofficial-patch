@@ -9717,7 +9717,7 @@ LAUNCH_CLOCK_RE = re.compile(r"^\[(?P<clock>\d{2}:\d{2}:\d{2}\.\d{3})\] (?P<body
 PROFILE_DETAIL_RE = re.compile(
     r"^profile: (?P<active>flat|vr|passthrough) \(scope (?P<scope>both|vr|flat)"
     r"(?: from schema-1 descriptor| with no descriptor)?; 3D mode (?P<mode>\d+|unknown) from .*?"
-    r"(?: \(file absent\))?; command line (?P<cmd>none|/novr|/vr)(?: applied| not applied, H2 open)?\)$")
+    r"(?: \(file absent\))?; command line (?P<cmd>none|/novr|/vr)(?: applied| not applied(?:, H2 open)?)?\)$")
 PROFILE_ANY_RE = re.compile(r"^profile: (?P<active>\w+)(?: \((?P<rest>.*)\))?$")
 OLD_PROFILE_RE = re.compile(r"^installation profile: (?P<rest>.*)$")
 WATCH_START_RE = re.compile(r"^mode watch: started on .*; launch file mode (?P<mode>\d+|unknown) \((?P<cls>flat|vr)\)"
