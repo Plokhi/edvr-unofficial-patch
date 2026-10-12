@@ -37,27 +37,24 @@
   at the frame boundary (3.3), what cannot switch live (3.4), the hold keyed
   to the mode (3.5), the scope prompt in one installer (4).
 - **Still open for Sean:** none.
-- **Hypotheses (section 7 names the evidence for each):**
-  - H1: a flat launch never loads `openvr_api.dll`, and 3D-on loads it then.
-  - H2 HOLDS both ways (Steam 2026-10-12): `/steam /vr` over a file at 0
-    went VR; `/steam /novr` over 4 stayed flat with no HMD mode offered.
-    Both applied (6fbb4919). The command line is logged redacted.
-  - H10 (open): a `/vr` launch over a file at 0 left the file stale: 3D off
-    took the game out of the headset but re-wrote 0, so the watch missed
-    it. Flight D: what an unrelated apply writes there, and whether the eye
-    submit rate (ed0bddd8, log only) stops at 3D off.
-  - H3 REFUTED under a launcher switch: the switch, not the file, is the
-    start mode (H2). Holds for a launch with neither.
-  - H4: after 3D off the OpenXR session idles at no flat cost.
-  - H5: the Settings.xml path resolves on every store and on Proton.
-  - H6 HOLDS (Steam B): a 3D apply rewrites the file; the watch saw the
-    write 70-80 ms after the setter call, confirmed 250 ms later.
-  - H7: a toggle keeps the device and swapchain (no new-chain line in B).
-  - H8: the always-installed hooks cost VR nothing measurable.
+- **Hypotheses** (evidence in section 11, the flight journal):
+  - H1 open: what a launch with neither switch does at 3D on.
+  - H2 HOLDS both ways: `/vr` and `/novr` override the file; applied.
+  - H3 REFUTED under a launcher switch; holds for a launch with neither.
+  - H4 open: after 3D off the OpenXR session idles at no flat cost.
+  - H5 open: the Settings.xml path on every store and on Proton.
+  - H6 HOLDS: a 3D apply rewrites the file and the watch sees it.
+  - H7 holds so far: no new swap chain at a toggle in B or D.
+  - H8 open: the always-installed hooks cost VR nothing measurable.
+  - H10 SETTLED: a launch the file did not decide leaves it stale until
+    the game's first write, which holds the live mode (f11b7a3e).
+  - Regression fixed (7b0358b4): Passthrough stood the window rewrite
+    down; 3D on came back 1280x768 windowed and the game saved it.
 - **Ruled out while designing:** section 9.
 - **Temporary keys:** none. No user-facing key is added.
-- **Next:** flight D on Steam (H10). Then a launch with neither switch, if
-  the launcher can make one (H1's second half).
+- **Next:** a flight of the fixed build on Steam: `/vr` launch, 3D off and
+  on (the window keeps its mode; one switch line). Then a launch with
+  neither switch, if the launcher can make one (H1).
 
 ## 1. What exists today
 
@@ -482,3 +479,25 @@ launches. The phase-1 build switches to Passthrough rather than live.
      `release/README.txt`, and AGENTS.md's `edvr-flat.ini` bullet.
 4. **Release.** Notes via `reflow_notes.py`, and credits via
    `release_credits.py`.
+
+## 11. Flight journal
+
+### 2026-10-12, Steam, phase 1 (Sean)
+
+- 16:03 and 16:05 (build 02a80404): Steam launches `EDLaunch.exe /Steam /VR`, which passes `/vr`. Settings.xml at 0, yet VR went
+  live 1.7 s in; EDVR chose flat and dropped to Passthrough at the live rise. The `game command line:` line carried the Frontier
+  ServerToken verbatim; it is redacted since 6f3f9362 (exe name and bare switches only).
+- B, 16:38 (`/steam /vr`, file 0): `profile: vr ... /vr applied`. 3D off at 16:39:37 took the game out of the headset but
+  re-wrote 0 (unchanged), so the watch missed it; 3D on at 16:39:48 wrote 4, seen 80 ms after the setter call and confirmed
+  250 ms later (H6). No new swap chain (H7).
+- C, 16:42 (`/steam /novr`, file 4): `openvr_api.dll` never loaded, no live rise in 110 s, no HMD mode offered in the menu. EDVR
+  chose VR (`/novr` was not applied yet), so F8 opened the VR menu with no compositor. H2 holds both ways; `/novr` applied since
+  6fbb4919.
+- D, 17:36 (`/steam /vr`, file 0, build 17236b9a): a Supersampling-only apply at 17:37:11 wrote mode 3 (the live mode). 3D off at
+  17:37:26.6: eye submits stopped 28.6, file 0 at 31.2, posted flat, Passthrough. 3D on at 17:37:44.27: the window went
+  0x94020000 3840x2160 -> 0x14C80000 1280x768 at 44.36, submits resumed 44.6, file 4 at 49.1; DisplaySettings.xml was saved
+  1280x768 windowed. Cause: `requestReplacement` forwarded every request once the profile left VR
+  (`vr_window_trampolines.cpp:111`); fixed in 7b0358b4.
+- ruled out: the file alone as the switch signal after a launch the file did not decide, because it stays stale until the
+  game's first write (B missed a real 3D off).
+- ruled out: an unrelated apply writing the stale value, because D's Supersampling apply wrote the live mode 3.
