@@ -53,6 +53,7 @@
 #include "vscreen.h"        // vScreenRenderBelowEye: Elite's Supersampling below 1, from the sizes
 #include "vr_ssaa_hold.h"       // vrSsaaHoldNoticeDue: the Supersampling hold's toast (a requested value held at 1.0)
 #include "vr_ssaa_hold_math.h"  // ssaahold::formatHoldToast
+#include "mode_watch.h"         // modeWatchNoticeDue: the 3D mode watch's toast, once per commit
 #include "vscreen_res.h"
 #include "xinput_watch.h"   // the Hotkeys page's capture reads the pad
 // fsr3_engine.h is deliberately NOT included: the Temporal AA status line
@@ -4226,6 +4227,20 @@ void menuTick(ID3D11Device* dev) {
                     Log::get().note("vr ssaa gate: notice queued as a toast (\"%s\")", holdToast);
                 } else {
                     Log::get().note("vr ssaa gate: notice not queued: menu.toasts is off");
+                }
+                s.contentDirty = true;
+            }
+        }
+
+        // The 3D mode watch (mode_watch.h): a commit that drops EDVR to Passthrough says once, as a toast, that Elite must restart.
+        {
+            char modeToast[160];
+            if (modeWatchNoticeDue(modeToast, sizeof(modeToast))) {
+                if (s.toasts) {
+                    s.toastQueue.push_back(modeToast);
+                    Log::get().note("mode watch: notice queued as a toast (\"%s\")", modeToast);
+                } else {
+                    Log::get().note("mode watch: notice not queued: menu.toasts is off");
                 }
                 s.contentDirty = true;
             }

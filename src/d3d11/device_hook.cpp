@@ -48,6 +48,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "vr_ssaa_gate.h"   // the step-1 Supersampling gate instruments (log only)
 #include "vr_ssaa_hold.h"   // the Supersampling hold's shutdown (the loader slot goes back)
 #include "vr_display_observer.h"  // the game window's state (read only) and its handle
+#include "mode_watch.h"     // modeWatchFrameBoundary: the 3D mode watch's commit, at the frame boundary
 
 #include <intrin.h>         // _ReturnAddress: the caller of each observed call
 #include "orbital_width.h" // orbitalWidthRememberVs: the orbit lines' shader, captured at its creation
@@ -1197,6 +1198,7 @@ HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers1(IDXGISwapChain3* self, UINT c
 // A fault no longer ends the frame's boundary either: the next tick runs the same
 // frame. What is not under a budget is arithmetic and flag reads that cannot
 // fault: the frame counter, the graphics-off test, whether the config poll is due.
+EDVR_BOUNDARY_TICK(tkModeWatch, "mode_watch");
 EDVR_BOUNDARY_TICK(tkKinematicProbe, "kinematic_probe");
 EDVR_BOUNDARY_TICK(tkEngineVelocityClock, "engine_velocity_clock");
 EDVR_BOUNDARY_TICK(tkSchedulerProbe, "scheduler_probe");
@@ -1511,6 +1513,8 @@ void presentFrameBoundary() {
     // The kinematic probe's clock: exactly once per owned Present. Here,
     // not beside vScreenFrameBoundary below -- that site sits behind the
     // graphicsRuntimeDisabled early return and would skip those presents.
+    // The 3D mode watch's commit (mode_watch.h): a posted mode is applied here, at the one point no draw of the next frame has started.
+    tkModeWatch.run([] { modeWatchFrameBoundary(); });
     tkKinematicProbe.run([] {
         kinematicEvalProbe.notePresentFrame(static_cast<uint32_t>(g_state->frameCounter));
     });
@@ -2941,7 +2945,18 @@ void hookSwapChain(IDXGISwapChain* swapChain) {
     if (!swapChain) return;
     State& s = ensureState();
     if (s.recoveryDisabled) return;
-    if (s.swapChain) return;
+    if (s.swapChain) {
+        // Only the first swap chain is hooked. A new one (a toggle that recreates it, say) is never hooked, so its Present is never
+        // seen; the line says so (H7). The callers are the two swap chain creations, so this is not per frame, and the last pointer is
+        // kept so a repeat of the same one logs nothing.
+        static IDXGISwapChain* lastUnhooked = nullptr;
+        if (swapChain != s.swapChain && swapChain != lastUnhooked) {
+            lastUnhooked = swapChain;
+            Log::get().note("swap chain: a new swap chain %p after %p is not hooked (H7)", static_cast<void*>(swapChain),
+                            static_cast<void*>(s.swapChain));
+        }
+        return;
+    }
 
     if (!s.swapChainHook.attach(swapChain) ||
         s.swapChainHook.executablePrefix() <= kSwapPresent) {

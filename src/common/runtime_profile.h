@@ -61,6 +61,7 @@ inline std::string runtimeProfileUtf8(const std::wstring& wide) {
 // written later, from these.
 inline LaunchDecision g_launchDecision{};
 inline std::string g_settingsPathUtf8;
+inline std::wstring g_settingsPathWide;
 inline std::string g_gameCommandLineUtf8;
 
 inline void runtimeProfileInitialize(const std::wstring& moduleDir,
@@ -80,6 +81,7 @@ inline void runtimeProfileInitialize(const std::wstring& moduleDir,
     const std::wstring settingsPath = localAppData.empty() ? std::wstring()
         : eliteGraphicsFolderUnder(localAppData) + L"\\Settings.xml";
     g_settingsPathUtf8 = settingsPath.empty() ? std::string("(LOCALAPPDATA not set)") : runtimeProfileUtf8(settingsPath);
+    g_settingsPathWide = settingsPath;
     std::string xml;
     const bool haveXml = !settingsPath.empty() && readBoundedFile(settingsPath, 1024 * 1024, xml) == FileState::Read;
     const ModeRead mode = readGameMode(haveXml ? xml.c_str() : nullptr);
@@ -119,6 +121,13 @@ inline std::string runtimeProfileLogLine() {
     return formatProfileLine(g_launchDecision, runtimeProfileName(), g_settingsPathUtf8);
 }
 inline const std::string& runtimeGameCommandLine() { return g_gameCommandLineUtf8; }
+
+// What the mode watch starts from: the Settings.xml path (empty when LOCALAPPDATA is not set), the install scope, and the launch file's
+// read (its mode is Vr when the read is unknown, design Q2). The command line's override is not part of it.
+inline const std::wstring& runtimeSettingsPathWide() { return g_settingsPathWide; }
+inline InstallScope runtimeInstallScope() { return g_launchDecision.scope.scope; }
+inline ModeRead runtimeLaunchRead() { return g_launchDecision.mode; }
+inline RuntimeProfile runtimeProfileValue() { return g_runtimeProfile.load(std::memory_order_relaxed); }
 
 // Flat owns a separate mono adapter. Generic setting reads cannot activate the
 // stereo pipeline or unrelated fixes; the mono adapter explicitly reads the

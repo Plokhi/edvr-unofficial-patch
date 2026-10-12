@@ -556,6 +556,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\remlok_fix.cpp" "src\d3d11\holo_fix.cpp" ^
     "src\d3d11\target_sharp.cpp" "src\d3d11\night_vision.cpp" ^
     "src\d3d11\wake_pulse.cpp" "src\d3d11\vr_ssaa_gate.cpp" "src\d3d11\vr_ssaa_hold.cpp" "src\d3d11\vr_display_observer.cpp" "src\d3d11\vr_window_trampolines.cpp" ^
+    "src\d3d11\mode_watch.cpp" ^
     "src\d3d11\ui_depth.cpp" ^
     "src\d3d11\ui_layer.cpp" "src\d3d11\ui_surfaces.cpp" "src\d3d11\ui_panel_scale.cpp" "src\d3d11\orbital_width.cpp" "src\d3d11\supercruise_bars.cpp" ^
     "third_party\dxbc_hash\DxilHash.cpp" ^
@@ -3497,6 +3498,21 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMIN
 if errorlevel 1 ( echo [edvr] ERROR: runtime_profile_test build failed & exit /b 1 )
 "%OBJ%\runtimeprofile\runtime_profile_test.exe" --dry-run || exit /b 1
 "%OBJ%\runtimeprofile\runtime_profile_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_mode_watch_test
+echo [edvr] === mode_watch_test.exe ===
+REM The mode watch's decisions (src\d3d11\mode_watch_logic.h, docs\design-unified-install-2026-10-12.md section 3.2): the 250 ms
+REM confirm, half-written reads ignored, a flip-flop dropped, the live rise, the toggles in order and the unknown launch. No Windows
+REM API: the rig includes only the pure headers.
+if not exist "%OBJ%\modewatch" mkdir "%OBJ%\modewatch"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\modewatch\\" /Fe"%OBJ%\modewatch\mode_watch_test.exe" ^
+    "tools\mode_watch_test\mode_watch_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: mode_watch_test build failed & exit /b 1 )
+"%OBJ%\modewatch\mode_watch_test.exe" --dry-run || exit /b 1
+"%OBJ%\modewatch\mode_watch_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_orbital_width_test

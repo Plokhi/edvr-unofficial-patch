@@ -31,6 +31,7 @@
 #include "format_support_log.h"
 #include "input_gate.h"
 #include "vr_ssaa_hold.h"  // vrSsaaHoldEarlyInstall: the Supersampling hold's hooks at DLL load
+#include "mode_watch.h"    // modeWatchStart: the 3D mode watch, started after the profile lines
 #include "oculus_route.h"
 
 extern "C" const EdvrNativeStartupRouting edvrNativeStartupRouting = {
@@ -288,6 +289,7 @@ BOOL CALLBACK initOnceCallback(PINIT_ONCE, PVOID, PVOID*) {
     edvr::pinGraphicsModuleOnce(reinterpret_cast<const void*>(&initOnceCallback));
     edvr::Log::get().note("%s", edvr::runtimeProfileLogLine().c_str());
     edvr::Log::get().note("game command line: %s", edvr::runtimeGameCommandLine().c_str());
+    edvr::modeWatchStart();  // after the profile lines: the watch's first line follows them (mode_watch.h)
     edvr::oculusRouteReport();
 
     const std::string build = edvr::gameBuildVersion();
