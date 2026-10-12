@@ -133,6 +133,8 @@ inline ModeRead runtimeLaunchRead() { return g_launchDecision.mode; }
 // The class the launch runs: the file's, or the command line's when /vr overrode it.
 inline GameMode runtimeLaunchEffective() { return g_launchDecision.effective; }
 inline RuntimeProfile runtimeProfileValue() { return g_runtimeProfile.load(std::memory_order_relaxed); }
+// The profile the launch decision chose (before any mid-session commit), for gates that must still know a VR launch after a drop.
+inline RuntimeProfile runtimeLaunchProfile() { return g_launchDecision.active; }
 
 // Flat owns a separate mono adapter. Generic setting reads cannot activate the
 // stereo pipeline or unrelated fixes; the mono adapter explicitly reads the

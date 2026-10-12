@@ -5,6 +5,7 @@
 // --self-test runs the checks.
 #include "../../src/common/install_scope.h"
 #include "../../src/common/stereo_mode.h"
+#include "../../src/d3d11/vr_window_gate.h"
 
 #include <cstdio>
 #include <cstring>
@@ -263,6 +264,26 @@ void redactCases() {
         "redact: no output carries a server token, a password, an account name or a user id");
 }
 
+// The mode request's rewrite gate (vr_window_gate.h) over the eight combinations of the current profile and the launch's: true only for
+// a VR current profile, and for Passthrough after a VR launch. A flat launch never rewrites.
+void windowGateCases() {
+    struct Row { RuntimeProfile current; const char* name; RuntimeProfile launch; const char* launchName; bool want; };
+    const Row rows[] = {
+        {RuntimeProfile::Vr, "vr", RuntimeProfile::Vr, "vr", true},
+        {RuntimeProfile::Vr, "vr", RuntimeProfile::Flat, "flat", true},
+        {RuntimeProfile::Flat, "flat", RuntimeProfile::Vr, "vr", false},
+        {RuntimeProfile::Flat, "flat", RuntimeProfile::Flat, "flat", false},
+        {RuntimeProfile::Passthrough, "passthrough", RuntimeProfile::Vr, "vr", true},
+        {RuntimeProfile::Passthrough, "passthrough", RuntimeProfile::Flat, "flat", false},
+        {RuntimeProfile::Invalid, "invalid", RuntimeProfile::Vr, "vr", false},
+        {RuntimeProfile::Invalid, "invalid", RuntimeProfile::Flat, "flat", false},
+    };
+    for (const Row& row : rows) {
+        const std::string name = std::string("window gate: current ") + row.name + ", launch " + row.launchName;
+        check(vrWindowRewriteAllowed(row.current, row.launch) == row.want, name.c_str());
+    }
+}
+
 void nameCases() {
     check(std::strcmp(scopeName(InstallScope::Both), "both") == 0 && std::strcmp(scopeName(InstallScope::Vr), "vr") == 0 &&
         std::strcmp(scopeName(InstallScope::Flat), "flat") == 0 && std::strcmp(scopeName(InstallScope::Invalid), "invalid") == 0,
@@ -292,6 +313,7 @@ int main(int argc, char** argv) {
     lineCases();
     redactCases();
     nameCases();
+    windowGateCases();
     if (g_fails) {
         std::printf("FAIL: runtime_profile_test %d of %d checks failed\n", g_fails, g_checks);
         return 1;

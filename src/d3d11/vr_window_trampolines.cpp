@@ -5,6 +5,7 @@
 #include "device_hook.h"     // deviceHookPanelSettings: DisplaySettings.xml's window size
 #include "vr_ssaa_gate.h"    // vrSsaaGateFrame: the frame number the log carries
 #include "vr_ssaa_hold.h"    // vrSsaaHoldVrLive, vrSsaaHoldAfterCopy, vrSsaaHoldReadSettings
+#include "vr_window_gate.h"  // vrWindowRewriteAllowed: the rewrite's profile gate (VR launch stays rewritten in Passthrough)
 
 #include "../common/code_hook.h"
 #include "../common/log.h"
@@ -108,7 +109,8 @@ void refreshUserSize() {
 // (kind 0) gets the remembered block restored before the original runs, so the apply builds the remembered mode. Nothing is changed
 // while VR is inactive.
 uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
-    if (!runtimeVrProfile()) return g_requestOrig(a, b, c, d, e, f, g, h);  // before any read of the saved mode
+    // Before any read of the saved mode. A VR launch keeps the rewrite in Passthrough (vr_window_gate.h).
+    if (!vrWindowRewriteAllowed(runtimeProfileValue(), runtimeLaunchProfile())) return g_requestOrig(a, b, c, d, e, f, g, h);
     const uintptr_t req = reinterpret_cast<uintptr_t>(b);
     uint32_t kind = 0;
     const bool haveKind = readU32(req + kReqKindOff, &kind);
