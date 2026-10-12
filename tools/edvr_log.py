@@ -9720,7 +9720,8 @@ PROFILE_DETAIL_RE = re.compile(
     r"(?: \(file absent\))?; command line (?P<cmd>none|/novr|/vr)(?: applied| not applied, H2 open)?\)$")
 PROFILE_ANY_RE = re.compile(r"^profile: (?P<active>\w+)(?: \((?P<rest>.*)\))?$")
 OLD_PROFILE_RE = re.compile(r"^installation profile: (?P<rest>.*)$")
-WATCH_START_RE = re.compile(r"^mode watch: started on .*; launch file mode (?P<mode>\d+|unknown) \((?P<cls>flat|vr)\); scope (?P<scope>both|vr|flat)$")
+WATCH_START_RE = re.compile(r"^mode watch: started on .*; launch file mode (?P<mode>\d+|unknown) \((?P<cls>flat|vr)\)"
+                            r"(?:; launch mode (?P<launch>flat|vr))?; scope (?P<scope>both|vr|flat)$")
 WATCH_HINT_RE = re.compile(r"^mode watch: hint (?P<kind>setter|window|live-rise) t=(?P<t>\d+)$")
 WATCH_WRITE_RE = re.compile(r"^mode watch: write t=(?P<t>\d+)(?P<stat> \(stat\))?$")
 WATCH_READ_RE = re.compile(r"^mode watch: read t=(?P<t>\d+) mode (?P<mode>\d+|unknown) -> "
@@ -10296,7 +10297,7 @@ def self_test_switches():
     flight = "\n".join([
         version,
         "[00:00:00.010] profile: flat (scope both; 3D mode 0 from C:\\Game\\Options\\Graphics\\Settings.xml; command line none)",
-        "[00:00:00.011] game command line: \"C:\\Game\\EliteDangerous64.exe\" /autorun",
+        "[00:00:00.011] game command line: EliteDangerous64.exe /autorun",
         "[00:00:00.020] mode watch: started on C:\\Game\\Options\\Graphics; launch file mode 0 (flat); scope both",
         "[00:00:01.000] mode watch: hint setter t=1000",
         "[00:00:01.200] mode watch: hint window t=1200",
@@ -10370,7 +10371,7 @@ def self_test_switches():
 
         rc, out = cli(flight_path, "--version")
         if rc != 0 or "profile: flat (scope both; 3D mode 0 from C:\\Game\\Options\\Graphics\\Settings.xml; command line none)" not in out \
-                or 'game command line: "C:\\Game\\EliteDangerous64.exe" /autorun' not in out:
+                or 'game command line: EliteDangerous64.exe /autorun' not in out:
             fail("--version on the flight log lacks its profile or game command line:\n%s" % out)
         if "mode watch" in out or "switches:" in out:
             fail("--version printed past its own lines:\n%s" % out)

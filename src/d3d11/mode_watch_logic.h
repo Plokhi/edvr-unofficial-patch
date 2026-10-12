@@ -27,8 +27,10 @@ struct Step {
 // (design section 3.2), and neither may a stale file be.
 class Watch {
 public:
-    // Both classes start as the launch file's class. An unknown launch file already reads as Vr (design Q2).
-    explicit Watch(GameMode launchMode) : committed_(launchMode), fileMode_(launchMode) {}
+    // fileMode is the launch file's class; effectiveMode is the class the launch runs, which a /vr override makes Vr over a flat file
+    // (design section 3.1). A read is compared with fileMode, and EDVR runs effectiveMode from the start, so a /vr launch over a flat
+    // file does not post the file's flat when the file is read unchanged. An unknown launch file already reads as Vr (design Q2).
+    Watch(GameMode fileMode, GameMode effectiveMode) : committed_(effectiveMode), fileMode_(fileMode) {}
 
     Step onRead(uint64_t nowMs, const ModeRead& r) {
         if (!r.known) return Step{Outcome::Ignored, r.mode};

@@ -33,7 +33,7 @@ ModeRead unknownRead() { return readGameMode("<Settings></Settings>"); }
 bool outcomeIs(const Step& s, Outcome o) { return s.outcome == o; }
 
 void writeThenConfirm() {
-    Watch w(GameMode::Flat);
+    Watch w(GameMode::Flat, GameMode::Flat);
     const Step first = w.onRead(1000, readOf(GameMode::Vr));
     check(outcomeIs(first, Outcome::Pending) && first.mode == GameMode::Vr && w.confirmDueMs() == 1250,
         "flat launch, write 0 -> 4: pending Vr, confirm at +250");
@@ -46,7 +46,7 @@ void writeThenConfirm() {
 }
 
 void halfWrittenDuringPending() {
-    Watch w(GameMode::Flat);
+    Watch w(GameMode::Flat, GameMode::Flat);
     w.onRead(0, readOf(GameMode::Vr));
     const Step half = w.onRead(100, unknownRead());
     check(outcomeIs(half, Outcome::Ignored) && w.pending() && w.confirmDueMs() == 250,
@@ -57,7 +57,7 @@ void halfWrittenDuringPending() {
 }
 
 void flipFlop() {
-    Watch w(GameMode::Flat);
+    Watch w(GameMode::Flat, GameMode::Flat);
     w.onRead(0, readOf(GameMode::Vr));
     const Step back = w.onRead(100, readOf(GameMode::Flat));
     check(outcomeIs(back, Outcome::Dropped) && !w.pending() && w.committed() == GameMode::Flat,
@@ -68,7 +68,7 @@ void flipFlop() {
 }
 
 void confirmDisagrees() {
-    Watch w(GameMode::Flat);
+    Watch w(GameMode::Flat, GameMode::Flat);
     w.onRead(0, readOf(GameMode::Vr));
     const Step confirm = w.onRead(250, readOf(GameMode::Flat));
     check(outcomeIs(confirm, Outcome::Dropped) && w.committed() == GameMode::Flat && !w.pending(),
@@ -76,25 +76,25 @@ void confirmDisagrees() {
 }
 
 void hintNoChange() {
-    Watch vr(GameMode::Vr);
+    Watch vr(GameMode::Vr, GameMode::Vr);
     check(outcomeIs(vr.onRead(0, readOf(GameMode::Vr)), Outcome::Same) && !vr.pending(),
         "hint read with no change from a Vr launch: same");
-    Watch flat(GameMode::Flat);
+    Watch flat(GameMode::Flat, GameMode::Flat);
     check(outcomeIs(flat.onRead(0, readOf(GameMode::Flat)), Outcome::Same) && !flat.pending() && flat.confirmDueMs() == 0,
         "hint read with no change from a flat launch: same, nothing due");
 }
 
 void liveRise() {
-    Watch flat(GameMode::Flat);
+    Watch flat(GameMode::Flat, GameMode::Flat);
     const Step rise = flat.onLiveRise(0);
     check(outcomeIs(rise, Outcome::Posted) && rise.mode == GameMode::Vr && flat.committed() == GameMode::Vr,
         "live rise from a flat launch: posted Vr");
 
-    Watch vr(GameMode::Vr);
+    Watch vr(GameMode::Vr, GameMode::Vr);
     check(outcomeIs(vr.onLiveRise(0), Outcome::Nothing) && vr.committed() == GameMode::Vr,
         "live rise from a Vr launch: nothing");
 
-    Watch after(GameMode::Vr);
+    Watch after(GameMode::Vr, GameMode::Vr);
     after.onRead(0, readOf(GameMode::Flat));
     after.onRead(250, readOf(GameMode::Flat));
     check(after.committed() == GameMode::Flat, "live rise after a posted Flat: flat committed first");
@@ -105,7 +105,7 @@ void liveRise() {
 
 // A live rise does not cancel a pending file change; the confirm of that change finds the class already posted.
 void liveRiseDuringPending() {
-    Watch w(GameMode::Flat);
+    Watch w(GameMode::Flat, GameMode::Flat);
     w.onRead(0, readOf(GameMode::Vr));
     const Step rise = w.onLiveRise(100);
     check(outcomeIs(rise, Outcome::Posted) && rise.mode == GameMode::Vr && w.committed() == GameMode::Vr,
@@ -119,7 +119,7 @@ void liveRiseDuringPending() {
 // Epic's "Launch in VR": the live rise posts Vr while Settings.xml still says flat. The unchanged file must not post Flat; a later
 // real change of the file is still posted in each direction.
 void liveRiseThenFileChanges() {
-    Watch w(GameMode::Flat);
+    Watch w(GameMode::Flat, GameMode::Flat);
     const Step rise = w.onLiveRise(0);
     check(outcomeIs(rise, Outcome::Posted) && rise.mode == GameMode::Vr, "live rise with the file still flat: posted Vr");
     const Step unchanged = w.onRead(100, readOf(GameMode::Flat));
@@ -138,7 +138,7 @@ void liveRiseThenFileChanges() {
 }
 
 void threeToggles() {
-    Watch w(GameMode::Vr);
+    Watch w(GameMode::Vr, GameMode::Vr);
     std::vector<GameMode> posted;
     uint64_t t = 0;
     const GameMode reads[] = {GameMode::Flat, GameMode::Vr, GameMode::Flat};
@@ -155,11 +155,33 @@ void threeToggles() {
 
 void unknownLaunch() {
     const ModeRead launch = unknownRead();
-    Watch w(launch.mode);
+    Watch w(launch.mode, launch.mode);
     check(w.committed() == GameMode::Vr, "unknown launch file counts as Vr");
     const ModeRead three = readGameMode("<StereoscopicMode>3</StereoscopicMode>");
     check(outcomeIs(w.onRead(0, three), Outcome::Same) && !w.pending(),
         "unknown launch, then a read of 3: same");
+}
+
+// A /vr launch over a flat file (EDLaunch /Steam /VR with Settings.xml at 0): the launch runs Vr from the start, so the unchanged flat
+// file posts nothing; the file's own changes are posted in each direction.
+void vrLaunchOverFlatFile() {
+    Watch w(GameMode::Flat, GameMode::Vr);
+    check(w.committed() == GameMode::Vr && !w.pending(), "vr launch over a flat file: runs Vr from the start");
+    const Step same = w.onRead(0, readOf(GameMode::Flat));
+    check(outcomeIs(same, Outcome::Same) && !w.pending() && w.committed() == GameMode::Vr,
+        "vr launch over a flat file: a read of the unchanged 0 is same, not posted Flat");
+    const Step rise = w.onLiveRise(10);
+    check(outcomeIs(rise, Outcome::Nothing) && w.committed() == GameMode::Vr, "vr launch over a flat file: a live rise is nothing");
+    const Step toVr = w.onRead(100, readOf(GameMode::Vr));
+    check(outcomeIs(toVr, Outcome::Pending) && toVr.mode == GameMode::Vr, "vr launch over a flat file: file 0 -> 4 pending");
+    const Step toVrConfirm = w.onRead(350, readOf(GameMode::Vr));
+    check(outcomeIs(toVrConfirm, Outcome::Same) && w.committed() == GameMode::Vr && !w.pending(),
+        "vr launch over a flat file: file 0 -> 4 confirmed is same (already Vr)");
+    const Step toFlat = w.onRead(400, readOf(GameMode::Flat));
+    check(outcomeIs(toFlat, Outcome::Pending) && toFlat.mode == GameMode::Flat, "vr launch over a flat file: file 4 -> 0 pending");
+    const Step toFlatConfirm = w.onRead(650, readOf(GameMode::Flat));
+    check(outcomeIs(toFlatConfirm, Outcome::Posted) && toFlatConfirm.mode == GameMode::Flat && w.committed() == GameMode::Flat,
+        "vr launch over a flat file: file 4 -> 0 confirmed posts Flat");
 }
 
 }  // namespace
@@ -184,11 +206,12 @@ int main(int argc, char** argv) {
     liveRiseThenFileChanges();
     threeToggles();
     unknownLaunch();
+    vrLaunchOverFlatFile();
     if (g_fails) {
         std::printf("FAIL: mode_watch_test %d of %d checks failed\n", g_fails, g_checks);
         return 1;
     }
     std::printf("PASS: mode_watch_test %d checks (confirm at 250 ms, half-written reads ignored, flip-flop dropped, live rise, toggles in "
-                "order, unknown launch)\n", g_checks);
+                "order, unknown launch, a /vr launch over a flat file)\n", g_checks);
     return 0;
 }

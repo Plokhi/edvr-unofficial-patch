@@ -78,8 +78,8 @@ uint64_t writeTime(const std::wstring& path) {
 // The worker. One per process, pinned with the DLL, so it is never freed and has no shutdown path (module_pin.h).
 class Worker {
 public:
-    Worker(GameMode launch, std::wstring folder, std::wstring file, HANDLE hint)
-        : watch_(launch), folder_(std::move(folder)), file_(std::move(file)), hint_(hint) {}
+    Worker(GameMode launch, GameMode effective, std::wstring folder, std::wstring file, HANDLE hint)
+        : watch_(launch, effective), folder_(std::move(folder)), file_(std::move(file)), hint_(hint) {}
 
     static DWORD WINAPI threadMain(LPVOID p) { return static_cast<Worker*>(p)->run(); }
 
@@ -323,10 +323,11 @@ void modeWatchStart() {
     char launchMode[16];
     if (launch.known) std::snprintf(launchMode, sizeof(launchMode), "%d", launch.value);
     else std::snprintf(launchMode, sizeof(launchMode), "unknown");
-    Log::get().note("mode watch: started on %S; launch file mode %s (%s); scope %s", folder.c_str(), launchMode,
-                    gameModeName(launch.mode), scopeName(runtimeInstallScope()));
+    const GameMode effective = runtimeLaunchEffective();
+    Log::get().note("mode watch: started on %S; launch file mode %s (%s); launch mode %s; scope %s", folder.c_str(), launchMode,
+                    gameModeName(launch.mode), gameModeName(effective), scopeName(runtimeInstallScope()));
 
-    Worker* worker = new Worker(launch.mode, folder, path, hint);
+    Worker* worker = new Worker(launch.mode, effective, folder, path, hint);
     const HANDLE thread = CreateThread(nullptr, 0, Worker::threadMain, worker, 0, nullptr);
     if (!thread) {
         Log::get().note("mode watch: worker thread not started (error %lu)", GetLastError());

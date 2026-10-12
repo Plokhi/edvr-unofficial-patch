@@ -86,10 +86,12 @@ inline void runtimeProfileInitialize(const std::wstring& moduleDir,
     const bool haveXml = !settingsPath.empty() && readBoundedFile(settingsPath, 1024 * 1024, xml) == FileState::Read;
     const ModeRead mode = readGameMode(haveXml ? xml.c_str() : nullptr);
 
-    g_gameCommandLineUtf8 = runtimeProfileUtf8(std::wstring(GetCommandLineW()));
-    const VrSwitch cmd = parseVrSwitch(g_gameCommandLineUtf8);
-    // Production does not apply /novr or /vr yet: the override ships only once flight hypothesis H2 holds (design section 3.1).
-    g_launchDecision = decideLaunch(scope, mode, cmd, /*applyCommandLine=*/false);
+    // The raw line is parsed here and never logged: it carries the account's tokens. The log gets the redacted form.
+    const std::string commandLine = runtimeProfileUtf8(std::wstring(GetCommandLineW()));
+    const VrSwitch cmd = parseVrSwitch(commandLine);
+    g_gameCommandLineUtf8 = redactCommandLine(commandLine);
+    // /vr overrides Settings.xml in the game (flight 2026-10-12: EDLaunch /Steam /VR with the file at 0); /novr waits for a flight.
+    g_launchDecision = decideLaunch(scope, mode, cmd, /*applyVr=*/true, /*applyNoVr=*/false);
     g_runtimeProfile = g_launchDecision.active;
 }
 
@@ -127,6 +129,8 @@ inline const std::string& runtimeGameCommandLine() { return g_gameCommandLineUtf
 inline const std::wstring& runtimeSettingsPathWide() { return g_settingsPathWide; }
 inline InstallScope runtimeInstallScope() { return g_launchDecision.scope.scope; }
 inline ModeRead runtimeLaunchRead() { return g_launchDecision.mode; }
+// The class the launch runs: the file's, or the command line's when /vr overrode it.
+inline GameMode runtimeLaunchEffective() { return g_launchDecision.effective; }
 inline RuntimeProfile runtimeProfileValue() { return g_runtimeProfile.load(std::memory_order_relaxed); }
 
 // Flat owns a separate mono adapter. Generic setting reads cannot activate the
