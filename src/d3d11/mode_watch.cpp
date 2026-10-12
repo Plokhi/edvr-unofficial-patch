@@ -158,6 +158,7 @@ private:
                 Log::get().note("mode watch: live-rise t=%llu -> nothing", static_cast<unsigned long long>(now));
             }
         }
+        readAfterWrite_ = false;  // a hint's read is not a write: a stale file does not count for it
         readFile(false);
     }
 
@@ -169,6 +170,7 @@ private:
         char suffix[64];
         Log::get().note("mode watch: write t=%llu%s%s", static_cast<unsigned long long>(nowMs()), fromStat ? " (stat)" : "",
                         submitSuffix(suffix, sizeof(suffix)));
+        readAfterWrite_ = true;  // a read of a stale file counts only after a write: the watch's rule (mode_watch_logic.h)
         readFile(false);
     }
 
@@ -229,14 +231,16 @@ private:
             return;
         }
         retryAt_ = 0;
-        const Step s = watch_.onRead(now, r);
+        const Step s = watch_.onRead(now, r, readAfterWrite_);
 
         char mode[16];
         if (r.known) std::snprintf(mode, sizeof(mode), "%d", r.value);
         else std::snprintf(mode, sizeof(mode), "unknown");
         char result[96];
         switch (s.outcome) {
-        case Outcome::Ignored: std::snprintf(result, sizeof(result), "ignored"); break;
+        case Outcome::Ignored:
+            std::snprintf(result, sizeof(result), "%s", s.staleFile ? "ignored (stale file)" : "ignored");
+            break;
         case Outcome::Same: std::snprintf(result, sizeof(result), "same"); break;
         case Outcome::Pending:
             std::snprintf(result, sizeof(result), "pending %s confirm at t=%llu", gameModeName(s.mode),
@@ -296,6 +300,7 @@ private:
     std::wstring file_;
     HANDLE hint_;
     uint64_t lastWrite_ = 0;
+    bool readAfterWrite_ = false;  // the current read follows a write of the file (or is a retry of one)
     uint64_t retryAt_ = 0;
     int retries_ = 0;
     bool gaveUp_ = false;

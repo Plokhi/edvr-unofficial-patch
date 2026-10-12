@@ -9728,7 +9728,8 @@ WATCH_HINT_RE = re.compile(r"^mode watch: hint (?P<kind>setter|window|live-rise)
 SUBMIT_SUFFIX = r"(?: \(eye submits last 1 s: (?P<submits>\d+)\))?"
 WATCH_WRITE_RE = re.compile(r"^mode watch: write t=(?P<t>\d+)(?P<stat> \(stat\))?" + SUBMIT_SUFFIX + "$")
 WATCH_READ_RE = re.compile(r"^mode watch: read t=(?P<t>\d+) mode (?P<mode>\d+|unknown) -> "
-                           r"(?P<result>ignored|same|dropped|nothing|pending (?P<pending>flat|vr) confirm at t=(?P<due>\d+)|posted (?P<post>flat|vr))"
+                           r"(?P<result>ignored(?: \(stale file\))?|same|dropped|nothing|pending (?P<pending>flat|vr) confirm at t=(?P<due>\d+)"
+                           r"|posted (?P<post>flat|vr))"
                            + SUBMIT_SUFFIX + "$")
 WATCH_FAIL_RE = re.compile(r"^mode watch: read failed t=(?P<t>\d+) \(error (?P<err>\d+)\); (?P<what>.*?)" + SUBMIT_SUFFIX + "$")
 WATCH_LIVE_RE = re.compile(r"^mode watch: live-rise t=(?P<t>\d+) -> (?P<result>posted vr|nothing)$")
@@ -9792,9 +9793,13 @@ def _switch_event(body):
     m = WATCH_READ_RE.match(body)
     if m:
         post = m.group("post")
-        outcome = "pending" if m.group("pending") else ("posted" if post else m.group("result"))
+        result = m.group("result")
+        # "ignored (stale file)" is an ignored read the watch refused because the file is stale (mode_watch_logic.h): outcome ignored, stale set.
+        stale = result.startswith("ignored (stale file)")
+        outcome = "pending" if m.group("pending") else ("posted" if post else ("ignored" if stale else result))
         submits = None if m.group("submits") is None else int(m.group("submits"))
-        return {"kind": "read", "t": int(m.group("t")), "mode": m.group("mode"), "outcome": outcome, "post": post, "submits": submits}
+        return {"kind": "read", "t": int(m.group("t")), "mode": m.group("mode"), "outcome": outcome, "post": post, "stale": stale,
+                "submits": submits}
     m = WATCH_FAIL_RE.match(body)
     if m:
         submits = None if m.group("submits") is None else int(m.group("submits"))
@@ -10369,13 +10374,16 @@ def self_test_switches():
         "[00:00:03.000] mode watch: eye submits stopped t=3000",
         "[00:00:03.200] mode watch: read failed t=3200 (error 32); retry in 100 ms (eye submits last 1 s: 0)",
         "[00:00:03.300] mode watch: read t=3300 mode 4 -> posted vr (eye submits last 1 s: 0)",
+        "[00:00:03.350] mode watch: read t=3350 mode 0 -> ignored (stale file) (eye submits last 1 s: 0)",
         "",
     ])
     srows = switch_rows(switch_events(submit))
     skinds = [r["kind"] for r in srows]
-    if skinds != ["start", "write", "submits", "read", "submits", "read-failed", "read"]:
+    if skinds != ["start", "write", "submits", "read", "submits", "read-failed", "read", "read"]:
         fail("eye-submit kinds %r" % skinds)
     else:
+        if not (srows[7]["outcome"] == "ignored" and srows[7]["stale"] is True and srows[7]["submits"] == 0 and srows[6]["stale"] is False):
+            fail("stale-file read parsed as %r" % srows[7])
         if [srows[1]["submits"], srows[3]["submits"], srows[5]["submits"], srows[6]["submits"]] != [0, 88, 0, 0]:
             fail("eye-submit suffixes parsed as %r" % [r.get("submits") for r in srows])
         if (srows[2]["state"], srows[2]["n"], srows[4]["state"], srows[4]["n"]) != ("resumed", 88, "stopped", None):
