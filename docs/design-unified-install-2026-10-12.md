@@ -19,9 +19,6 @@
     undone by the next read of the unchanged file.
   - Not built yet: the switch rig (phase 2, with its leak count). `/novr`
     and `/vr` are parsed and logged, not applied (H2).
-- Written from read-only surveys of main `99476a0`: build, packaging,
-  installer, runtime, the 3D-toggle record, and an inventory of the
-  profile-dependent state. One web search covered the launcher's VR switches.
 - **Goal (Sean, 2026-10-12):**
   - one installer;
   - EDVR runs its flat profile when Elite's 3D mode is off (or anaglyph), and
@@ -37,27 +34,14 @@
   - Q7: settings fixed at device creation follow at the next launch.
   - Q8: SBS stays on VR. It is for future development and low priority, so
     no phase waits on it.
-- **Reverses:** the "two installers" recommendation of
-  `design-flat-temporal-aa-2026-09-23.md`, "the edition is fixed by the
-  artifact" of `design-plugin-architecture-2026-09-30.md`, and the "set once
-  per process" rule of `runtime_profile.h`. **Keeps:** one graphics DLL,
-  separate mono and VR adapters, and one adapter owning a frame stream at a
-  time.
-- **Correction to an assumption:** the code does not hook the 3D setting.
-  - It hooks four side effects: the Supersampling setter (fires at toggles),
-    the window mode request, the settings copy, and Present's window
-    observer.
-  - It polls the runtime's live flag, which never falls at 3D off.
-  - No hook sees the mode value (section 2). So the switch signal is a watch
-    on Settings.xml, confirmed by those side effects (section 3.2).
-- **Proposed:**
-  - scope (installed) and mode (live) as separate things (3.1);
-  - the switch signal (3.2);
-  - one commit point per switch at the frame boundary, with every hook either
-    mode needs installed from the start (3.3);
-  - what cannot switch live (3.4);
-  - the Supersampling hold keyed to the mode, not the runtime's flag (3.5);
-  - the scope prompt in one installer (4).
+- **Reverses:** the two-installer plan (`design-flat-temporal-aa-2026-09-23.md`,
+  `design-plugin-architecture-2026-09-30.md`) and the "set once per process"
+  profile. **Keeps:** one graphics DLL, separate mono and VR adapters.
+- **No hook sees the 3D mode value** (section 2): the switch signal is a
+  watch on Settings.xml, prompted by four side-effect hooks (3.2).
+- **Design:** scope vs mode (3.1), the switch signal (3.2), one commit point
+  at the frame boundary (3.3), what cannot switch live (3.4), the hold keyed
+  to the mode (3.5), the scope prompt in one installer (4).
 - **Still open for Sean:** none.
 - **Hypotheses (section 7 names the evidence for each):**
   - H1: a flat launch never loads `openvr_api.dll`, and 3D-on loads it then.
