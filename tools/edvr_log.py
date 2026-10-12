@@ -9723,12 +9723,19 @@ OLD_PROFILE_RE = re.compile(r"^installation profile: (?P<rest>.*)$")
 WATCH_START_RE = re.compile(r"^mode watch: started on .*; launch file mode (?P<mode>\d+|unknown) \((?P<cls>flat|vr)\)"
                             r"(?:; launch mode (?P<launch>flat|vr))?; scope (?P<scope>both|vr|flat)$")
 WATCH_HINT_RE = re.compile(r"^mode watch: hint (?P<kind>setter|window|live-rise) t=(?P<t>\d+)$")
-WATCH_WRITE_RE = re.compile(r"^mode watch: write t=(?P<t>\d+)(?P<stat> \(stat\))?$")
+# Every write and read line ends with the last full second's eye submits (mode_watch.cpp's submitSuffix). The suffix is optional here so an
+# older log still parses; a read or write without it has submits None.
+SUBMIT_SUFFIX = r"(?: \(eye submits last 1 s: (?P<submits>\d+)\))?"
+WATCH_WRITE_RE = re.compile(r"^mode watch: write t=(?P<t>\d+)(?P<stat> \(stat\))?" + SUBMIT_SUFFIX + "$")
 WATCH_READ_RE = re.compile(r"^mode watch: read t=(?P<t>\d+) mode (?P<mode>\d+|unknown) -> "
-                           r"(?P<result>ignored|same|dropped|nothing|pending (?P<pending>flat|vr) confirm at t=(?P<due>\d+)|posted (?P<post>flat|vr))$")
-WATCH_FAIL_RE = re.compile(r"^mode watch: read failed t=(?P<t>\d+) \(error (?P<err>\d+)\); (?P<what>.*)$")
+                           r"(?P<result>ignored|same|dropped|nothing|pending (?P<pending>flat|vr) confirm at t=(?P<due>\d+)|posted (?P<post>flat|vr))"
+                           + SUBMIT_SUFFIX + "$")
+WATCH_FAIL_RE = re.compile(r"^mode watch: read failed t=(?P<t>\d+) \(error (?P<err>\d+)\); (?P<what>.*?)" + SUBMIT_SUFFIX + "$")
 WATCH_LIVE_RE = re.compile(r"^mode watch: live-rise t=(?P<t>\d+) -> (?P<result>posted vr|nothing)$")
 WATCH_OPENVR_RE = re.compile(r"^mode watch: openvr_api\.dll (?P<state>loaded|unloaded) t=(?P<t>\d+)$")
+# The eye-submit transitions: a second with none after one with some (stopped), and the reverse (resumed, with that second's count).
+WATCH_SUBMIT_STOP_RE = re.compile(r"^mode watch: eye submits stopped t=(?P<t>\d+)$")
+WATCH_SUBMIT_RESUME_RE = re.compile(r"^mode watch: eye submits resumed t=(?P<t>\d+) \((?P<n>\d+)/s\)$")
 SWITCH_RES = (
     ("passthrough until restart", re.compile(
         r"^profile switch: none, passthrough until restart \(posted (?P<cls>flat|vr) t=(?P<t>\d+) from (?P<src>file|live-rise)\)$")),
@@ -9780,15 +9787,24 @@ def _switch_event(body):
         return {"kind": "hint", "t": int(m.group("t")), "hint": m.group("kind")}
     m = WATCH_WRITE_RE.match(body)
     if m:
-        return {"kind": "write", "t": int(m.group("t")), "stat": m.group("stat") is not None}
+        submits = None if m.group("submits") is None else int(m.group("submits"))
+        return {"kind": "write", "t": int(m.group("t")), "stat": m.group("stat") is not None, "submits": submits}
     m = WATCH_READ_RE.match(body)
     if m:
         post = m.group("post")
         outcome = "pending" if m.group("pending") else ("posted" if post else m.group("result"))
-        return {"kind": "read", "t": int(m.group("t")), "mode": m.group("mode"), "outcome": outcome, "post": post}
+        submits = None if m.group("submits") is None else int(m.group("submits"))
+        return {"kind": "read", "t": int(m.group("t")), "mode": m.group("mode"), "outcome": outcome, "post": post, "submits": submits}
     m = WATCH_FAIL_RE.match(body)
     if m:
-        return {"kind": "read-failed", "t": int(m.group("t")), "err": m.group("err")}
+        submits = None if m.group("submits") is None else int(m.group("submits"))
+        return {"kind": "read-failed", "t": int(m.group("t")), "err": m.group("err"), "submits": submits}
+    m = WATCH_SUBMIT_STOP_RE.match(body)
+    if m:
+        return {"kind": "submits", "t": int(m.group("t")), "state": "stopped", "n": None}
+    m = WATCH_SUBMIT_RESUME_RE.match(body)
+    if m:
+        return {"kind": "submits", "t": int(m.group("t")), "state": "resumed", "n": int(m.group("n"))}
     m = WATCH_LIVE_RE.match(body)
     if m:
         posted = m.group("result") == "posted vr"
@@ -9871,6 +9887,10 @@ def print_switches(text):
     print("       hints: %d (%s)" % (len(hints), ", ".join("%s %d" % kv for kv in kinds)))
     print("       writes: %d" % len(writes))
     print("       posts: %d" % len(posts))
+    submit_rows = [r for r in rows if r["kind"] == "submits"]
+    if submit_rows:
+        print("       eye submits: %d stopped, %d resumed" % (sum(1 for r in submit_rows if r["state"] == "stopped"),
+                                                              sum(1 for r in submit_rows if r["state"] == "resumed")))
     if switches:
         counts = [(res, sum(1 for r in switches if r["result"] == res)) for res, _ in SWITCH_RES]
         print("       switches: %d (%s)" % (len(switches), ", ".join("%s %d" % kv for kv in counts if kv[1])))
@@ -10339,6 +10359,34 @@ def self_test_switches():
             fail("drift launch lines parsed as %r and %r" % (rows[0], rows[1]))
         if rows[4]["post"] != "vr" or rows[5]["outcome"] != "nothing" or rows[5]["post"] is not None:
             fail("drift live-rise lines parsed as %r and %r" % (rows[4], rows[5]))
+
+    # The eye-submit suffix on the write, read and failed-read lines, and the stopped and resumed lines (mode_watch.cpp's sampler).
+    submit = "\n".join([
+        "[00:00:00.020] mode watch: started on C:\\Game\\Options\\Graphics; launch file mode 4 (vr); scope both",
+        "[00:00:01.000] mode watch: write t=1000 (eye submits last 1 s: 0)",
+        "[00:00:02.000] mode watch: eye submits resumed t=2000 (88/s)",
+        "[00:00:02.100] mode watch: read t=2100 mode 4 -> same (eye submits last 1 s: 88)",
+        "[00:00:03.000] mode watch: eye submits stopped t=3000",
+        "[00:00:03.200] mode watch: read failed t=3200 (error 32); retry in 100 ms (eye submits last 1 s: 0)",
+        "[00:00:03.300] mode watch: read t=3300 mode 4 -> posted vr (eye submits last 1 s: 0)",
+        "",
+    ])
+    srows = switch_rows(switch_events(submit))
+    skinds = [r["kind"] for r in srows]
+    if skinds != ["start", "write", "submits", "read", "submits", "read-failed", "read"]:
+        fail("eye-submit kinds %r" % skinds)
+    else:
+        if [srows[1]["submits"], srows[3]["submits"], srows[5]["submits"], srows[6]["submits"]] != [0, 88, 0, 0]:
+            fail("eye-submit suffixes parsed as %r" % [r.get("submits") for r in srows])
+        if (srows[2]["state"], srows[2]["n"], srows[4]["state"], srows[4]["n"]) != ("resumed", 88, "stopped", None):
+            fail("eye-submit transitions parsed as %r and %r" % (srows[2], srows[4]))
+        if srows[6]["post"] != "vr" or srows[1].get("stat") is not False:
+            fail("eye-submit read or write parsed as %r and %r" % (srows[6], srows[1]))
+        shown = io.StringIO()
+        with contextlib.redirect_stdout(shown):
+            print_switches(submit)
+        if "eye submits: 1 stopped, 1 resumed" not in shown.getvalue():
+            fail("--switches summary lacks the eye-submit counts: %r" % shown.getvalue()[-300:])
 
     tmp = tempfile.mkdtemp(prefix="edvr_switches_test_")
     try:

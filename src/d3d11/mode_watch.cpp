@@ -7,6 +7,7 @@
 
 #include "../common/install_scope.h"
 #include "../common/log.h"
+#include "../common/native_frame.h"           // nativeFrameLatchedFrames: the eye-submit count the watch samples
 #include "../common/native_render_settings.h"  // edvrQueryNativeRenderSizing: the runtime's live VR session
 #include "../common/runtime_profile.h"
 
@@ -96,15 +97,20 @@ private:
             Log::get().note("mode watch: no folder notification (error %lu); polling once a second", GetLastError());
         }
         lastWrite_ = writeTime(file_);
+        submitsAtSample_ = nativeFrameLatchedFrames();
+        nextSampleMs_ = nowMs() + kMaxWaitMs;
 
         for (;;) {
-            // A timed read (a confirm or a retry) runs as soon as it is due; the wait below ends no later than the next one.
+            // A timed read (a confirm or a retry) runs as soon as it is due; the wait below ends no later than the next one, and no
+            // later than the next eye-submit sample.
             const uint64_t at = timedReadAt();
             if (at && nowMs() >= at) readFile(retryAt_ != 0);
+            uint64_t wake = nextSampleMs_;
             const uint64_t next = timedReadAt();
+            if (next && next < wake) wake = next;
             const uint64_t now = nowMs();
             DWORD timeout = kMaxWaitMs;
-            if (next) timeout = next > now ? static_cast<DWORD>(std::min<uint64_t>(kMaxWaitMs, next - now)) : 0;
+            if (wake) timeout = wake > now ? static_cast<DWORD>(std::min<uint64_t>(kMaxWaitMs, wake - now)) : 0;
 
             const DWORD r = WaitForMultipleObjects(count, handles, FALSE, timeout);
             if (r == WAIT_OBJECT_0) {
@@ -116,6 +122,7 @@ private:
             } else if (r == WAIT_TIMEOUT) {
                 // A hint can land before the event exists or be missed while the worker is between waits; the bits are read here too.
                 if (g_hints.load(std::memory_order_acquire)) handleHints();
+                sampleSubmits(nowMs());
                 checkWrite(true);
                 checkOpenVr();
             } else {
@@ -159,8 +166,34 @@ private:
         const uint64_t wt = writeTime(file_);
         if (wt == lastWrite_) return;
         lastWrite_ = wt;
-        Log::get().note("mode watch: write t=%llu%s", static_cast<unsigned long long>(nowMs()), fromStat ? " (stat)" : "");
+        char suffix[64];
+        Log::get().note("mode watch: write t=%llu%s%s", static_cast<unsigned long long>(nowMs()), fromStat ? " (stat)" : "",
+                        submitSuffix(suffix, sizeof(suffix)));
         readFile(false);
+    }
+
+    // The eye-submit rate: the frame pairs the game submitted in the last full second, sampled on the timeout path once a second. It is
+    // file-independent, so it says whether the game still reaches the VR runtime when Settings.xml does not change. Logs only when the
+    // state changes: "stopped" when a second with none follows one with some, "resumed" for the reverse.
+    void sampleSubmits(uint64_t now) {
+        if (now < nextSampleMs_) return;
+        const uint64_t total = nativeFrameLatchedFrames();
+        lastSecondSubmits_ = total - submitsAtSample_;
+        submitsAtSample_ = total;
+        nextSampleMs_ = now + kMaxWaitMs;
+        const bool flowing = lastSecondSubmits_ > 0;
+        if (flowing && !flowing_)
+            Log::get().note("mode watch: eye submits resumed t=%llu (%llu/s)", static_cast<unsigned long long>(now),
+                            static_cast<unsigned long long>(lastSecondSubmits_));
+        else if (!flowing && flowing_)
+            Log::get().note("mode watch: eye submits stopped t=%llu", static_cast<unsigned long long>(now));
+        flowing_ = flowing;
+    }
+
+    // The suffix every read and write line carries: the last full second's eye submits (zero until the first sample completes).
+    const char* submitSuffix(char* buf, size_t size) const {
+        std::snprintf(buf, size, " (eye submits last 1 s: %llu)", static_cast<unsigned long long>(lastSecondSubmits_));
+        return buf;
     }
 
     void checkOpenVr() {
@@ -180,17 +213,18 @@ private:
         }
         ModeRead r{};
         DWORD error = 0;
+        char suffix[64];
         if (!readSettings(&r, &error)) {
             retryAt_ = 0;
             if (retries_ < kMaxRetries) {
                 ++retries_;
                 retryAt_ = now + kRetryMs;
-                Log::get().note("mode watch: read failed t=%llu (error %lu); retry in 100 ms",
-                                static_cast<unsigned long long>(now), error);
+                Log::get().note("mode watch: read failed t=%llu (error %lu); retry in 100 ms%s",
+                                static_cast<unsigned long long>(now), error, submitSuffix(suffix, sizeof(suffix)));
             } else {
                 gaveUp_ = true;
-                Log::get().note("mode watch: read failed t=%llu (error %lu); giving up on this write after %d retries",
-                                static_cast<unsigned long long>(now), error, kMaxRetries);
+                Log::get().note("mode watch: read failed t=%llu (error %lu); giving up on this write after %d retries%s",
+                                static_cast<unsigned long long>(now), error, kMaxRetries, submitSuffix(suffix, sizeof(suffix)));
             }
             return;
         }
@@ -214,7 +248,8 @@ private:
             break;
         default: std::snprintf(result, sizeof(result), "nothing"); break;
         }
-        Log::get().note("mode watch: read t=%llu mode %s -> %s", static_cast<unsigned long long>(now), mode, result);
+        Log::get().note("mode watch: read t=%llu mode %s -> %s%s", static_cast<unsigned long long>(now), mode, result,
+                        submitSuffix(suffix, sizeof(suffix)));
         if (s.outcome == Outcome::Posted) postMode(now, s.mode, false);
     }
 
@@ -265,6 +300,12 @@ private:
     int retries_ = 0;
     bool gaveUp_ = false;
     bool openvrLoaded_ = false;
+    // The eye-submit sampler: the counter at the last sample, the next sample's time, the last full second's count, and whether that
+    // second had any. flowing_ starts false, so the first second with submits logs "resumed".
+    uint64_t submitsAtSample_ = 0;
+    uint64_t nextSampleMs_ = 0;
+    uint64_t lastSecondSubmits_ = 0;
+    bool flowing_ = false;
 };
 
 // The render thread's commit: the posted mode becomes the profile it selects, or a log line and a notice when this build does not
