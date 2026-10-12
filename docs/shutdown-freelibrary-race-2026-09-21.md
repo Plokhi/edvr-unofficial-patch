@@ -2,7 +2,12 @@
 
 ## Status
 
-- **State (2026-09-25): fix BUILT, NOT FLOWN.** Opened 2026-09-21 from a
+- **State (2026-10-12): PR #40 FLOWN, DID NOT FIX IT.** v0.19.1 (build
+  6ACAF769, PR #40 in it) crashed the same way with `device_module_reset,
+  pinned=1`; the `FreeLibrary` hypothesis is dead (`## Fourth flight`). The
+  frozen address is in the runtime's own context table, not in EDVR memory;
+  who wrote it is unknown. Next: crash-handler instrument, below.
+- *Earlier state (2026-09-25): fix BUILT, NOT FLOWN.* Opened 2026-09-21 from a
   supporter's log bundle: a crash after closing the game, on a thread that
   lands in unmapped ("no module") memory 31 ms, to the millisecond in both
   logged flights, after the OpenXR shutdown reports clean. PR #40 made
@@ -37,11 +42,13 @@
   jitter?) may narrow which side owns the next call.
 - **Ruled out:** see `## Ruled out` (four items: EDVR's own shutdown
   throwing, the overlay as bystander, a stale build, SteamVR as runtime).
-- **Next flight:** raise `log.max_mb` first so the gfx-side log survives to
-  the close. Repro once with EDHM's chain target switched to the system
-  `d3d11.dll`, and once with the Steam overlay disabled for Elite (Steam
-  library > Elite Dangerous > Properties > General). The investigation
-  stays open until a flight shows the crash gone and `pinned=` logged.
+- **Next flight (2026-10-12):** build a crash-handler instrument first, so
+  the next crash names its cause (see `## Fourth flight`): `VirtualQuery`
+  of the fault address, the runtime context table's slots 40-48 and how
+  many of its cells fall outside any image, and a ring of DLL unloads
+  (`LdrRegisterDllNotification`) printed into the breadcrumb. Then repro
+  once with EDHM's chain target switched to the system `d3d11.dll` (overlay
+  on) and once with the overlay off. This user crashes every session.
 - **Environment:** build v0.17.0 in both logged flights (`edvr_log.py
   --expect-build v0.17.0` matched); "separate device" mode (the default for
   every normal install); flight 2 on VirtualDesktopXR / Meta Quest 3.
@@ -319,6 +326,47 @@ without a flight that removes EDHM instead, and its result matches the
 mechanism -- with the overlay gone, nothing calls back into `d3d11.dll`
 through the chain after `host_graphics_reset` frees it, so there is no
 late call left to land in the unmapped module.
+
+## Fourth flight -- 2026-10-12, v0.19.1, `pinned=1`
+
+`edvr-logs-20261012-211612.zip`. Build 6ACAF769 = `dist\edvr-0.19.1`
+(`d3d11.dll` sha256 f4dd6654, matches `edvr_install_state.ini`). PlayStation
+VR2 on SteamVR/OpenXR, RX 9060 XT, EDHM chained, Steam overlay on. One
+session, 80 min, then the same crash. `edvr_breadcrumbs.txt` holds four
+crashes of this one signature (this user crashes every session).
+
+- **`device_module_reset,pinned=1` was logged and the crash happened.** The
+  System32 `d3d11.dll` was never unmapped, so PR #40's change was inert, as
+  its review predicted. It stays (harmless).
+- **Timing:** the runtime's `module_shutdown_return` is at tick 74212703 and
+  the crash at 74212734, 31 ms later, as in the 2026-09-21 flights. The
+  crashing thread is the render thread (0x6E70 = 28272), which Presents
+  three more times after the runtime says it is done.
+- **The faulting call, read from the shipped DLL.** `d3d11.dll+0x2E1EC4` is
+  the return address after `call rax` in vScreen's `hookedRSSetViewports`
+  (`rcx` = the game's context, `edx` = 1, `r8` = the stack viewport; the
+  v0.17.0 flight's `+0x177009` is the same site in that build). `rax` =
+  0x1353228DDB0 = context 0x1353228DC48 + 0x168 = the runtime's own embedded
+  table, slot 44. That is the live-mode stub (`mov rax, &cell; jmp [rax]`)
+  having run, so the jump target, 0x7FFF59EEF780, is the CONTENT of the
+  runtime's table cell. EDVR's stub block is never freed and is not what
+  faulted. Something wrote a non-image address into the runtime's slot 44,
+  or the cell was valid and its target went away.
+- **The address recurs.** The low 16 bits are 0xF780 in all four breadcrumb
+  crashes and in the 2026-09-21 flight (0x7FFC59E4F780), across two builds
+  and several boots, and the 64 KB base repeats within a boot. A fixed
+  offset in a 64 KB-aligned base points at an image or a hook block, not at
+  a heap accident. It is not an entry in `openvr_api.dll` (mid-instruction),
+  `openxr_loader.dll` (int3 padding) or `nvngx_dlss.dll`.
+- The gfx log's tail adds nothing: the render thread's last stall samples
+  are Elite's own crash reporter (`dbgcore`, 0.9-1.2 s) writing a dump.
+
+ruled out: `FreeLibrary(systemModule_)` unmapping System32 `d3d11.dll`,
+because `pinned=1` and the crash reproduced on a build that no longer calls
+it.
+ruled out: EDVR's live stub block as the freed memory, because the fault is
+the jump target read from the runtime's cell, and the block is leaked by
+design.
 
 ## Not ruled out
 
