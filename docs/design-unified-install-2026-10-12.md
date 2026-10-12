@@ -22,16 +22,12 @@
   - EDVR runs its flat profile when Elite's 3D mode is off (or anaglyph), and
     its VR profile otherwise;
   - it follows a mid-session switch seamlessly.
-- **Decided (Sean, 2026-10-12):**
-  - Q1: seamless mid-session switching, not a restart.
-  - Q2: unknown 3D mode means VR.
-  - Q3: an install without a descriptor follows the 3D setting too.
-  - Q4: no override; everything follows the game's 3D setting.
-  - Q5: one installer, which asks VR, Flat or Both (a scope, section 4).
-  - Q6: mode 1 (anaglyph) is flat; mode 2 (SBS) is VR.
-  - Q7: settings fixed at device creation follow at the next launch.
-  - Q8: SBS stays on VR. It is for future development and low priority, so
-    no phase waits on it.
+- **Decided (Sean, 2026-10-12; section 8):** Q1 switch live; Q2 unknown is
+  VR; Q3 no descriptor follows the 3D setting; Q4 no override key (the
+  launcher's `/vr` and `/novr` are the game's own, so they count); Q5 one
+  installer with a scope prompt; Q6 modes 0-1 flat, 2-6 VR; Q7
+  creation-time settings follow at the next launch; Q8 SBS is VR, low
+  priority.
 - **Reverses:** the two-installer plan (`design-flat-temporal-aa-2026-09-23.md`,
   `design-plugin-architecture-2026-09-30.md`) and the "set once per process"
   profile. **Keeps:** one graphics DLL, separate mono and VR adapters.
@@ -43,21 +39,25 @@
 - **Still open for Sean:** none.
 - **Hypotheses (section 7 names the evidence for each):**
   - H1: a flat launch never loads `openvr_api.dll`, and 3D-on loads it then.
-  - H2: `/vr` half HOLDS (Steam 2026-10-12, edvr_gfx_20261012_160543:
-    EDLaunch `/Steam /VR`, file at 0, VR live 1.7 s in); applied since
-    6f3f9362. `/novr` half open, logged only. The command line is logged
-    redacted (exe name and bare switches; it carried the ServerToken).
-  - H3: Settings.xml's mode at start is the start mode.
+  - H2 HOLDS both ways (Steam 2026-10-12): `/steam /vr` over a file at 0
+    went VR; `/steam /novr` over 4 stayed flat with no HMD mode offered.
+    Both applied (6fbb4919). The command line is logged redacted.
+  - H10 (open): a `/vr` launch over a file at 0 left the file stale: 3D off
+    took the game out of the headset but re-wrote 0, so the watch missed
+    it. Flight D: what an unrelated apply writes there, and whether the eye
+    submit rate (ed0bddd8, log only) stops at 3D off.
+  - H3 REFUTED under a launcher switch: the switch, not the file, is the
+    start mode (H2). Holds for a launch with neither.
   - H4: after 3D off the OpenXR session idles at no flat cost.
   - H5: the Settings.xml path resolves on every store and on Proton.
-  - H6: Settings.xml is rewritten at a 3D apply, and a folder watch sees it.
-  - H7: a toggle keeps the device and swapchain.
+  - H6 HOLDS (Steam B): a 3D apply rewrites the file; the watch saw the
+    write 70-80 ms after the setter call, confirmed 250 ms later.
+  - H7: a toggle keeps the device and swapchain (no new-chain line in B).
   - H8: the always-installed hooks cost VR nothing measurable.
 - **Ruled out while designing:** section 9.
 - **Temporary keys:** none. No user-facing key is added.
-- **Next:** the phase-1 instrument flight on Steam (section 7, launches A
-  to C; read with `edvr_log.py --target steam --expect-build HEAD --version`
-  and `--switches`). It answers H1-H7 before phase 2 builds the live switch.
+- **Next:** flight D on Steam (H10). Then a launch with neither switch, if
+  the launcher can make one (H1's second half).
 
 ## 1. What exists today
 
