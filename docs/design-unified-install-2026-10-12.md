@@ -17,8 +17,11 @@
     class apart from the class EDVR runs. A read posts only when the FILE
     changes, so a live rise (Epic's "Launch in VR", file still 0) is not
     undone by the next read of the unchanged file.
-  - Not built yet: the switch rig (phase 2, with its leak count). `/novr`
-    and `/vr` are parsed and logged, not applied (H2).
+  - 7dcdd6ee: the watch starts from the launch's effective mode (a `/vr`
+    launch over a flat file). 549e8d91: rigs run under a pinned
+    LOCALAPPDATA (Settings.xml mode 4), so the gate does not follow the
+    3D mode the maintainer last flew.
+  - Not built yet: the switch rig (phase 2, with its leak count).
 - **Goal (Sean, 2026-10-12):**
   - one installer;
   - EDVR runs its flat profile when Elite's 3D mode is off (or anaglyph), and
@@ -45,7 +48,10 @@
 - **Still open for Sean:** none.
 - **Hypotheses (section 7 names the evidence for each):**
   - H1: a flat launch never loads `openvr_api.dll`, and 3D-on loads it then.
-  - H2: `/novr` reaches the exe and overrides Settings.xml.
+  - H2: `/vr` half HOLDS (Steam 2026-10-12, edvr_gfx_20261012_160543:
+    EDLaunch `/Steam /VR`, file at 0, VR live 1.7 s in); applied since
+    6f3f9362. `/novr` half open, logged only. The command line is logged
+    redacted (exe name and bare switches; it carried the ServerToken).
   - H3: Settings.xml's mode at start is the start mode.
   - H4: after 3D off the OpenXR session idles at no flat cost.
   - H5: the Settings.xml path resolves on every store and on Proton.
