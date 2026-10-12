@@ -125,20 +125,23 @@ inline bool isLaunchSpace(char c) { return c == ' ' || c == '\t' || c == '\r' ||
 
 // The switch in a command line. Tokens are whitespace-separated and compared case-insensitively; a quoted span is one token, so a
 // "/novr" inside quotes (a path, say) does not count. The token keeps its quote characters, so only a bare /novr or /vr matches.
+// The next token of a command line from position i, or empty at the end. A quoted span is one token and keeps its quote characters.
+inline std::string nextLaunchToken(const std::string& s, size_t& i) {
+    const size_t n = s.size();
+    while (i < n && isLaunchSpace(s[i])) ++i;
+    const size_t start = i;
+    bool quoted = false;
+    while (i < n && (quoted || !isLaunchSpace(s[i]))) {
+        if (s[i] == '"') quoted = !quoted;
+        ++i;
+    }
+    return s.substr(start, i - start);
+}
+
 inline VrSwitch parseVrSwitch(const std::string& commandLine) {
     VrSwitch result = VrSwitch::None;
-    const size_t n = commandLine.size();
     size_t i = 0;
-    while (i < n) {
-        while (i < n && isLaunchSpace(commandLine[i])) ++i;
-        if (i >= n) break;
-        const size_t start = i;
-        bool quoted = false;
-        while (i < n && (quoted || !isLaunchSpace(commandLine[i]))) {
-            if (commandLine[i] == '"') quoted = !quoted;
-            ++i;
-        }
-        std::string token = commandLine.substr(start, i - start);
+    for (std::string token = nextLaunchToken(commandLine, i); !token.empty(); token = nextLaunchToken(commandLine, i)) {
         for (char& c : token) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
         }
@@ -146,6 +149,38 @@ inline VrSwitch parseVrSwitch(const std::string& commandLine) {
         else if (token == "/vr") result = VrSwitch::Vr;
     }
     return result;
+}
+
+// A bare switch: '/' or '-', then 1 to 32 characters of [A-Za-z0-9_] and nothing else. No '=', no quotes, no spaces.
+inline bool isBareSwitch(const std::string& token) {
+    if (token.size() < 2 || token.size() > 33) return false;
+    if (token[0] != '/' && token[0] != '-') return false;
+    for (size_t k = 1; k < token.size(); ++k) {
+        const char c = token[k];
+        const bool word = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        if (!word) return false;
+    }
+    return true;
+}
+
+// The command line as the log may carry it, since logs are posted publicly: the program's file name only, bare switches kept, and
+// every other token (a server token, an account, a password) replaced by <redacted>. Tokens are joined with single spaces.
+inline std::string redactCommandLine(const std::string& commandLine) {
+    size_t i = 0;
+    std::string exe = nextLaunchToken(commandLine, i);
+    if (exe.empty()) return std::string();
+    std::string bare;
+    for (char c : exe) {
+        if (c != '"') bare += c;
+    }
+    const size_t slash = bare.find_last_of("\\/");
+    if (slash != std::string::npos) bare.erase(0, slash + 1);
+    std::string out = bare.empty() ? std::string("<redacted>") : bare;
+    for (std::string token = nextLaunchToken(commandLine, i); !token.empty(); token = nextLaunchToken(commandLine, i)) {
+        out += ' ';
+        out += isBareSwitch(token) ? token : std::string("<redacted>");
+    }
+    return out;
 }
 
 inline const char* scopeName(InstallScope scope) {
@@ -168,17 +203,18 @@ inline RuntimeProfile activeProfileFor(InstallScope scope, GameMode mode) {
     return RuntimeProfile::Passthrough;
 }
 
-// The command line overrides the mode for this launch only when applyCommandLine is true.
-inline LaunchDecision decideLaunch(const ScopeRead& scope, const ModeRead& mode, VrSwitch cmd, bool applyCommandLine) {
+// Each switch applies only when its own flag is set. Production applies /vr (flight 2026-10-12: EDLaunch /Steam /VR with the file at
+// mode 0 went into VR) and waits for a flight before applying /novr.
+inline LaunchDecision decideLaunch(const ScopeRead& scope, const ModeRead& mode, VrSwitch cmd, bool applyVr, bool applyNoVr) {
     LaunchDecision d{};
     d.scope = scope;
     d.mode = mode;
     d.cmd = cmd;
     d.effective = mode.mode;
-    if (applyCommandLine && cmd == VrSwitch::NoVr) {
+    if (cmd == VrSwitch::NoVr && applyNoVr) {
         d.effective = GameMode::Flat;
         d.cmdApplied = true;
-    } else if (applyCommandLine && cmd == VrSwitch::Vr) {
+    } else if (cmd == VrSwitch::Vr && applyVr) {
         d.effective = GameMode::Vr;
         d.cmdApplied = true;
     }
@@ -207,7 +243,10 @@ inline std::string formatProfileLine(const LaunchDecision& d, const char* active
     case VrSwitch::Vr: out += "/vr"; break;
     default: out += "none"; break;
     }
-    if (d.cmd != VrSwitch::None) out += d.cmdApplied ? " applied" : " not applied, H2 open";
+    if (d.cmd != VrSwitch::None) {
+        if (d.cmdApplied) out += " applied";
+        else out += d.cmd == VrSwitch::NoVr ? " not applied, H2 open" : " not applied";
+    }
     out += ")";
     return out;
 }

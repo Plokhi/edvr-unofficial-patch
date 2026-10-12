@@ -1,7 +1,8 @@
 // runtime_profile_test -- the launch decision's pure rules (src\common\install_scope.h): the descriptor parse (schema 1 and 2 and their
 // strictness), the frozen v1 parser an older DLL runs, Settings.xml's 3D mode, the command line's switch, the scope-by-mode profile
-// table, the decision with and without the command line, and the launch's log line. Built from the repo root by build.bat's
-// :rig_runtime_profile_test. Windows-free: it includes no Windows header. --dry-run writes nothing; --self-test runs the checks.
+// table, the decision with and without each switch, the launch's log line, and the redaction of the logged command line. Built from
+// the repo root by build.bat's :rig_runtime_profile_test. Windows-free: it includes no Windows header. --dry-run writes nothing;
+// --self-test runs the checks.
 #include "../../src/common/install_scope.h"
 #include "../../src/common/stereo_mode.h"
 
@@ -174,17 +175,24 @@ void switchCases() {
 
 void decisionCases() {
     const ScopeRead scope = parseInstallDescriptor("[install]\r\nschema = 2\r\nscope = both\r\n");
-    const ModeRead mode = readGameMode("<StereoscopicMode>4</StereoscopicMode>");
-    const LaunchDecision off = decideLaunch(scope, mode, VrSwitch::NoVr, false);
-    check(off.effective == GameMode::Vr && !off.cmdApplied && off.active == RuntimeProfile::Vr,
-        "decision: /novr over mode 4 is not applied when applyCommandLine is false");
-    const LaunchDecision on = decideLaunch(scope, mode, VrSwitch::NoVr, true);
-    check(on.effective == GameMode::Flat && on.cmdApplied && on.active == RuntimeProfile::Flat,
-        "decision: /novr over mode 4 is Flat when applyCommandLine is true");
-    const LaunchDecision none = decideLaunch(scope, mode, VrSwitch::None, true);
+    const ModeRead mode4 = readGameMode("<StereoscopicMode>4</StereoscopicMode>");
+    const ModeRead mode0 = readGameMode("<StereoscopicMode>0</StereoscopicMode>");
+    const LaunchDecision vrOver0 = decideLaunch(scope, mode0, VrSwitch::Vr, true, false);
+    check(vrOver0.effective == GameMode::Vr && vrOver0.cmdApplied && vrOver0.active == RuntimeProfile::Vr,
+        "decision: /vr over mode 0 is Vr when applyVr is true");
+    const LaunchDecision vrOff = decideLaunch(scope, mode0, VrSwitch::Vr, false, true);
+    check(vrOff.effective == GameMode::Flat && !vrOff.cmdApplied && vrOff.active == RuntimeProfile::Flat,
+        "decision: /vr is not applied by the applyNoVr flag alone");
+    const LaunchDecision novrOff = decideLaunch(scope, mode4, VrSwitch::NoVr, true, false);
+    check(novrOff.effective == GameMode::Vr && !novrOff.cmdApplied && novrOff.active == RuntimeProfile::Vr,
+        "decision: /novr over mode 4 is not applied when applyNoVr is false");
+    const LaunchDecision novrOn = decideLaunch(scope, mode4, VrSwitch::NoVr, true, true);
+    check(novrOn.effective == GameMode::Flat && novrOn.cmdApplied && novrOn.active == RuntimeProfile::Flat,
+        "decision: /novr over mode 4 is Flat when applyNoVr is true");
+    const LaunchDecision none = decideLaunch(scope, mode4, VrSwitch::None, true, true);
     check(none.effective == GameMode::Vr && !none.cmdApplied && none.active == RuntimeProfile::Vr,
         "decision: no switch leaves mode 4 as Vr");
-    const LaunchDecision invalid = decideLaunch(parseInstallDescriptor("[install]\nschema=3\n"), mode, VrSwitch::None, false);
+    const LaunchDecision invalid = decideLaunch(parseInstallDescriptor("[install]\nschema=3\n"), mode4, VrSwitch::None, false, false);
     check(invalid.active == RuntimeProfile::Invalid, "decision: an invalid descriptor is Invalid whatever the mode");
 }
 
@@ -192,34 +200,60 @@ void lineCases() {
     const char* path = R"(C:\Users\x\AppData\Local\Frontier Developments\Elite Dangerous\Options\Graphics\Settings.xml)";
     const std::string p = path;
     const ScopeRead schema2Flat = parseInstallDescriptor("[install]\nschema = 2\nscope = flat\n");
+    const ScopeRead schema2Both = parseInstallDescriptor("[install]\nschema = 2\nscope = both\n");
+    const ModeRead mode0 = readGameMode("<StereoscopicMode>0</StereoscopicMode>");
+    const ModeRead mode4 = readGameMode("<StereoscopicMode>4</StereoscopicMode>");
     checkText("line: schema 2 flat with mode 0",
-        formatProfileLine(decideLaunch(schema2Flat, readGameMode("<StereoscopicMode>0</StereoscopicMode>"), VrSwitch::None, false),
-            "flat", p),
+        formatProfileLine(decideLaunch(schema2Flat, mode0, VrSwitch::None, false, false), "flat", p),
         "profile: flat (scope flat; 3D mode 0 from " + p + "; command line none)");
     const ScopeRead schema1Vr = parseInstallDescriptor("[install]\nschema = 1\nprofile = vr\n");
     checkText("line: schema 1 vr with mode 4",
-        formatProfileLine(decideLaunch(schema1Vr, readGameMode("<StereoscopicMode>4</StereoscopicMode>"), VrSwitch::None, false),
-            "vr", p),
+        formatProfileLine(decideLaunch(schema1Vr, mode4, VrSwitch::None, false, false), "vr", p),
         "profile: vr (scope both from schema-1 descriptor; 3D mode 4 from " + p + "; command line none)");
     checkText("line: no descriptor and the file absent",
-        formatProfileLine(decideLaunch(absentDescriptor(), readGameMode(nullptr), VrSwitch::None, false), "vr", p),
+        formatProfileLine(decideLaunch(absentDescriptor(), readGameMode(nullptr), VrSwitch::None, false, false), "vr", p),
         "profile: vr (scope both with no descriptor; 3D mode unknown from " + p + " (file absent); command line none)");
-    const ScopeRead schema2Both = parseInstallDescriptor("[install]\nschema = 2\nscope = both\n");
     checkText("line: the tag missing from a read file",
-        formatProfileLine(decideLaunch(schema2Both, readGameMode("<Settings/>"), VrSwitch::None, false), "vr", p),
+        formatProfileLine(decideLaunch(schema2Both, readGameMode("<Settings/>"), VrSwitch::None, false, false), "vr", p),
         "profile: vr (scope both; 3D mode unknown from " + p + "; command line none)");
+    checkText("line: /vr applied over mode 0",
+        formatProfileLine(decideLaunch(schema2Both, mode0, VrSwitch::Vr, true, false), "vr", p),
+        "profile: vr (scope both; 3D mode 0 from " + p + "; command line /vr applied)");
+    checkText("line: /vr not applied over mode 0",
+        formatProfileLine(decideLaunch(schema2Both, mode0, VrSwitch::Vr, false, false), "flat", p),
+        "profile: flat (scope both; 3D mode 0 from " + p + "; command line /vr not applied)");
     checkText("line: /novr not applied while H2 is open",
-        formatProfileLine(decideLaunch(schema2Both, readGameMode("<StereoscopicMode>4</StereoscopicMode>"), VrSwitch::NoVr, false),
-            "vr", p),
+        formatProfileLine(decideLaunch(schema2Both, mode4, VrSwitch::NoVr, true, false), "vr", p),
         "profile: vr (scope both; 3D mode 4 from " + p + "; command line /novr not applied, H2 open)");
     checkText("line: /novr applied",
-        formatProfileLine(decideLaunch(schema2Both, readGameMode("<StereoscopicMode>4</StereoscopicMode>"), VrSwitch::NoVr, true),
-            "flat", p),
+        formatProfileLine(decideLaunch(schema2Both, mode4, VrSwitch::NoVr, true, true), "flat", p),
         "profile: flat (scope both; 3D mode 4 from " + p + "; command line /novr applied)");
     checkText("line: an invalid descriptor",
-        formatProfileLine(decideLaunch(parseInstallDescriptor("[install]\nschema = 3\n"), readGameMode(nullptr), VrSwitch::None, false),
+        formatProfileLine(decideLaunch(parseInstallDescriptor("[install]\nschema = 3\n"), readGameMode(nullptr), VrSwitch::None, false, false),
             "invalid", p),
         "profile: invalid (edvr_profile.ini malformed; fixes disabled, proxy chaining retained; repair the installation)");
+}
+
+bool leaksSecret(const std::string& s) {
+    return s.find("ServerToken") != std::string::npos || s.find("AUTH_PASSWORD") != std::string::npos ||
+        s.find("epicusername") != std::string::npos || s.find("abc123") != std::string::npos ||
+        s.find("4d15") != std::string::npos || s.find("Sean M") != std::string::npos ||
+        s.find("22702") != std::string::npos;
+}
+
+void redactCases() {
+    const std::string steam = R"("C:\Steam\steamapps\common\Elite Dangerous\EliteDangerous64.exe" "wseed 22702"   "ServerToken 4d15 67b6" /vr)";
+    checkText("redact: the Steam shape", redactCommandLine(steam), "EliteDangerous64.exe <redacted> <redacted> /vr");
+    const std::string epic = R"("D:\Epic\x y\EliteDangerous64.exe" -AUTH_LOGIN=unused -AUTH_PASSWORD=abc123 -AUTH_TYPE=exchangecode -epicapp=Foo -epicenv=Prod -EpicPortal -epicusername="Sean M" -epicuserid=0123)";
+    checkText("redact: the Epic shape", redactCommandLine(epic),
+        "EliteDangerous64.exe <redacted> <redacted> <redacted> <redacted> <redacted> -EpicPortal <redacted> <redacted>");
+    checkText("redact: an empty line", redactCommandLine(""), "");
+    checkText("redact: a 40-character switch is redacted", redactCommandLine("x.exe /" + std::string(40, 'a')), "x.exe <redacted>");
+    checkText("redact: a 32-character switch is kept", redactCommandLine("x.exe -" + std::string(32, 'a')),
+        "x.exe -" + std::string(32, 'a'));
+    checkText("redact: a switch with an equals sign is redacted", redactCommandLine("x.exe /a=b"), "x.exe <redacted>");
+    check(!leaksSecret(redactCommandLine(steam)) && !leaksSecret(redactCommandLine(epic)),
+        "redact: no output carries a server token, a password, an account name or a user id");
 }
 
 void nameCases() {
@@ -249,12 +283,13 @@ int main(int argc, char** argv) {
     switchCases();
     decisionCases();
     lineCases();
+    redactCases();
     nameCases();
     if (g_fails) {
         std::printf("FAIL: runtime_profile_test %d of %d checks failed\n", g_fails, g_checks);
         return 1;
     }
     std::printf("PASS: runtime_profile_test %d checks (descriptor schema 1 and 2, the v1 parser, Settings.xml mode, scope by mode, "
-                "command line, decision, log line)\n", g_checks);
+                "command line, decision, log line, redaction)\n", g_checks);
     return 0;
 }
