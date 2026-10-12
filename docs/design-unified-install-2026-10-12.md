@@ -18,6 +18,9 @@
   - Q4: no override; everything follows the game's 3D setting.
   - Q5: one installer, which asks VR, Flat or Both (a scope, section 4).
   - Q6: mode 1 (anaglyph) is flat; mode 2 (SBS) is VR.
+  - Q7: settings fixed at device creation follow at the next launch.
+  - Q8: SBS stays on VR. It is for future development and low priority, so
+    no phase waits on it.
 - **Reverses:** the "two installers" recommendation of
   `design-flat-temporal-aa-2026-09-23.md`, "the edition is fixed by the
   artifact" of `design-plugin-architecture-2026-09-30.md`, and the "set once
@@ -39,9 +42,7 @@
   - what cannot switch live (3.4);
   - the Supersampling hold keyed to the mode, not the runtime's flag (3.5);
   - the scope prompt in one installer (4).
-- **Still open for Sean (section 8):**
-  - Q7: settings fixed at device creation follow at the next launch;
-  - Q8: SBS gets the VR profile, whose fixes probably starve there.
+- **Still open for Sean:** none.
 - **Hypotheses (section 7 names the evidence for each):**
   - H1: a flat launch never loads `openvr_api.dll`, and 3D-on loads it then.
   - H2: `/novr` reaches the exe and overrides Settings.xml.
@@ -268,7 +269,7 @@ These are patched into the game or the device at creation:
 - `fix.vscreen_res_width`, patched into game code (`device_hook.cpp:2894`).
   Images already allocated keep their size.
 
-Proposed: they keep the launch mode's values until the next launch. The
+Decided (Q7): they keep the launch mode's values until the next launch. The
 switch's log line names any whose value differs between the two settings
 files.
 
@@ -411,7 +412,7 @@ launches. The phase-1 build switches to Passthrough rather than live.
   toggle's switch line, the flat or VR fixes visibly in effect after it, and
   no leak across ten toggles (GPU memory from the VRAM watch).
 
-## 8. Decisions (Sean, 2026-10-12) and what is still open
+## 8. Decisions (Sean, 2026-10-12)
 
 - **Q1, seamless switching.** Decided: switch live (sections 3.2 to 3.5).
   Until phase 2 lands, a mid-session switch goes to Passthrough, with a toast
@@ -424,13 +425,16 @@ launches. The phase-1 build switches to Passthrough rather than live.
   `README.md`'s download section (around lines 59-74) collapses to one. The
   release notes tell flat players the prompt now chooses what they get.
 - **Q6, modes.** Decided: 0 and 1 are flat; 2 to 6 are VR.
-- **Q7, open: settings fixed at device creation** (3.4) keep the launch
-  mode's values until the next launch. Proposed: yes, logged at the switch.
-- **Q8, open: SBS (mode 2).** SBS renders both eyes to the monitor's
-  swapchain with no OpenXR session. The VR fixes are driven by the runtime's
-  eye targets, so they probably starve there and leave SBS as stock Elite.
-  The flat fixes would run temporal AA across two half-width views.
-  Proposed: VR as decided, recorded as unflown.
+- **Q7, settings fixed at device creation** (3.4). Decided: they keep the
+  launch mode's values until the next launch, and the switch's log line names
+  them.
+- **Q8, SBS (mode 2).** Decided: VR, for future development and low
+  priority. No phase or flight waits on it.
+  - SBS renders both eyes to the monitor's swapchain with no OpenXR session.
+    The VR fixes are driven by the runtime's eye targets, so today they
+    probably starve there and leave SBS as stock Elite.
+  - The flat fixes would run temporal AA across two half-width views, which
+    is why SBS is not flat.
 
 ## 9. Ruled out while designing
 
