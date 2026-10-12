@@ -2,10 +2,26 @@
 
 ## Status
 
-- **State:** design only. Nothing is built. Written from read-only surveys of
-  main `99476a0`: build, packaging, installer, runtime, the 3D-toggle record,
-  and an inventory of the profile-dependent state. One web search covered the
-  launcher's VR switches.
+- **State (2026-10-12):** phase 1 BUILT on branch
+  `claude/unified-install-feature-74bc24`, NOT FLOWN, not on main (Sean
+  approves before it ships). Installed to Steam (`--scope both`, schema-2
+  descriptor, inis untouched) at 7df255b2.
+  - 3ebfb348: the launch decision (`src/common/install_scope.h`), the
+    schema-2 descriptor, the `profile:` and `game command line:` lines,
+    `tools\runtime_profile_test`.
+  - 9cc62b2c, d0015820: the Settings.xml watch, log-only, with its hints
+    (`src/d3d11/mode_watch*.{h,cpp}`); Passthrough plus a restart toast at a
+    confirmed switch; the H7 swap-chain line; `tools\mode_watch_test`.
+  - 7df255b2: `install_edvr.py --scope`, `edvr_log.py --switches`.
+  - Built differently from 3.2: the watch keeps the file's last confirmed
+    class apart from the class EDVR runs. A read posts only when the FILE
+    changes, so a live rise (Epic's "Launch in VR", file still 0) is not
+    undone by the next read of the unchanged file.
+  - Not built yet: the switch rig (phase 2, with its leak count). `/novr`
+    and `/vr` are parsed and logged, not applied (H2).
+- Written from read-only surveys of main `99476a0`: build, packaging,
+  installer, runtime, the 3D-toggle record, and an inventory of the
+  profile-dependent state. One web search covered the launcher's VR switches.
 - **Goal (Sean, 2026-10-12):**
   - one installer;
   - EDVR runs its flat profile when Elite's 3D mode is off (or anaglyph), and
@@ -54,10 +70,9 @@
   - H8: the always-installed hooks cost VR nothing measurable.
 - **Ruled out while designing:** section 9.
 - **Temporary keys:** none. No user-facing key is added.
-- **Next:** phase 1 (section 10): the launch decision, the scope descriptor,
-  a stand-down on a mid-session switch, and the switch signal in log-only
-  mode. Then the instrument flight of section 7, which answers H1-H7 before
-  phase 2 builds the live switch.
+- **Next:** the phase-1 instrument flight on Steam (section 7, launches A
+  to C; read with `edvr_log.py --target steam --expect-build HEAD --version`
+  and `--switches`). It answers H1-H7 before phase 2 builds the live switch.
 
 ## 1. What exists today
 
