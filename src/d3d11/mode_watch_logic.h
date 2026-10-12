@@ -21,15 +21,19 @@ struct Step {
     GameMode mode;
 };
 
+// Two classes are kept. fileMode_ is the last class Settings.xml was confirmed to hold: a read is compared with it, so a read posts only
+// when the file changes. committed_ is the class EDVR runs. They differ after a live rise: Epic's "Launch in VR" goes live with
+// Settings.xml still saying flat, and a later read of that unchanged file must not post Flat. The live flag is never used for the fall
+// (design section 3.2), and neither may a stale file be.
 class Watch {
 public:
-    // The committed class starts as the launch file's class. An unknown launch file already reads as Vr (design Q2).
-    explicit Watch(GameMode launchMode) : committed_(launchMode) {}
+    // Both classes start as the launch file's class. An unknown launch file already reads as Vr (design Q2).
+    explicit Watch(GameMode launchMode) : committed_(launchMode), fileMode_(launchMode) {}
 
     Step onRead(uint64_t nowMs, const ModeRead& r) {
         if (!r.known) return Step{Outcome::Ignored, r.mode};
         if (!pending_) {
-            if (r.mode == committed_) return Step{Outcome::Same, committed_};
+            if (r.mode == fileMode_) return Step{Outcome::Same, committed_};
             pending_ = true;
             pendingMode_ = r.mode;
             due_ = nowMs + kConfirmMs;
@@ -44,14 +48,17 @@ public:
         const GameMode mode = pendingMode_;
         pending_ = false;
         if (!confirmed) return Step{Outcome::Dropped, r.mode};
+        fileMode_ = mode;
+        // A live rise may already have posted this class; then the confirmed file changes nothing EDVR runs.
+        if (mode == committed_) return Step{Outcome::Same, committed_};
         committed_ = mode;
         return Step{Outcome::Posted, committed_};
     }
 
+    // Touches committed_ only. A pending file change stays pending, and fileMode_ is not changed.
     Step onLiveRise(uint64_t /*nowMs*/) {
         if (committed_ != GameMode::Flat) return Step{Outcome::Nothing, committed_};
         committed_ = GameMode::Vr;
-        pending_ = false;
         return Step{Outcome::Posted, committed_};
     }
 
@@ -64,6 +71,7 @@ public:
 
 private:
     GameMode committed_;
+    GameMode fileMode_;
     bool pending_ = false;
     GameMode pendingMode_ = GameMode::Vr;
     uint64_t due_ = 0;

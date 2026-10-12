@@ -103,12 +103,38 @@ void liveRise() {
         "live rise after a posted Flat: posted Vr");
 }
 
-void liveRiseClearsPending() {
+// A live rise does not cancel a pending file change; the confirm of that change finds the class already posted.
+void liveRiseDuringPending() {
     Watch w(GameMode::Flat);
     w.onRead(0, readOf(GameMode::Vr));
     const Step rise = w.onLiveRise(100);
-    check(outcomeIs(rise, Outcome::Posted) && rise.mode == GameMode::Vr && !w.pending() && w.confirmDueMs() == 0,
-        "live rise while a Vr change is pending: posted Vr, pending cleared");
+    check(outcomeIs(rise, Outcome::Posted) && rise.mode == GameMode::Vr && w.committed() == GameMode::Vr,
+        "live rise while a Vr file change is pending: posted Vr");
+    check(w.pending() && w.confirmDueMs() == 250, "live rise while pending: the pending change is kept, due unchanged");
+    const Step confirm = w.onRead(250, readOf(GameMode::Vr));
+    check(outcomeIs(confirm, Outcome::Same) && w.committed() == GameMode::Vr && !w.pending(),
+        "live rise during pending: the confirm returns same (already Vr)");
+}
+
+// Epic's "Launch in VR": the live rise posts Vr while Settings.xml still says flat. The unchanged file must not post Flat; a later
+// real change of the file is still posted in each direction.
+void liveRiseThenFileChanges() {
+    Watch w(GameMode::Flat);
+    const Step rise = w.onLiveRise(0);
+    check(outcomeIs(rise, Outcome::Posted) && rise.mode == GameMode::Vr, "live rise with the file still flat: posted Vr");
+    const Step unchanged = w.onRead(100, readOf(GameMode::Flat));
+    check(outcomeIs(unchanged, Outcome::Same) && !w.pending() && w.committed() == GameMode::Vr,
+        "a read of the unchanged flat file after a live rise: same, nothing posted");
+    const Step toVr = w.onRead(200, readOf(GameMode::Vr));
+    check(outcomeIs(toVr, Outcome::Pending) && toVr.mode == GameMode::Vr, "file 0 -> 4 after a live rise: pending Vr");
+    const Step toVrConfirm = w.onRead(450, readOf(GameMode::Vr));
+    check(outcomeIs(toVrConfirm, Outcome::Same) && w.committed() == GameMode::Vr && !w.pending(),
+        "file 0 -> 4 confirmed after a live rise: same (already Vr)");
+    const Step toFlat = w.onRead(500, readOf(GameMode::Flat));
+    check(outcomeIs(toFlat, Outcome::Pending) && toFlat.mode == GameMode::Flat, "file 4 -> 0: pending Flat");
+    const Step toFlatConfirm = w.onRead(750, readOf(GameMode::Flat));
+    check(outcomeIs(toFlatConfirm, Outcome::Posted) && toFlatConfirm.mode == GameMode::Flat && w.committed() == GameMode::Flat,
+        "file 4 -> 0 confirmed: posted Flat");
 }
 
 void threeToggles() {
@@ -154,7 +180,8 @@ int main(int argc, char** argv) {
     confirmDisagrees();
     hintNoChange();
     liveRise();
-    liveRiseClearsPending();
+    liveRiseDuringPending();
+    liveRiseThenFileChanges();
     threeToggles();
     unknownLaunch();
     if (g_fails) {
