@@ -4,23 +4,18 @@
 
 - **State (2026-10-12):** phase 1 BUILT on branch
   `claude/unified-install-feature-74bc24`, NOT FLOWN, not on main (Sean
-  approves before it ships). Installed to Steam (`--scope both`, schema-2
-  descriptor, inis untouched) at 7df255b2.
-  - 3ebfb348: the launch decision (`src/common/install_scope.h`), the
-    schema-2 descriptor, the `profile:` and `game command line:` lines,
-    `tools\runtime_profile_test`.
-  - 9cc62b2c, d0015820: the Settings.xml watch, log-only, with its hints
-    (`src/d3d11/mode_watch*.{h,cpp}`); Passthrough plus a restart toast at a
-    confirmed switch; the H7 swap-chain line; `tools\mode_watch_test`.
-  - 7df255b2: `install_edvr.py --scope`, `edvr_log.py --switches`.
+  approves before it ships). Installed to Steam (`--scope both`).
+  - The launch decision (`src/common/install_scope.h`, rig
+    `runtime_profile_test`); the Settings.xml watch, log-only
+    (`src/d3d11/mode_watch*`, rig `mode_watch_test`); Passthrough plus a
+    restart toast at a confirmed switch; the H7 swap-chain line;
+    `install_edvr.py --scope`; `edvr_log.py --switches`.
   - Built differently from 3.2: the watch keeps the file's last confirmed
-    class apart from the class EDVR runs. A read posts only when the FILE
-    changes, so a live rise (Epic's "Launch in VR", file still 0) is not
-    undone by the next read of the unchanged file.
-  - 7dcdd6ee: the watch starts from the launch's effective mode (a `/vr`
-    launch over a flat file). 549e8d91: rigs run under a pinned
-    LOCALAPPDATA (Settings.xml mode 4), so the gate does not follow the
-    3D mode the maintainer last flew.
+    class apart from the class EDVR runs, and starts from the launch's
+    effective mode. A read posts only when the FILE changes, so neither a
+    live rise nor a `/vr` launch over a file at 0 is undone by the file.
+  - Rigs run under a pinned LOCALAPPDATA (Settings.xml mode 4), so the gate
+    does not follow the 3D mode the maintainer last flew (549e8d91).
   - Not built yet: the switch rig (phase 2, with its leak count).
 - **Goal (Sean, 2026-10-12):**
   - one installer;
