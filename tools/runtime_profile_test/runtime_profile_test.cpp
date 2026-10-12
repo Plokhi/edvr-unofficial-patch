@@ -1,0 +1,260 @@
+// runtime_profile_test -- the launch decision's pure rules (src\common\install_scope.h): the descriptor parse (schema 1 and 2 and their
+// strictness), the frozen v1 parser an older DLL runs, Settings.xml's 3D mode, the command line's switch, the scope-by-mode profile
+// table, the decision with and without the command line, and the launch's log line. Built from the repo root by build.bat's
+// :rig_runtime_profile_test. Windows-free: it includes no Windows header. --dry-run writes nothing; --self-test runs the checks.
+#include "../../src/common/install_scope.h"
+#include "../../src/common/stereo_mode.h"
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+namespace {
+
+using namespace edvr;
+
+int g_checks = 0;
+int g_fails = 0;
+
+void check(bool ok, const char* name) {
+    ++g_checks;
+    if (!ok) ++g_fails;
+    std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
+}
+
+void checkText(const char* name, const std::string& got, const std::string& want) {
+    if (got == want) {
+        check(true, name);
+        return;
+    }
+    check(false, name);
+    std::printf("  got:  %s\n  want: %s\n", got.c_str(), want.c_str());
+}
+
+// The frozen copy of the v1 parser shipped up to this branch (runtime_profile.h's parseRuntimeProfile, before schema 2). An older DLL
+// runs this body, so the rig reads schema 2 through it to show that an older build refuses the new descriptor. Do not change it.
+RuntimeProfile legacyParseV1(std::string text) {
+    if (text.size() > 4096 || text.find('\0') != std::string::npos)
+        return RuntimeProfile::Invalid;
+    if (text.compare(0, 3, "\xef\xbb\xbf") == 0) text.erase(0, 3);
+    bool section = false, schema = false, profile = false;
+    RuntimeProfile result = RuntimeProfile::Invalid;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        const std::string line = profileTrim(text.substr(pos, end - pos));
+        pos = end + 1;
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        if (line == "[install]") {
+            if (section) return RuntimeProfile::Invalid;
+            section = true;
+            continue;
+        }
+        if (!section) return RuntimeProfile::Invalid;
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) return RuntimeProfile::Invalid;
+        const auto key = profileTrim(line.substr(0, eq));
+        const auto value = profileTrim(line.substr(eq + 1));
+        if (key == "schema" && !schema && value == "1") schema = true;
+        else if (key == "profile" && !profile) {
+            profile = true;
+            if (value == "flat") result = RuntimeProfile::Flat;
+            else if (value == "vr") result = RuntimeProfile::Vr;
+            else return RuntimeProfile::Invalid;
+        } else return RuntimeProfile::Invalid;
+    }
+    return section && schema && profile ? result : RuntimeProfile::Invalid;
+}
+
+void expectScope(const char* name, const std::string& text, InstallScope scope, int schema) {
+    const ScopeRead r = parseInstallDescriptor(text);
+    check(r.scope == scope && r.schema == schema && r.present, name);
+}
+
+void descriptorCases() {
+    const ScopeRead absent = absentDescriptor();
+    check(absent.scope == InstallScope::Both && absent.schema == 0 && !absent.present, "descriptor: absent is both, no schema");
+    expectScope("descriptor: schema 1 vr is both", "[install]\r\nschema = 1\r\nprofile = vr\r\n", InstallScope::Both, 1);
+    expectScope("descriptor: schema 1 flat is flat", "[install]\r\nschema = 1\r\nprofile = flat\r\n", InstallScope::Flat, 1);
+    expectScope("descriptor: schema 2 both", "[install]\r\nschema = 2\r\nscope = both\r\n", InstallScope::Both, 2);
+    expectScope("descriptor: schema 2 vr", "[install]\r\nschema = 2\r\nscope = vr\r\n", InstallScope::Vr, 2);
+    expectScope("descriptor: schema 2 flat", "[install]\r\nschema = 2\r\nscope = flat\r\n", InstallScope::Flat, 2);
+    expectScope("descriptor: schema 2 with a BOM and CRLF", "\xef\xbb\xbf[install]\r\nschema = 2\r\nscope = vr\r\n",
+        InstallScope::Vr, 2);
+    expectScope("descriptor: duplicate scope is invalid", "[install]\nschema=2\nscope=vr\nscope=both\n", InstallScope::Invalid, 0);
+    expectScope("descriptor: duplicate schema is invalid", "[install]\nschema=2\nschema=2\nscope=both\n", InstallScope::Invalid, 0);
+    expectScope("descriptor: duplicate profile under schema 1 is invalid", "[install]\nschema=1\nprofile=flat\nprofile=vr\n",
+        InstallScope::Invalid, 0);
+    expectScope("descriptor: unknown key is invalid", "[install]\nschema=2\nscope=both\nfoo=1\n", InstallScope::Invalid, 0);
+    expectScope("descriptor: scope under schema 1 is invalid", "[install]\nschema=1\nprofile=vr\nscope=both\n", InstallScope::Invalid, 0);
+    expectScope("descriptor: profile under schema 2 is invalid", "[install]\nschema=2\nscope=both\nprofile=vr\n", InstallScope::Invalid, 0);
+    expectScope("descriptor: schema 3 is invalid", "[install]\nschema=3\nscope=both\n", InstallScope::Invalid, 0);
+    expectScope("descriptor: missing section is invalid", "schema=2\nscope=both\n", InstallScope::Invalid, 0);
+    expectScope("descriptor: empty text is invalid", "", InstallScope::Invalid, 0);
+
+    std::string nul = "[install]\nschema=2\nscope=both\n";
+    nul.push_back('\0');
+    expectScope("descriptor: a NUL byte is invalid", nul, InstallScope::Invalid, 0);
+
+    const std::string header = "[install]\nschema=2\nscope=both\n";
+    expectScope("descriptor: 5000 bytes is invalid", header + std::string(5000 - header.size(), '#'), InstallScope::Invalid, 0);
+    expectScope("descriptor: 4096 bytes is read", header + "#" + std::string(4096 - header.size() - 2, 'x') + "\n",
+        InstallScope::Both, 2);
+}
+
+void legacyCases() {
+    check(legacyParseV1("[install]\nschema=1\nprofile=vr\n") == RuntimeProfile::Vr, "legacy v1: schema 1 vr still reads Vr");
+    check(legacyParseV1("[install]\r\nschema = 1\r\nprofile = flat\r\n") == RuntimeProfile::Flat,
+        "legacy v1: schema 1 flat still reads Flat");
+    check(legacyParseV1("[install]\nschema = 2\nscope = both\n") == RuntimeProfile::Invalid, "legacy v1: schema 2 both reads Invalid");
+    check(legacyParseV1("[install]\nschema = 2\nscope = vr\n") == RuntimeProfile::Invalid, "legacy v1: schema 2 vr reads Invalid");
+    check(legacyParseV1("[install]\nschema = 2\nscope = flat\n") == RuntimeProfile::Invalid, "legacy v1: schema 2 flat reads Invalid");
+}
+
+void settingsCases() {
+    const ModeRead none = readGameMode(nullptr);
+    check(!none.known && none.value == -1 && none.mode == GameMode::Vr && !none.fileRead,
+        "settings: null text is unknown, Vr, file absent");
+    for (int m = 0; m <= 6; ++m) {
+        const std::string xml = "<Settings>\r\n<StereoscopicMode>" + std::to_string(m) + "</StereoscopicMode>\r\n</Settings>\r\n";
+        const ModeRead r = readGameMode(xml.c_str());
+        const GameMode want = m <= 1 ? GameMode::Flat : GameMode::Vr;
+        char name[80];
+        std::snprintf(name, sizeof name, "settings: mode %d reads %s", m, gameModeName(want));
+        check(r.known && r.value == m && r.mode == want && r.fileRead, name);
+    }
+    const ModeRead bom = readGameMode("\xef\xbb\xbf<?xml version=\"1.0\"?>\r\n<Settings>\r\n<StereoscopicMode>3</StereoscopicMode>\r\n</Settings>");
+    check(bom.known && bom.value == 3 && bom.mode == GameMode::Vr, "settings: a BOM before <?xml> reads mode 3");
+    const ModeRead spaced = readGameMode("<Settings>\r\n<StereoscopicMode>\r\n  1 \t\r\n</StereoscopicMode>\r\n</Settings>");
+    check(spaced.known && spaced.value == 1 && spaced.mode == GameMode::Flat, "settings: CRLF and spaces inside the tag read mode 1");
+    const ModeRead absentTag = readGameMode("<Settings><PresetName>Custom</PresetName></Settings>");
+    check(!absentTag.known && absentTag.mode == GameMode::Vr && absentTag.fileRead, "settings: tag absent is unknown, Vr, file read");
+    const ModeRead seven = readGameMode("<StereoscopicMode>7</StereoscopicMode>");
+    check(!seven.known && seven.mode == GameMode::Vr && seven.fileRead, "settings: mode 7 is unknown");
+    const ModeRead minus = readGameMode("<StereoscopicMode>-1</StereoscopicMode>");
+    check(!minus.known && minus.mode == GameMode::Vr && minus.fileRead, "settings: mode -1 is unknown");
+    const ModeRead empty = readGameMode("");
+    check(!empty.known && empty.mode == GameMode::Vr && empty.fileRead, "settings: empty text is unknown, file read");
+}
+
+void profileCases() {
+    struct Row {
+        InstallScope scope;
+        GameMode mode;
+        RuntimeProfile want;
+        const char* name;
+    };
+    const Row rows[] = {
+        {InstallScope::Both, GameMode::Flat, RuntimeProfile::Flat, "profile: both with flat mode is Flat"},
+        {InstallScope::Both, GameMode::Vr, RuntimeProfile::Vr, "profile: both with vr mode is Vr"},
+        {InstallScope::Vr, GameMode::Flat, RuntimeProfile::Passthrough, "profile: vr scope with flat mode is Passthrough"},
+        {InstallScope::Vr, GameMode::Vr, RuntimeProfile::Vr, "profile: vr scope with vr mode is Vr"},
+        {InstallScope::Flat, GameMode::Flat, RuntimeProfile::Flat, "profile: flat scope with flat mode is Flat"},
+        {InstallScope::Flat, GameMode::Vr, RuntimeProfile::Passthrough, "profile: flat scope with vr mode is Passthrough"},
+        {InstallScope::Invalid, GameMode::Flat, RuntimeProfile::Invalid, "profile: invalid scope with flat mode is Invalid"},
+        {InstallScope::Invalid, GameMode::Vr, RuntimeProfile::Invalid, "profile: invalid scope with vr mode is Invalid"},
+    };
+    for (const Row& r : rows) check(activeProfileFor(r.scope, r.mode) == r.want, r.name);
+}
+
+void switchCases() {
+    check(parseVrSwitch("") == VrSwitch::None, "switch: an empty line is none");
+    check(parseVrSwitch(R"("C:\game\EliteDangerous64.exe")") == VrSwitch::None, "switch: the program path alone is none");
+    check(parseVrSwitch(R"(C:\game\EliteDangerous64.exe /novr)") == VrSwitch::NoVr, "switch: a bare /novr");
+    check(parseVrSwitch("x.exe /VR") == VrSwitch::Vr, "switch: /VR is case-insensitive");
+    check(parseVrSwitch("x.exe\t/vr") == VrSwitch::Vr, "switch: a tab separates tokens");
+    check(parseVrSwitch(R"("C:\a b\x.exe" /novr)") == VrSwitch::NoVr, "switch: a quoted path with a space, then /novr");
+    check(parseVrSwitch(R"("C:\a b\x.exe" /vr /novr)") == VrSwitch::NoVr, "switch: /vr then /novr: the last wins, NoVr");
+    check(parseVrSwitch(R"(x.exe /novr /vr)") == VrSwitch::Vr, "switch: /novr then /vr: the last wins, Vr");
+    check(parseVrSwitch("x.exe /novrx") == VrSwitch::None, "switch: /novrx is not /novr");
+    check(parseVrSwitch(R"(x.exe "/novr")") == VrSwitch::None, "switch: a quoted /novr is none");
+    check(parseVrSwitch(R"("x.exe /novr")") == VrSwitch::None, "switch: /novr inside a quoted span is none");
+}
+
+void decisionCases() {
+    const ScopeRead scope = parseInstallDescriptor("[install]\r\nschema = 2\r\nscope = both\r\n");
+    const ModeRead mode = readGameMode("<StereoscopicMode>4</StereoscopicMode>");
+    const LaunchDecision off = decideLaunch(scope, mode, VrSwitch::NoVr, false);
+    check(off.effective == GameMode::Vr && !off.cmdApplied && off.active == RuntimeProfile::Vr,
+        "decision: /novr over mode 4 is not applied when applyCommandLine is false");
+    const LaunchDecision on = decideLaunch(scope, mode, VrSwitch::NoVr, true);
+    check(on.effective == GameMode::Flat && on.cmdApplied && on.active == RuntimeProfile::Flat,
+        "decision: /novr over mode 4 is Flat when applyCommandLine is true");
+    const LaunchDecision none = decideLaunch(scope, mode, VrSwitch::None, true);
+    check(none.effective == GameMode::Vr && !none.cmdApplied && none.active == RuntimeProfile::Vr,
+        "decision: no switch leaves mode 4 as Vr");
+    const LaunchDecision invalid = decideLaunch(parseInstallDescriptor("[install]\nschema=3\n"), mode, VrSwitch::None, false);
+    check(invalid.active == RuntimeProfile::Invalid, "decision: an invalid descriptor is Invalid whatever the mode");
+}
+
+void lineCases() {
+    const char* path = R"(C:\Users\x\AppData\Local\Frontier Developments\Elite Dangerous\Options\Graphics\Settings.xml)";
+    const std::string p = path;
+    const ScopeRead schema2Flat = parseInstallDescriptor("[install]\nschema = 2\nscope = flat\n");
+    checkText("line: schema 2 flat with mode 0",
+        formatProfileLine(decideLaunch(schema2Flat, readGameMode("<StereoscopicMode>0</StereoscopicMode>"), VrSwitch::None, false),
+            "flat", p),
+        "profile: flat (scope flat; 3D mode 0 from " + p + "; command line none)");
+    const ScopeRead schema1Vr = parseInstallDescriptor("[install]\nschema = 1\nprofile = vr\n");
+    checkText("line: schema 1 vr with mode 4",
+        formatProfileLine(decideLaunch(schema1Vr, readGameMode("<StereoscopicMode>4</StereoscopicMode>"), VrSwitch::None, false),
+            "vr", p),
+        "profile: vr (scope both from schema-1 descriptor; 3D mode 4 from " + p + "; command line none)");
+    checkText("line: no descriptor and the file absent",
+        formatProfileLine(decideLaunch(absentDescriptor(), readGameMode(nullptr), VrSwitch::None, false), "vr", p),
+        "profile: vr (scope both with no descriptor; 3D mode unknown from " + p + " (file absent); command line none)");
+    const ScopeRead schema2Both = parseInstallDescriptor("[install]\nschema = 2\nscope = both\n");
+    checkText("line: the tag missing from a read file",
+        formatProfileLine(decideLaunch(schema2Both, readGameMode("<Settings/>"), VrSwitch::None, false), "vr", p),
+        "profile: vr (scope both; 3D mode unknown from " + p + "; command line none)");
+    checkText("line: /novr not applied while H2 is open",
+        formatProfileLine(decideLaunch(schema2Both, readGameMode("<StereoscopicMode>4</StereoscopicMode>"), VrSwitch::NoVr, false),
+            "vr", p),
+        "profile: vr (scope both; 3D mode 4 from " + p + "; command line /novr not applied, H2 open)");
+    checkText("line: /novr applied",
+        formatProfileLine(decideLaunch(schema2Both, readGameMode("<StereoscopicMode>4</StereoscopicMode>"), VrSwitch::NoVr, true),
+            "flat", p),
+        "profile: flat (scope both; 3D mode 4 from " + p + "; command line /novr applied)");
+    checkText("line: an invalid descriptor",
+        formatProfileLine(decideLaunch(parseInstallDescriptor("[install]\nschema = 3\n"), readGameMode(nullptr), VrSwitch::None, false),
+            "invalid", p),
+        "profile: invalid (edvr_profile.ini malformed; fixes disabled, proxy chaining retained; repair the installation)");
+}
+
+void nameCases() {
+    check(std::strcmp(scopeName(InstallScope::Both), "both") == 0 && std::strcmp(scopeName(InstallScope::Vr), "vr") == 0 &&
+        std::strcmp(scopeName(InstallScope::Flat), "flat") == 0 && std::strcmp(scopeName(InstallScope::Invalid), "invalid") == 0,
+        "names: scope names");
+    check(std::strcmp(gameModeName(GameMode::Flat), "flat") == 0 && std::strcmp(gameModeName(GameMode::Vr), "vr") == 0,
+        "names: mode names");
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    bool dryRun = false, selfTest = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--dry-run") == 0) dryRun = true;
+        if (std::strcmp(argv[i], "--self-test") == 0) selfTest = true;
+    }
+    if (dryRun && !selfTest) {
+        std::printf("runtime_profile_test: dry run, nothing written\n");
+        return 0;
+    }
+    descriptorCases();
+    legacyCases();
+    settingsCases();
+    profileCases();
+    switchCases();
+    decisionCases();
+    lineCases();
+    nameCases();
+    if (g_fails) {
+        std::printf("FAIL: runtime_profile_test %d of %d checks failed\n", g_fails, g_checks);
+        return 1;
+    }
+    std::printf("PASS: runtime_profile_test %d checks (descriptor schema 1 and 2, the v1 parser, Settings.xml mode, scope by mode, "
+                "command line, decision, log line)\n", g_checks);
+    return 0;
+}

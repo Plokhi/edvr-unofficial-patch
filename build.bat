@@ -3484,6 +3484,21 @@ if errorlevel 1 ( echo [edvr] ERROR: vr_ssaa_hold_test build failed & exit /b 1 
 "%OBJ%\vrssaahold\vr_ssaa_hold_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_runtime_profile_test
+echo [edvr] === runtime_profile_test.exe ===
+REM The launch decision's pure rules (src\common\install_scope.h, docs\design-unified-install-2026-10-12.md section 3.1): the descriptor
+REM parse for schema 1 and 2, the frozen v1 parser an older DLL runs, Settings.xml's 3D mode, the command line's switch, the profile by
+REM scope and mode, and the launch's log line. No Windows API: the rig includes only the two pure headers.
+if not exist "%OBJ%\runtimeprofile" mkdir "%OBJ%\runtimeprofile"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\runtimeprofile\\" /Fe"%OBJ%\runtimeprofile\runtime_profile_test.exe" ^
+    "tools\runtime_profile_test\runtime_profile_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: runtime_profile_test build failed & exit /b 1 )
+"%OBJ%\runtimeprofile\runtime_profile_test.exe" --dry-run || exit /b 1
+"%OBJ%\runtimeprofile\runtime_profile_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_orbital_width_test
 echo [edvr] === orbital_width_test.exe ===
 REM fix.ui_quality's orbit lines (src\d3d11\orbital_width*.h; docs\ui-layer-2026-09-23.md, "2026-10-06: the orbit lines"): the game's own

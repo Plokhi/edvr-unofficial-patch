@@ -1,95 +1,124 @@
 // Installation scope is read before feature configuration. INI reloads never
 // widen it. The absent-descriptor path preserves existing manual VR installs.
+// The rules that decide the profile are in install_scope.h; this file reads the
+// files and the command line and holds the one global the fixes read.
 #pragma once
 #include <windows.h>
+#include <atomic>
 #include <cstring>
 #include <string>
 
+#include "elite_graphics_folder.h"
+#include "install_scope.h"
+
 namespace edvr {
-enum class RuntimeProfile { LegacyVr, Vr, Flat, Invalid };
-inline RuntimeProfile g_runtimeProfile = RuntimeProfile::LegacyVr;
+inline std::atomic<RuntimeProfile> g_runtimeProfile{RuntimeProfile::LegacyVr};
 
-inline std::string profileTrim(const std::string& value) {
-    const size_t first = value.find_first_not_of(" \t\r");
-    if (first == std::string::npos) return {};
-    return value.substr(first, value.find_last_not_of(" \t\r") - first + 1);
-}
+enum class FileState { Absent, Unreadable, Read };
 
-// Reject duplicates/unknown fields so two readers cannot disagree on scope.
-inline RuntimeProfile parseRuntimeProfile(std::string text) {
-    if (text.size() > 4096 || text.find('\0') != std::string::npos)
-        return RuntimeProfile::Invalid;
-    if (text.compare(0, 3, "\xef\xbb\xbf") == 0) text.erase(0, 3);
-    bool section = false, schema = false, profile = false;
-    RuntimeProfile result = RuntimeProfile::Invalid;
-    size_t pos = 0;
-    while (pos < text.size()) {
-        size_t end = text.find('\n', pos);
-        if (end == std::string::npos) end = text.size();
-        const std::string line = profileTrim(text.substr(pos, end - pos));
-        pos = end + 1;
-        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
-        if (line == "[install]") {
-            if (section) return RuntimeProfile::Invalid;
-            section = true;
-            continue;
-        }
-        if (!section) return RuntimeProfile::Invalid;
-        const size_t eq = line.find('=');
-        if (eq == std::string::npos) return RuntimeProfile::Invalid;
-        const auto key = profileTrim(line.substr(0, eq));
-        const auto value = profileTrim(line.substr(eq + 1));
-        if (key == "schema" && !schema && value == "1") schema = true;
-        else if (key == "profile" && !profile) {
-            profile = true;
-            if (value == "flat") result = RuntimeProfile::Flat;
-            else if (value == "vr") result = RuntimeProfile::Vr;
-            else return RuntimeProfile::Invalid;
-        } else return RuntimeProfile::Invalid;
-    }
-    return section && schema && profile ? result : RuntimeProfile::Invalid;
-}
-
-inline RuntimeProfile readRuntimeProfile(const std::wstring& directory) {
-    const std::wstring path = directory + L"\\edvr_profile.ini";
+// Reads a whole file of at most maxBytes. Absent means the path names nothing; a file that is too large, cannot be opened or cannot be
+// read is Unreadable. An empty file is Read with an empty text.
+inline FileState readBoundedFile(const std::wstring& path, size_t maxBytes, std::string& text) {
+    text.clear();
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
-        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
-            ? RuntimeProfile::LegacyVr : RuntimeProfile::Invalid;
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? FileState::Absent : FileState::Unreadable;
     }
     LARGE_INTEGER size{};
-    std::string text;
     DWORD got = 0;
-    const bool sized = GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= 4096;
-    if (sized) text.resize(static_cast<size_t>(size.QuadPart));
-    const bool read = sized && ReadFile(file, &text[0], static_cast<DWORD>(text.size()), &got, nullptr)
-        && got == text.size();
+    bool ok = GetFileSizeEx(file, &size) && size.QuadPart >= 0 && size.QuadPart <= static_cast<LONGLONG>(maxBytes);
+    if (ok) {
+        text.resize(static_cast<size_t>(size.QuadPart));
+        ok = text.empty() || (ReadFile(file, &text[0], static_cast<DWORD>(text.size()), &got, nullptr) && got == text.size());
+    }
     CloseHandle(file);
-    return read ? parseRuntimeProfile(text) : RuntimeProfile::Invalid;
+    return ok ? FileState::Read : FileState::Unreadable;
 }
+
+inline ScopeRead readInstallDescriptor(const std::wstring& directory) {
+    std::string text;
+    switch (readBoundedFile(directory + L"\\edvr_profile.ini", 4096, text)) {
+    case FileState::Absent: return absentDescriptor();
+    case FileState::Unreadable: return ScopeRead{InstallScope::Invalid, 0, true};
+    default: return parseInstallDescriptor(text);
+    }
+}
+
+inline std::string runtimeProfileUtf8(const std::wstring& wide) {
+    if (wide.empty()) return {};
+    const int size = static_cast<int>(wide.size());
+    const int need = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), size, nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return {};
+    std::string out(static_cast<size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), size, &out[0], need, nullptr, nullptr);
+    return out;
+}
+
+// The decision and the paths and command line it was made from. The log is not open when the decision runs, so the log line is
+// written later, from these.
+inline LaunchDecision g_launchDecision{};
+inline std::string g_settingsPathUtf8;
+inline std::string g_gameCommandLineUtf8;
 
 inline void runtimeProfileInitialize(const std::wstring& moduleDir,
                                      const std::wstring& exeDir) {
-    g_runtimeProfile = readRuntimeProfile(moduleDir);
-    if (g_runtimeProfile == RuntimeProfile::LegacyVr && moduleDir != exeDir)
-        g_runtimeProfile = readRuntimeProfile(exeDir);
+    ScopeRead scope = readInstallDescriptor(moduleDir);
+    if (!scope.present && moduleDir != exeDir) scope = readInstallDescriptor(exeDir);
+
+    // Settings.xml sits under the Windows profile. Without LOCALAPPDATA the mode is unknown, as it is for a missing file.
+    std::wstring localAppData;
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (length > 0) {
+        localAppData.resize(length);
+        const DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", &localAppData[0], length);
+        if (got > 0 && got < length) localAppData.resize(got);
+        else localAppData.clear();
+    }
+    const std::wstring settingsPath = localAppData.empty() ? std::wstring()
+        : eliteGraphicsFolderUnder(localAppData) + L"\\Settings.xml";
+    g_settingsPathUtf8 = settingsPath.empty() ? std::string("(LOCALAPPDATA not set)") : runtimeProfileUtf8(settingsPath);
+    std::string xml;
+    const bool haveXml = !settingsPath.empty() && readBoundedFile(settingsPath, 1024 * 1024, xml) == FileState::Read;
+    const ModeRead mode = readGameMode(haveXml ? xml.c_str() : nullptr);
+
+    g_gameCommandLineUtf8 = runtimeProfileUtf8(std::wstring(GetCommandLineW()));
+    const VrSwitch cmd = parseVrSwitch(g_gameCommandLineUtf8);
+    // Production does not apply /novr or /vr yet: the override ships only once flight hypothesis H2 holds (design section 3.1).
+    g_launchDecision = decideLaunch(scope, mode, cmd, /*applyCommandLine=*/false);
+    g_runtimeProfile = g_launchDecision.active;
 }
-inline bool runtimeFlatProfile() { return g_runtimeProfile == RuntimeProfile::Flat; }
+
+// Called only at the commit point, at the frame boundary (design section 3.3).
+inline void runtimeProfileSet(RuntimeProfile p) { g_runtimeProfile.store(p, std::memory_order_relaxed); }
+
+inline bool runtimeFlatProfile() {
+    return g_runtimeProfile.load(std::memory_order_relaxed) == RuntimeProfile::Flat;
+}
 inline bool runtimeVrProfile() {
-    return g_runtimeProfile == RuntimeProfile::Vr || g_runtimeProfile == RuntimeProfile::LegacyVr;
+    const RuntimeProfile p = g_runtimeProfile.load(std::memory_order_relaxed);
+    return p == RuntimeProfile::Vr || p == RuntimeProfile::LegacyVr;
 }
-inline bool runtimeFeaturesAllowed() { return g_runtimeProfile != RuntimeProfile::Invalid; }
+// Passthrough forwards only, like Invalid, so no fix runs in it.
+inline bool runtimeFeaturesAllowed() {
+    const RuntimeProfile p = g_runtimeProfile.load(std::memory_order_relaxed);
+    return p != RuntimeProfile::Invalid && p != RuntimeProfile::Passthrough;
+}
 inline const char* runtimeProfileName() {
-    switch (g_runtimeProfile) {
+    switch (g_runtimeProfile.load(std::memory_order_relaxed)) {
     case RuntimeProfile::LegacyVr: return "legacy-vr";
     case RuntimeProfile::Vr: return "vr";
     case RuntimeProfile::Flat: return "flat";
+    case RuntimeProfile::Passthrough: return "passthrough";
     default: return "invalid";
     }
 }
+inline std::string runtimeProfileLogLine() {
+    return formatProfileLine(g_launchDecision, runtimeProfileName(), g_settingsPathUtf8);
+}
+inline const std::string& runtimeGameCommandLine() { return g_gameCommandLineUtf8; }
 
 // Flat owns a separate mono adapter. Generic setting reads cannot activate the
 // stereo pipeline or unrelated fixes; the mono adapter explicitly reads the
