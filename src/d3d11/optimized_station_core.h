@@ -228,6 +228,42 @@ inline bool padIsPlatformA(const PadObs& p) noexcept {
     return len > 0 && p.name[len - 1] == 'A';
 }
 
+// Built v14.8: a platform named B (LandingPadMediumB) is the lift platform in a medium bay, ~40 m lateral to A; the A platform of the same size is
+// the bay's pad. A B pad is never picked while an A pad of the same size is within kPlatformAM metres of the camera.
+constexpr float kPlatformAM = 60.0f;
+// Built v14.8: the box is a seal only with every half-extent at least this many metres (a zero box culls the whole bay).
+constexpr float kBoxMinHalfM = 10.0f;
+// Built v14.8: a ship has many parts; a boarding volume or a GUI record does not. A prefix names a ship only with this many records within
+// kShipRecordsM of the camera.
+constexpr uint32_t kShipRecordsMin = 10;
+constexpr float kShipRecordsM = 40.0f;
+
+inline bool padIsPlatformB(const PadObs& p) noexcept {
+    const size_t len = std::strlen(p.name);
+    return len > 0 && p.name[len - 1] == 'B';
+}
+
+// True when an A-platform pad of this size is within kPlatformAM of the camera.
+inline bool aPadNear(const PadObs* obs, size_t n, const float camera[3], PadSize size) noexcept {
+    for (size_t i = 0; i < n; ++i) {
+        if (obs[i].size != size || !padIsPlatformA(obs[i])) continue;
+        if (distance(obs[i].centre, camera) <= kPlatformAM) return true;
+    }
+    return false;
+}
+
+// Why the pad's cell cannot seal, or nullptr when it can: a pad, a shaft target, a box with every half-extent at least kBoxMinHalfM (the floor is
+// the box's height half-extent, which includes the below distance).
+inline const char* cellInvalidWhy(const OwnCell& c) noexcept {
+    if (!c.has) return "no own pad";
+    if (!c.capsule) return "no shaft target (no instance of the pad's target name on the shaft)";
+    if (!c.box) return "no box (the pad's pose or the target axis is unreadable)";
+    for (int k = 0; k < 3; ++k) {
+        if (!(c.boxHalf[k] >= kBoxMinHalfM)) return "box under 10 m on an axis (no valid bay volume)";
+    }
+    return nullptr;
+}
+
 inline void fillOwnFromPad(const PadObs& p, const float radii[3], float d, OwnCell* out) noexcept {
     out->has = true;
     out->size = p.size;
@@ -245,13 +281,18 @@ inline void pickOwnPad(const PadObs* obs, size_t n, const float camera[3], const
         std::snprintf(out->reason, sizeof(out->reason), "no LandingPad record this frame");
         return;
     }
+    // Built v14.8: a B platform is not eligible while an A platform of its size is within kPlatformAM.
+    auto eligible = [&](size_t i) noexcept {
+        if (obs[i].size == PadSize::kNone) return false;
+        return !(padIsPlatformB(obs[i]) && aPadNear(obs, n, camera, obs[i].size));
+    };
     bool containing = false;
     for (size_t i = 0; i < n && !containing; ++i) {
-        if (obs[i].size != PadSize::kNone && distance(obs[i].centre, camera) <= obs[i].radius) containing = true;
+        if (eligible(i) && distance(obs[i].centre, camera) <= obs[i].radius) containing = true;
     }
     float nearest = -1.0f;
     for (size_t i = 0; i < n; ++i) {
-        if (obs[i].size == PadSize::kNone) continue;
+        if (!eligible(i)) continue;
         const float d = distance(obs[i].centre, camera);
         if (!(containing ? d <= obs[i].radius : d <= kPadFallbackM)) continue;
         if (nearest < 0.0f || d < nearest) nearest = d;
@@ -264,7 +305,7 @@ inline void pickOwnPad(const PadObs* obs, size_t n, const float camera[3], const
     float bestD = 0.0f, bestLat = 0.0f;
     bool bestA = false;
     for (size_t i = 0; i < n; ++i) {
-        if (obs[i].size == PadSize::kNone) continue;
+        if (!eligible(i)) continue;
         const float d = distance(obs[i].centre, camera);
         if (!(containing ? d <= obs[i].radius : d <= kPadFallbackM)) continue;
         if (d > nearest + kPadTieM) continue;   // not a near-tie with the nearest
@@ -1023,6 +1064,15 @@ struct ShellHeightSources {
     }
 };
 
+// Built v14.8: a prefix names a ship only with kShipRecordsMin records within kShipRecordsM of the camera, and never GUI_ or BoardingVolume prefixes.
+inline bool shipPrefixNamesShip(const char* prefix, uint32_t records) noexcept {
+    if (prefix == nullptr || prefix[0] == '\0') return false;
+    if (records < kShipRecordsMin) return false;
+    if (hasPrefixNoCase(prefix, "GUI_")) return false;
+    if (containsNoCase(prefix, "BoardingVolume")) return false;
+    return true;
+}
+
 // Built v14.6: the own ship's type prefix, read from the candidate record each tick. A change of prefix is a ship change, but only after
 // kShipChangeTicks readings in a row of the new prefix: a flicker between two near records is not a swap. The first reading only sets the prefix.
 constexpr uint32_t kShipChangeTicks = 10;
@@ -1118,7 +1168,8 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         st->immediate = true;
         return SealAction::kRequestEngage;
     }
-    if (!st->stillValid || in.sourceChanged || std::fabs(in.rel - st->anchor) > kSealStillM) {
+    if (in.sourceChanged && st->stillValid) st->anchor = in.rel;   // a new centre source re-bases the reading; the still clock keeps running (built v14.8)
+    if (!st->stillValid || std::fabs(in.rel - st->anchor) > kSealStillM) {
         st->stillValid = true;
         st->anchor = in.rel;
         st->stillSinceMs = in.nowMs;
@@ -1199,14 +1250,21 @@ struct OwnPadSticky {
 
 inline void pickOwnPadSticky(const PadObs* obs, size_t n, const float camera[3], const float radii[3], OwnPadSticky* st, OwnCell* out) noexcept {
     if (st->pad != 0) {
+        const PadObs* held = nullptr;
         for (size_t i = 0; i < n; ++i) {
-            if (obs[i].addr != st->pad || obs[i].size == PadSize::kNone) continue;
+            if (obs[i].addr == st->pad && obs[i].size != PadSize::kNone) {
+                held = &obs[i];
+                break;
+            }
+        }
+        // Built v14.8: a held B platform gives way to the A platform of its size within kPlatformAM (a fresh pick).
+        if (held != nullptr && !(padIsPlatformB(*held) && aPadNear(obs, n, camera, held->size))) {
             st->unseen = 0;
             *out = OwnCell{};
-            fillOwnFromPad(obs[i], radii, distance(obs[i].centre, camera), out);
+            fillOwnFromPad(*held, radii, distance(held->centre, camera), out);
             return;
         }
-        if (++st->unseen < kHeldLostFrames) {
+        if (held == nullptr && ++st->unseen < kHeldLostFrames) {
             *out = OwnCell{};
             std::snprintf(out->reason, sizeof(out->reason), "the own pad is not in the store this frame (%u of %u frames before another can take over)",
                           static_cast<unsigned>(st->unseen), static_cast<unsigned>(kHeldLostFrames));

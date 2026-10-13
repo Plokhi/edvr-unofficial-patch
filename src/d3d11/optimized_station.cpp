@@ -58,6 +58,14 @@ uintptr_t g_preShellPad = 0;
 char g_preShellName[48] = {};
 char g_ownPrefix[32] = {};
 char g_ownCandidateName[48] = {};
+// Built v14.8: the records within kShipRecordsM of the camera by type prefix, this frame (the ship's part count).
+struct PrefixTally {
+    char p[32] = {};
+    uint32_t n = 0;
+};
+constexpr size_t kPrefixSlots = 24;
+PrefixTally g_prefixTally[kPrefixSlots];
+size_t g_prefixTallyN = 0;
 float g_ownCandidateDist = -1.0f;
 sealed::PadObs g_pads[sealed::kPadSlots];
 sealed::OwnPadSticky g_ownSticky;   // Built v14 (fix 1): the own pad, kept while its record is seen (reset when it is replaced)
@@ -430,7 +438,32 @@ sealed::NameClass classOf(uintptr_t record, uintptr_t* nodeOut) noexcept {
     return cls;
 }
 
-// Built v13 (fix 1): at each named engage, the own ship's type prefix from the candidate record (the one nearest the camera that contains it), logged.
+// Built v14.8: count one record of a type prefix (the records within kShipRecordsM of the camera).
+void tallyShipPrefix(const char* name) noexcept {
+    char pfx[32] = {};
+    sealed::ownPrefixOf(name, pfx, sizeof(pfx));
+    if (pfx[0] == '\0') return;
+    for (size_t i = 0; i < g_prefixTallyN; ++i) {
+        if (std::strcmp(g_prefixTally[i].p, pfx) == 0) {
+            ++g_prefixTally[i].n;
+            return;
+        }
+    }
+    if (g_prefixTallyN < kPrefixSlots) {
+        std::snprintf(g_prefixTally[g_prefixTallyN].p, sizeof(g_prefixTally[g_prefixTallyN].p), "%s", pfx);
+        g_prefixTally[g_prefixTallyN].n = 1;
+        ++g_prefixTallyN;
+    }
+}
+
+uint32_t prefixTallyOf(const char* pfx) noexcept {
+    for (size_t i = 0; i < g_prefixTallyN; ++i) {
+        if (std::strcmp(g_prefixTally[i].p, pfx) == 0) return g_prefixTally[i].n;
+    }
+    return 0;
+}
+
+// Built v13 (fix 1): at each named engage, the own ship\'s type prefix from the candidate record (the one nearest the camera that contains it), logged.
 void setOwnPrefixAtEngage(uint32_t frame) {
     (void)frame;
     sealed::ownPrefixOf(g_ownCandidateName, g_ownPrefix, sizeof(g_ownPrefix));
@@ -1001,6 +1034,7 @@ void buildBoxFor(sealed::OwnCell& cell, const float target[3]) {
 void promoteFrame(uint32_t stamp, uint32_t frame) {
     sealed::OwnCell next;
     g_ownCandidateDist = -1.0f;
+    g_prefixTallyN = 0;   // the tally is this frame's records (built v14.8)
     std::memcpy(g_nearPrev, g_nearCur, sizeof(g_nearPrev));
     g_nearPrevN = g_nearCurN;
     g_nearCurN = 0;
@@ -1087,7 +1121,7 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
     // The engage: the cell is frozen from the pad when the seal rule asked for it. Held frames take the held cell.
     if (g_engagePending) {
         ++g_engageTries;
-        if (next.has && next.radius > 0.0f && g_relOk) {
+        if (next.has && next.radius > 0.0f && g_relOk && sealed::cellInvalidWhy(next) == nullptr) {
             setOwnPrefixAtEngage(frame);
             pickOwnRecord(frame);
             g_heldCell = next;
@@ -1097,9 +1131,18 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
             g_sealedFlag.store(true, std::memory_order_release);
             sealStatus(g_heldCell, frame);
         } else if (g_engageTries >= kEngageTries) {
+            // Built v14.8: the cell is not valid (no box, a zero box, no target), so no seal. The seal is requested again (the pad may gain a target);
+            // the note is written once per distinct reason.
             g_engagePending = false;
-            Log::get().note("optimized station: no cell could be built at the seal (%u promotes; last: %s); the seal waits for the pad to move "
-                            "and settle again.", g_engageTries, next.reason);
+            g_sealState.requested = false;
+            const char* why = sealed::cellInvalidWhy(next);
+            if (why == nullptr) why = next.reason;
+            static char lastWhy[120] = {};
+            if (std::strcmp(lastWhy, why) != 0) {
+                std::snprintf(lastWhy, sizeof(lastWhy), "%s", why);
+                Log::get().note("optimized station: no seal: the cell is not valid (%s); the station keeps drawing everything, and the seal is tried again.", why);
+            }
+            g_engageTries = 0;
         }
         if (!g_heldValid) next = sealed::OwnCell{};
     } else if (g_heldValid) {
@@ -1246,6 +1289,10 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
                 }
             }
         }
+    if (sealed::distance(centre, cam) <= sealed::kShipRecordsM) {   // the ship's part count by prefix (built v14.8)
+        char tn[48] = {};
+        if (cachedName(record, tn, sizeof(tn))) tallyShipPrefix(tn);
+    }
     if (!judge) return;   // gathering only: the pads and the explicit parts are in hand; the judgement is sealed-only
     const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, record);
     keep = v.keep;
@@ -1352,7 +1399,7 @@ void optimizedStationFrame(uint32_t frame) {
         sealed::ownPrefixOf(g_ownCandidateName, curPrefix, sizeof(curPrefix));
         char oldPrefix[32] = {};
         std::snprintf(oldPrefix, sizeof(oldPrefix), "%s", g_shipWatch.prefix);
-        if (g_shipWatch.step(curPrefix)) {
+        if (sealed::shipPrefixNamesShip(curPrefix, prefixTallyOf(curPrefix)) && g_shipWatch.step(curPrefix)) {
             char why[160];
             std::snprintf(why, sizeof(why), "ship changed (%s -> %s)", oldPrefix, curPrefix);
             if (g_heldValid) {
@@ -1463,7 +1510,7 @@ void optimizedStationFrame(uint32_t frame) {
         w.relM = g_relM;
         w.relOk = g_relOk;
         w.stillS = g_sealState.stillValid ? static_cast<float>(now - g_sealState.stillSinceMs) / 1000.0f : 0.0f;
-        w.cellBuilt = g_pickCell.has && g_pickCell.radius > 0.0f && g_relOk;
+        w.cellBuilt = g_relOk && sealed::cellInvalidWhy(g_pickCell) == nullptr;
         w.gathered = g_recordsLast;
         w.descent = g_sealState.moved;
         w.cameraKnown = g_frameCamValid;
@@ -1476,8 +1523,9 @@ void optimizedStationFrame(uint32_t frame) {
             ev.contains = g_frameCamValid && ev.d <= p.radius;
         }
         if (!w.cellBuilt) {
-            if (!g_pickCell.has) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_pickCell.reason);
-            else std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", "no pad height (the pad's pose is unreadable)");
+            if (!g_relOk) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", "no shell height (the pad or the shell pose is unreadable)");
+            else if (!g_pickCell.has) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_pickCell.reason);
+            else std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", sealed::cellInvalidWhy(g_pickCell));
         }
         const bool changed = !g_waitLastSet || sealed::waitingKeyChanged(g_waitLast, w);
         const bool periodic = w.docked && g_waitLastSet && now - g_waitLastMs >= 10000;

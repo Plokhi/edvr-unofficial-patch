@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
         se::pickOwnPad(ordBA, 2, camMid, radii, &c2);
         check(c1.has && c1.pad == 0x1000 && c2.has && c2.pad == 0x1000, "fix 1: a tie within 5 m goes to the platform named A, whatever the record order");
         se::pickOwnPad(ordAB, 2, camB, radii, &c3);
-        check(c3.has && c3.pad == 0x2000, "fix 1: no tie (B nearer by 20 m): the nearest pad wins, not the one named A");
+        check(c3.has && c3.pad == 0x1000, "v14.8: the B platform is not picked while the A platform of its size is within 60 m (the nearer B loses)");
 
         se::OwnPadSticky st;
         se::OwnCell s;
@@ -409,7 +409,78 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Built v14.6: a ship change (the own ship's type prefix) resets the trigger; a flicker is not a change -----------------------------
+    // ---- Built v14.8: the lift platform B, the cell validity, the ship part count, the still clock across a source change ----------------
+    {
+        se::PadObs pa{};
+        pa.addr = 0x1000;
+        pa.centre[0] = -20.0f;
+        pa.radius = 30.0f;
+        pa.size = se::PadSize::kMedium;
+        std::snprintf(pa.name, sizeof(pa.name), "%s", "LandingPadMediumA");
+        se::PadObs pb{};
+        pb.addr = 0x2000;
+        pb.centre[0] = 20.0f;
+        pb.radius = 30.0f;
+        pb.size = se::PadSize::kMedium;
+        std::snprintf(pb.name, sizeof(pb.name), "%s", "LandingPadMediumB");
+        const float radii[3] = {80.0f, 120.0f, 145.0f};
+        const float camB[3] = {10.0f, 0.0f, 0.0f};   // B 10 m, A 30 m
+        se::PadObs ordAB[2] = {pa, pb};
+        se::OwnCell c;
+        se::pickOwnPad(ordAB, 2, camB, radii, &c);
+        check(c.has && c.pad == 0x1000, "v14.8: the nearer B platform loses to the A platform of its size within 60 m");
+        se::PadObs farA = pa;
+        farA.centre[0] = -80.0f;   // A 90 m from the camera
+        se::PadObs ordFar[2] = {farA, pb};
+        se::pickOwnPad(ordFar, 2, camB, radii, &c);
+        check(c.has && c.pad == 0x2000, "v14.8: beyond 60 m the A platform does not count: B is picked");
+        se::OwnPadSticky st;
+        se::OwnCell s;
+        se::PadObs onlyB[1] = {pb};
+        se::pickOwnPadSticky(onlyB, 1, camB, radii, &st, &s);
+        check(s.has && s.pad == 0x2000, "v14.8 sticky: B picked while no A is in the store");
+        se::pickOwnPadSticky(ordAB, 2, camB, radii, &st, &s);
+        check(s.has && s.pad == 0x1000, "v14.8 sticky: a held B gives way to the A platform within 60 m at once");
+
+        se::OwnCell none;
+        check(se::cellInvalidWhy(none) != nullptr, "v14.8 cell: no pad, no seal");
+        se::OwnCell noTarget;
+        noTarget.has = true;
+        check(se::cellInvalidWhy(noTarget) != nullptr, "v14.8 cell: a pad with no shaft target does not seal");
+        se::OwnCell zero = noTarget;
+        zero.capsule = true;
+        zero.box = true;   // the zero box the flight sealed with
+        check(se::cellInvalidWhy(zero) != nullptr, "v14.8 cell: a zero box never seals (the flight's 0 x 0 x 0)");
+        se::OwnCell ok = zero;
+        ok.boxHalf[0] = ok.boxHalf[1] = ok.boxHalf[2] = 12.0f;
+        check(se::cellInvalidWhy(ok) == nullptr, "v14.8 cell: a box with every half-extent at least 10 m is a valid cell");
+        se::OwnCell thin = ok;
+        thin.boxHalf[1] = 5.0f;
+        check(se::cellInvalidWhy(thin) != nullptr, "v14.8 cell: a box under 10 m on any axis does not seal");
+    }
+    {
+        // The ship's part count: a real ship has many records near the camera; a boarding volume or a GUI record does not.
+        check(se::shipPrefixNamesShip("LakonMiner_", 10), "v14.8 ship: a prefix with ten records near the camera names a ship");
+        check(!se::shipPrefixNamesShip("LakonMiner_", 9), "v14.8 ship: nine records are not enough");
+        check(!se::shipPrefixNamesShip("ShipBoardingVolume_", 50), "v14.8 ship: a BoardingVolume prefix never names a ship");
+        check(!se::shipPrefixNamesShip("GUI_", 50) && !se::shipPrefixNamesShip("GUI_Panel", 50), "v14.8 ship: a GUI_ prefix never names a ship");
+        check(!se::shipPrefixNamesShip("", 50) && !se::shipPrefixNamesShip(nullptr, 50), "v14.8 ship: no prefix, no ship");
+    }
+    {
+        // A new centre source re-bases the still reading; the still clock keeps running (no restart at the source change).
+        se::SealState st = descended();   // moved, the still clock from 100 ms
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        uint64_t req = 0;
+        for (uint64_t tt = 200; tt <= 10000; tt += 100) {
+            se::SealInputs in = quiet(tt);
+            if (tt >= 3000) in.rel = -47.4f;   // the same pad, read from another source: 2.4 m lower by the reading
+            if (tt == 3000) in.sourceChanged = true;
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
+        }
+        check(req == 100 + se::kSealDelayMs, "v14.8: a source change re-bases the reading; the seal still comes 6 s after the pad settled (6100 ms)");
+    }
+
+    // ---- Built v14.6: a ship change (the own ship\'s type prefix) resets the trigger; a flicker is not a change -----------------------------
     {
         se::ShipWatch w;
         check(!w.step("Anaconda"), "v14.6: the first reading sets the own ship's prefix: no change");
