@@ -516,3 +516,22 @@ launches. The phase-1 build switches to Passthrough rather than live.
   Artifact: `monitor: FREEZE -- 49118.3 ms` at the flat -> vr switch, because perfMonitorFrame runs only from the VR menu tick and
   its clock paused while flat (frames 7770 -> 19442 in those 49 s); fixed in a6ee51a7. The `"off" is not WIDTHxHEIGHT` burst after
   vr -> flat is the flat allow-list reading VR-only keys; a flat launch prints the same lines (13 at 16:03).
+## 12. The headset while flat (2026-10-13, Sean: "clear + message panel")
+
+- Problem (flight F and the leak flight): after 3D off the game makes no OpenVR call, the session stays up, and SteamVR keeps the
+  last submitted frame (the menu), frozen. Elite never calls ClearLastSubmittedFrame (no evidence it does).
+- Survey facts: loading frames run from the game's Present callback with the render thread parked during a blocking xrWaitFrame
+  (native_module.cpp:40-44, native_runtime_host.h:875-936); in flat that would pace the flat game by the headset. No quad layers
+  exist; the runtime owns two eye swapchains and, with `separate_device=1` (the installer's default), its own device and immediate
+  context, usable from the owner thread. XR-only calls (xrWaitFrame/BeginFrame/EndFrame with zero layers) are legal from the owner
+  thread in either mode. The menu's GDI rasteriser makes no D3D calls (menu_panel.cpp:748-885).
+- Design:
+  - N1, clear: a `vr profile active` bit in the shared frame-flag block (the intro-recentre pattern), written by the graphics DLL
+    at launch and at every switch. While it says not-VR and the game has made no frame call for 250 ms, the runtime's owner thread
+    runs its own frames (zero layers), and the Present callback stops routing into the runtime so the flat game never waits on it.
+    The game's next WaitGetPoses takes priority and the runtime's frames stop at once.
+  - N2, panel (separate device only): the same frames carry a projection layer: both eye images cleared to black with a head-locked
+    message rasterised by GDI in the runtime ("Elite is in flat mode. Turn 3D on in Elite's graphics options to return to VR.").
+    Borrowed-device mode keeps N1's empty frames.
+- Hypothesis N-H1: SteamVR shows its own environment, not the frozen frame, while the app submits zero-layer frames. A flight
+  decides it before N2 builds on it.
