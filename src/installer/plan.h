@@ -116,6 +116,10 @@ struct Survey {
     // a trip through the launcher's file verification.
     std::vector<std::wstring> openvrOrigInBackups;
 
+    // The tool's receipts for this folder (state.h readToolReceipts). They are provenance for the files they list: a file the tool placed
+    // is EDVR's, by its hash, whether or not the installer's own record lists it.
+    std::vector<ToolReceipt> toolReceipts;
+
     InstallState state;
     // Which Elite Dangerous the folder's executable is; the gate refuses
     // everything but OdysseyQualified and says why per case.

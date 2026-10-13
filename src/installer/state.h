@@ -15,6 +15,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace edvr::installer {
 
@@ -85,6 +86,26 @@ bool scopeHasFlatIni(const std::string& scope);
 // record from before the profiles existed says nothing and means VR.
 const wchar_t* settingsLeafFor(const std::string& profile);
 std::wstring   settingsPathFor(const std::wstring& gameDir, const std::string& profile);
+
+// The tool's receipts (tools\install_edvr.py) for this folder. The tool keeps its own record beside the game: each file it placed, what
+// it replaced, and the hashes of both. The installer reads them for provenance only; its own record stays the authority for what it did.
+struct ToolReceiptFile {
+    std::string  key;           // runtime, loader, notice, config, xess, ... (a version 1 receipt: native, graphics)
+    std::wstring target;        // the file the tool placed
+    std::wstring backup;        // the copy of what it replaced; empty when nothing was there
+    std::string  beforeSha;     // the hash of what it replaced
+    std::string  installedSha;  // the hash of what it placed
+};
+struct ToolReceipt {
+    std::wstring path;          // the receipt file that was read
+    bool         native = false;  // kind edvr-native-openxr, else edvr-flat
+    std::vector<ToolReceiptFile> files;
+};
+
+// The newest receipt of each kind in the game folder, picked as install_edvr.py picks its current receipts: the newest backup-named
+// sibling of the receipt when there is one, else the receipt itself. A receipt is read only when its target is this folder and it
+// its state is "installed". Anything that does not parse as one is absent.
+std::vector<ToolReceipt> readToolReceipts(const std::wstring& gameDir);
 
 InstallState readState(const std::wstring& gameDir);
 InstallState parseState(const std::string& text);

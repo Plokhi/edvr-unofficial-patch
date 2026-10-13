@@ -2446,10 +2446,12 @@ static void testContentOwnership(const std::wstring& scratch) {
               hasStep(plan, Action::Delete, L"OPENXR-LOADER-LICENSE.txt", nullptr) &&
               hasStep(plan, Action::Delete, L"edvr_openxr.ini", nullptr),
               "removes the loader, licence and startup config without a record");
-        check(hasStep(plan, Action::Delete, L"libxess.dll", nullptr) &&
-              hasStep(plan, Action::Delete, L"INTEL-XESS-LICENSE.txt", nullptr) &&
-              hasStep(plan, Action::Delete, L"INTEL-XESS-THIRD-PARTY.txt", nullptr),
-              "removes the XeSS trio by its payload hashes");
+        // Payload-identical, with no record or receipt listing them: nothing shows EDVR placed them, so they are kept.
+        check(!hasStep(plan, Action::Delete, L"libxess.dll", nullptr) &&
+              !hasStep(plan, Action::Delete, L"INTEL-XESS-LICENSE.txt", nullptr) &&
+              !hasStep(plan, Action::Delete, L"INTEL-XESS-THIRD-PARTY.txt", nullptr) &&
+              notesMention(plan, "nothing shows EDVR placed it"),
+              "keeps the XeSS trio: a payload match with no record or receipt is not proof");
         check(hasStep(plan, Action::Delete, L"openvr_api.dll", nullptr) &&
               hasStep(plan, Action::Rename, L"openvr_api_orig.dll", L"openvr_api.dll"),
               "and puts the game's own openvr_api.dll back, as before");
@@ -2500,6 +2502,138 @@ static void testContentOwnership(const std::wstring& scratch) {
         planUninstall(leftoverSurvey(cdir, p, false, shaOfText(kTestLoaderChanged)), testOptions(), p);
         check((listing(cdir) + listing(joinPath(cdir, L"Openvr\\win64"))) == before,
               "and planning the three cases over real files changed nothing in the folder");
+    }
+}
+
+// A file whose bytes are EDVR's is removed only with provenance: the record, or the tool's receipt, lists it. Another mod's identical
+// copy of a Khronos loader, or of the XeSS runtime, is someone else's and stays where it is.
+static void testSharedFilesKept() {
+    printf("\na shared file is removed only with EDVR provenance\n");
+    const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+    const PayloadInfo p = contentPayload();
+    const std::wstring loaderPath = joinPath(joinPath(dir, L"Openvr\\win64"), L"openxr_loader.dll");
+    const char* kept = "matches EDVR's copy but nothing shows EDVR placed it; left alone";
+    {   // A fresh flat install, stock runtime, no record, no descriptor: another mod's loader matching the payload is kept.
+        Survey s = baseSurvey(dir);
+        s.openxrLoader = fakeDll(DllKind::Foreign, loaderPath, p.openxrLoaderSha);
+        Options o = testOptions();
+        o.scope = "flat";
+        const Plan plan = planInstall(s, o, p);
+        check(!plan.blocked, "a fresh flat install over a stock runtime is not blocked", unifiedProblems(plan));
+        check(!hasStep(plan, Action::Delete, L"openxr_loader.dll", nullptr) &&
+              !hasStep(plan, Action::Backup, L"openxr_loader.dll", nullptr),
+              "the matching loader is neither backed up nor removed");
+        check(notesMention(plan, kept), "and the report says nothing shows EDVR placed it");
+    }
+    {   // The same bytes with the record listing them: the file is EDVR's, and goes.
+        Survey s = baseSurvey(dir);
+        s.openxrLoader = fakeDll(DllKind::Foreign, loaderPath, p.openxrLoaderSha);
+        s.state.present = true; s.state.profile = "vr"; s.state.scope = "both";
+        s.state.openxrLoaderSha = p.openxrLoaderSha;
+        Options o = testOptions();
+        o.scope = "flat";
+        check(hasStep(planInstall(s, o, p), Action::Delete, L"openxr_loader.dll", nullptr),
+              "a loader the record lists is removed by a flat install");
+    }
+    {   // The same bytes with the tool's receipt listing them as placed: EDVR's, and removed.
+        Survey s = baseSurvey(dir);
+        s.openxrLoader = fakeDll(DllKind::Foreign, loaderPath, p.openxrLoaderSha);
+        ToolReceiptFile placed;
+        placed.key = "loader"; placed.target = loaderPath; placed.installedSha = p.openxrLoaderSha;
+        ToolReceipt receipt;
+        receipt.native = true; receipt.files.push_back(placed);
+        s.toolReceipts.push_back(receipt);
+        Options o = testOptions();
+        o.scope = "flat";
+        check(hasStep(planInstall(s, o, p), Action::Delete, L"openxr_loader.dll", nullptr),
+              "a loader the tool's receipt lists as placed is removed");
+    }
+    {   // XeSS: payload-identical libxess.dll and no record or receipt entry is kept on uninstall; a record or a receipt removes it.
+        const std::wstring xess = joinPath(dir, L"libxess.dll");
+        Survey bare = baseSurvey(dir);
+        bare.xess = fakeDll(DllKind::Foreign, xess, p.xessSha);
+        const Plan kept1 = planUninstall(bare, testOptions(), p);
+        check(!hasStep(kept1, Action::Delete, L"libxess.dll", nullptr) && notesMention(kept1, kept),
+              "uninstall keeps a payload-identical libxess.dll with no record or receipt entry");
+        Survey recorded = bare;
+        recorded.state.present = true; recorded.state.xessSha = p.xessSha;
+        check(hasStep(planUninstall(recorded, testOptions(), p), Action::Delete, L"libxess.dll", nullptr),
+              "uninstall removes it when the record lists it");
+        Survey listed = bare;
+        ToolReceiptFile placed;
+        placed.key = "xess"; placed.target = xess; placed.installedSha = p.xessSha;
+        ToolReceipt receipt;
+        receipt.native = true; receipt.files.push_back(placed);
+        listed.toolReceipts.push_back(receipt);
+        check(hasStep(planUninstall(listed, testOptions(), p), Action::Delete, L"libxess.dll", nullptr),
+              "and when the tool's receipt lists it as placed");
+    }
+}
+
+static std::string jsonString(const std::wstring& path) {
+    std::string out = "\"";
+    for (const char c : toUtf8(path)) {
+        if (c == '\\') out += "\\\\";
+        else out += c;
+    }
+    return out + "\"";
+}
+
+// A version 2 native receipt as install_edvr.py writes it, with one entry: the loader it placed. The key carries a \u escape.
+static std::string receiptText(const std::wstring& target, const char* state, const std::string& loaderSha) {
+    return std::string("{\"version\": 2, \"kind\": \"edvr-native-openxr\", \"target\": ") + jsonString(target) +
+           ", \"state\": \"" + state + "\", \"files\": [{\"key\": \"lo\\u0061der\", \"target\": " +
+           jsonString(joinPath(target, L"Openvr\\win64\\openxr_loader.dll")) +
+           ", \"backup\": null, \"before_sha256\": null, \"installed_sha256\": \"" + loaderSha + "\"}]}";
+}
+
+static void testToolReceipts(const std::wstring& scratch) {
+    printf("\nthe tool's receipts: which one is read, and what it proves\n");
+    const std::wstring root = joinPath(scratch, L"tool-receipts");
+    auto fresh = [&](const wchar_t* name) {
+        const std::wstring dir = joinPath(root, name);
+        removeTree(dir);
+        makeTree(dir);
+        return dir;
+    };
+    {   // The current receipt is read, and its escaped key is decoded.
+        const std::wstring dir = fresh(L"current");
+        writeAll(joinPath(dir, L"edvr_native_receipt.json"), receiptText(dir, "installed", "now"));
+        const std::vector<ToolReceipt> got = readToolReceipts(dir);
+        check(got.size() == 1 && got[0].native && got[0].files.size() == 1 && got[0].files[0].key == "loader" &&
+              got[0].files[0].installedSha == "now" && got[0].files[0].backup.empty(),
+              "the installed native receipt is read, its \\u-escaped key decoded");
+    }
+    {   // Of the backup-named siblings the newest stamp wins, then the highest counter, as install_edvr.py picks its current receipt.
+        const std::wstring dir = fresh(L"siblings");
+        writeAll(joinPath(dir, L"edvr_native_receipt.json"), receiptText(dir, "installed", "base"));
+        writeAll(joinPath(dir, L"edvr_native_receipt.json.pre-a-20261012-090000.bak"), receiptText(dir, "installed", "older"));
+        writeAll(joinPath(dir, L"edvr_native_receipt.json.pre-a-20261013-120000.bak"), receiptText(dir, "installed", "same-stamp-0"));
+        writeAll(joinPath(dir, L"edvr_native_receipt.json.pre-a-20261013-120000.bak.2"), receiptText(dir, "installed", "newest"));
+        const std::vector<ToolReceipt> got = readToolReceipts(dir);
+        check(got.size() == 1 && got[0].files.size() == 1 && got[0].files[0].installedSha == "newest",
+              "the newest backup-named sibling is the current receipt, the highest counter breaking the tie");
+    }
+    {   // A receipt for another folder, one still staging, and one that does not parse prove nothing and are not read.
+        const std::wstring dir = fresh(L"refused");
+        writeAll(joinPath(dir, L"edvr_native_receipt.json"), receiptText(L"C:\\Games\\Elsewhere", "installed", "x"));
+        check(readToolReceipts(dir).empty(), "a receipt for another folder is not read");
+        writeAll(joinPath(dir, L"edvr_native_receipt.json"), receiptText(dir, "staging", "x"));
+        check(readToolReceipts(dir).empty(), "a receipt still staging is not read");
+        writeAll(joinPath(dir, L"edvr_native_receipt.json"), receiptText(dir, "installed", "x").substr(0, 60));
+        check(readToolReceipts(dir).empty(), "a receipt that does not parse is not read");
+    }
+    {   // The flat receipt is read beside the native one: each family has its own newest receipt.
+        const std::wstring dir = fresh(L"both-kinds");
+        writeAll(joinPath(dir, L"edvr_native_receipt.json"), receiptText(dir, "installed", "n"));
+        writeAll(joinPath(dir, L"edvr_flat_receipt.json"),
+                 "{\"version\": 2, \"kind\": \"edvr-flat\", \"target\": " + jsonString(dir) +
+                 ", \"state\": \"installed\", \"files\": [{\"key\": \"graphics\", \"target\": " +
+                 jsonString(joinPath(dir, L"d3d11.dll")) +
+                 ", \"backup\": null, \"before_sha256\": null, \"installed_sha256\": \"g\"}]}");
+        const std::vector<ToolReceipt> got = readToolReceipts(dir);
+        check(got.size() == 2 && got[0].native && !got[1].native && got[1].files[0].key == "graphics",
+              "the native and the flat receipt are both read");
     }
 }
 
@@ -6033,6 +6167,8 @@ int wmain(int argc, wchar_t** argv) {
     testStaleRecordBase();
     testXessPlanner();
     testContentOwnership(scratch);
+    testSharedFilesKept();
+    testToolReceipts(scratch);
     testFlatSettingsPlanner();
     testApply(scratch);
     testMirror(scratch);

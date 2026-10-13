@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cwctype>
 #include <utility>
 
@@ -155,13 +156,6 @@ bool isCanonicalDescriptor(const std::string& sha) {
     return ownDescriptorScope(sha, &scope);
 }
 
-// A file is EDVR's by its hash when its bytes are the ones the record kept, or the ones this installer carries. Either is proof; a
-// file that is absent or unreadable is not EDVR's by anything, and a changed one matches neither and is someone's to keep.
-bool ownedByHash(const DllInfo& info, const std::string& recorded, const std::string& carried) {
-    if (info.kind == DllKind::Absent || info.kind == DllKind::Unreadable || info.sha256.empty()) return false;
-    return info.sha256 == recorded || info.sha256 == carried;
-}
-
 std::string trimmedSpaces(const std::string& text) {
     const size_t first = text.find_first_not_of(" \t");
     if (first == std::string::npos) return std::string();
@@ -225,23 +219,72 @@ std::wstring nativeDirOf(const Survey& s) {
     return s.game.openvrDir.empty() ? joinPath(s.game.dir, L"Openvr\\win64") : s.game.openvrDir;
 }
 
-// The OpenXR files EDVR places beside the game's VR runtime, each EDVR's by one of its proofs: the record's hash, or the bytes this
-// installer carries (loader, licence), or for the startup config, its text naming this folder's loader and graphics (the same
-// paths the planner writes into it).
-bool loaderOwned(const Survey& s, const std::string& carriedSha) {
-    return ownedByHash(s.openxrLoader, s.state.openxrLoaderSha, carriedSha);
+bool sameSha(const std::string& a, const std::string& b) {
+    return !a.empty() && _stricmp(a.c_str(), b.c_str()) == 0;
 }
 
-bool licenseOwned(const Survey& s, const std::string& carriedSha) {
-    return ownedByHash(s.openxrLicense, s.state.openxrLicenseSha, carriedSha);
+// The tool's receipt lists this path as a file it placed. What the tool REPLACED is somebody else's by definition, so only the placed
+// hash is a proof of EDVR's bytes.
+bool toolListsPath(const Survey& s, const std::wstring& path) {
+    for (const ToolReceipt& r : s.toolReceipts)
+        for (const ToolReceiptFile& f : r.files)
+            if (_wcsicmp(f.target.c_str(), path.c_str()) == 0) return true;
+    return false;
 }
 
-bool startupConfigOwned(const Survey& s) {
-    if (ownedByHash(s.nativeConfig, s.state.nativeConfigSha, std::string())) return true;
+bool toolPlacedHash(const Survey& s, const std::wstring& path, const std::string& sha) {
+    for (const ToolReceipt& r : s.toolReceipts)
+        for (const ToolReceiptFile& f : r.files)
+            if (_wcsicmp(f.target.c_str(), path.c_str()) == 0 && sameSha(f.installedSha, sha)) return true;
+    return false;
+}
+
+// A file is EDVR's to remove only with PROVENANCE -- the record or the tool's receipt lists it, or the proof the caller names -- AND its
+// bytes confirmed: the ones the record kept, the tool placed, or this installer carries. Either part alone is not enough. Matching bytes
+// alone are what another mod's copy of a standard vendor binary looks like, and a provenance alone is not proof the file is intact.
+// A file that is absent or unreadable is not EDVR's by anything.
+bool ownedFile(const Survey& s, const DllInfo& info, bool provenance, const std::string& recorded,
+               const std::string& carried) {
+    if (!provenance || info.kind == DllKind::Absent || info.kind == DllKind::Unreadable || info.sha256.empty())
+        return false;
+    return sameSha(info.sha256, recorded) || sameSha(info.sha256, carried) ||
+           toolPlacedHash(s, info.path, info.sha256);
+}
+
+// The startup config names this folder's loader and graphics paths, the same paths the planner writes into it.
+bool startupConfigIsEdvrs(const Survey& s) {
     if (s.nativeConfig.kind == DllKind::Absent || s.nativeConfig.kind == DllKind::Unreadable) return false;
     return isEdvrStartupConfig(s.nativeConfigText, joinPath(nativeDirOf(s), L"openxr_loader.dll"),
                                joinPath(s.game.dir, kD3d11));
 }
+
+// The OpenXR files beside the game's VR runtime have three proofs of provenance: the record lists them, the tool's receipt lists them,
+// or EDVR's startup config for this folder names the loader they travel with.
+bool openxrProvenance(const Survey& s, const DllInfo& info, const std::string& recorded) {
+    return !recorded.empty() || toolListsPath(s, info.path) || startupConfigIsEdvrs(s);
+}
+
+bool loaderOwned(const Survey& s, const std::string& carriedSha) {
+    return ownedFile(s, s.openxrLoader, openxrProvenance(s, s.openxrLoader, s.state.openxrLoaderSha),
+                     s.state.openxrLoaderSha, carriedSha);
+}
+
+bool licenseOwned(const Survey& s, const std::string& carriedSha) {
+    return ownedFile(s, s.openxrLicense, openxrProvenance(s, s.openxrLicense, s.state.openxrLicenseSha),
+                     s.state.openxrLicenseSha, carriedSha);
+}
+
+// The startup config is EDVR's by its own text, which names this folder's paths; or by its record or the tool's receipt and its bytes.
+bool startupConfigOwned(const Survey& s) {
+    if (ownedFile(s, s.nativeConfig,
+                  !s.state.nativeConfigSha.empty() || toolListsPath(s, s.nativeConfig.path),
+                  s.state.nativeConfigSha, std::string()))
+        return true;
+    return startupConfigIsEdvrs(s);
+}
+
+// The note for a file whose bytes are EDVR's but which nothing shows EDVR placed: another mod's identical copy looks exactly like this.
+const char* kMatchesNoProof = "matches EDVR's copy but nothing shows EDVR placed it; left alone";
 
 }  // namespace
 
@@ -320,6 +363,7 @@ Survey surveyTarget(const GameInstall& game) {
     s.baseIniText = readTextFile(baseIniPath(game.dir));
     s.flatBaseIniText = readTextFile(flatBaseIniPath(game.dir));
     s.state = readState(game.dir);
+    if (!game.dir.empty()) s.toolReceipts = readToolReceipts(game.dir);
     s.descriptorPresent = fileExists(joinPath(game.dir, kProfile));
     if (s.descriptorPresent) s.descriptorSha = sha256File(joinPath(game.dir, kProfile));
     s.ngx = probeDll(joinPath(game.dir, kNgx));
@@ -897,15 +941,17 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
             restoreOriginal.why = "restores the game's original VR library";
             body.push_back(restoreOriginal);
         }
-        const struct NativeFile { const DllInfo* info; bool owned; } nativeFiles[] = {
-            {&s.openxrLoader, loaderOwned(s, p.openxrLoaderSha)},
-            {&s.openxrLicense, licenseOwned(s, p.openxrLicenseSha)},
-            {&s.nativeConfig, startupConfigOwned(s)},
+        const struct NativeFile { const DllInfo* info; bool owned; bool matches; } nativeFiles[] = {
+            {&s.openxrLoader, loaderOwned(s, p.openxrLoaderSha), sameSha(s.openxrLoader.sha256, p.openxrLoaderSha)},
+            {&s.openxrLicense, licenseOwned(s, p.openxrLicenseSha), sameSha(s.openxrLicense.sha256, p.openxrLicenseSha)},
+            {&s.nativeConfig, startupConfigOwned(s), false},
         };
         for (const NativeFile& file : nativeFiles) {
             if (file.info->kind == DllKind::Absent) continue;
             if (!file.owned) {
-                plan.notes.push_back("Keeping a changed OpenXR file: " + say(leafOf(file.info->path)));
+                plan.notes.push_back(file.matches
+                    ? say(leafOf(file.info->path)) + " " + kMatchesNoProof
+                    : "Keeping a changed OpenXR file: " + say(leafOf(file.info->path)));
                 continue;
             }
             backup(file.info->path, "the EDVR OpenXR asset being retired");
@@ -1269,17 +1315,19 @@ Plan planUninstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     // The OpenXR files EDVR placed beside the VR runtime are removed by their proofs, whether or not this folder's record lists them
     // (a record from an older flat install lists none); a changed one is kept.
     {
-        auto retire=[&](const DllInfo& info,bool owned) {
+        auto retire=[&](const DllInfo& info,bool owned,bool matches) {
             if(info.kind==DllKind::Absent)return;
             if(!owned) {
-                plan.notes.push_back("Keeping a changed OpenXR file: "+say(leafOf(info.path)));return;
+                plan.notes.push_back(matches ? say(leafOf(info.path))+" "+kMatchesNoProof
+                                             : "Keeping a changed OpenXR file: "+say(leafOf(info.path)));
+                return;
             }
             backup(info.path,"the native OpenXR file being removed");
             remove(info.path,"removes EDVR's OpenXR dependency",info.sha256);
         };
-        retire(s.openxrLoader,loaderOwned(s,p.openxrLoaderSha));
-        retire(s.openxrLicense,licenseOwned(s,p.openxrLicenseSha));
-        retire(s.nativeConfig,startupConfigOwned(s));
+        retire(s.openxrLoader,loaderOwned(s,p.openxrLoaderSha),sameSha(s.openxrLoader.sha256,p.openxrLoaderSha));
+        retire(s.openxrLicense,licenseOwned(s,p.openxrLicenseSha),sameSha(s.openxrLicense.sha256,p.openxrLicenseSha));
+        retire(s.nativeConfig,startupConfigOwned(s),false);
     }
 
     // ---- NVIDIA's DLSS runtime ----------------------------------------
@@ -1303,9 +1351,13 @@ Plan planUninstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     for (unsigned i=0; i<3; ++i) {
         const DllInfo& cur = *xessFiles[i];
         if (cur.kind == DllKind::Absent) continue;
-        // EDVR's by the record's hash, or by the bytes the payload carries; a changed file is someone's to keep.
-        if (!ownedByHash(cur, *xessOwned[i], *xessCarried[i])) {
-            plan.notes.push_back("Keeping a changed XeSS file: " + say(leafOf(cur.path)));
+        // EDVR's when the record or the tool's receipt lists it AND its bytes are the record's, the tool's or the payload's. A file with
+        // matching bytes and no provenance is someone's to keep; a changed one is kept too.
+        const bool provenance = !xessOwned[i]->empty() || toolListsPath(s, cur.path);
+        if (!ownedFile(s, cur, provenance, *xessOwned[i], *xessCarried[i])) {
+            const bool matches = sameSha(cur.sha256, *xessCarried[i]);
+            plan.notes.push_back(matches ? say(leafOf(cur.path)) + " " + kMatchesNoProof
+                                         : "Keeping a changed XeSS file: " + say(leafOf(cur.path)));
             continue;
         }
         remove(cur.path, "removes Intel XeSS-SR file EDVR placed", cur.sha256);
