@@ -95,28 +95,54 @@ inline bool seqCellRead(const SeqCell& c, uintptr_t* rec, uint32_t* gen, float v
     return c.seq.load(std::memory_order_relaxed) == s1;
 }
 
+// Built v14.26: the same cell on exact uint32 words (a verdict and a collection pointer are not floats). The float forms below are wrappers.
+inline bool seqCellWriteWords(SeqCell& c, uintptr_t rec, uint32_t gen, const uint32_t w[4]) noexcept {
+    uint32_t s = c.seq.load(std::memory_order_acquire);
+    if ((s & 1u) != 0) return false;
+    if (!c.seq.compare_exchange_strong(s, s + 1, std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    c.rec.store(rec, std::memory_order_relaxed);
+    c.gen.store(gen, std::memory_order_relaxed);
+    for (size_t k = 0; k < 4; ++k) c.word[k].store(w[k], std::memory_order_relaxed);
+    c.seq.store(s + 2, std::memory_order_release);
+    return true;
+}
+
+inline bool seqCellReadWords(const SeqCell& c, uintptr_t* rec, uint32_t* gen, uint32_t w[4]) noexcept {
+    const uint32_t s1 = c.seq.load(std::memory_order_acquire);
+    if ((s1 & 1u) != 0) return false;
+    *rec = c.rec.load(std::memory_order_relaxed);
+    *gen = c.gen.load(std::memory_order_relaxed);
+    for (size_t k = 0; k < 4; ++k) w[k] = c.word[k].load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return c.seq.load(std::memory_order_relaxed) == s1;
+}
+
 // The table: `cap` cells, bounded probing (kTableProbeMax), a generation per frame. A cell of an earlier generation is free. Returns false when the
-// bounded probe finds no cell (the caller counts it and runs uncached).
-inline bool seqTableInsert(SeqCell* cells, size_t cap, size_t home, uintptr_t rec, uint32_t gen, const float v[4], uint32_t* probes) noexcept {
+// bounded probe finds no cell (the caller counts it and runs uncached). indexOut, when given, is the cell's index on success.
+inline bool seqTableInsertWords(SeqCell* cells, size_t cap, size_t home, uintptr_t rec, uint32_t gen, const uint32_t w[4], uint32_t* probes,
+                                size_t* indexOut = nullptr) noexcept {
     for (int attempt = 0; attempt < 64; ++attempt) {
         const ProbeResult p = boundedProbe(
             home, cap, kTableProbeMax,
             [&](size_t i) {
                 uintptr_t r = 0;
                 uint32_t g = 0;
-                float tmp[4];
-                return seqCellRead(cells[i], &r, &g, tmp) && g == gen && r == rec;
+                uint32_t tmp[4];
+                return seqCellReadWords(cells[i], &r, &g, tmp) && g == gen && r == rec;
             },
             [&](size_t i) {
                 uintptr_t r = 0;
                 uint32_t g = 0;
-                float tmp[4];
-                return seqCellRead(cells[i], &r, &g, tmp) && g != gen;
+                uint32_t tmp[4];
+                return seqCellReadWords(cells[i], &r, &g, tmp) && g != gen;
             });
         if (probes != nullptr) *probes = p.probes;
         if (p.exhausted) return false;
         if (p.found || p.empty) {
-            if (seqCellWrite(cells[p.index], rec, gen, v)) return true;
+            if (seqCellWriteWords(cells[p.index], rec, gen, w)) {
+                if (indexOut != nullptr) *indexOut = p.index;
+                return true;
+            }
             // another writer holds that cell: try again (the cell may now hold another record, so the probe runs again)
         }
     }
@@ -124,26 +150,42 @@ inline bool seqTableInsert(SeqCell* cells, size_t cap, size_t home, uintptr_t re
 }
 
 // The cell for `rec` in this generation, if cached. False when it is not (or a writer is in the way).
-inline bool seqTableFind(const SeqCell* cells, size_t cap, size_t home, uintptr_t rec, uint32_t gen, float v[4], uint32_t* probes) noexcept {
+inline bool seqTableFindWords(const SeqCell* cells, size_t cap, size_t home, uintptr_t rec, uint32_t gen, uint32_t w[4], uint32_t* probes,
+                              size_t* indexOut = nullptr) noexcept {
     const ProbeResult p = boundedProbe(
         home, cap, kTableProbeMax,
         [&](size_t i) {
             uintptr_t r = 0;
             uint32_t g = 0;
-            float tmp[4];
-            return seqCellRead(cells[i], &r, &g, tmp) && g == gen && r == rec;
+            uint32_t tmp[4];
+            return seqCellReadWords(cells[i], &r, &g, tmp) && g == gen && r == rec;
         },
         [&](size_t i) {
             uintptr_t r = 0;
             uint32_t g = 0;
-            float tmp[4];
-            return seqCellRead(cells[i], &r, &g, tmp) && g != gen;
+            uint32_t tmp[4];
+            return seqCellReadWords(cells[i], &r, &g, tmp) && g != gen;
         });
     if (probes != nullptr) *probes = p.probes;
     if (!p.found) return false;
     uintptr_t r = 0;
     uint32_t g = 0;
-    return seqCellRead(cells[p.index], &r, &g, v) && r == rec && g == gen;
+    if (!seqCellReadWords(cells[p.index], &r, &g, w) || r != rec || g != gen) return false;
+    if (indexOut != nullptr) *indexOut = p.index;
+    return true;
+}
+
+// The float payload forms (the producer cells): the same table on the words of the floats.
+inline bool seqTableInsert(SeqCell* cells, size_t cap, size_t home, uintptr_t rec, uint32_t gen, const float v[4], uint32_t* probes) noexcept {
+    const uint32_t w[4] = {floatBits(v[0]), floatBits(v[1]), floatBits(v[2]), floatBits(v[3])};
+    return seqTableInsertWords(cells, cap, home, rec, gen, w, probes, nullptr);
+}
+
+inline bool seqTableFind(const SeqCell* cells, size_t cap, size_t home, uintptr_t rec, uint32_t gen, float v[4], uint32_t* probes) noexcept {
+    uint32_t w[4] = {};
+    if (!seqTableFindWords(cells, cap, home, rec, gen, w, probes, nullptr)) return false;
+    for (size_t k = 0; k < 4; ++k) v[k] = bitsFloat(w[k]);
+    return true;
 }
 
 }  // namespace edvr::sealed

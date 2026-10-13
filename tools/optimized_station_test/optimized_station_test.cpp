@@ -4,6 +4,7 @@
 // prefix and sphere, the bay's volume, and the unreadable rule. No DLL and no game.
 #include "../../src/d3d11/optimized_station_core.h"
 #include "../../src/d3d11/explorer_cam_core.h"
+#include "../../src/d3d11/station_gather_core.h"
 #include "../../src/d3d11/station_lockfree_core.h"
 
 #include <atomic>
@@ -1265,6 +1266,143 @@ int main(int argc, char** argv) {
               "v14.25 table, threads: eight writers inserting the same records give the same decisions as the single-thread reference");
         float got[4] = {};
         check(!se::seqTableFind(par, kCap, homeOf(0x7000), 0x7000, 2, got, nullptr), "v14.25 table: a record of another generation is not found");
+    }
+    // ---- Built v14.26 (2026-10-13): the gather buffers and the rig publication, from several threads --------------------------------------------
+    {
+        // The gather buffers, one thread: a full slot keeps its first entries and counts the rest; the entries come back in the order written, once.
+        struct Item {
+            uint32_t thread = 0;
+            uint32_t seq = 0;
+        };
+        se::GatherBuffers<Item, 2, 8> gb;
+        for (uint32_t k = 0; k < 10; ++k) {
+            Item it;
+            it.seq = k;
+            gb.push(it);
+        }
+        std::vector<uint32_t> got;
+        const uint64_t lost = gb.drain([&](const Item& it) { got.push_back(it.seq); });
+        check(got.size() == 8 && lost == 2, "v14.26 gather, one thread: a full slot keeps its first entries and counts the rest as lost");
+        bool inOrder = true;
+        for (size_t k = 0; k < got.size(); ++k) inOrder = inOrder && got[k] == k;
+        check(inOrder, "v14.26 gather, one thread: the entries come back in the order written");
+        got.clear();
+        const uint64_t lostAgain = gb.drain([&](const Item& it) { got.push_back(it.seq); });
+        check(got.empty() && lostAgain == 0, "v14.26 gather, one thread: a drained entry is not delivered twice, and the loss is counted once");
+    }
+    {
+        // Eight writers and a draining tick: every entry is delivered once or counted as lost, and each writer's entries keep their order.
+        struct Item {
+            uint32_t thread = 0;
+            uint32_t seq = 0;
+        };
+        se::GatherBuffers<Item, 16, 512> gb;
+        std::atomic<int> done{0};
+        const uint32_t kPer = 4000;
+        std::vector<std::thread> writers;
+        for (uint32_t t = 0; t < 8; ++t) {
+            writers.emplace_back([&, t] {
+                for (uint32_t k = 0; k < kPer; ++k) {
+                    Item it;
+                    it.thread = t;
+                    it.seq = k;
+                    gb.push(it);
+                }
+                done.fetch_add(1);
+            });
+        }
+        std::vector<uint32_t> nextSeq(8, 0);
+        uint64_t delivered = 0;
+        uint64_t lostTotal = 0;
+        bool ordered = true;
+        auto visit = [&](const Item& it) {
+            ++delivered;
+            if (it.seq < nextSeq[it.thread]) ordered = false;
+            nextSeq[it.thread] = it.seq + 1;
+        };
+        while (done.load() < 8) {
+            lostTotal += gb.drain(visit);
+            std::this_thread::yield();
+        }
+        for (auto& th : writers) th.join();
+        lostTotal += gb.drain(visit);
+        check(delivered + lostTotal == 8u * kPer, "v14.26 gather, threads: every entry is delivered once or counted as lost");
+        check(ordered, "v14.26 gather, threads: each writer's entries come back in the order written");
+        check(delivered > 0, "v14.26 gather, threads: the tick received entries while the writers ran");
+    }
+    {
+        // The rig publication, one thread: an outside rig is vetoed thirty calls in a row and let through once (the refresh), a mixed verdict resets the
+        // run, and a rig the latest publication does not hold forwards.
+        se::RigPubTable pub;
+        pub.begin();
+        const uintptr_t rig = 0x5000;
+        const uintptr_t kColl = 0x123400000ull;
+        size_t idx = 0;
+        check(pub.insert(rig, 7, se::kRigVerdictOutside, kColl, &idx), "v14.26 rig publication: an outside rig is inserted");
+        uint8_t v = 0;
+        uintptr_t c = 0;
+        size_t i2 = 0;
+        check(pub.lookup(rig, 7, &v, &c, &i2) && v == se::kRigVerdictOutside && c == kColl, "v14.26 rig publication: the verdict and collection read back");
+        int vetoes = 0;
+        bool pattern = true;
+        for (int call = 1; call <= 61; ++call) {
+            const se::RigOutcome o = pub.decide(idx, se::kRigVerdictOutside, 1);
+            if (call == 31) pattern = pattern && o == se::RigOutcome::kRefresh;
+            else pattern = pattern && o == se::RigOutcome::kVetoed;
+            if (o == se::RigOutcome::kVetoed) ++vetoes;
+        }
+        check(pattern && vetoes == 60, "v14.26 rig publication: an outside rig is vetoed thirty calls in a row, then let through once");
+        const se::RigOutcome m = pub.decide(idx, se::kRigVerdictMixed, 1);
+        const se::RigOutcome after = pub.decide(idx, se::kRigVerdictOutside, 1);
+        check(m == se::RigOutcome::kMixed && after == se::RigOutcome::kVetoed, "v14.26 rig publication: a mixed verdict resets the run");
+        pub.begin();
+        check(!pub.lookup(rig, 7, &v, &c, &i2), "v14.26 rig publication: a rig the latest publication does not hold is not found");
+    }
+    {
+        // Eight readers decide and look up while the tick republishes two verdicts, each with its own collection. No reader sees a verdict paired with
+        // the other collection, and the last publication is the one read at the end.
+        se::RigPubTable pub;
+        const uintptr_t kRig = 0x9000;
+        const uintptr_t kCollOut = 0xAAAA00000ull;
+        const uintptr_t kCollUnk = 0xBBBB00000ull;
+        pub.begin();
+        size_t i0 = 0;
+        pub.insert(kRig, 9, se::kRigVerdictOutside, kCollOut, &i0);
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> torn{0};
+        std::atomic<uint64_t> reads{0};
+        std::vector<std::thread> readers;
+        for (int r = 0; r < 8; ++r) {
+            readers.emplace_back([&] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    uint8_t v = 0;
+                    uintptr_t c = 0;
+                    size_t idx = 0;
+                    if (pub.lookup(kRig, 9, &v, &c, &idx)) {
+                        const bool ok = (v == se::kRigVerdictOutside && c == kCollOut) || (v == se::kRigVerdictUnknown && c == kCollUnk);
+                        if (!ok) torn.fetch_add(1);
+                        (void)pub.decide(idx, v, 1);
+                        reads.fetch_add(1);
+                    }
+                }
+            });
+        }
+        while (reads.load() == 0) std::this_thread::yield();   // the readers run before the first republish (the same wait as the ring test)
+        for (uint32_t k = 0; k < 20000; ++k) {
+            pub.begin();
+            size_t idx = 0;
+            const bool outside = (k & 1u) == 0;
+            pub.insert(kRig, 9, outside ? se::kRigVerdictOutside : se::kRigVerdictUnknown, outside ? kCollOut : kCollUnk, &idx);
+        }
+        stop.store(true);
+        for (auto& th : readers) th.join();
+        uint8_t v = 0;
+        uintptr_t c = 0;
+        size_t idx = 0;
+        check(torn.load() == 0, "v14.26 rig publication, threads: no reader pairs a verdict with the other publication's collection");
+        check(pub.lookup(kRig, 9, &v, &c, &idx) && v == se::kRigVerdictUnknown && c == kCollUnk,
+              "v14.26 rig publication, threads: the last publication is the one read at the end");
+        check(reads.load() > 0, "v14.26 rig publication, threads: the readers did read");
     }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);

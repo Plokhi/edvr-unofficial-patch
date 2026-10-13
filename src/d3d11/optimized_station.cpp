@@ -19,6 +19,7 @@
 #include "journal_watch.h"
 #include "kinematic_eval_hook.h"
 #include "optimized_station_core.h"
+#include "station_gather_core.h"
 #include "station_lockfree_core.h"
 #include "pad_state_probe.h"
 #include "store_hook.h"
@@ -32,16 +33,16 @@ std::recursive_mutex g_sealedMutex;        // the lock: the view, the cell, the 
 std::atomic<uint32_t> g_frameStamp{0};     // advanced at every frame tick: the observer resolves the view once per frame
 std::atomic<bool> g_cameraKnown{false};
 std::atomic<uint64_t> g_kept{0}, g_keptUnknown{0}, g_culled{0}, g_faults{0};
-uint64_t g_worldSrc[5] = {};               // the named rule's world centre by source (worldOfRecord)
+std::atomic<uint64_t> g_worldSrc[5] = {};               // the named rule's world centre by source (worldOfRecord)
 float g_margin = sealed::kMarginDefaultM;  // the box's margin (fixed; the trial's tuning ladder is removed)
 // The sealed rule's sphere radius while no cell is held (the trial's starting radius; the named cell does not use it).
 constexpr float kFallbackSphereM = 80.0f;
-uint64_t g_winFaults = 0;                  // reads or writes that failed in the window
+std::atomic<uint64_t> g_winFaults{0};                  // reads or writes that failed in the window
 // Forward: the held cell is localized and the shell picked by setHeldFrame (below), called from the engage.
 void setHeldFrame(const sealed::OwnCell& cell, uint32_t frame);
-struct RigTally {
-    uint64_t seen = 0, vetoed = 0, mixed = 0, unknown = 0, refresh = 0;
-    uint64_t assocSync = 0, assocJob = 0, assocNone = 0, matched = 0, unevaluated = 0;
+struct RigTally {   // built v14.26: atomic (the callbacks count their vetoes)
+    std::atomic<uint64_t> seen{0}, vetoed{0}, mixed{0}, unknown{0}, refresh{0};
+    std::atomic<uint64_t> assocSync{0}, assocJob{0}, assocNone{0}, matched{0}, unevaluated{0};
 };
 RigTally g_rigTally;
 sealed::OwnCell g_heldCell;                // the sealed cell, in the world frame of the frame that reads it (refreshed each frame)
@@ -77,7 +78,8 @@ sealed::ExplicitObs g_explicits[sealed::kExplicitSlots];
 size_t g_explicitCount = 0;
 float g_frameCam[3] = {};
 bool g_frameCamValid = false;
-uint32_t g_recordsFrame = 0, g_recordsLast = 0;   // store records the observer took this frame, and last frame (the waiting line's evidence)
+std::atomic<uint32_t> g_recordsFrame{0};   // the callbacks count the records they took (built v14.26: atomic)
+uint32_t g_recordsLast = 0;   // store records the observer took this frame, and last frame (the waiting line's evidence)
 sealed::OwnCell g_pickCell;                // the frame's pick before the seal (what the seal rule reads)
 sealed::OwnCell g_cellPrev;                // the cell the observer judges against this frame
 uintptr_t g_explicitPrev[sealed::kExplicitNodes] = {};
@@ -88,7 +90,7 @@ uint32_t g_viewStamp = 0;
 bool g_viewReady = false;
 uint32_t g_viewTries = 0;
 view::Resolved g_view;
-uintptr_t g_lastCtx = 0;
+std::atomic<uintptr_t> g_ctxSeen{0};   // the context the last callback saw: the tick resolves the view from it (built v14.26)
 // The pad-local frame and the shell (the release by the pad's motion along the shaft).
 sealed::OwnCell g_heldLocal;
 bool g_heldLocalValid = false;
@@ -188,42 +190,6 @@ bool writeMem(uintptr_t dst, const void* src, size_t n) noexcept {
 
 template <typename T>
 bool readVal(T* dst, uintptr_t src) noexcept { return readMem(dst, src, sizeof(T)); }
-
-// The name of a record, copied out under the lock (no pointer into the cache escapes: the slot may be reused as soon as the lock is let go).
-// False when no name can be read. Used by the builder probe, the geometry probe and the report.
-bool cachedName(uintptr_t record, char* out, size_t cap) noexcept {
-    if (!out || cap == 0) return false;
-    out[0] = '\0';
-    uintptr_t node = 0;
-    if (!record || !readVal(&node, record + kRecName) || !node) return false;
-    std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
-    struct NameSlot {
-        uintptr_t node = 0;
-        uint32_t stamp = 0;
-        bool ok = false;
-        char name[64] = {};
-    };
-    static NameSlot names[kNameSlots];
-    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
-    NameSlot& slot = names[(node >> 4) % kNameSlots];
-    if (slot.node != node || slot.stamp != stamp) {
-        slot.node = node;
-        slot.stamp = stamp;
-        slot.ok = false;
-        slot.name[0] = '\0';
-        uintptr_t text = 0;
-        uint8_t bytes[sealed::kNameBytes] = {};
-        std::string name;
-        if (readVal(&text, node) && text && readMem(bytes, text, sizeof(bytes)) &&
-            (sealed::textName(bytes, sizeof(bytes), false, &name) || sealed::textName(bytes, sizeof(bytes), true, &name))) {
-            std::snprintf(slot.name, sizeof(slot.name), "%s", name.c_str());
-            slot.ok = true;
-        }
-    }
-    if (!slot.ok) return false;
-    std::snprintf(out, cap, "%s", slot.name);
-    return true;
-}
 
 // --- Built v8.4: a record's centre. The builder's centre is computed from the pose it reads, *(rec+0x290): q = pose+0x10, t = pose+0x20, c =
 // pose+0x80 (sealed_trial_core.h builderCentre; decomp_42B4420.txt:196-237). rec+0x240 is the fallback when the pose cannot be read (counted).
@@ -398,29 +364,91 @@ struct PadSnapshot {
     size_t explicitCount = 0;
     uintptr_t explicitPrev[sealed::kExplicitNodes] = {};
     char ownPrefix[32] = {};
+    bool giveUp = false;          // the hangar watch gave up: the explicit parts are not gathered
+    bool latchPending = false;    // a latch is pending: the mechanism candidates are gathered
+    bool namesPending = false;    // the hangar names are wanted: the names near the pad are gathered
+    float padC[3] = {};           // the pad's centre the names are measured from
+    bool ownLiveValid = false;
+    float ownLiveCentre[3] = {};
+    float ownLiveRadius = 0.0f;
+    bool lost = false;            // gathered entries were lost before this publication: the callbacks keep every record
 };
 sealed::SnapshotRing<PadSnapshot, 4> g_snapRing;
-uint32_t g_snapStamp = 0xFFFFFFFFu;   // the frame stamp of the last publish (under the lock)
 
-// Publishes the view (under g_sealedMutex; the single publisher). Writes no shared state a reader can see until publish().
-void publishSnapshot() noexcept {
-    prodSync();
-    PadSnapshot& s = g_snapRing.beginWrite();
-    s.frameStamp = g_frameStamp.load(std::memory_order_relaxed);
-    s.prodGen = g_prodGenA.load(std::memory_order_relaxed);
-    s.held = g_heldValid;
-    s.camValid = g_frameCamValid;
-    std::memcpy(s.cam, g_frameCam, sizeof(s.cam));
-    s.cell = g_cellPrev;
-    s.explicitCount = g_explicitPrevCount < sealed::kExplicitNodes ? g_explicitPrevCount : sealed::kExplicitNodes;
-    std::memcpy(s.explicitPrev, g_explicitPrev, sizeof(s.explicitPrev));
-    std::memcpy(s.ownPrefix, g_ownPrefix, sizeof(s.ownPrefix));
-    g_snapRing.publish();
-    g_snapStamp = s.frameStamp;
+// Pins the published view for one callback: the slot stays valid until the pin ends (built v14.26: every callback reads the view this way).
+class SnapshotPin {
+public:
+    SnapshotPin() noexcept : p_(g_snapRing.pin(&idx_)) {}
+    ~SnapshotPin() { g_snapRing.unpin(idx_); }
+    SnapshotPin(const SnapshotPin&) = delete;
+    SnapshotPin& operator=(const SnapshotPin&) = delete;
+    const PadSnapshot& get() const noexcept { return *p_; }
+
+private:
+    size_t idx_ = 0;
+    const PadSnapshot* p_;
+};
+
+// Built v14.26: what a callback gathers for the tick. Each callback appends to its own thread's slot (sealed::GatherBuffers); the tick drains the entries of
+// the previous pass in the order they were written, and applies them to its own tables.
+enum class GKind : uint8_t { kNone, kPad, kExplicit, kNear, kOwnCand, kTally, kLatch, kHangar, kRigNote, kRigAssoc, kCost };
+constexpr uint8_t kFlagJob = 1;   // kRigNote: the store's bucket path (the rig comes from the bucket's collection, resolved on the tick)
+struct GatherEntry {
+    GKind kind = GKind::kNone;
+    uint8_t flags = 0;            // kPad: the PadSize; kRigNote: kFlagJob; kCost: 0 store, 1 producer, 2 rig
+    uint32_t stamp = 0;
+    uintptr_t record = 0;
+    uintptr_t aux = 0;            // kExplicit: the node; kRigNote: the rig (synchronous path) or the bucket's owner (job path); kRigAssoc: the rig
+    uintptr_t bucket = 0;         // kRigNote: the store's bucket
+    uintptr_t coll = 0;           // kRigAssoc: the collection the association moved to
+    float centre[3] = {};
+    float radius = 0.0f;
+    float dist = 0.0f;
+    float ms = 0.0f;              // kCost: the sampled call's time
+    char name[64] = {};
+};
+constexpr size_t kGatherSlots = 16;
+constexpr size_t kGatherCap = 1024;
+sealed::GatherBuffers<GatherEntry, kGatherSlots, kGatherCap> g_gather;
+bool g_lossPublished = false;                // the tick: entries were lost in the pass it last drained (the next publication keeps every record)
+uint64_t g_winLost = 0;                      // entries lost in the window (the cost line)
+std::atomic<uint64_t> g_lockOnCallback{0};   // state-lock acquisitions made by a callback (must stay 0; the cost line reports it)
+thread_local bool tlsOnCallback = false;
+
+// Marks a callback's extent for the lock counter above.
+class CallbackScope {
+public:
+    CallbackScope() noexcept { tlsOnCallback = true; }
+    ~CallbackScope() { tlsOnCallback = false; }
+    CallbackScope(const CallbackScope&) = delete;
+    CallbackScope& operator=(const CallbackScope&) = delete;
+};
+
+// A gathered entry with a centre and a name: the callbacks' common shape.
+GatherEntry gatherEntry(GKind kind, uintptr_t record, const float c[3], float r, uint32_t stamp, const char* name) noexcept {
+    GatherEntry e;
+    e.kind = kind;
+    e.stamp = stamp;
+    e.record = record;
+    e.centre[0] = c[0];
+    e.centre[1] = c[1];
+    e.centre[2] = c[2];
+    e.radius = r;
+    if (name != nullptr) std::snprintf(e.name, sizeof(e.name), "%s", name);
+    return e;
 }
 
-// The record's name for the producer path, cached per thread (built v14.25): the same name rule as cachedName, with no lock.
-bool cachedNameLocal(uintptr_t record, char* out, size_t cap) noexcept {
+// A callback's cost sample, pushed to the tick (no lock). 0 store, 1 producer, 2 rig.
+void costPush(uint8_t which, double ms) noexcept {
+    GatherEntry e;
+    e.kind = GKind::kCost;
+    e.flags = which;
+    e.ms = static_cast<float>(ms);
+    g_gather.push(e);
+}
+
+// The record's name, cached per thread and per frame: the one name reader on every path (built v14.25; lock-free since v14.26).
+bool cachedName(uintptr_t record, char* out, size_t cap) noexcept {
     if (!out || cap == 0) return false;
     out[0] = '\0';
     uintptr_t node = 0;
@@ -463,7 +491,7 @@ bool producerDecideSnap(uintptr_t rec, const PadSnapshot& s) noexcept {
     if (!ok || !s.camValid) return false;
     if (sealed::keepNamedCell(centre, radius, s.cam, kFallbackSphereM, s.cell, s.explicitPrev, s.explicitCount, rec).keep) return false;
     char nm[48] = {};
-    if (s.ownPrefix[0] != '\0') cachedNameLocal(rec, nm, sizeof(nm));
+    if (s.ownPrefix[0] != '\0') cachedName(rec, nm, sizeof(nm));
     if (sealed::ownShipExempt(sealed::containsCamera(centre, radius, s.cam), radius, nm, s.ownPrefix)) return false;
     return true;
 }
@@ -474,10 +502,9 @@ struct WorldRead {
     uint8_t source = 4;   // 0 producer B, 1 pose, 2 store-style, 3 raw fallback, 4 none
 };
 
-// The named rule's world centre and radius for a record (see the block comment above). Called under the lock.
+// The named rule's world centre and radius for a record (see the block comment above). Lock-free (built v14.26): any thread.
 WorldRead worldOfRecord(uintptr_t rec) noexcept {
     WorldRead w;
-    prodSync();
     if (prodGet(rec, w.world, &w.radius)) {
         w.source = 0;
         return w;
@@ -671,23 +698,22 @@ constexpr size_t kRigSlots = 4096;
 struct RigSlot {
     uintptr_t rig = 0;               // 0: an empty slot
     uint32_t epoch = 0;              // built v14.20 (review 4): the lifecycle epoch the slot was claimed in; an older one is free and forwards
-    uint32_t evalStamp = 0;          // the frame stamp of the rig's last decision
     uint32_t curStamp = 0;           // the frame stamp the current box was accumulated in
     bool curValid = false;
     float curMn[3] = {}, curMx[3] = {};
     bool lastValid = false;          // the box of the last frame that had records (the one before curStamp)
     float lastMn[3] = {}, lastMx[3] = {};
-    uint32_t vetoedRun = 0;          // vetoes since the rig was last let through
     bool named = false;
     char name[48] = {};              // the name of the rig's first record (for the own-ship prefix)
     uintptr_t coll = 0;              // the rig's collection (rig+0x348), as last read at a decision
-    uint32_t collStamp = 0;          // Built v13.1: the frame stamp the collection was last read in (once per rig per frame)
     uint8_t verdict = 0;             // kVerdictUnknown / kVerdictMixed / kVerdictOutside, refreshed once per frame (refreshRigVerdicts)
 };
 
 constexpr uint8_t kVerdictUnknown = 0, kVerdictMixed = 1, kVerdictOutside = 2;
 
 RigSlot g_rigSlots[kRigSlots];
+// The rig verdicts the tick publishes for the callbacks (built v14.26): the rig veto reads it, with no lock.
+sealed::RigPubTable g_rigPub;
 
 // The collection table (Built v12.1): collection -> rig, for the job path's association. Open addressing, written at a decision when a rig's
 // collection is read, read per bucket by the store's observer. Under the trial's lock.
@@ -696,7 +722,6 @@ constexpr size_t kCollSlots = 1024;
 // Built v14.20 (review 4): every association carries the lifecycle epoch it was made in. An association from an earlier epoch is free: a lookup misses
 // it and an insert reuses it. The epoch is bumped at undock, hangar change, ship change, setting toggle and an association change (bumpRigEpoch).
 uint32_t g_rigEpoch = 1;
-bool g_rigVerdictsFresh = false;   // the verdicts were refreshed for the held cell this frame (review 7a)
 uint64_t g_rigEpochs = 0;          // the lifecycle bumps this window (the summary's count)
 
 struct CollSlot {
@@ -738,7 +763,6 @@ uintptr_t collFind(uintptr_t coll) noexcept {
 uintptr_t g_rigBucketCache = 0, g_rigBucketRig = 0;
 uintptr_t g_rigBucketColl = 0;   // built v14.24: the collection the cached bucket names (the job path's association check)
 
-uint32_t g_rigBucketStamp = 0;
 
 uint64_t g_rigNamesLogged = 0;
 
@@ -772,85 +796,13 @@ RigSlot* rigFind(uintptr_t rig, bool insert) noexcept {
     return nullptr;
 }
 
-// The store's observer, for each record with a world sphere: the record's rig gets the record's box (this frame) and, the first time, the record's
-// name is logged (eight names a session at most, so the identity can be checked by eye).
-void rigNoteRecord(uintptr_t bucket, uintptr_t record, const float c[3], float r) noexcept {
-    if (!(r > 0.0f) || !std::isfinite(r)) return;
-    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
-    // The association (Built v12.1, flight fix c; the record's +0x2B8 is NOT used: the v12 flight showed it is not the evaluated object). Synchronous
-    // path: the rig evaluation's forward is on this thread's stack, so the record belongs to that rig. Job path: the store's bucket is the batch
-    // entry copied from the Submit's entry (decomp_431AFE0 lines 106 to 117: [0] ctx, [2] = collection+0x300, [5] record array), so the rig is the
-    // one whose collection is bucket[2] - 0x300. One cache entry per bucket per frame; the lookup is per bucket, not per record.
-    uintptr_t rig = kinematicEvalCurrentRig();
-    const bool jobPath = rig == 0;   // built v14.24: a job-path association is checked against the rig's own collection below
-    if (rig) {
-        ++g_rigTally.assocSync;
-    } else {
-        if (g_rigBucketStamp != stamp) {
-            g_rigBucketStamp = stamp;
-            g_rigBucketCache = 0;
-            g_rigBucketRig = 0;
-        }
-        if (bucket && bucket == g_rigBucketCache) {
-            rig = g_rigBucketRig;
-        } else {
-            uintptr_t owner = 0;
-            rig = 0;
-            if (bucket && readVal(&owner, bucket + 0x10) && owner > 0x300) rig = collFind(owner - 0x300);
-            g_rigBucketColl = (owner > 0x300) ? owner - 0x300 : 0;   // built v14.24: the collection this bucket names
-            g_rigBucketCache = bucket;
-            g_rigBucketRig = rig;
-        }
-        if (rig) ++g_rigTally.assocJob;
-        else ++g_rigTally.assocNone;
-    }
-    if (!rig) return;
-    RigSlot* s = rigFind(rig, true);
-    if (!s) return;
-    // Built v14.24: a job-path association is current only while the rig still holds that collection (a stale table entry names a rig whose
-    // collection has moved on; its records belong to nobody here).
-    if (jobPath && !sealed::collAssociationIs(s->coll, g_rigBucketColl)) return;
-    if (s->evalStamp == stamp) ++g_rigTally.matched;
-    else ++g_rigTally.unevaluated;
-    if (s->curStamp != stamp) {
-        if (s->curValid) {
-            for (int k = 0; k < 3; ++k) {
-                s->lastMn[k] = s->curMn[k];
-                s->lastMx[k] = s->curMx[k];
-            }
-            s->lastValid = true;
-        }
-        s->curStamp = stamp;
-        s->curValid = false;
-    }
-    for (int k = 0; k < 3; ++k) {
-        const float lo = c[k] - r, hi = c[k] + r;
-        if (!s->curValid) {
-            s->curMn[k] = lo;
-            s->curMx[k] = hi;
-        } else {
-            if (lo < s->curMn[k]) s->curMn[k] = lo;
-            if (hi > s->curMx[k]) s->curMx[k] = hi;
-        }
-    }
-    s->curValid = true;
-    if (!s->named) {
-        s->named = true;
-        char name[64] = {};
-        if (!cachedName(record, name, sizeof(name))) std::snprintf(name, sizeof(name), "(none)");
-        std::snprintf(s->name, sizeof(s->name), "%s", name);   // Built v13: the own-ship prefix test reads it
-    }
-}
-
-// Built v12.1 (flight fix d): the per-frame refresh of every rig's verdict, on the frame tick (render thread), from its bound: the box of its
-// records' spheres in the last frame that had records. The cell is the one in force. The decision then reads one slot per rig.
+// Built v12.1 (flight fix d), v14.26: the per-frame refresh of every rig's verdict, on the frame tick, from its bound: the box of its records' spheres in
+// the last frame that had records. The verdicts are published for the callbacks: the rig veto reads the publication, with no lock. A rig with no bound,
+// the own ship's rig, and every rig after a loss of gathered entries are unknown, and forward.
 void refreshRigVerdicts() noexcept {
-    std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
-    // Built v14.20 (review 7a): no cell held, no verdict is read (the veto answers only while sealed): no work. The first veto after an engage refreshes.
-    if (!g_heldValid) {
-        g_rigVerdictsFresh = false;
-        return;
-    }
+    g_rigPub.begin();
+    // No cell held, no verdict is published (the veto answers only while sealed).
+    if (!g_heldValid) return;
     const bool allMode = false;
     for (RigSlot& s : g_rigSlots) {
         if (s.rig == 0 || s.epoch != g_rigEpoch) continue;
@@ -882,23 +834,15 @@ void refreshRigVerdicts() noexcept {
         if (!allMode && bounded && g_frameCamValid) ownRig = sealed::containsCamera(c, r, g_frameCam) && r < sealed::kOwnShipRadiusM;
         if (!allMode && !ownRig && g_ownPrefix[0] != '\0') ownRig = sealed::ownShipExempt(false, 0.0f, s.name, g_ownPrefix);
         s.verdict = ownRig ? kVerdictUnknown : sealed::verdictCode(v);   // 2 outside, 1 mixed, 0 unknown
+        const uint8_t published = g_lossPublished ? kVerdictUnknown : s.verdict;
+        size_t idx = 0;
+        g_rigPub.insert(s.rig, rigIndex(s.rig), published, s.coll, &idx);
     }
-    g_rigVerdictsFresh = true;
 }
 
-
-uint32_t g_rigCacheStamp = 0;
-uintptr_t g_rigCacheRig = 0;
-RigSlot* g_rigCacheSlot = nullptr;
-
-
-
-// The rig verdict's veto (the early veto, 0x431AFE0's entry): a rig whose verdict is outside the cell is skipped while its refresh counter is
-// below sealed::kRigRefreshN. Answers only while sealed; the verdicts are refreshed on the frame tick.
 // ---- Built v14.24 (2026-10-13): the station's own costs, clocked with QPC and reported in the 30 s summary ---------------------------------------
 // The store observer, the producer veto and the rig veto are timed one call in 32 (their p50, p95 and max are per call); the frame tick is timed every
-// frame (per frame). The state lock's wait is timed on every acquisition it guards. The samples sit behind a small leaf lock (g_costMutex), which is
-// never held while the state lock is taken.
+// frame (per frame). The state lock's wait is timed on every acquisition it guards. The samples are the tick's (built v14.26: the callbacks' samples arrive as gathered entries).
 int64_t costTicks() noexcept {
     LARGE_INTEGER q{};
     QueryPerformanceCounter(&q);
@@ -925,7 +869,6 @@ struct CostRing {
     size_t used() const noexcept { return n < kCostSamples ? n : kCostSamples; }
     void clear() noexcept { n = 0; }
 };
-std::mutex g_costMutex;   // a leaf lock: the samples and the wait totals; never held while the state lock is taken
 CostRing g_costStore;
 CostRing g_costProducer;
 CostRing g_costRig;
@@ -937,7 +880,7 @@ std::atomic<uint64_t> g_callsStore{0};      // built v14.25: every call (the per
 std::atomic<uint64_t> g_callsProducer{0};
 std::atomic<uint64_t> g_callsRig{0};
 
-// The per-thread-safe mean of a ring's samples (under g_costMutex).
+// The mean of a ring's samples (tick only).
 double ringMean(const CostRing& r) noexcept {
     const size_t n = r.used();
     if (n == 0) return 0.0;
@@ -963,20 +906,19 @@ double g_mutexWaitMaxMs = 0.0;
 uint64_t g_mutexBlocked = 0;          // acquisitions that waited more than 0.1 ms
 uint64_t g_waitingLinesWritten = 0;   // waiting lines written this window (the change-only line)
 
-void costAdd(CostRing& r, double ms) noexcept {
-    std::lock_guard<std::mutex> g(g_costMutex);
-    r.add(ms);
-}
+// The tick's sample (built v14.26: the callbacks push theirs as entries, and the tick adds them here, with no lock).
+void costAdd(CostRing& r, double ms) noexcept { r.add(ms); }
 bool costSampleCall(std::atomic<uint32_t>& calls) noexcept { return (calls.fetch_add(1, std::memory_order_relaxed) & 31u) == 31u; }
 
-// The state lock, with its wait timed. The wait is counted after the lock is held (so the counters are written under the lock they describe).
+// The state lock, with its wait timed. Built v14.26: taken by the tick (and the setting's toggle) only. An acquisition made by a callback is counted
+// (the cost line reports the count, which must stay 0).
 class TimedStateLock {
 public:
     TimedStateLock() noexcept {
+        if (tlsOnCallback) g_lockOnCallback.fetch_add(1, std::memory_order_relaxed);
         const int64_t t0 = costTicks();
         g_sealedMutex.lock();
         const double waitMs = costMs(t0, costTicks());
-        std::lock_guard<std::mutex> g(g_costMutex);
         g_mutexWaitTotalMs += waitMs;
         if (waitMs > g_mutexWaitMaxMs) g_mutexWaitMaxMs = waitMs;
         if (waitMs > 0.1) ++g_mutexBlocked;
@@ -993,73 +935,54 @@ void bumpRigEpoch() noexcept {
     ++g_rigEpochs;
     g_rigStats.used = 0;
     g_collStats.used = 0;
-    g_rigVerdictsFresh = false;
-    g_rigCacheStamp = 0;
-    g_rigCacheRig = 0;
-    g_rigCacheSlot = nullptr;
     g_rigBucketCache = 0;
     g_rigBucketRig = 0;
-    g_rigBucketStamp = 0;
 }
 
-bool sealedTrialRigVeto(uintptr_t rig, uintptr_t ctx) noexcept {
-    (void)ctx;
-    // Built v14.20 (review 3): an atomic fast gate before the lock; g_heldValid is read again under it (engage and release write it under the lock).
-    if (!g_sealedFlag.load(std::memory_order_acquire) || !rig) return false;
-    TimedStateLock lock;
-    if (!g_heldValid) return false;
-    if (!g_rigVerdictsFresh) refreshRigVerdicts();   // review 7a: the first veto after an engage reads verdicts refreshed for the held cell
-    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+// The rig early veto, lock-free (built v14.26). The verdict and the collection come from the tick's publication (RigPubTable). A rig the publication does
+// not hold forwards, as a rig the tick never bounded did. A collection that moved since the publication forwards; the tick applies the move, one frame
+// behind. The run of vetoes per rig is a compare-and-swap in the table.
+bool rigVetoLockFree(uintptr_t rig) noexcept {
+    if (!rig) return false;
+    SnapshotPin pin;
+    if (!pin.get().held) return false;
     ++g_rigTally.seen;
-    RigSlot* s = nullptr;
-    if (rig == g_rigCacheRig && g_rigCacheStamp == stamp && g_rigCacheSlot && g_rigCacheSlot->rig == rig && g_rigCacheSlot->epoch == g_rigEpoch) {
-        s = g_rigCacheSlot;
-    } else {
-        s = rigFind(rig, true);
-        if (!s) {
-            ++g_rigTally.unknown;
-            return false;
-        }
-        g_rigCacheRig = rig;
-        g_rigCacheStamp = stamp;
-        g_rigCacheSlot = s;
+    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+    uint8_t verdict = kVerdictUnknown;
+    uintptr_t published = 0;
+    size_t idx = 0;
+    if (!g_rigPub.lookup(rig, rigIndex(rig), &verdict, &published, &idx)) {
+        ++g_rigTally.unknown;
+        return false;
     }
-    s->evalStamp = stamp;
-    if (s->collStamp != stamp) {
-        s->collStamp = stamp;
-        uintptr_t coll = 0;
-        if (readVal(&coll, rig + 0x348) && coll && coll != s->coll) {
-            // Built v14.24 (review 4, per rig): this rig's association changed. Only this rig's bounds and verdict are forgotten, so it forwards until a
-            // fresh bound exists; the other rigs keep theirs (a whole-epoch bump here disabled the early veto: flight 013c6122).
-            sealed::rigForgetBounds(&s->curValid, &s->lastValid, &s->verdict, &s->vetoedRun);
-            s->coll = coll;
-            collInsert(coll, rig);
-            ++g_rigTally.unknown;
-            return false;
+    uintptr_t coll = 0;
+    if (readVal(&coll, rig + 0x348) && coll != 0 && coll != published) {
+        g_rigPub.touch(idx, stamp);
+        if (g_rigPub.askOnce(idx, stamp)) {
+            GatherEntry e;
+            e.kind = GKind::kRigAssoc;
+            e.stamp = stamp;
+            e.aux = rig;
+            e.coll = coll;
+            g_gather.push(e);
         }
+        ++g_rigTally.unknown;
+        return false;
     }
-    bool veto = false;
-    switch (s->verdict) {
-        case kVerdictOutside:
-            if (s->vetoedRun >= sealed::kRigRefreshN) {
-                ++g_rigTally.refresh;
-                s->vetoedRun = 0;
-            } else {
-                ++g_rigTally.vetoed;
-                ++s->vetoedRun;
-                veto = true;
-            }
-            break;
-        case kVerdictMixed:
+    switch (g_rigPub.decide(idx, verdict, stamp)) {
+        case sealed::RigOutcome::kVetoed:
+            ++g_rigTally.vetoed;
+            return true;
+        case sealed::RigOutcome::kRefresh:
+            ++g_rigTally.refresh;
+            return false;
+        case sealed::RigOutcome::kMixed:
             ++g_rigTally.mixed;
-            s->vetoedRun = 0;
-            break;
+            return false;
         default:
             ++g_rigTally.unknown;
-            s->vetoedRun = 0;
-            break;
+            return false;
     }
-    return veto;
 }
 
 // The post-store cull of one record, with its fault handling: true when it was culled. A failed read or write leaves the record as the store wrote
@@ -1160,10 +1083,10 @@ uint32_t g_settingPoll = 0;                // frames since the setting was last 
 uint64_t g_summaryStartMs = 0;             // the 30 s summary's window
 uint64_t g_winFrames = 0;                  // ticks in the window
 uint64_t g_winSealedFrames = 0;            // ticks in the window while sealed
-uint64_t g_winRigVetoes = 0;               // rig vetoes (before the forward) in the window
+std::atomic<uint64_t> g_winRigVetoes{0};               // rig vetoes (before the forward) in the window
 std::atomic<uint64_t> g_winProducerVetoes{0};          // records the producer-B veto skipped in the window
-uint64_t g_winCulled = 0;                  // records culled after the store in the window
-uint64_t g_winKeptUnknown = 0;             // records kept because their centre could not be read, in the window
+std::atomic<uint64_t> g_winCulled{0};                  // records culled after the store in the window
+std::atomic<uint64_t> g_winKeptUnknown{0};             // records kept because their centre could not be read, in the window
 uint32_t g_sealCount = 0;                  // seals since the setting was turned on (for the status lines)
 
 // The sun pass the station skips while sealed (the pair the trial measured: VS 7E38A6AA1269C901 with PS 7CECABDE34FFBE9E).
@@ -1213,7 +1136,6 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
     Log::get().note("optimized station: released (frame %u): %s. Everything is drawn as without the station until the seal conditions hold again.",
                     frame, why);
     g_heldValid = false;
-    g_rigVerdictsFresh = false;   // built v14.20 (review 7a): the next engage refreshes the verdicts before its first veto
     g_heldCell = sealed::OwnCell{};
     g_heldLocalValid = false;
     g_shellValid = false;
@@ -1234,18 +1156,14 @@ bool bayWatchKeep() noexcept {
            g_dockedNow.load(std::memory_order_acquire);   // from docking, not only after a descent: a load-in seal latches too (built v14.15)
 }
 
-// Built v14.12: a gathered record that may be a mechanism record (its name from the cache), within 150 m of the camera. Only while a latch is pending.
-void latchCandNote(uintptr_t record, const float* centre) noexcept {
-    if (!g_latchPending || g_latchCandN >= sealed::kLatchCandCap) return;
-    if (g_frameCamValid && sealed::distance(centre, g_frameCam) > 400.0f) return;   // a bay's span reaches ~270 m along the shaft (built v14.15)
-    char nm[48] = {};
+// Built v14.12, v14.26: a gathered record that may be a mechanism record (its name from the cache), within 400 m of the camera. Only while a latch is
+// pending (the view says so). The tick applies it.
+void latchCandNote(uintptr_t record, const float* centre, const PadSnapshot& s) noexcept {
+    if (!s.latchPending) return;
+    if (s.camValid && sealed::distance(centre, s.cam) > 400.0f) return;   // a bay's span reaches ~270 m along the shaft (built v14.15)
+    char nm[64] = {};
     if (!cachedName(record, nm, sizeof(nm)) || !sealed::mechanismName(nm)) return;
-    sealed::LatchCand& cand = g_latchCands[g_latchCandN++];
-    cand.addr = record;
-    std::snprintf(cand.name, sizeof(cand.name), "%s", nm);
-    cand.centre[0] = centre[0];
-    cand.centre[1] = centre[1];
-    cand.centre[2] = centre[2];
+    g_gather.push(gatherEntry(GKind::kLatch, record, centre, 0.0f, g_frameStamp.load(std::memory_order_relaxed), nm));
 }
 
 // Built v14.12: latch the bay's mechanism once: the own pad's shaft (its up axis), the pads of its size and the mechanism records near the shaft.
@@ -1314,17 +1232,16 @@ const char* engageHow() noexcept {
     return how;
 }
 
-// Built v14.13: a gathered record that may name the hangar, near the pad, while the names are wanted (a docked pad with no sized shell, not yet noted).
-void hangarNameNote(uintptr_t record, const float* centre, float radius) noexcept {
-    if (!g_namesPending || g_nameLogN >= 12) return;
-    const float d = sealed::distance(centre, g_namesPadC);
+// Built v14.13, v14.26: a gathered record that may name the hangar, near the pad, while the names are wanted (the view says so). The tick applies it.
+void hangarNameNote(uintptr_t record, const float* centre, float radius, const PadSnapshot& s) noexcept {
+    if (!s.namesPending) return;
+    const float d = sealed::distance(centre, s.padC);
     if (d > 150.0f) return;
-    char nm[48] = {};
+    char nm[64] = {};
     if (!cachedName(record, nm, sizeof(nm)) || !sealed::hangarLikeName(nm)) return;
-    NameNote& nn = g_nameLog[g_nameLogN++];
-    std::snprintf(nn.name, sizeof(nn.name), "%s", nm);
-    nn.dist = d;
-    nn.radius = radius;
+    GatherEntry e = gatherEntry(GKind::kHangar, record, centre, radius, g_frameStamp.load(std::memory_order_relaxed), nm);
+    e.dist = d;
+    g_gather.push(e);
 }
 
 // Built v14.13: the once-per-dock note with no sized shell: the hangar-like and pad records near the pad (the first carrier dock tells us its
@@ -1389,6 +1306,7 @@ void summaryLine(uint64_t now) noexcept {
                     static_cast<unsigned>(g_rigEpoch));
     // Built v14.25: the station's own costs over the window. Per call (one in 32 sampled): p50, p95 and max. Per frame: the calls each callback made, and
     // the estimated ms per frame (the sampled mean times the calls, over the frames). The frame tick per frame. The state lock's wait. Change-only waits.
+    // Built v14.26: the callbacks' samples are drained by the tick; the entries lost in the window; the state-lock acquisitions a callback made (must be 0).
     {
         double s50 = 0.0, s95 = 0.0, smax = 0.0, p50 = 0.0, p95 = 0.0, pmax = 0.0, r50 = 0.0, r95 = 0.0, rmax = 0.0, f50 = 0.0, f95 = 0.0, fmax = 0.0;
         double meanStore = 0.0, meanProd = 0.0, meanRig = 0.0;
@@ -1399,45 +1317,47 @@ void summaryLine(uint64_t now) noexcept {
         const uint64_t callsStore = g_callsStore.exchange(0, std::memory_order_relaxed);
         const uint64_t callsProd = g_callsProducer.exchange(0, std::memory_order_relaxed);
         const uint64_t callsRig = g_callsRig.exchange(0, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> g(g_costMutex);
-            nStore = g_costStore.used();
-            meanStore = ringMean(g_costStore);
-            sealed::samplePercentiles(g_costStore.v, nStore, &s50, &s95, &smax);
-            nProd = g_costProducer.used();
-            meanProd = ringMean(g_costProducer);
-            sealed::samplePercentiles(g_costProducer.v, nProd, &p50, &p95, &pmax);
-            nRig = g_costRig.used();
-            meanRig = ringMean(g_costRig);
-            sealed::samplePercentiles(g_costRig.v, nRig, &r50, &r95, &rmax);
-            nFrame = g_costFrame.used();
-            sealed::samplePercentiles(g_costFrame.v, nFrame, &f50, &f95, &fmax);
-            blocked = g_mutexBlocked;
-            waitTotal = g_mutexWaitTotalMs;
-            waitMax = g_mutexWaitMaxMs;
-            waitingLines = g_waitingLinesWritten;
-            g_costStore.clear();
-            g_costProducer.clear();
-            g_costRig.clear();
-            g_costFrame.clear();
-            g_mutexBlocked = 0;
-            g_mutexWaitTotalMs = 0.0;
-            g_mutexWaitMaxMs = 0.0;
-            g_waitingLinesWritten = 0;
-        }
+        nStore = g_costStore.used();
+        meanStore = ringMean(g_costStore);
+        sealed::samplePercentiles(g_costStore.v, nStore, &s50, &s95, &smax);
+        nProd = g_costProducer.used();
+        meanProd = ringMean(g_costProducer);
+        sealed::samplePercentiles(g_costProducer.v, nProd, &p50, &p95, &pmax);
+        nRig = g_costRig.used();
+        meanRig = ringMean(g_costRig);
+        sealed::samplePercentiles(g_costRig.v, nRig, &r50, &r95, &rmax);
+        nFrame = g_costFrame.used();
+        sealed::samplePercentiles(g_costFrame.v, nFrame, &f50, &f95, &fmax);
+        blocked = g_mutexBlocked;
+        waitTotal = g_mutexWaitTotalMs;
+        waitMax = g_mutexWaitMaxMs;
+        waitingLines = g_waitingLinesWritten;
+        const uint64_t lost = g_winLost;
+        const uint64_t onCallback = g_lockOnCallback.load(std::memory_order_relaxed);
+        g_costStore.clear();
+        g_costProducer.clear();
+        g_costRig.clear();
+        g_costFrame.clear();
+        g_mutexBlocked = 0;
+        g_mutexWaitTotalMs = 0.0;
+        g_mutexWaitMaxMs = 0.0;
+        g_waitingLinesWritten = 0;
+        g_winLost = 0;
+        g_lockOnCallback.store(0, std::memory_order_relaxed);
         const double fr = frames > 0 ? static_cast<double>(frames) : 1.0;
         Log::get().note("optimized station: cost last %llu s: store observer %llu calls (%.1f per frame, ~%.4f ms per frame; p50/p95/max %.4f/%.4f/%.4f "
                         "ms per call, %llu sampled), producer veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu "
                         "sampled), rig veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu sampled), frame tick "
                         "%.3f/%.3f/%.3f ms per frame (%llu frames), mutex wait total %.3f ms max %.3f ms (blocked over 0.1 ms: %llu), waiting lines "
-                        "written %llu.",
+                        "written %llu; gathered entries lost %llu; state lock taken from a callback %llu.",
                         static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(callsStore),
                         static_cast<double>(callsStore) / fr, meanStore * static_cast<double>(callsStore) / fr, s50, s95, smax,
                         static_cast<unsigned long long>(nStore), static_cast<unsigned long long>(callsProd), static_cast<double>(callsProd) / fr,
                         meanProd * static_cast<double>(callsProd) / fr, p50, p95, pmax, static_cast<unsigned long long>(nProd),
                         static_cast<unsigned long long>(callsRig), static_cast<double>(callsRig) / fr, meanRig * static_cast<double>(callsRig) / fr,
                         r50, r95, rmax, static_cast<unsigned long long>(nRig), f50, f95, fmax, static_cast<unsigned long long>(nFrame), waitTotal,
-                        waitMax, static_cast<unsigned long long>(blocked), static_cast<unsigned long long>(waitingLines));
+                        waitMax, static_cast<unsigned long long>(blocked), static_cast<unsigned long long>(waitingLines),
+                        static_cast<unsigned long long>(lost), static_cast<unsigned long long>(onCallback));
     }
 
     g_prodStats.maxProbes.store(0, std::memory_order_relaxed);
@@ -1463,30 +1383,33 @@ bool producerVetoBody(uintptr_t rec, uintptr_t owner) noexcept {
     return veto;
 }
 
-// The producer-B veto, timed one call in 32 (built v14.24).
+// The producer-B veto, timed one call in 32 (built v14.24; the sample is gathered since v14.26).
 bool producerVetoHook(uintptr_t rec, uintptr_t owner) noexcept {
+    CallbackScope scope;
     g_callsProducer.fetch_add(1, std::memory_order_relaxed);
     const bool sample = costSampleCall(g_costProducerCalls);
     const int64_t t0 = sample ? costTicks() : 0;
     const bool veto = producerVetoBody(rec, owner);
-    if (sample) costAdd(g_costProducer, costMs(t0, costTicks()));
+    if (sample) costPush(1, costMs(t0, costTicks()));
     return veto;
 }
 
-bool rigVetoBody(uintptr_t rig, uintptr_t ctx) noexcept {
+bool rigVetoBody(uintptr_t rig) noexcept {
     if (!g_sealedFlag.load(std::memory_order_acquire)) return false;
-    const bool veto = sealedTrialRigVeto(rig, ctx);
+    const bool veto = rigVetoLockFree(rig);
     if (veto) ++g_winRigVetoes;
     return veto;
 }
 
-// The rig early veto, timed one call in 32 (built v14.24).
+// The rig early veto, timed one call in 32 (built v14.24; the sample is gathered since v14.26).
 bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
+    (void)ctx;
+    CallbackScope scope;
     g_callsRig.fetch_add(1, std::memory_order_relaxed);
     const bool sample = costSampleCall(g_costRigCalls);
     const int64_t t0 = sample ? costTicks() : 0;
-    const bool veto = rigVetoBody(rig, ctx);
-    if (sample) costAdd(g_costRig, costMs(t0, costTicks()));
+    const bool veto = rigVetoBody(rig);
+    if (sample) costPush(2, costMs(t0, costTicks()));
     return veto;
 }
 
@@ -1557,6 +1480,165 @@ void buildBoxFor(sealed::OwnCell& cell, const float target[3]) {
 }
 
 // The promote: the frame's first record. The pad pick, the pad's heights, the capsule and box, the engage, the hangar-change drops.
+// ---- Built v14.26: the tick applies the gathered entries of the previous pass, in the order the callbacks wrote them ------------------------------
+
+// The rig note of one judged record: the rig, its bounds, and its name the first time. The job path's rig is the bucket's collection, resolved here with
+// the bucket's one cache entry (a bucket's records come in a run).
+void applyRigNote(const GatherEntry& e) {
+    uintptr_t rig = e.aux;
+    const bool jobPath = (e.flags & kFlagJob) != 0;
+    if (!jobPath) {
+        ++g_rigTally.assocSync;
+    } else {
+        if (e.bucket != 0 && e.bucket == g_rigBucketCache) {
+            rig = g_rigBucketRig;
+        } else {
+            const uintptr_t owner = e.aux;
+            rig = 0;
+            if (e.bucket != 0 && owner > 0x300) rig = collFind(owner - 0x300);
+            g_rigBucketColl = owner > 0x300 ? owner - 0x300 : 0;   // built v14.24: the collection this bucket names
+            g_rigBucketCache = e.bucket;
+            g_rigBucketRig = rig;
+        }
+        if (rig) ++g_rigTally.assocJob;
+        else ++g_rigTally.assocNone;
+    }
+    if (!rig) return;
+    RigSlot* s = rigFind(rig, true);
+    if (!s) return;
+    // Built v14.24: a job-path association is current only while the rig still holds that collection.
+    if (jobPath && !sealed::collAssociationIs(s->coll, g_rigBucketColl)) return;
+    size_t pidx = 0;
+    uint8_t pv = 0;
+    uintptr_t pc = 0;
+    if (g_rigPub.lookup(rig, rigIndex(rig), &pv, &pc, &pidx) && g_rigPub.evalStampAt(pidx) == e.stamp) ++g_rigTally.matched;
+    else ++g_rigTally.unevaluated;
+    if (s->curStamp != e.stamp) {
+        if (s->curValid) {
+            for (int k = 0; k < 3; ++k) {
+                s->lastMn[k] = s->curMn[k];
+                s->lastMx[k] = s->curMx[k];
+            }
+            s->lastValid = true;
+        }
+        s->curStamp = e.stamp;
+        s->curValid = false;
+    }
+    for (int k = 0; k < 3; ++k) {
+        const float lo = e.centre[k] - e.radius, hi = e.centre[k] + e.radius;
+        if (!s->curValid) {
+            s->curMn[k] = lo;
+            s->curMx[k] = hi;
+        } else {
+            if (lo < s->curMn[k]) s->curMn[k] = lo;
+            if (hi > s->curMx[k]) s->curMx[k] = hi;
+        }
+    }
+    s->curValid = true;
+    if (!s->named) {
+        s->named = true;
+        char name[64] = {};
+        if (!cachedName(e.record, name, sizeof(name))) std::snprintf(name, sizeof(name), "(none)");
+        std::snprintf(s->name, sizeof(s->name), "%s", name);   // Built v13: the own-ship prefix test reads it
+    }
+}
+
+// A rig's collection moved (its veto found the new one): its bounds are forgotten, the association is recorded, and its run of vetoes starts afresh.
+void applyRigAssoc(uintptr_t rig, uintptr_t coll) {
+    RigSlot* s = rigFind(rig, true);
+    if (!s || coll == s->coll) return;
+    uint32_t run = 0;
+    sealed::rigForgetBounds(&s->curValid, &s->lastValid, &s->verdict, &run);
+    s->coll = coll;
+    collInsert(coll, rig);
+    size_t idx = 0;
+    uint8_t v = 0;
+    uintptr_t c = 0;
+    if (g_rigPub.lookup(rig, rigIndex(rig), &v, &c, &idx)) g_rigPub.resetRun(idx);
+}
+
+void applyEntry(const GatherEntry& e) {
+    switch (e.kind) {
+        case GKind::kPad:
+            if (g_padCount < sealed::kPadSlots) {
+                sealed::PadObs& p = g_pads[g_padCount];
+                p.addr = e.record;
+                for (int k = 0; k < 3; ++k) p.centre[k] = e.centre[k];
+                p.radius = e.radius;
+                p.size = static_cast<sealed::PadSize>(e.flags);
+                std::snprintf(p.name, sizeof(p.name), "%s", e.name);
+                if (p.size != sealed::PadSize::kNone) ++g_padCount;
+            }
+            break;
+        case GKind::kExplicit:
+            if (g_explicitCount < sealed::kExplicitSlots) {
+                sealed::ExplicitObs& x = g_explicits[g_explicitCount++];
+                x.addr = e.record;
+                x.node = e.aux;
+                for (int k = 0; k < 3; ++k) x.centre[k] = e.centre[k];
+                std::snprintf(x.name, sizeof(x.name), "%s", e.name);
+            }
+            break;
+        case GKind::kNear:
+            if (g_nearCurN < kNearSlots) {
+                NearRec& nr = g_nearCur[g_nearCurN++];
+                nr.addr = e.record;
+                std::snprintf(nr.name, sizeof(nr.name), "%s", e.name);
+                for (int k = 0; k < 3; ++k) nr.centre[k] = e.centre[k];
+                nr.radius = e.radius;
+                nr.dist = e.dist;
+            }
+            break;
+        case GKind::kOwnCand:
+            if (g_ownCandidateDist < 0.0f || e.dist < g_ownCandidateDist) {
+                std::snprintf(g_ownCandidateName, sizeof(g_ownCandidateName), "%s", e.name);
+                g_ownCandidateDist = e.dist;
+            }
+            break;
+        case GKind::kTally:
+            tallyShipPrefix(e.name);
+            break;
+        case GKind::kLatch:
+            if (g_latchCandN < sealed::kLatchCandCap) {
+                sealed::LatchCand& cand = g_latchCands[g_latchCandN++];
+                cand.addr = e.record;
+                std::snprintf(cand.name, sizeof(cand.name), "%s", e.name);
+                for (int k = 0; k < 3; ++k) cand.centre[k] = e.centre[k];
+            }
+            break;
+        case GKind::kHangar:
+            if (g_nameLogN < 12) {
+                NameNote& nn = g_nameLog[g_nameLogN++];
+                std::snprintf(nn.name, sizeof(nn.name), "%s", e.name);
+                nn.dist = e.dist;
+                nn.radius = e.radius;
+            }
+            break;
+        case GKind::kRigNote:
+            applyRigNote(e);
+            break;
+        case GKind::kRigAssoc:
+            applyRigAssoc(e.aux, e.coll);
+            break;
+        case GKind::kCost:
+            if (e.flags == 0) costAdd(g_costStore, static_cast<double>(e.ms));
+            else if (e.flags == 1) costAdd(g_costProducer, static_cast<double>(e.ms));
+            else costAdd(g_costRig, static_cast<double>(e.ms));
+            break;
+        case GKind::kNone:
+            break;
+    }
+}
+
+// Drains the gathered entries (the tick only, under the lock). A loss in the drained pass is kept for the next publication.
+void drainGather() {
+    g_rigBucketCache = 0;
+    g_rigBucketRig = 0;
+    const uint64_t lost = g_gather.drain([](const GatherEntry& e) { applyEntry(e); });
+    g_winLost += lost;
+    g_lossPublished = lost != 0;
+}
+
 void promoteFrame(uint32_t stamp, uint32_t frame) {
     sealed::OwnCell next;
     g_ownCandidateDist = -1.0f;
@@ -1657,7 +1739,6 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
             g_heldCell = next;
             g_heldValid = true;
             snapshotSealPose();              // built v14.24: each latched record's pose at the seal (the mechanism re-seal compares against it)
-            g_rigVerdictsFresh = false;     // built v14.20 (review 7a): the verdicts are refreshed before this seal's first veto
             setHeldFrame(g_heldCell, frame);
             g_engagePending = false;
             g_sealedFlag.store(true, std::memory_order_release);
@@ -1722,13 +1803,76 @@ void setHeldFrame(const sealed::OwnCell& cell, uint32_t frame) {
     }
 }
 
-// The store observer's judgement, for one record the store has written, while sealed. Order: the centre (unreadable: kept), the named keep (the
-// pad and explicit parts, then the cell), the bay keep, the own ship (the prefix, then the live sphere), otherwise culled.
-// judge: the sealed judgement (the keep and the cull); false: gathering only (the frame's camera, pads and explicit parts).
+// Publishes the view the callbacks read. The tick only (under g_sealedMutex): the callbacks pin the ring and never write it.
+void publishSnapshot() noexcept {
+    PadSnapshot& s = g_snapRing.beginWrite();
+    s.frameStamp = g_frameStamp.load(std::memory_order_relaxed);
+    s.prodGen = g_prodGenA.load(std::memory_order_relaxed);
+    s.held = g_heldValid;
+    s.camValid = g_frameCamValid;
+    std::memcpy(s.cam, g_frameCam, sizeof(s.cam));
+    s.cell = g_cellPrev;
+    s.explicitCount = g_explicitPrevCount < sealed::kExplicitNodes ? g_explicitPrevCount : sealed::kExplicitNodes;
+    std::memcpy(s.explicitPrev, g_explicitPrev, sizeof(s.explicitPrev));
+    std::memcpy(s.ownPrefix, g_ownPrefix, sizeof(s.ownPrefix));
+    s.giveUp = g_hangarWatch.giveUp;
+    s.latchPending = g_latchPending;
+    s.namesPending = g_namesPending;
+    std::memcpy(s.padC, g_namesPadC, sizeof(s.padC));
+    s.ownLiveValid = g_ownLiveValid;
+    std::memcpy(s.ownLiveCentre, g_ownLiveCentre, sizeof(s.ownLiveCentre));
+    s.ownLiveRadius = g_ownLiveRadius;
+    s.lost = g_lossPublished;
+    g_snapRing.publish();
+}
+
+// The tick's view of the camera: resolved from the context the last callback saw (built v14.26: one frame behind the callbacks that read it). Up to
+// kViewTries resolves while the centre the consumer uses is not ready, as the callbacks did.
+void resolveTickView() noexcept {
+    const uintptr_t ctx = g_ctxSeen.load(std::memory_order_relaxed);
+    if (ctx == 0) return;   // no callback has seen a store yet: the camera stays unknown
+    view::resolveView(ctx, &g_view);
+    for (uint32_t t = 1; t < kViewTries && !sealed::viewCentreReady(g_view.originOk, g_view.poseOk, g_view.source == view::Source::kExplorerCam); ++t)
+        view::resolveView(ctx, &g_view);
+    float cam[3] = {};
+    if (cameraOf(g_view, cam)) {
+        std::memcpy(g_frameCam, cam, sizeof(g_frameCam));
+        g_frameCamValid = true;
+        g_cameraKnown.store(true, std::memory_order_relaxed);
+    } else {
+        g_frameCamValid = false;
+        g_faults.fetch_add(1, std::memory_order_relaxed);
+        ++g_winFaults;
+    }
+}
+
+// The gathered rig sphere of one judged record: the rig on the synchronous path (the evaluation's own stack), or the bucket's owner on the job path (the
+// tick resolves its collection). A record without a sphere is not gathered.
+void gatherRigNote(uintptr_t bucket, uintptr_t record, const float c[3], float r, uint32_t stamp) noexcept {
+    if (!(r > 0.0f) || !std::isfinite(r)) return;
+    GatherEntry e = gatherEntry(GKind::kRigNote, record, c, r, stamp, nullptr);
+    e.bucket = bucket;
+    const uintptr_t rig = kinematicEvalCurrentRig();
+    if (rig != 0) {
+        e.aux = rig;
+    } else {
+        e.flags = kFlagJob;
+        uintptr_t owner = 0;
+        if (bucket != 0) readVal(&owner, bucket + 0x10);
+        e.aux = owner;
+    }
+    g_gather.push(e);
+}
+
+// The store observer's judgement, for one record the store has written. Built v14.26: no lock. The callback reads the published view, gathers the parts
+// the tick needs into its thread's slot, and judges from the view alone. Order: the centre (unreadable: kept), the gathered parts (pads, explicit parts,
+// the near list, the own candidate, the ship's tally, the latch and the hangar names), then (judge only) the named keep, the bay keep, the own ship, and
+// otherwise culled. judge: the sealed judgement; false: gathering only.
 void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
-    TimedStateLock lock;
-    ++g_recordsFrame;
-    if (judge && !g_heldValid) return;
+    g_recordsFrame.fetch_add(1, std::memory_order_relaxed);
+    SnapshotPin pin;
+    const PadSnapshot& s = pin.get();
+    if (judge && !s.held) return;
     uintptr_t ctx = 0;
     uint32_t count = 0;
     if (!bucket || !record || !readVal(&ctx, bucket) || !ctx || !readVal(&count, ctx + kCtxCount) || count == 0) {
@@ -1736,34 +1880,19 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         ++g_winFaults;
         return;
     }
-    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
-    if (g_viewStamp != stamp) {
-        g_viewStamp = stamp;
-        g_viewTries = 0;
-        g_viewReady = false;
-    }
-    // Built v14.20 (review 7c): retry while the centre the consumer uses is missing (the origin, or the explorer cam's rows), not on a missing eye pose.
-    if (!g_viewReady || (!sealed::viewCentreReady(g_view.originOk, g_view.poseOk, g_view.source == view::Source::kExplorerCam) && g_viewTries < kViewTries)) {
-        ++g_viewTries;
-        view::resolveView(ctx, &g_view);
-        g_viewReady = true;
-    }
-    g_lastCtx = ctx;
-    float cam[3] = {};
-    if (!cameraOf(g_view, cam)) {
+    g_ctxSeen.store(ctx, std::memory_order_relaxed);   // the tick resolves the view from it (one frame behind)
+    if (!s.camValid) {
         g_faults.fetch_add(1, std::memory_order_relaxed);
         ++g_winFaults;
         return;
     }
-    g_cameraKnown.store(true, std::memory_order_relaxed);
-    if (sealed::framePromoteDue(g_cellStamp, stamp)) promoteFrame(stamp, stamp);
-    std::memcpy(g_frameCam, cam, sizeof(g_frameCam));
-    g_frameCamValid = true;
-    if (g_snapStamp != stamp) publishSnapshot();   // built v14.25: the first callback of a frame publishes the view (under the lock)
+    const float* cam = s.cam;
+    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+    const bool lost = s.lost || g_gather.lostSinceDrain() != 0;   // a loss keeps every record (fail-safe)
     const WorldRead wr = worldOfRecord(record);
     if (judge) {
-        ++g_worldSrc[wr.source];
-        if (wr.source != 4) rigNoteRecord(bucket, record, wr.world, wr.radius);
+        g_worldSrc[wr.source].fetch_add(1, std::memory_order_relaxed);
+        if (wr.source != 4) gatherRigNote(bucket, record, wr.world, wr.radius, stamp);
     }
     const float* centre = wr.world;
     const float radius = wr.radius;
@@ -1775,84 +1904,72 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         }
         return;
     }
-    bool keep = false;
-    bool containing = false;
     uintptr_t node = 0;
     const sealed::NameClass cls = classOf(record, &node);
-    if (cls == sealed::NameClass::kPad && g_padCount < sealed::kPadSlots) {
-        sealed::PadObs& p = g_pads[g_padCount];
+    if (cls == sealed::NameClass::kPad) {
         char name[64] = {};
         if (cachedName(record, name, sizeof(name))) {
-            p.addr = record;
-            p.centre[0] = centre[0];
-            p.centre[1] = centre[1];
-            p.centre[2] = centre[2];
-            p.radius = radius;
-            p.size = sealed::padSizeOf(name);
-            std::snprintf(p.name, sizeof(p.name), "%s", name);
-            if (p.size != sealed::PadSize::kNone) ++g_padCount;
+            const sealed::PadSize size = sealed::padSizeOf(name);
+            if (size != sealed::PadSize::kNone) {
+                GatherEntry e = gatherEntry(GKind::kPad, record, centre, radius, stamp, name);
+                e.flags = static_cast<uint8_t>(size);
+                g_gather.push(e);
+            }
         }
-    } else if (cls == sealed::NameClass::kExplicit && g_explicitCount < sealed::kExplicitSlots && !g_hangarWatch.giveUp) {   // built v14.13: stops after the give-up
-        sealed::ExplicitObs& x = g_explicits[g_explicitCount++];
-        x.addr = record;
-        x.node = node;
-        x.centre[0] = centre[0];
-        x.centre[1] = centre[1];
-        x.centre[2] = centre[2];
-        char xn[48] = {};
-        if (cachedName(record, xn, sizeof(xn))) std::snprintf(x.name, sizeof(x.name), "%s", xn);
-        else x.name[0] = '\0';
+    } else if (cls == sealed::NameClass::kExplicit && !s.giveUp) {   // built v14.13: stops after the give-up
+        char xn[64] = {};
+        cachedName(record, xn, sizeof(xn));   // no name: the explicit part is still gathered, with an empty name
+        GatherEntry e = gatherEntry(GKind::kExplicit, record, centre, radius, stamp, xn);
+        e.aux = node;
+        g_gather.push(e);
     }
     // The own ship: the own candidate (the nearest small containing sphere), the prefix rule, then the live own sphere.
     const bool containsCam = sealed::containsCamera(centre, radius, cam);
-    {
-        const float dCam = sealed::distance(centre, cam);
-        if (dCam <= kOwnNearM && g_nearCurN < kNearSlots) {
-            char nn[48] = {};
-            if (cachedName(record, nn, sizeof(nn))) {
-                NearRec& nr = g_nearCur[g_nearCurN++];
-                nr.addr = record;
-                std::snprintf(nr.name, sizeof(nr.name), "%s", nn);
-                for (int k = 0; k < 3; ++k) nr.centre[k] = centre[k];
-                nr.radius = radius;
-                nr.dist = dCam;
-            }
+    const float dCam = sealed::distance(centre, cam);
+    if (dCam <= kOwnNearM) {
+        char nn[64] = {};
+        if (cachedName(record, nn, sizeof(nn))) {
+            GatherEntry e = gatherEntry(GKind::kNear, record, centre, radius, stamp, nn);
+            e.dist = dCam;
+            g_gather.push(e);
         }
-        if (containsCam && radius < sealed::kOwnShipRadiusM) {
-            if (g_ownCandidateDist < 0.0f || dCam < g_ownCandidateDist) {
-                char cn[48] = {};
-                if (cachedName(record, cn, sizeof(cn))) {
-                    std::snprintf(g_ownCandidateName, sizeof(g_ownCandidateName), "%s", cn);
-                    g_ownCandidateDist = dCam;
-                }
-            }
-        }
-    if (sealed::distance(centre, cam) <= sealed::kShipRecordsM) {   // the ship's part count by prefix (built v14.8)
-        char tn[48] = {};
-        if (cachedName(record, tn, sizeof(tn))) tallyShipPrefix(tn);
     }
-    latchCandNote(record, centre);   // built v14.12: gathered only while a latch is pending
-    hangarNameNote(record, centre, radius);   // built v14.13: only while the names are wanted
-    if (!judge) return;   // gathering only: the pads and the explicit parts are in hand; the judgement is sealed-only
-    const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, record);
-    keep = v.keep;
-    containing = v.containing;
+    if (containsCam && radius < sealed::kOwnShipRadiusM) {
+        char cn[64] = {};
+        if (cachedName(record, cn, sizeof(cn))) {
+            GatherEntry e = gatherEntry(GKind::kOwnCand, record, centre, radius, stamp, cn);
+            e.dist = dCam;
+            g_gather.push(e);
+        }
+    }
+    if (dCam <= sealed::kShipRecordsM) {   // the ship's part count by prefix (built v14.8)
+        char tn[64] = {};
+        if (cachedName(record, tn, sizeof(tn))) g_gather.push(gatherEntry(GKind::kTally, record, centre, radius, stamp, tn));
+    }
+    latchCandNote(record, centre, s);   // built v14.12: gathered only while a latch is pending
+    hangarNameNote(record, centre, radius, s);   // built v14.13: only while the names are wanted
+    if (!judge) return;   // gathering only: the judgement is sealed-only
+    if (lost) {
+        g_kept.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, s.cell, s.explicitPrev, s.explicitCount, record);
+    bool keep = v.keep;
+    const bool containing = v.containing;
     // The bay: the own hangar's parts inside the bay volume, even where the box alone would cull them. The shaft is the cell's.
-    if (!keep && g_cellPrev.capsule) {
+    if (!keep && s.cell.capsule) {
         float u[3] = {};
-        if (sealed::unitBetween(g_cellPrev.capA, g_cellPrev.capB, u) &&
-            sealed::inBayVolume(centre, g_cellPrev.capA, u, g_cellPrev.capLen, belowFor(g_cellPrev.size))) {
-            char bn[48] = {};
+        if (sealed::unitBetween(s.cell.capA, s.cell.capB, u) && sealed::inBayVolume(centre, s.cell.capA, u, s.cell.capLen, belowFor(s.cell.size))) {
+            char bn[64] = {};
             if (cachedName(record, bn, sizeof(bn)) && sealed::bayPartName(bn)) keep = true;
         }
     }
-        if (!keep) {
-            char nm[48] = {};
-            if (g_ownPrefix[0] != '\0') cachedName(record, nm, sizeof(nm));
-            if (sealed::ownShipExempt(containsCam, radius, nm, g_ownPrefix)) keep = true;
-        }
-        if (!keep && g_ownLiveValid && sealed::ownSphereKeeps(centre, g_ownLiveCentre, g_ownLiveRadius, kOwnSphereMarginM)) keep = true;
+    if (!keep) {
+        char nm[64] = {};
+        if (s.ownPrefix[0] != '\0') cachedName(record, nm, sizeof(nm));
+        if (sealed::ownShipExempt(containsCam, radius, nm, s.ownPrefix)) keep = true;
     }
+    if (!keep && s.ownLiveValid && sealed::ownSphereKeeps(centre, s.ownLiveCentre, s.ownLiveRadius, kOwnSphereMarginM)) keep = true;
     if (keep) {
         g_kept.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -1893,13 +2010,14 @@ void afterStoreDispatch(uintptr_t bucket, uintptr_t record) noexcept {
     afterStoreJudge(bucket, record, mode == sealed::StoreMode::kJudge);
 }
 
-// The store observer's entry (the store hook calls it per record), timed one call in 32 (built v14.24).
+// The store observer's entry (the store hook calls it per record), timed one call in 32 (built v14.24; the sample is gathered since v14.26).
 void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept {
+    CallbackScope scope;
     g_callsStore.fetch_add(1, std::memory_order_relaxed);
     const bool sample = costSampleCall(g_costStoreCalls);
     const int64_t t0 = sample ? costTicks() : 0;
     afterStoreDispatch(bucket, record);
-    if (sample) costAdd(g_costStore, costMs(t0, costTicks()));
+    if (sample) costPush(0, costMs(t0, costTicks()));
 }
 
 // The render thread's frame tick: the setting, the held cell in the pad's frame, the seal and release rules, the rig verdicts, the summary.
@@ -2032,8 +2150,10 @@ void optimizedStationFrameBody(uint32_t frame) {
     // Built v14.2: the frame advances here, once per tick. The observer's promote and view resolve run once per frame off this stamp.
     g_frameStamp.fetch_add(1, std::memory_order_relaxed);
     TimedStateLock lock;
-    g_recordsLast = g_recordsFrame;
-    g_recordsFrame = 0;
+    prodSync();   // built v14.26: the producer generation moves with the frame (the callbacks never move it)
+    g_recordsLast = g_recordsFrame.exchange(0, std::memory_order_relaxed);
+    drainGather();          // the entries the callbacks gathered in the previous pass, in the order they were written
+    resolveTickView();      // the view from the last callback's context (one frame behind)
     ++g_winFrames;
     if (g_heldValid) ++g_winSealedFrames;
     g_dockedKnownNow.store(journalDockedKnown(), std::memory_order_release);
@@ -2298,6 +2418,11 @@ void optimizedStationFrameBody(uint32_t frame) {
             g_waitLastSet = true;
             g_waitLastMs = now;
         }
+    }
+    {
+        // Built v14.26: the pads, explicit parts and camera of the pass just drained make the cell for the next pass (the observer's promote, moved here).
+        const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+        if (g_recordsLast != 0 && sealed::framePromoteDue(g_cellStamp, stamp)) promoteFrame(stamp, stamp);
     }
     refreshRigVerdicts();
     publishSnapshot();   // built v14.25: the tick's view for the per-record path (under the lock)
