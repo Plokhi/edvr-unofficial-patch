@@ -80,7 +80,9 @@ float g_engageAxes[3][3] = {};
 uintptr_t g_shellAddr = 0;
 char g_shellName[48] = {};
 bool g_shellValid = false;
-float g_shellRelEngage = 0.0f;
+sealed::ShellMotion g_shellMotion;        // the pad against its shell: the reference is captured live at the first frame held (built v14.4)
+uint32_t g_shellSampleStamp = 0xFFFFFFFFu;// the frame stamp of the last motion sample (the tick and the observer both refresh; one sample a frame)
+sealed::SealRateGuard g_sealGuard;        // the flicker safety net: seals in a minute (built v14.4)
 float g_frameShiftM = 0.0f;
 float g_shellDeltaM = 0.0f;
 bool g_releaseMotion = false;
@@ -496,6 +498,10 @@ void refreshHeldWorld() {
     g_cellPrev = w;
     g_frameShiftM = sealed::distance(pw.world, g_engageCentre);
     if (!g_shellValid) return;
+    // One sample a frame: the tick and the observer both refresh the held cell.
+    const uint32_t shellStamp = g_frameStamp.load(std::memory_order_relaxed);
+    if (g_shellSampleStamp == shellStamp) return;
+    g_shellSampleStamp = shellStamp;
     char nm[48] = {};
     const WorldRead sw = worldOfRecord(g_shellAddr);
     if (sw.source == 4 || !cachedName(g_shellAddr, nm, sizeof(nm)) || std::strcmp(nm, g_shellName) != 0) {
@@ -505,9 +511,15 @@ void refreshHeldWorld() {
         return;
     }
     const float up[3] = {g_engageAxes[2][0], g_engageAxes[2][1], g_engageAxes[2][2]};
-    const float relNow = sealed::shellRelative(pw.world, sw.world, up);
-    g_shellDeltaM = relNow - g_shellRelEngage;
-    if (sealed::padMovedAway(g_shellRelEngage, relNow)) g_releaseMotion = true;
+    const bool first = !g_shellMotion.captured;
+    const bool release = g_shellMotion.sample(pw.world, pw.source, sw.world, sw.source, up);
+    if (first && g_shellMotion.captured) {
+        Log::get().note("optimized station: motion reference read live at the first frame held: the pad sits %.2f m along the shaft above the shell %s "
+                        "(centre sources pad %u, shell %u).", static_cast<double>(g_shellMotion.ref), g_shellName,
+                        static_cast<unsigned>(pw.source), static_cast<unsigned>(sw.source));
+    }
+    g_shellDeltaM = g_shellMotion.delta;
+    if (release) g_releaseMotion = true;
 }
 
 // The record's view mask and admitted flag through the guarded reads and writes, for the fault-safe cull (sealed_trial_core.h).
@@ -883,7 +895,7 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
     g_heldAbsent = 0;
     g_otherPicked = 0;
     g_engagePending = false;
-    g_sealState = sealed::SealState{};
+    sealed::clearTrigger(&g_sealState);   // the pad's motion memory stays: a release by motion makes the next seal wait its delay (built v14.4)
     g_sealedFlag.store(false, std::memory_order_release);
 }
 
@@ -932,6 +944,8 @@ bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
 // Attaches or detaches the vetoes and the store observer to the setting. Attach is refused (logged once) when a hook stands down.
 void applySetting(bool on, uint32_t frame) noexcept {
     if (on == g_vetoesAttached) return;
+    g_sealState = sealed::SealState{};   // a setting toggle starts the trigger and its memory afresh (built v14.4)
+    g_sealGuard = sealed::SealRateGuard{};
     if (on) {
         const char* direct = kinematicEvalDirectVetoAttach();
         const char* rig = kinematicEvalRigVetoAttach();
@@ -1112,6 +1126,8 @@ void setHeldFrame(const sealed::OwnCell& cell, uint32_t frame) {
     g_heldLocalValid = false;
     g_shellValid = false;
     g_releaseMotion = false;
+    g_shellMotion = sealed::ShellMotion{};
+    g_shellSampleStamp = 0xFFFFFFFFu;
     float axes[3][3] = {};
     float ext[3] = {};
     bool extOk = false;
@@ -1127,7 +1143,6 @@ void setHeldFrame(const sealed::OwnCell& cell, uint32_t frame) {
         g_shellAddr = x.addr;
         std::snprintf(g_shellName, sizeof(g_shellName), "%s", x.name);
         g_shellValid = true;
-        g_shellRelEngage = sealed::shellRelative(cell.centre, x.centre, axes[2]);
     }
 }
 
@@ -1344,6 +1359,7 @@ void optimizedStationFrame(uint32_t frame) {
     in.held = g_heldValid;
     in.cameraOutside = cameraOutside;
     in.padMoved = g_flagPadMoved;
+    if (g_flagHangarChanged) g_sealGuard = sealed::SealRateGuard{};   // a new hangar: the safety net starts afresh
     in.hangarChanged = g_flagHangarChanged;
     in.launched = false;   // the pad state object's reader is not in this build (optimized-station doc, "Not yet")
     in.nowMs = now;
@@ -1354,9 +1370,16 @@ void optimizedStationFrame(uint32_t frame) {
     if (act == sealed::SealAction::kRelease) {
         releaseSeal(releaseText(why), frame);
     } else if (act == sealed::SealAction::kRequestEngage) {
-        g_engagePending = true;
-        g_engageTries = 0;
-        g_engageAtLoadIn = g_sealState.immediate;
+        if (g_sealGuard.tripped) {
+            // refused until a hangar change or a setting toggle (the safety net, built v14.4)
+        } else if (g_sealGuard.note(now)) {
+            Log::get().note("optimized station: sealing stopped for this hangar: more than %u seals in a minute (the pad flickers). "
+                            "It resumes at a hangar change or a setting toggle.", static_cast<unsigned>(sealed::kSealRateMax));
+        } else {
+            g_engagePending = true;
+            g_engageTries = 0;
+            g_engageAtLoadIn = g_sealState.immediate;
+        }
     }
     // Built v14.1: while docked and unsealed, one line when the seal's inputs change, and at most every 10 s while docked: the unmet condition.
     if (!g_heldValid) {

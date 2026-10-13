@@ -1126,6 +1126,63 @@ inline size_t pickShell(const ExplicitObs* obs, size_t n, const float centre[3],
     return best;
 }
 
+// Built v14.4 (the flicker fix): the pad's motion against its shell, measured along the shaft. The reference is captured ONCE, at the first sample after
+// the seal is held, by the same function and inputs as every later sample (the v14.3 flight took it from the gather snapshot, a different centre by a
+// constant: the pad read 2.4 m off its shell at once). A sample whose centre sources differ from the reference's is another centre: it is not
+// compared, and the run is kept. A release needs the offset beyond kPadMoveReleaseM on kPadMoveFrames consecutive samples: motion is continuous.
+constexpr uint32_t kPadMoveFrames = 10;
+
+struct ShellMotion {
+    bool captured = false;
+    float ref = 0.0f;        // the pad's height along the shaft above the shell, at the capture
+    uint8_t padSrc = 4;      // the centre sources the reference was read from
+    uint8_t shellSrc = 4;
+    uint32_t run = 0;        // consecutive samples beyond the limit
+    float delta = 0.0f;      // the latest sample minus the reference
+    // Returns true when the pad has been beyond the limit for kPadMoveFrames samples in a row.
+    bool sample(const float pad[3], uint8_t ps, const float shell[3], uint8_t ss, const float up[3]) noexcept {
+        if (!captured) {
+            ref = shellRelative(pad, shell, up);
+            padSrc = ps;
+            shellSrc = ss;
+            captured = true;
+            run = 0;
+            delta = 0.0f;
+            return false;
+        }
+        if (ps != padSrc || ss != shellSrc) return false;
+        const float now = shellRelative(pad, shell, up);
+        delta = now - ref;
+        run = padMovedAway(ref, now) ? run + 1 : 0;
+        return run >= kPadMoveFrames;
+    }
+};
+
+// Built v14.4 (the safety net): more than kSealRateMax seals in kSealRateWindowMs, in one hangar, stops the sealing until a hangar change or a
+// setting toggle. A user must never see the sun flicker from this feature again.
+constexpr uint32_t kSealRateMax = 6;
+constexpr uint64_t kSealRateWindowMs = 60000;
+
+struct SealRateGuard {
+    uint64_t times[kSealRateMax + 1] = {};
+    uint32_t n = 0;
+    uint32_t head = 0;
+    bool tripped = false;
+    // Records a seal request at now. Returns true when it trips the guard (the first time, and every time after while tripped).
+    bool note(uint64_t now) noexcept {
+        if (tripped) return true;
+        times[head] = now;
+        head = (head + 1) % (kSealRateMax + 1);
+        if (n < kSealRateMax + 1) ++n;
+        uint32_t inWindow = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (now >= times[i] && now - times[i] <= kSealRateWindowMs) ++inWindow;
+        }
+        if (inWindow > kSealRateMax) tripped = true;
+        return tripped;
+    }
+};
+
 // Built v14.1: what the store observer does with a record. Judging (the keep and the cull) is sealed-only. Gathering (the camera, the frame's
 // pads, the explicit parts and so the own-pad pick the seal trigger needs) runs while docked and unsealed, so a pad is in hand before the seal.
 // Setting off: nothing. The v14 flight never sealed because the gathering was inside the sealed-only judge (no pad, so no seal, ever).

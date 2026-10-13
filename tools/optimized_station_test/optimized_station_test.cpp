@@ -418,6 +418,72 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- Built v14.4: the flicker fix (the reference, the hysteresis, the sequence after a motion release, the safety net) ----------------------
+    {
+        // (1) A static pad, its reference read from one source. A later read of the same pad from another source is a different centre (a constant
+        // offset in the two computations): it is not compared, and it never releases. The same source, unchanged, never releases.
+        se::ShellMotion sm;
+        const float up[3] = {0.0f, 0.0f, 1.0f};
+        const float shell[3] = {0.0f, 0.0f, 0.0f};
+        const float padAt[3] = {0.0f, 0.0f, 10.0f};
+        const float padOff[3] = {0.0f, 0.0f, 7.6f};   // the other source reads 2.4 m lower: the observed -2.4 m constant
+        check(!sm.sample(padAt, 1, shell, 2, up) && sm.captured, "v14.4: the reference is captured at the first sample");
+        bool released = false;
+        for (int k = 0; k < 200; ++k) released = released || sm.sample(padAt, 1, shell, 2, up);
+        check(!released && sm.delta == 0.0f, "v14.4: a static pad read from the same source never releases (200 samples)");
+        released = false;
+        for (int k = 0; k < 200; ++k) released = released || sm.sample(padOff, 0, shell, 2, up);
+        check(!released, "v14.4: a static pad read from another source (a constant -2.4 m computation difference) never releases");
+    }
+    {
+        // (2) Hysteresis: a pad 3 m off its reference releases only on the tenth consecutive sample; a single sample never releases.
+        se::ShellMotion sm;
+        const float up[3] = {0.0f, 0.0f, 1.0f};
+        const float shell[3] = {0.0f, 0.0f, 0.0f};
+        const float padAt[3] = {0.0f, 0.0f, 10.0f};
+        const float padMoved[3] = {0.0f, 0.0f, 13.0f};
+        sm.sample(padAt, 1, shell, 2, up);
+        bool early = false;
+        for (int k = 0; k < 9; ++k) early = early || sm.sample(padMoved, 1, shell, 2, up);
+        check(!early, "v14.4: 3 m off the reference for nine samples does not release");
+        check(sm.sample(padMoved, 1, shell, 2, up), "v14.4: 3 m off the reference for ten consecutive samples releases");
+        se::ShellMotion one;
+        one.sample(padAt, 1, shell, 2, up);
+        check(!one.sample(padMoved, 1, shell, 2, up) && !one.sample(padAt, 1, shell, 2, up), "v14.4: a single sample off the reference never releases");
+    }
+    {
+        // (3) The sequence: load-in seal -> motion release -> no immediate re-seal. The release runs sealStep (which records the motion) and then
+        // clearTrigger, as the engine's releaseSeal does; the next frame must wait the delay.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        check(se::sealStep(quiet(100), &st, &w) == se::SealAction::kRequestEngage && st.immediate,
+              "v14.4 sequence: the pad first seen at rest seals at load-in");
+        se::SealInputs rel = quiet(150);
+        rel.held = true;
+        rel.padMoved = true;
+        check(se::sealStep(rel, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kPadMoved, "v14.4 sequence: the pad moved: released");
+        se::clearTrigger(&st);
+        check(st.moved && st.seen, "v14.4 sequence: the motion memory survives the release");
+        check(se::sealStep(quiet(200), &st, &w) == se::SealAction::kNone && !st.immediate,
+              "v14.4 sequence: no immediate re-seal after a motion release (the first frame after it waits)");
+        check(firstEngage(&st, quiet(0), 200, 20000) == 200 + se::kSealDelayMs && !st.immediate,
+              "v14.4 sequence: the re-seal after a motion release comes after the full delay");
+    }
+    {
+        // (4) The safety net: more than six seals in a minute trips it; spaced seals never do; a reset (a hangar change or a setting toggle) clears it.
+        se::SealRateGuard g;
+        bool any = false;
+        for (uint64_t i = 0; i < 6; ++i) any = any || g.note(i * 1000);
+        check(!any && !g.tripped, "v14.4 safety net: six seals in a minute do not trip it");
+        check(g.note(6000) && g.tripped, "v14.4 safety net: the seventh seal in a minute trips it");
+        se::SealRateGuard h;
+        bool spaced = false;
+        for (uint64_t i = 0; i < 12; ++i) spaced = spaced || h.note(i * 70000);
+        check(!spaced, "v14.4 safety net: seals spaced over a minute apart never trip it");
+        g = se::SealRateGuard{};
+        check(!g.tripped && !g.note(7000), "v14.4 safety net: a reset clears it");
+    }
+
     // ---- The rules the seal relies on -------------------------------------------------------------------------------------------------------------
     check(se::kPadMoveReleaseM == 2.0f && se::kCameraLeaveM == 2.0f && se::kSealStillM == 0.2f && se::kSealDelayMs == 6000,
           "the constants: the pad-move release 2 m, the camera 2 m, the still 0.2 m, the seal delay 6 s");
