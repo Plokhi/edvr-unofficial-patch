@@ -870,6 +870,21 @@ uint64_t g_waitLastMs = 0;                // when the waiting line was last writ
 sealed::SealState g_sealState;             // the seal trigger (optimized_station_core.h sealStep)
 bool g_flagHangarChanged = false;          // promote saw the held pad go or another own pad nearest: the tick releases on it
 bool g_engageAtLoadIn = false;             // the seal in force was requested at load-in (built v14.3): the status line says so
+// Built v14.13: the sun inside the hangar (its own state, the skip read by the draw), the hangar watch, the names near a pad with no sized shell.
+sealed::SunState g_sun;
+std::atomic<bool> g_sunOff{false};
+sealed::HangarWatch g_hangarWatch;
+char g_hangarWhy[160] = "searching for a hangar shell";
+struct NameNote {
+    char name[48] = {};
+    float dist = 0.0f;
+    float radius = 0.0f;
+};
+NameNote g_nameLog[12];
+size_t g_nameLogN = 0;
+bool g_namesPending = false;
+float g_namesPadC[3] = {};
+uintptr_t g_hangarPad = 0;
 // Built v14.12: the bay's mechanism, latched once per descent (core LatchSet). Candidates are gathered only while a latch is pending.
 sealed::LatchSet g_latch;
 sealed::LatchCand g_latchCands[sealed::kLatchCandCap];
@@ -1052,6 +1067,39 @@ const char* engageHow() noexcept {
     return how;
 }
 
+// Built v14.13: a gathered record that may name the hangar, near the pad, while the names are wanted (a docked pad with no sized shell, not yet noted).
+void hangarNameNote(uintptr_t record, const float* centre, float radius) noexcept {
+    if (!g_namesPending || g_nameLogN >= 12) return;
+    const float d = sealed::distance(centre, g_namesPadC);
+    if (d > 150.0f) return;
+    char nm[48] = {};
+    if (!cachedName(record, nm, sizeof(nm)) || !sealed::hangarLikeName(nm)) return;
+    NameNote& nn = g_nameLog[g_nameLogN++];
+    std::snprintf(nn.name, sizeof(nn.name), "%s", nm);
+    nn.dist = d;
+    nn.radius = radius;
+}
+
+// Built v14.13: the once-per-dock note with no sized shell: the hangar-like and pad records near the pad (the first carrier dock tells us its
+// names), or, when there are none, that there is no hangar here.
+void hangarNote() noexcept {
+    if (g_nameLogN == 0) {
+        std::snprintf(g_hangarWhy, sizeof(g_hangarWhy), "%s", "no hangar here (outpost or open pad): nothing to do");
+        Log::get().note("optimized station: no hangar here (outpost or open pad): nothing to do");
+        return;
+    }
+    std::snprintf(g_hangarWhy, sizeof(g_hangarWhy), "%s", "no sized hangar shell matched near the pad (names logged)");
+    char text[400] = {};
+    size_t used = 0;
+    for (size_t i = 0; i < g_nameLogN; ++i) {
+        const int w = std::snprintf(text + used, sizeof(text) - used, "%s%s (%.1f m, r %.1f m)", i > 0 ? "; " : "", g_nameLog[i].name,
+                                    static_cast<double>(g_nameLog[i].dist), static_cast<double>(g_nameLog[i].radius));
+        if (w < 0 || used + static_cast<size_t>(w) >= sizeof(text)) break;
+        used += static_cast<size_t>(w);
+    }
+    Log::get().note("optimized station: no sized hangar shell near the pad; the hangar-like and pad records near it: %s", text);
+}
+
 // The seal's status line, once per seal (called from the engage, after the cell is held and localized).
 void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
     ++g_sealCount;
@@ -1101,6 +1149,11 @@ void applySetting(bool on, uint32_t frame) noexcept {
     g_heightSrc = sealed::ShellHeightSources{};
     g_preShellValid = false;
     g_sealGuard = sealed::SealRateGuard{};
+    if (!on && g_sun.off) {   // setting off: the sun comes back on (built v14.13)
+        g_sun.off = false;
+        g_sunOff.store(false, std::memory_order_release);
+        Log::get().note("optimized station: sun light inside the hangar back on (setting off)");
+    }
     if (on) {
         const char* direct = kinematicEvalDirectVetoAttach();
         const char* rig = kinematicEvalRigVetoAttach();
@@ -1369,7 +1422,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
             std::snprintf(p.name, sizeof(p.name), "%s", name);
             if (p.size != sealed::PadSize::kNone) ++g_padCount;
         }
-    } else if (cls == sealed::NameClass::kExplicit && g_explicitCount < sealed::kExplicitSlots) {
+    } else if (cls == sealed::NameClass::kExplicit && g_explicitCount < sealed::kExplicitSlots && !g_hangarWatch.giveUp) {   // built v14.13: stops after the give-up
         sealed::ExplicitObs& x = g_explicits[g_explicitCount++];
         x.addr = record;
         x.node = node;
@@ -1409,6 +1462,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         if (cachedName(record, tn, sizeof(tn))) tallyShipPrefix(tn);
     }
     latchCandNote(record, centre);   // built v14.12: gathered only while a latch is pending
+    hangarNameNote(record, centre, radius);   // built v14.13: only while the names are wanted
     if (!judge) return;   // gathering only: the pads and the explicit parts are in hand; the judgement is sealed-only
     const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, record);
     keep = v.keep;
@@ -1456,7 +1510,7 @@ bool optimizedStationSealed() noexcept { return g_sealedFlag.load(std::memory_or
 
 // The draw path asks: while sealed, the sun pair is not drawn.
 bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps) noexcept {
-    return g_sealedFlag.load(std::memory_order_acquire) && vs == kSunVs && ps == kSunPs;
+    return g_sunOff.load(std::memory_order_acquire) && vs == kSunVs && ps == kSunPs;   // the sun skip follows the pad, not the seal (built v14.13)
 }
 
 // The store calls this after it has written a record (bucket = the collection, record = its record). While sealed it judges the record; while
@@ -1544,7 +1598,7 @@ void optimizedStationFrame(uint32_t frame) {
     g_heightChanged = false;
     if (g_pickCell.has) {
         g_relOk = false;
-        if (!g_preShellValid || g_preShellPad != g_pickCell.pad) {
+        if (!g_hangarWatch.giveUp && (!g_preShellValid || g_preShellPad != g_pickCell.pad)) {
             const size_t pick = sealed::pickShell(g_explicits, g_explicitCount, g_pickCell.centre, g_pickCell.size, 150.0f);
             g_preShellValid = pick < g_explicitCount;
             g_preShellPad = g_pickCell.pad;
@@ -1599,10 +1653,35 @@ void optimizedStationFrame(uint32_t frame) {
     if (g_latchPending && g_pickCell.has) latchNow(now);
     g_latchCandN = 0;
     if (g_latch.latched && g_bayNoting) latchRead(now);
+    // Built v14.13: the hangar watch (a sized shell near the pad) and its once-per-dock names; the sun inside the hangar (its own state).
+    const bool shellFound = g_preShellValid;
+    const bool padChanged = g_pickCell.has && g_pickCell.pad != g_hangarPad;
+    if (g_pickCell.has) {
+        g_hangarPad = g_pickCell.pad;
+        for (int k = 0; k < 3; ++k) g_namesPadC[k] = g_pickCell.centre[k];
+    }
+    if (g_hangarWatch.step(shellFound, g_dockedNow.load(std::memory_order_acquire), padChanged)) hangarNote();
+    if (!g_dockedNow.load(std::memory_order_acquire)) g_nameLogN = 0;
+    g_namesPending = g_dockedNow.load(std::memory_order_acquire) && !shellFound && g_pickCell.has && !g_hangarWatch.logged;
+    {
+        sealed::SunInputs su;
+        su.setting = g_setting.load(std::memory_order_acquire);
+        su.docked = g_dockedNow.load(std::memory_order_acquire);
+        su.hangar = shellFound;
+        su.relOk = g_relOk;
+        su.rel = g_relM;
+        su.hangarChanged = g_flagHangarChanged;
+        const char* why = "";
+        if (sealed::sunStep(su, &g_sun, &why)) {
+            g_sunOff.store(g_sun.off, std::memory_order_release);
+            if (g_sun.off) Log::get().note("optimized station: sun light inside the hangar off (pad lowered)");
+            else Log::get().note("optimized station: sun light inside the hangar back on (%s)", why);
+        }
+    }
     sealed::SealInputs in;
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
-    in.pickOk = g_pickCell.has;
+    in.pickOk = g_pickCell.has && g_preShellValid;   // no sized shell: the trigger stays idle (built v14.13)
     in.padHeld = padHeld;
     in.bayLastMotionMs = g_latch.lastMotionMs;
     in.padLastMotionMs = padLastMotion();
@@ -1671,7 +1750,8 @@ void optimizedStationFrame(uint32_t frame) {
             ev.contains = g_frameCamValid && ev.d <= p.radius;
         }
         if (!w.cellBuilt) {
-            if (!g_relOk) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", "no shell height (the pad or the shell pose is unreadable)");
+            if (!g_preShellValid) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_hangarWhy);
+            else if (!g_relOk) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", "no shell height (the pad or the shell pose is unreadable)");
             else if (!g_pickCell.has) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_pickCell.reason);
             else std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", sealed::cellInvalidWhy(g_pickCell));
         }

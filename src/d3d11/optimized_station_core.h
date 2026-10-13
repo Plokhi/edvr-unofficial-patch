@@ -1282,6 +1282,101 @@ inline size_t selectMechanism(const LatchCand* cands, size_t n, uintptr_t ownAdd
     return k;
 }
 
+// Built v14.13: the sun inside the hangar. The sun pass is skipped while the setting is on, docked, a sized hangar shell is found near the pad, and the
+// own pad is lowered (below kLoweredM above the shell). It does not wait for the seal. It comes back on when the pad rises (launch), on undock, on setting
+// off, on a hangar change, or when the shell is lost; while the pad height is unreadable it holds.
+struct SunInputs {
+    bool setting = false;
+    bool docked = false;
+    bool hangar = false;         // a sized hangar shell is found near the pad
+    bool relOk = false;          // the pad's height above the shell is readable this frame
+    float rel = 0.0f;
+    bool hangarChanged = false;
+};
+
+struct SunState {
+    bool off = false;
+};
+
+// Returns true when the skip changed. *why names the change for the state line ("pad lowered" for off, the reason for back on).
+inline bool sunStep(const SunInputs& in, SunState* st, const char** why) noexcept {
+    *why = "";
+    if (!st->off) {
+        if (in.setting && in.docked && in.hangar && in.relOk && in.rel < kLoweredM) {
+            st->off = true;
+            *why = "pad lowered";
+            return true;
+        }
+        return false;
+    }
+    if (!in.setting) {
+        st->off = false;
+        *why = "setting off";
+        return true;
+    }
+    if (!in.docked) {
+        st->off = false;
+        *why = "undocked";
+        return true;
+    }
+    if (in.hangarChanged) {
+        st->off = false;
+        *why = "hangar changed";
+        return true;
+    }
+    if (!in.hangar) {
+        st->off = false;
+        *why = "no hangar shell";
+        return true;
+    }
+    if (!in.relOk) return false;   // unreadable this frame: hold
+    if (in.rel >= kLoweredM) {
+        st->off = false;
+        *why = "pad raised (launch)";
+        return true;
+    }
+    return false;
+}
+
+// Built v14.13: a docked pad with no sized shell. The no-hangar note is due once per dock (after kHangarNoteFrames frames without a shell). After
+// kNoShellGiveUpFrames the gather of the shell parts stops until undock or a new pad. A shell found resets the count.
+constexpr uint32_t kHangarNoteFrames = 60;
+constexpr uint32_t kNoShellGiveUpFrames = 300;
+
+struct HangarWatch {
+    uint32_t missing = 0;
+    bool giveUp = false;
+    bool logged = false;
+    // One frame. Returns true on the frame the once-per-dock note is due.
+    bool step(bool shellFound, bool docked, bool padChanged) noexcept {
+        if (!docked) {
+            *this = HangarWatch{};
+            return false;
+        }
+        if (padChanged) {
+            missing = 0;
+            giveUp = false;
+        }
+        if (shellFound) {
+            missing = 0;
+            return false;
+        }
+        if (missing < kNoShellGiveUpFrames) ++missing;
+        if (missing >= kNoShellGiveUpFrames) giveUp = true;
+        if (!logged && missing >= kHangarNoteFrames) {
+            logged = true;
+            return true;
+        }
+        return false;
+    }
+};
+
+// Built v14.13: the names that may mark a hangar (or a pad or a bay door) near a pad with no sized shell: logged once per dock.
+inline bool hangarLikeName(const char* name) noexcept {
+    return containsNoCase(name, "Hanger") || containsNoCase(name, "Hangar") || containsNoCase(name, "Pad") || containsNoCase(name, "Lift") ||
+           containsNoCase(name, "BlastShield") || containsNoCase(name, "Bay") || containsNoCase(name, "Elevator");
+}
+
 // Advances the state and returns the action. With kRelease, *why says which rule released (the order of the brief: setting off, undocked,
 // Explorer Cam, camera left, pad moved, hangar changed, launch). A pad first seen lowered with no descent observed seals on the first eligible
 // frame (the load-in rule, v14.3); after an observed descent the still delay applies. A raised pad never seals. The camera must be in the bay.
@@ -1486,6 +1581,7 @@ inline size_t pickShell(const ExplicitObs* obs, size_t n, const float centre[3],
         const float d = distance(obs[i].centre, centre);
         if (d > maxM) continue;
         const int r = shellRank(obs[i].name, size);
+        if (r == 2) continue;   // built v14.13: a shell needs a size word (HangerSmall, HangerMedium, HangerLarge)
         if (best == n || r < bestRank || (r == bestRank && d < bestD)) {
             best = i;
             bestRank = r;

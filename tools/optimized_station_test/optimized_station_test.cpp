@@ -669,6 +669,76 @@ int main(int argc, char** argv) {
         check(req == 4000 + se::kBayStillMs, "v14.12: the own pad must be still for 2 s too: sealed 2 s after the pad's last move");
     }
 
+    // ---- Built v14.13: the sun inside the hangar (its own state), the hangar watch, the no-hangar pad, the names --------------------------
+    {
+        se::SunState su;
+        const char* why = "";
+        se::SunInputs in;
+        in.setting = true;
+        in.docked = true;
+        in.hangar = true;
+        in.relOk = true;
+        in.rel = 14.0f;
+        bool changed = false;
+        for (int k = 0; k < 100; ++k) changed = changed || se::sunStep(in, &su, &why);
+        check(!changed && !su.off, "v14.13 sun: a raised pad on the surface never skips the sun (100 frames)");
+        in.rel = -20.0f;
+        check(se::sunStep(in, &su, &why) && su.off && std::strcmp(why, "pad lowered") == 0,
+              "v14.13 sun: the descent turns the sun off at the lowered frame");
+        se::SealState st = descended();   // the seal comes 2 s after the lowering, later than the sun
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        uint64_t req = 0;
+        for (uint64_t tt = 200; tt <= 4000 && req == 0; tt += 100) {
+            if (se::sealStep(quiet(tt), &st, &w) == se::SealAction::kRequestEngage) req = tt;
+        }
+        check(su.off && req == 100 + se::kBayStillMs, "v14.13 sun: the sun is off long before the seal (the seal waits 2 s)");
+        in.rel = 5.0f;
+        check(se::sunStep(in, &su, &why) && !su.off && std::strcmp(why, "pad raised (launch)") == 0,
+              "v14.13 sun: the launch (the pad rises above the shell) turns the sun back on");
+        in.rel = -20.0f;
+        se::sunStep(in, &su, &why);
+        in.docked = false;
+        check(se::sunStep(in, &su, &why) && !su.off && std::strcmp(why, "undocked") == 0, "v14.13 sun: undock turns the sun back on");
+        in.docked = true;
+        se::sunStep(in, &su, &why);
+        in.setting = false;
+        check(se::sunStep(in, &su, &why) && !su.off && std::strcmp(why, "setting off") == 0, "v14.13 sun: setting off turns the sun back on");
+        in.setting = true;
+        se::SunState none;
+        se::SunInputs nh = in;
+        nh.hangar = false;
+        nh.rel = -20.0f;
+        check(!se::sunStep(nh, &none, &why) && !none.off, "v14.13 sun: a docked pad with no sized shell never skips the sun");
+    }
+    {
+        // A docked pad with no sized shell: the note is due once; the give-up after kNoShellGiveUpFrames; a shell resets the count; undock starts over.
+        se::HangarWatch hw;
+        int notes = 0;
+        for (uint32_t k = 0; k < se::kHangarNoteFrames + 20; ++k) notes += hw.step(false, true, false) ? 1 : 0;
+        check(notes == 1 && hw.logged && !hw.giveUp, "v14.13 hangar: the no-hangar note is due once per dock, at 60 frames");
+        for (uint32_t k = 0; k < se::kNoShellGiveUpFrames; ++k) hw.step(false, true, false);
+        check(hw.giveUp, "v14.13 hangar: after 300 frames without a shell the gather of the shell parts stops");
+        se::HangarWatch found;
+        for (uint32_t k = 0; k < 100; ++k) found.step(false, true, false);
+        found.step(true, true, false);
+        check(found.missing == 0 && !found.giveUp, "v14.13 hangar: a shell found resets the count (no give-up)");
+        found.step(false, false, false);
+        check(!found.logged && found.missing == 0, "v14.13 hangar: undock starts the dock over (the note is due again)");
+    }
+    {
+        // Names: the hangar-like filter (hangars, pads, lifts, doors and bays), not a plain structure.
+        check(se::hangarLikeName("HangerSmall") && se::hangarLikeName("LandingPadSmallA") && se::hangarLikeName("Elevator_1") &&
+                  se::hangarLikeName("BayDoor_2") && !se::hangarLikeName("Container_1"),
+              "v14.13 names: hangar, pad, elevator and bay names are noted; a container is not");
+        // A part with no size word is not the shell (outposts and carriers have none of the sized kind).
+        se::ExplicitObs ex[1] = {};
+        ex[0].addr = 1;
+        std::snprintf(ex[0].name, sizeof(ex[0].name), "%s", "HangarXYZ");
+        const float centre[3] = {0.0f, 0.0f, 0.0f};
+        check(se::pickShell(ex, 1, centre, se::PadSize::kMedium, 150.0f) == 1,
+              "v14.13 shell: a hangar part with no size word is not the reference");
+    }
+
     // ---- Built v14.9: a pad absent    // ---- Built v14.9: a pad absent for a frame or two keeps the still clock (the flight's 97 s re-seal) --------------------------------------
     {
         // The pad is missing from the store one frame in every five while the still clock runs: it still seals at 6.1 s (the clock is not reset).
