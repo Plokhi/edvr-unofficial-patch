@@ -2193,6 +2193,37 @@ static void testUnifiedDescriptor() {
     }
 }
 
+// An older flat install wrote its flat defaults into edvr.ini.base. A newer both install changes the descriptor and leaves that record
+// behind. The VR customization that equals a flat default must survive the upgrade: the base does not describe the VR file.
+static void testStaleRecordBase() {
+    printf("\na stale flat record does not vouch for the VR base\n");
+    const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+    const std::string vrDefault = "[fix]\r\ntemporal_aa = off\r\n[hotkey]\r\nmenu = F8\r\n#dump_draws =\r\n[log]\r\nenabled = 1\r\n";
+    const std::string flatBase = "[fix]\r\ntemporal_aa = off\r\n[hotkey]\r\nmenu = F8\r\ndump_draws = NUMLOCK\r\n[log]\r\nenabled = 1\r\n";
+    std::string userVr = vrDefault;
+    const size_t hotkey = userVr.find("#dump_draws =");
+    check(hotkey != std::string::npos, "the VR default has the hotkey to customise");
+    if (hotkey == std::string::npos) return;
+    userVr.replace(hotkey, sizeof("#dump_draws =") - 1, "dump_draws = NUMLOCK");
+
+    const PayloadInfo vr = testPayload(vrDefault);
+    Survey s = toolBothSurvey(dir, vr);
+    s.openvrOrigInBackups.clear();
+    s.state.present = true; s.state.profile = "flat"; s.state.scope = "flat";
+    s.state.descriptorSha = descriptorShaFor("flat");
+    s.iniPresent = true;
+    s.iniText = userVr;
+    s.baseIniText = flatBase;
+    s.flatIniPresent = true;
+    s.flatIniText = kTestFlatIni;
+    const Plan plan = planInstall(s, testOptions(), vr);
+    check(!plan.blocked, "a both descriptor over a stale flat record is not blocked", unifiedProblems(plan));
+    // A plan with no edvr.ini write leaves the file as the user has it, which is the outcome asserted.
+    const std::string planned = plannedIni(plan);
+    expectEq(iniValue(planned.empty() ? userVr : planned, "hotkey.dump_draws", "<absent>"), "NUMLOCK",
+             "the edvr.ini the install leaves keeps the VR customization equal to a flat default");
+}
+
 static void testXessPlanner() {
     printf("\noptional XeSS files: planning and ownership\n");
     const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
@@ -5999,6 +6030,7 @@ int wmain(int argc, wchar_t** argv) {
     testNativePlanner();
     testFlatPlanner();
     testUnifiedDescriptor();
+    testStaleRecordBase();
     testXessPlanner();
     testContentOwnership(scratch);
     testFlatSettingsPlanner();

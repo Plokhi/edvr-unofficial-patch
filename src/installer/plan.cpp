@@ -954,10 +954,12 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     // file's merge report (plan.merge) is the one left when both are installed.
     plan.settingsFile = wantsVrIni ? "edvr.ini" : "edvr-flat.ini";
     // The base is the shipped text of the version that last wrote the file: edvr.ini.base for edvr.ini, edvr-flat.ini.base for
-    // edvr-flat.ini. The record can vouch for edvr.ini's base only when it is not a flat-scope record: a flat install wrote the single
-    // base of older installs from the flat payload, so under a flat record that base describes no VR file. Where a base does not
-    // describe the file, the merge is two-way.
-    const bool vrBaseDescribes = !(s.state.present && installed == "flat");
+    // edvr-flat.ini. Which version wrote edvr.ini.base is the RECORD's question, not the descriptor's: the descriptor says what this
+    // run installs, and an older flat record left its flat defaults in that base. So the base vouches for the VR file only under a
+    // VR-scope record (vr or both); a flat record, or none, vouches for nothing. Where a base does not describe the file, the merge
+    // is two-way.
+    const std::string baseWriter = s.state.present ? recordedScope(s.state) : std::string();
+    const bool vrBaseDescribes = baseWriter == "vr" || baseWriter == "both";
     const std::string* vrBase = (vrBaseDescribes && !s.baseIniText.empty()) ? &s.baseIniText : nullptr;
     const std::string* flatBase = s.flatBaseIniText.empty() ? nullptr : &s.flatBaseIniText;
     std::string vrSha, flatSha;
