@@ -19,7 +19,7 @@ static bool has(const Lines& lines, const char* needle) {
 }
 static void validLines(const Lines& lines) {
     check(!lines.values.empty(), "report emitted no lines");
-    check(lines.values.size() <= 23, "report exceeds bounded line count");
+    check(lines.values.size() <= 30, "report exceeds bounded line count");
     for (const auto& line : lines.values) check(line.size() < 192, "line exceeds breadcrumb bound");
 }
 static std::vector<DWORD64> unwindPCs(const Lines& lines) {
@@ -91,10 +91,14 @@ int main(int argc, char** argv) {
     }
     check(!has(lines, " +0x100="), "stack capture ends at 256 bytes");
     check(unwindPCs(lines).size() == 8 && has(lines, "stop=frame-limit"), "leaf unwind bounded");
+    check(has(lines, "crash: fault-page state=free type=none"), "a wild address reports a free page");
+    check(has(lines, "crash: ledger events=") && has(lines, "covered-by=none"), "a wild address is covered by no image");
+    check(!has(lines, "crash: cell"), "a data fault does not look for a table cell");
 
     for (ULONG_PTR op : {ULONG_PTR(0), ULONG_PTR(8), ULONG_PTR(7)}) {
         access.ExceptionInformation[0] = op; run();
         check(has(lines, op == 0 ? "op=read" : op == 8 ? "op=execute" : "op=unknown"), "access operation");
+        check(has(lines, "crash: cell none") == (op == 8), "only a jump to a bad address looks for its cell");
     }
     access.NumberParameters = 1; run();
     check(has(lines, "params=truncated") && !has(lines, "address="), "missing address not fabricated");
@@ -144,6 +148,62 @@ int main(int argc, char** argv) {
     check(inFunction(pcs[0], reinterpret_cast<void*>(&captureLargeFrame)), "frame zero is captured function");
     check(inFunction(pcs[1], reinterpret_cast<void*>(&captureCaller)), "caller recovered across 32KB frame");
     check(has(lines, "module=crash_context_test.exe rva=0x"), "module identity and RVA retained");
+
+    // The shutdown crash's shape, rebuilt: an image the loader mapped and then
+    // freed, a table cell that still holds an address inside it, and a jump
+    // through that cell. The ledger must name the image and how long ago it
+    // left, the page must read as free, and the cell scan must find the
+    // register that points at the cell, its distance from another register,
+    // and one junk cell among 255 image pointers.
+    {
+        using namespace edvr;
+        dll_ledger::clearForTest();
+        check(dll_ledger::install() && dll_ledger::install(), "the ledger installs, and installing twice is harmless");
+        HMODULE victim = LoadLibraryW(L"dbghelp.dll");
+        check(victim != nullptr, "a DLL to load and free");
+        const uintptr_t base = reinterpret_cast<uintptr_t>(victim);
+        check(FreeLibrary(victim) != 0 && GetModuleHandleW(L"dbghelp.dll") == nullptr, "the DLL is really unmapped");
+        dll_ledger::Entry hit;
+        check(dll_ledger::covering(base + 0xF780, hit) && hit.unloaded && hit.base == base &&
+                  std::string(hit.name) == "dbghelp.dll",
+              "the ledger answers for an address inside the freed image");
+        check(!dll_ledger::covering(0x1234, hit), "and for no address outside any image");
+
+        alignas(16) uintptr_t table[300];
+        for (auto& cell : table) cell = reinterpret_cast<uintptr_t>(&captureCaller);
+        table[150] = base + 0xF780;
+        alignas(16) uintptr_t shapeStack[32]{};
+        CONTEXT crash{};
+        crash.Rax = reinterpret_cast<DWORD64>(&table[150]);
+        crash.Rcx = reinterpret_cast<DWORD64>(&table[0]);
+        crash.Rsp = reinterpret_cast<DWORD64>(shapeStack);
+        crash.Rip = base + 0xF780;
+        EXCEPTION_RECORD jump{};
+        jump.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        jump.ExceptionAddress = reinterpret_cast<PVOID>(crash.Rip);
+        jump.NumberParameters = 2;
+        jump.ExceptionInformation[0] = 8;
+        jump.ExceptionInformation[1] = base + 0xF780;
+        EXCEPTION_POINTERS shape{&jump, &crash};
+        lines.values.clear();
+        edvr::crash_context::report(&shape, collect, &lines);
+        validLines(lines);
+        check(has(lines, "state=free type=none"), "the freed image's address reads as a free page");
+        check(has(lines, "covered-by-unloaded=dbghelp.dll"), "the crash line names the image that was freed");
+        check(has(lines, "crash: ledger newest-unloads ") && has(lines, ".dll@"),
+              "and the newest unloads are listed with their ages");
+        check(has(lines, "crash: cell reg=rax") && has(lines, "rcx+0x4B0"),
+              "the cell is found through rax, 0x4B0 bytes past rcx");
+        check(has(lines, "crash: cell window cells=256 image=255 zero=0 other=1"),
+              "one junk cell among 255 image pointers is counted");
+        check(has(lines, "crash: cell first-other [0]=0x"), "and listed at its own offset");
+
+        const uint32_t before = dll_ledger::events();
+        dll_ledger::remove();
+        HMODULE other = LoadLibraryW(L"winmm.dll");
+        if (other) FreeLibrary(other);
+        check(dll_ledger::events() == before, "a removed ledger records nothing more");
+    }
 
     std::printf("crash context self-test: %u checks PASS\n", checks);
     return 0;

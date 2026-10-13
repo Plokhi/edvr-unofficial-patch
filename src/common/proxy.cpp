@@ -381,9 +381,17 @@ void breadcrumbInstallCrashHandler() {
     if (InterlockedExchange(&done, 1) != 0) return;
     g_prevFilter = SetUnhandledExceptionFilter(edvrCrashFilter);
     g_filterInstalled = true;
+    // The ledger the filter's "ledger" lines read: which images were mapped
+    // and unmapped, so an address "in no module" can be matched to a DLL that
+    // was freed. Started here so it covers the whole session; a refusal just
+    // leaves "events=0" in the crash lines.
+    dll_ledger::install();
 }
 
 void breadcrumbRemoveCrashHandler() {
+    // The ledger's callback lives in this image, so it comes down with it,
+    // whatever the filter's state below.
+    dll_ledger::remove();
     // A FILTER LEFT BEHIND BY AN UNLOADED MODULE POINTS INTO FREED ADDRESS
     // SPACE, and the next unhandled exception in the process jumps into it --
     // so the cost of skipping this is not "no breadcrumb", it is that the game
