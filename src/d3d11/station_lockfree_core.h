@@ -15,15 +15,26 @@
 
 namespace edvr::sealed {
 
-template <typename T, size_t N>
+// Built v14.29: a caller can also pin with a per-thread hazard cell (pinThread): the cell is the thread's own cache line, so a pin writes no line another
+// thread touches. The thread keeps its slot pinned until its next pinThread, so a batch of calls on one published slot costs two loads of the published
+// index. The publisher skips a slot that a hazard cell names. A thread past the last cell pins by the shared count (pin / unpin), as before. A ring that
+// hazard cells hold needs N above the number of threads that can each hold a different old slot (the station uses 40 for 16 gather slots).
+template <typename T, size_t N, size_t kHazards = 48>
 class SnapshotRing {
 public:
-    // The publisher's slot, free for writing: the slot after the published one, once no caller holds it. Single publisher only.
+    SnapshotRing() noexcept : id_(nextId().fetch_add(1, std::memory_order_relaxed)) {}
+    // The publisher's slot, free for writing: the first slot after the published one that no caller holds (by count or by hazard cell). Single publisher only.
     T& beginWrite() noexcept {
-        next_ = (cur_.load(std::memory_order_seq_cst) + 1) % N;
-        while (refs_[next_].load(std::memory_order_seq_cst) != 0) {
+        for (;;) {
+            const size_t c = cur_.load(std::memory_order_seq_cst);
+            for (size_t k = 1; k < N; ++k) {
+                const size_t cand = (c + k) % N;
+                if (refs_[cand].load(std::memory_order_seq_cst) == 0 && !hazarded(cand)) {
+                    next_ = cand;
+                    return slots_[cand];
+                }
+            }
         }
-        return slots_[next_];
     }
     // Makes the slot from beginWrite the published one.
     void publish() noexcept {
@@ -43,13 +54,60 @@ public:
         }
     }
     void unpin(size_t idx) noexcept { refs_[idx].fetch_sub(1, std::memory_order_seq_cst); }
+
+    // The per-thread pin. Returns the published slot, valid until this thread's next pinThread. *counted is 0 when the thread's hazard cell holds the
+    // slot (nothing to release), or idx + 1 when the thread had no cell and the shared count holds it (release with unpin(*counted - 1)).
+    const T* pinThread(size_t* counted) noexcept {
+        Hazard* h = hazardOfThisThread();
+        if (h == nullptr) {
+            size_t idx = 0;
+            const T* p = pin(&idx);
+            *counted = idx + 1;
+            return p;
+        }
+        *counted = 0;
+        for (;;) {
+            const size_t i = cur_.load(std::memory_order_seq_cst);
+            if (h->idx.load(std::memory_order_relaxed) != i) h->idx.store(static_cast<uint32_t>(i), std::memory_order_seq_cst);
+            if (cur_.load(std::memory_order_seq_cst) == i) return &slots_[i];
+        }
+    }
     uint64_t publishes() const noexcept { return publishes_.load(std::memory_order_relaxed); }
 
 private:
+    static constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
+    struct alignas(64) Hazard {
+        std::atomic<uint32_t> idx{kNoSlot};
+    };
+    static std::atomic<uint64_t>& nextId() noexcept {
+        static std::atomic<uint64_t> next{1};
+        return next;
+    }
+    bool hazarded(size_t slot) const noexcept {
+        const uint32_t used = claimed_.load(std::memory_order_seq_cst);
+        const uint32_t n = used < kHazards ? used : static_cast<uint32_t>(kHazards);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (haz_[i].idx.load(std::memory_order_seq_cst) == slot) return true;
+        }
+        return false;
+    }
+    Hazard* hazardOfThisThread() noexcept {
+        thread_local uint64_t tlsOwner = 0;
+        thread_local uint32_t tlsCell = 0;
+        if (tlsOwner != id_) {
+            tlsOwner = id_;
+            tlsCell = claimed_.fetch_add(1, std::memory_order_seq_cst);
+        }
+        return tlsCell < kHazards ? &haz_[tlsCell] : nullptr;
+    }
+
+    const uint64_t id_;
     T slots_[N] = {};
     std::atomic<size_t> cur_{0};
     size_t next_ = 1;
     std::atomic<uint32_t> refs_[N] = {};
+    std::atomic<uint32_t> claimed_{0};
+    Hazard haz_[kHazards];
     std::atomic<uint64_t> publishes_{0};
 };
 

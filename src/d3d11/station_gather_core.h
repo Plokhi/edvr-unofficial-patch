@@ -277,12 +277,14 @@ public:
 
     // Any thread: the veto decision for a found rig; records the stamp of its last call (the tally's "matched").
     RigOutcome decide(size_t idx, uint8_t verdict, uint32_t stamp) noexcept {
-        evalStamp_[idx].store(stamp, std::memory_order_relaxed);
+        if (evalStamp_[idx].load(std::memory_order_relaxed) != stamp) evalStamp_[idx].store(stamp, std::memory_order_relaxed);   // v14.29: no write on a repeat
         return rigOutcomeOf(verdict, run_[idx]);
     }
 
     // Any thread: records the stamp of a call that did not decide (the association moved).
-    void touch(size_t idx, uint32_t stamp) noexcept { evalStamp_[idx].store(stamp, std::memory_order_relaxed); }
+    void touch(size_t idx, uint32_t stamp) noexcept {
+        if (evalStamp_[idx].load(std::memory_order_relaxed) != stamp) evalStamp_[idx].store(stamp, std::memory_order_relaxed);
+    }
 
     // Any thread: true for the first caller of this stamp on this cell (one association request per rig per frame).
     bool askOnce(size_t idx, uint32_t stamp) noexcept { return askStamp_[idx].exchange(stamp, std::memory_order_relaxed) != stamp; }

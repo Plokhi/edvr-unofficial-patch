@@ -1918,6 +1918,173 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- Built v14.29: the node cache with flags, the sampled gathers, the per-thread pin ---------------------------------------------------------------
+    {
+        const uintptr_t node = 0x7ff612345678ull & ~uintptr_t(7);
+        const uint32_t key = se::classKey(100, 0);
+        const uint64_t v = se::packSlot(node, se::NameClass::kExplicit, se::kNodeMechanism | se::kNodeShipPrefix, key);
+        se::NameClass cls = se::NameClass::kNone;
+        uint32_t flags = 0;
+        check(se::unpackSlot(v, node, key, &cls, &flags) && cls == se::NameClass::kExplicit && flags == (se::kNodeMechanism | se::kNodeShipPrefix),
+              "v14.29 node cache: a slot returns the node's class and flags under its key");
+        check(!se::unpackSlot(v, node + 8, key, &cls, &flags), "v14.29 node cache: another node in the same slot is a miss (node reuse)");
+        check(se::unpackSlot(v, node, se::classKey(100 + se::kClassKeyFrames - 1 - (100 % se::kClassKeyFrames), 0), &cls, &flags),
+              "v14.29 node cache: a node is trusted for the rest of its group of frames");
+        check(!se::unpackSlot(v, node, se::classKey(100 + se::kClassKeyFrames, 0), &cls, &flags), "v14.29 node cache: the next group of frames reads the name again");
+        check(!se::unpackSlot(v, node, se::classKey(100, 1), &cls, &flags), "v14.29 node cache: a lifecycle generation (an epoch bump) reads every name again");
+        check(!se::unpackSlot(0, node, key, &cls, &flags), "v14.29 node cache: an empty slot is a miss");
+        // a node reused by another model after a bump gets its own flags
+        const uint64_t v2 = se::packSlot(node, se::NameClass::kOther, 0, se::classKey(100, 1));
+        check(se::unpackSlot(v2, node, se::classKey(100, 1), &cls, &flags) && cls == se::NameClass::kOther && flags == 0,
+              "v14.29 node cache: after a bump the node's new name is cached with its own flags");
+        check(se::nodeFlagsOf("Lift_01") == (se::kNodeMechanism | se::kNodeHangarLike | se::kNodeShipPrefix), "v14.29 node flags: a Lift is a mechanism and a hangar name");
+        check(se::nodeFlagsOf("CobraMkV_Hull") == se::kNodeShipPrefix, "v14.29 node flags: a ship part has the prefix flag only");
+        check(se::nodeFlagsOf("Rock") == 0 && se::nodeFlagsOf("") == 0, "v14.29 node flags: a plain or empty name has none");
+        check((se::nodeFlagsOf("HangarGate_Ramp1_0") & se::kNodeMechanism) != 0, "v14.29 node flags: a hangar gate is a mechanism record");
+        // which records an unsealed pass reads the centre of
+        using NC = se::NameClass;
+        check(!se::nodeWantsCentre(NC::kOther, 0, false, false, false, false), "v14.29 gather: a plain record is not read on a sampling-free pass");
+        check(se::nodeWantsCentre(NC::kPad, 0, false, false, false, false), "v14.29 gather: a pad is always read");
+        check(se::nodeWantsCentre(NC::kExplicit, 0, false, false, false, false) && !se::nodeWantsCentre(NC::kExplicit, 0, true, false, false, false),
+              "v14.29 gather: an explicit part is read until the hangar watch gives up");
+        check(se::nodeWantsCentre(NC::kOther, se::kNodeMechanism, false, true, false, false) && !se::nodeWantsCentre(NC::kOther, se::kNodeMechanism, false, false, false, false),
+              "v14.29 gather: a mechanism record is read only while a latch is pending");
+        check(se::nodeWantsCentre(NC::kOther, se::kNodeHangarLike, false, false, true, false) && !se::nodeWantsCentre(NC::kOther, se::kNodeHangarLike, false, false, false, false),
+              "v14.29 gather: a hangar-like record is read only while the names are wanted");
+        check(se::nodeWantsCentre(NC::kOther, 0, false, false, false, true), "v14.29 gather: a full pass reads every record");
+        check(se::fullGatherPass(8, false) && se::fullGatherPass(16, false) && !se::fullGatherPass(9, false) && se::fullGatherPass(9, true),
+              "v14.29 gather: every eighth stamp is a full pass, and every stamp while sealed or an engage is pending");
+    }
+    {
+        // The sampled gathers over many ticks: the pad is seen at every informative tick (it is read on every pass), the own candidate and the tally
+        // arrive on the full passes only, and a ship swap is seen after ten samples (about eighty ticks unsealed, ten sealed). Most records are never read.
+        struct Rec {
+            se::NameClass cls;
+            uint32_t flags;
+            bool inShip;   // within the ship's tally radius and containing the camera for the candidate
+            bool pad;
+            bool cand;
+        };
+        struct E {
+            uint32_t kind = 0;   // 1 pad, 2 candidate, 3 tally
+            uint32_t stamp = 0;
+            int ship = 0;
+        };
+        using NC = se::NameClass;
+        auto run = [&](bool gatherAll, int shipAfter, int ticks, int* seen, uint64_t* centreReads, uint64_t* calls, int* padSeen, int* candArrivals) {
+            std::atomic<uint32_t> stamp{1};
+            auto gbHeap = std::make_unique<se::PassGather<E, 4, 2048>>(stamp);
+            se::PassGather<E, 4, 2048>& gb = *gbHeap;
+            se::ShipWatch watch;
+            *seen = -1;
+            *centreReads = *calls = 0;
+            *padSeen = *candArrivals = 0;
+            std::vector<Rec> recs;
+            recs.push_back({NC::kPad, 0, false, true, false});
+            for (int i = 0; i < 40; ++i) recs.push_back({NC::kOther, se::kNodeShipPrefix, true, false, i == 0});   // a ship's parts; the first holds the camera
+            for (int i = 0; i < 200; ++i) recs.push_back({NC::kOther, 0, false, false, false});                   // scenery
+            for (int t = 0; t < ticks; ++t) {
+                const uint32_t st = stamp.load();
+                const int ship = (shipAfter >= 0 && t >= shipAfter) ? 2 : 1;
+                const bool full = se::fullGatherPass(st, gatherAll);
+                {
+                    se::PassGather<E, 4, 2048>::Writer w(gb);
+                    for (const Rec& r : recs) {
+                        w.call(0x1);
+                        ++*calls;
+                        if (!se::nodeWantsCentre(r.cls, r.flags, false, false, false, full)) continue;
+                        ++*centreReads;
+                        E e;
+                        if (r.pad) {
+                            e.kind = 1;
+                            w.push(e);
+                        }
+                        if (full && r.cand) {
+                            e.kind = 2;
+                            e.ship = ship;
+                            w.push(e);
+                        }
+                        if (full && r.inShip && (r.flags & se::kNodeShipPrefix) != 0) {
+                            e.kind = 3;
+                            e.ship = ship;
+                            w.push(e);
+                        }
+                    }
+                }
+                stamp.fetch_add(1);
+                int candShip = 0;
+                int tally = 0;
+                bool pad = false;
+                gb.drain([&](const E& e) {
+                    if (e.kind == 1) pad = true;
+                    if (e.kind == 2) candShip = e.ship;
+                    if (e.kind == 3) ++tally;
+                });
+                if (pad) ++*padSeen;
+                if (candShip != 0) {
+                    ++*candArrivals;
+                    char pfx[32];
+                    std::snprintf(pfx, sizeof(pfx), "Ship%d_", candShip);
+                    if (se::shipPrefixNamesShip(pfx, static_cast<uint32_t>(tally)) && watch.step(pfx) && *seen < 0) *seen = t;
+                }
+            }
+        };
+        int seen = -1, padSeen = 0, cands = 0;
+        uint64_t reads = 0, calls = 0;
+        run(false, 100, 400, &seen, &reads, &calls, &padSeen, &cands);
+        check(padSeen >= 395, "v14.29 sampled gathers: the pad is read on every pass, so it is seen at every tick");
+        check(cands >= 400 / 8 - 2 && cands <= 400 / 8 + 2, "v14.29 sampled gathers: the own candidate arrives on the full passes only (one tick in eight)");
+        check(seen > 100 && seen <= 100 + 10 * 8 + 16, "v14.29 sampled gathers: an unsealed ship swap is seen after ten samples, about eighty ticks");
+        check(reads * 100 < calls * 20, "v14.29 sampled gathers: the unsealed gather reads the centre of under a fifth of the records");
+        run(true, 100, 400, &seen, &reads, &calls, &padSeen, &cands);
+        check(cands >= 399 && seen > 100 && seen <= 112, "v14.29 sampled gathers: sealed or with an engage pending, every pass samples and the swap is seen in ten ticks");
+    }
+    {
+        // The per-thread pin: a slot a thread holds is not rewritten, whatever the publisher does; a later pin moves to the newest.
+        struct V {
+            uint64_t a = 0, b = 0, c = 0, d = 0;
+        };
+        auto ringHeap = std::make_unique<se::SnapshotRing<V, 8, 4>>();
+        se::SnapshotRing<V, 8, 4>& ring = *ringHeap;
+        auto publish = [&](uint64_t n) {
+            V& v = ring.beginWrite();
+            v.a = v.b = v.c = v.d = n;
+            ring.publish();
+        };
+        publish(1);
+        size_t counted = 7;
+        const V* held = ring.pinThread(&counted);
+        const uint64_t first = held->a;
+        for (uint64_t n = 2; n < 200; ++n) publish(n);
+        check(counted == 0 && held->a == first && held->b == first && held->d == first,
+              "v14.29 per-thread pin: the slot a thread holds is never rewritten while the publisher goes round the ring");
+        size_t c2 = 7;
+        const V* newest = ring.pinThread(&c2);
+        check(newest->a == 199, "v14.29 per-thread pin: the next pin on the thread moves to the newest slot");
+        // threads: more readers than hazard cells (4), so some pin by the shared count; none sees a torn value, the publisher never stalls
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> torn{0}, reads{0};
+        std::vector<std::thread> readers;
+        for (int r = 0; r < 10; ++r) {
+            readers.emplace_back([&] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    size_t cnt = 0;
+                    const V* p = ring.pinThread(&cnt);
+                    const uint64_t a = p->a;
+                    if (p->b != a || p->c != a || p->d != a) torn.fetch_add(1);
+                    reads.fetch_add(1);
+                    if (cnt != 0) ring.unpin(cnt - 1);
+                }
+            });
+        }
+        uint64_t n = 300;
+        for (; n < 30300; ++n) publish(n);
+        while (reads.load() < 1000) publish(n++);   // under load the readers may start late: keep publishing until they have read
+        stop.store(true);
+        for (auto& th : readers) th.join();
+        check(torn.load() == 0 && reads.load() > 0, "v14.29 per-thread pin, threads: ten readers (four hazard cells, six counted pins) never see a torn slot");
+    }
+
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

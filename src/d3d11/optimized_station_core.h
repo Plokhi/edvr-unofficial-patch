@@ -911,24 +911,36 @@ inline NamedKeep keepNamedCell(const float centre[3], float radius, const float 
 
 // The class cache's slot (lock-free): node>>3 in bits 0..43, the class in bits 44..46 (never 0 for a stored slot), the frame's stamp in bits
 // 47..63. A zero word is an empty slot. A node that is not 8-aligned or is out of the 47-bit user range is not cached.
+// Built v14.29: the slot also carries the node's flags (what its name is good for) in bits 47..49, and the key in bits 50..63 (14 bits). The key is the
+// frame stamp in groups of kClassKeyFrames plus the lifecycle generation, so a node's name is read once per group of frames (it was once per frame), and a
+// lifecycle point (undock, hangar change, ship change, setting toggle) starts every node afresh.
 constexpr uint64_t kSlotNodeMask = (uint64_t(1) << 44) - 1;
 
-constexpr uint32_t kSlotStampMask = (1u << 17) - 1;
+constexpr uint32_t kSlotKeyMask = (1u << 14) - 1;
+constexpr uint32_t kClassKeyFrames = 8;   // frames a node's class and flags are trusted (a node is a model definition; a freed and reused node is the risk)
+
+constexpr uint32_t kNodeMechanism = 1;    // the name is a bay mechanism record (Lift, BlastShield, HangarGate ...): a latch candidate
+constexpr uint32_t kNodeHangarLike = 2;   // the name could name the hangar (Hanger, Pad, Lift, Bay ...): the names note wants it
+constexpr uint32_t kNodeShipPrefix = 4;   // the name has a type prefix up to an underscore (the ship tally counts it)
 
 inline bool slotFits(uintptr_t node) noexcept { return (node & 7u) == 0 && (uint64_t(node) >> 3) <= kSlotNodeMask; }
 
-inline uint64_t packSlot(uintptr_t node, NameClass cls, uint32_t stamp) noexcept {
-    return (uint64_t(node) >> 3) | (uint64_t(static_cast<uint8_t>(cls)) << 44) | (uint64_t(stamp & kSlotStampMask) << 47);
+// The key a frame stamp and a lifecycle generation give.
+inline uint32_t classKey(uint32_t stamp, uint32_t generation) noexcept { return (stamp / kClassKeyFrames + generation) & kSlotKeyMask; }
+
+inline uint64_t packSlot(uintptr_t node, NameClass cls, uint32_t flags, uint32_t key) noexcept {
+    return (uint64_t(node) >> 3) | (uint64_t(static_cast<uint8_t>(cls)) << 44) | (uint64_t(flags & 7u) << 47) | (uint64_t(key & kSlotKeyMask) << 50);
 }
 
-// True when the slot holds this node's class in this frame; the class is written to *out.
-inline bool unpackSlot(uint64_t v, uintptr_t node, uint32_t stamp, NameClass* out) noexcept {
+// True when the slot holds this node's class and flags under this key; they are written to *cls and *flags.
+inline bool unpackSlot(uint64_t v, uintptr_t node, uint32_t key, NameClass* cls, uint32_t* flags) noexcept {
     if (v == 0) return false;
     if ((v & kSlotNodeMask) != (uint64_t(node) >> 3)) return false;
-    if (((v >> 47) & kSlotStampMask) != (stamp & kSlotStampMask)) return false;
+    if (((v >> 50) & kSlotKeyMask) != (key & kSlotKeyMask)) return false;
     const uint32_t c = static_cast<uint32_t>((v >> 44) & 7u);
     if (c == 0) return false;
-    *out = static_cast<NameClass>(c);
+    *cls = static_cast<NameClass>(c);
+    *flags = static_cast<uint32_t>((v >> 47) & 7u);
     return true;
 }
 
@@ -1724,6 +1736,33 @@ inline bool hangarLikeName(const char* name) noexcept {
     return containsNoCase(name, "Hanger") || containsNoCase(name, "Hangar") || containsNoCase(name, "Pad") || containsNoCase(name, "Lift") ||
            containsNoCase(name, "BlastShield") || containsNoCase(name, "Bay") || containsNoCase(name, "Elevator");
 }
+
+// Built v14.29: what a node's name is good for, once per node (the class cache stores it): a latch candidate, a hangar-name candidate, a ship tally
+// prefix. A pad or an explicit part is a class, not a flag. A name that is empty or unreadable has none.
+inline uint32_t nodeFlagsOf(const char* name) noexcept {
+    if (!name || !*name) return 0;
+    uint32_t f = 0;
+    if (mechanismName(name)) f |= kNodeMechanism;
+    if (hangarLikeName(name)) f |= kNodeHangarLike;
+    if (std::strchr(name, '_') != nullptr) f |= kNodeShipPrefix;
+    return f;
+}
+
+// Built v14.29: what the store observer gathers for a record in an unsealed pass, from its node alone (no centre read). A pass that samples the near
+// list, the own candidate and the tally gathers every record's parts; any other pass reads the centre only of the nodes that can matter.
+inline bool nodeWantsCentre(NameClass cls, uint32_t flags, bool giveUp, bool latchPending, bool namesPending, bool fullPass) noexcept {
+    if (fullPass) return true;
+    if (cls == NameClass::kPad) return true;
+    if (cls == NameClass::kExplicit && !giveUp) return true;
+    if (latchPending && (flags & kNodeMechanism) != 0) return true;
+    if (namesPending && (flags & kNodeHangarLike) != 0) return true;
+    return false;
+}
+
+// Built v14.29: whether a pass is a full one. The pass of stamp S samples the near list, the own candidate and the ship tally every kSamplePass-th stamp,
+// and every stamp while sealed or while an engage is pending.
+constexpr uint32_t kSamplePass = 8;
+inline bool fullGatherPass(uint32_t stamp, bool gatherAll) noexcept { return gatherAll || (stamp % kSamplePass) == 0; }
 
 // Advances the state and returns the action (built v14.23: the game's pad state decides). Seal when the own pad is in the hangar by the game (r1 1,
 // fresh), the setting is on, Status says docked, the pad pick and cell are valid, and the camera is in the bay for kCameraFrames. Seal at once: no
