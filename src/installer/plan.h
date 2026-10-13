@@ -46,9 +46,12 @@ struct PayloadInfo {
     std::string openxrLoaderSha;
     bool        haveOpenxrLicense = false;
     std::string openxrLicenseSha;
-    // The shipped default settings of this edition: edvr.ini's text for VR,
-    // edvr-flat.ini's for flat (state.h: settingsLeafFor names the file it becomes).
+    // The shipped default settings, one text per settings file (state.h: settingsLeafFor
+    // names each). The VR edition carries edvr.ini; both editions carry edvr-flat.ini.
+    bool        haveIni = false;      // edvr.ini
     std::string iniText;
+    bool        haveFlatIni = false;  // edvr-flat.ini
+    std::string flatIniText;
 };
 
 // The folder as it is right now.

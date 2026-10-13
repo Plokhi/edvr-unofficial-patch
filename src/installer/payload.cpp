@@ -37,6 +37,7 @@ int idFor(const std::string& item) {
     if (item == "openxr_loader") return IDR_EDVR_OPENXR_LOADER;
     if (item == "openxr_license") return IDR_EDVR_OPENXR_LICENSE;
     if (item == "profile") return IDR_EDVR_PROFILE;
+    if (item == "flat_ini") return IDR_EDVR_FLAT_INI;
     return 0;
 }
 
@@ -87,8 +88,15 @@ const PayloadInfo& payloadInfo() {
         const bool license = payloadItem("openxr_license", &data, &size);
         p.nativePairValid = graphics && runtime && loader && license;
         if (license) { p.haveOpenxrLicense = true; p.openxrLicenseSha = sha256Bytes(data, size); }
-        if (payloadItem("ini", &data, &size)) {
+        // Resource 103 is edvr.ini in the VR edition. The flat edition carries its own file
+        // there too (package_native checks it), but its settings are the flat file, read below.
+        if (p.profile != "flat" && payloadItem("ini", &data, &size)) {
+            p.haveIni = true;
             p.iniText.assign(static_cast<const char*>(data), size);
+        }
+        if (payloadItem("flat_ini", &data, &size)) {
+            p.haveFlatIni = true;
+            p.flatIniText.assign(static_cast<const char*>(data), size);
         }
         if (payloadItem("profile", &data, &size)) {
             p.descriptorText.assign(static_cast<const char*>(data), size);
