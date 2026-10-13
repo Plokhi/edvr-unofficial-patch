@@ -2521,7 +2521,7 @@ REM build would accidentally load EDVR's proxy instead of the system DLL.
 cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /D_CRT_SECURE_NO_WARNINGS ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX %XESSFLAGS% /I"%GEN%" ^
     /Fo"%OBJ%\xess_engine_test\\" /Fe"%OBJ%\xess_engine_test\xess_engine_test.exe" ^
-    "tools\xess_engine_test\xess_engine_test.cpp" "src\d3d11\xess_engine.cpp" ^
+    "tools\xess_engine_test\xess_engine_test.cpp" "src\d3d11\xess_engine.cpp" "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
     /link /INCREMENTAL:NO d3d11.lib dxgi.lib
 if errorlevel 1 ( echo [edvr] ERROR: XeSS engine test build failed & exit /b 1 )
 copy /y "%BUILD%\libxess.dll" "%OBJ%\xess_engine_test\libxess.dll" >nul

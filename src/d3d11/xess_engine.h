@@ -42,4 +42,21 @@ bool xessTestFeatureLive(unsigned slot);
 // maximum CPU milliseconds per successful evaluate. False until the slot has evaluated, and in a build without the SDK.
 bool xessSlotTotals(unsigned slot, uint32_t* evaluations, uint32_t* resets, double* avgMs, double* maxMs);
 
+// Bridge timing (log only). Every 30 s, a slot that executed logs one line splitting the D3D11<->D3D12 bridge: the
+// D3D11 copy-in, wait and copy-out intervals, the D3D12 execute, and the whole D3D11 span, all from GPU timestamps read
+// without a CPU wait. Reads trail the GPU by a few evaluations; `unread` counts evaluations still waiting on it.
+struct XessBridgeTiming {
+    unsigned evals = 0;    // evaluations read in the window (the line's k)
+    unsigned unread = 0;   // evaluations whose timing had not been read when the line was made
+    unsigned d11Samples = 0, d12Samples = 0;
+    double copyInMedian = 0.0, copyInP95 = 0.0, waitMedian = 0.0, waitP95 = 0.0;
+    double executeMedian = 0.0, executeP95 = 0.0, copyOutMedian = 0.0, copyOutP95 = 0.0;
+    double totalMedian = 0.0, totalP95 = 0.0;
+    char line[512] = "";   // the text logged by the report
+};
+// Reads back whatever the GPU has finished, for every slot. Never waits. Returns the evaluations still unread.
+unsigned xessBridgeTimingSweep(ID3D11DeviceContext* context);
+// Logs and fills the slot's line now, then starts a new window. False when the slot has executed nothing in its window.
+bool xessBridgeTimingReport(ID3D11DeviceContext* context, unsigned slot, XessBridgeTiming* out);
+
 }  // namespace edvr

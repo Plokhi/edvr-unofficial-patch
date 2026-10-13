@@ -387,6 +387,54 @@ bool eyeAlternation(ID3D11Device* device, ID3D11DeviceContext* context) {
                  size, size, outSize, outSize);
     return true;
 }
+// Forty evaluations alternate over slots 0 and 1 at the eye size. Timing is read back without waiting, so the rig sweeps
+// (bounded) until nothing is unread, then reports each slot. Each slot must show both D3D11 and D3D12 samples, with
+// nonzero execute and wait medians.
+bool bridgeTiming(ID3D11Device* device, ID3D11DeviceContext* context) {
+    // A fresh window: the lines below cover only the evaluations of this case.
+    edvr::XessBridgeTiming discard;
+    for (unsigned slot = 0; slot < 2; ++slot) edvr::xessBridgeTimingReport(context, slot, &discard);
+    constexpr UINT size = 1000;
+    constexpr UINT outSize = 2000;
+    const UINT inBinds = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    const UINT outBinds = D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+    ComPtr<ID3D11Texture2D> color[2], depth[2], motion[2], output[2];
+    constexpr FLOAT lit[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    constexpr FLOAT farDepth[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        color[eye] = texture(device, size, size, DXGI_FORMAT_R8G8B8A8_UNORM, inBinds);
+        depth[eye] = texture(device, size, size, DXGI_FORMAT_R32_FLOAT, inBinds);
+        motion[eye] = texture(device, size, size, DXGI_FORMAT_R16G16_FLOAT, inBinds);
+        output[eye] = texture(device, outSize, outSize, DXGI_FORMAT_R8G8B8A8_UNORM, outBinds);
+        if (!check(color[eye] && depth[eye] && motion[eye] && output[eye], "create bridge timing textures")) return false;
+        if (!check(clear(device, context, color[eye].Get(), lit) &&
+                   clear(device, context, depth[eye].Get(), farDepth) &&
+                   clear(device, context, motion[eye].Get(), farDepth), "clear bridge timing inputs")) return false;
+    }
+    for (unsigned n = 0; n < 40; ++n) {
+        const unsigned eye = n % 2;
+        const char* why = nullptr;
+        if (!edvr::xessEvaluate(context, eye, color[eye].Get(), depth[eye].Get(), motion[eye].Get(),
+                                output[eye].Get(), size, size, outSize, outSize,
+                                0.0f, 0.0f, n < 2, false, &why)) {
+            std::fprintf(stderr, "xess_engine_test: bridge timing evaluation %u refused: %s\n", n,
+                         why ? why : "unspecified");
+            return check(false, "bridge timing evaluations pass");
+        }
+    }
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    while (edvr::xessBridgeTimingSweep(context) != 0 && GetTickCount64() < deadline) Sleep(2);
+    for (unsigned slot = 0; slot < 2; ++slot) {
+        edvr::XessBridgeTiming timing;
+        // The engine logs the line itself (timing.line holds the same text), so the build log carries the measured numbers.
+        if (!check(edvr::xessBridgeTimingReport(context, slot, &timing), "bridge timing reports slot")) return false;
+        if (!check(timing.d11Samples > 0 && timing.d12Samples > 0 &&
+                   timing.executeMedian > 0.0 && timing.waitMedian > 0.0,
+                   "bridge timing reads D3D11 and D3D12 with nonzero execute and wait")) return false;
+    }
+    std::fprintf(stderr, "xess_engine_test: PASS bridge timing, 40 evals on slots 0,1\n");
+    return true;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -443,7 +491,8 @@ int main(int argc, char** argv) {
     const bool recreated = good && flight(device.Get(), context.Get(), 640, 360, 1280, 720, true);
     const bool slots = recreated && slotIsolation(device.Get(), context.Get());
     const bool eyes = slots && eyeAlternation(device.Get(), context.Get());
-    const bool rebound = eyes && rebindAfterFailedFeature(device.Get(), context.Get());
+    const bool bridge = eyes && bridgeTiming(device.Get(), context.Get());
+    const bool rebound = bridge && rebindAfterFailedFeature(device.Get(), context.Get());
     edvr::xessShutdown();
     return rebound ? 0 : 1;
 }

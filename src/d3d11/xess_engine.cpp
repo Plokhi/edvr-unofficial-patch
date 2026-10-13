@@ -15,15 +15,19 @@
 #endif
 
 #if EDVR_HAVE_XESS
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <string>
+#include <vector>
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <xess/xess_d3d12.h>
+#include "gpu_timing.h"
 #include "xess_feature_latch.h"
 #include "xess_runtime_version.h"
 #include "temporal_shader_bytecode.h"
@@ -86,6 +90,40 @@ struct CommandSlot {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     uint64_t doneValue = 0;
+    // Bridge timing: two timestamps around xessD3D12Execute, resolved into this allocator's readback buffer. The buffer is
+    // mapped for the slot's life. timingPending is set once a list that resolves into it has been submitted, and cleared
+    // only after the fence has passed that submission, so the readback is never read early or read twice.
+    ComPtr<ID3D12QueryHeap> timingHeap;
+    ComPtr<ID3D12Resource> timingReadback;
+    const uint64_t* ticks = nullptr;
+    bool timingPending = false;
+};
+
+constexpr uint64_t kBridgeReportMs = 30000;   // one line per slot per window
+constexpr size_t kBridgeCap = 8192;           // samples kept per window and metric
+constexpr unsigned kBridgeSets = 4;           // D3D11 evaluations in flight per slot before timing goes untimed
+// D3D11 intervals per evaluation. kBridgeTotal spans all of them; the other three are its parts, in order.
+constexpr unsigned kBridgeTotal = 0, kBridgeCopyIn = 1, kBridgeWait = 2, kBridgeCopyOut = 3, kBridgeParts = 4;
+constexpr unsigned kBridgeAll = (1u << kBridgeParts) - 1;
+
+// One evaluation's D3D11 timers. Begun inside the temporal pass's own interval they borrow its disjoint scope, so the
+// nesting costs no second disjoint query. The set is read a few evaluations later, once every part is ready or invalid.
+struct BridgeSet {
+    GpuTimer timers[kBridgeParts];
+    bool inUse = false;
+    unsigned ready = 0;   // bit per part once read
+    bool invalid = false;
+    double ms[kBridgeParts] = {};
+};
+
+// The current window of one slot's bridge timing. Samples are milliseconds; `executed` counts evaluations that ran.
+struct BridgeWindow {
+    std::vector<double> parts[kBridgeParts];   // D3D11 samples, by part
+    std::vector<double> execute;               // D3D12 execute samples
+    uint64_t startedAt = 0;                    // GetTickCount64 at the window's first execution
+    unsigned executed = 0;
+    unsigned untimed = 0;                      // evaluations whose D3D11 set could not begin
+    unsigned invalid = 0;                      // timings read back invalid
 };
 
 struct Feature {
@@ -111,6 +149,10 @@ struct FeatureSlot {
     // The slot's price, as CPU time for each successful evaluate call (submission and its copies; the GPU is not timed).
     uint32_t evaluations = 0, resets = 0;
     double timeSumMs = 0.0, timeMaxMs = 0.0;
+    // Bridge timing lives per slot, so it outlives a feature rebuild. The sets are reset on the owner context at shutdown.
+    std::array<BridgeSet, kBridgeSets> bridge;
+    BridgeWindow window;
+    char d12Note[96] = "";   // why this slot's D3D12 execute timestamps are absent, when they are
 };
 
 struct State {
@@ -130,6 +172,7 @@ struct State {
     // One counter for every slot: all slots signal the one shared fence in this order, so a wait on a slot's own
     // value also covers the other slots' earlier work, and the value never goes backwards.
     uint64_t nextFenceValue = 0;
+    uint64_t d12TimestampHz = 0;   // queue ticks per second; 0 when the queue reports none (bridge timing then off)
     uint32_t evaluations = 0, resets = 0, failures = 0;
     bool untrackedSubmission = false;
     bool untrackedRefusalLogged = false;
@@ -200,6 +243,170 @@ bool waitFor(State& state, uint64_t value, const char** why, const char* stage) 
     return true;
 }
 
+// Bridge timing. Everything below reads results the GPU has already finished and waits on nothing.
+
+bool summarize(const std::vector<double>& samples, double& median, double& p95) {
+    if (samples.empty()) return false;
+    std::vector<double> sorted(samples);
+    std::sort(sorted.begin(), sorted.end());
+    const size_t n = sorted.size();
+    median = (n % 2) ? sorted[n / 2] : 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
+    p95 = sorted[(n * 95 + 99) / 100 - 1];   // nearest rank
+    return true;
+}
+
+void noteSample(std::vector<double>& samples, double ms) {
+    if (samples.size() < kBridgeCap) samples.push_back(ms);
+}
+
+// One allocator's execute timestamps, read once the fence has passed the submission that wrote them.
+void collectExecute(State& state, BridgeWindow& window, CommandSlot& command) {
+    if (!command.timingPending) return;
+    const uint64_t completed = state.fence12->GetCompletedValue();
+    if (completed == UINT64_MAX || command.doneValue > completed) return;
+    command.timingPending = false;
+    const uint64_t begin = command.ticks[0], end = command.ticks[1];
+    if (!state.d12TimestampHz || !begin || end < begin) {
+        ++window.invalid;
+        return;
+    }
+    noteSample(window.execute, double(end - begin) * 1000.0 / double(state.d12TimestampHz));
+}
+
+// Polls one slot's D3D11 sets without waiting. A set is read once all four parts are ready or invalid; until then it
+// stays in flight. Returns the sets still waiting on the GPU.
+unsigned pollBridge(ID3D11DeviceContext* context, FeatureSlot& holder) {
+    unsigned waiting = 0;
+    for (BridgeSet& set : holder.bridge) {
+        if (!set.inUse) continue;
+        for (unsigned part = 0; part < kBridgeParts; ++part) {
+            if (set.ready & (1u << part)) continue;
+            double ms = 0.0;
+            const GpuTimerPoll result = set.timers[part].poll(context, ms);
+            if (result == GpuTimerPoll::Pending) continue;
+            set.ready |= 1u << part;
+            if (result == GpuTimerPoll::Ready) set.ms[part] = ms;
+            else set.invalid = true;
+        }
+        if (set.ready != kBridgeAll) {
+            ++waiting;
+            continue;
+        }
+        set.inUse = false;
+        if (set.invalid) ++holder.window.invalid;
+        else for (unsigned part = 0; part < kBridgeParts; ++part) noteSample(holder.window.parts[part], set.ms[part]);
+    }
+    return waiting;
+}
+
+void sweepBridge(State& state, unsigned slot, ID3D11DeviceContext* context) {
+    FeatureSlot& holder = state.slots[slot];
+    if (holder.feature)
+        for (CommandSlot& command : holder.feature->commands) collectExecute(state, holder.window, command);
+    pollBridge(context, holder);
+}
+
+// Evaluations whose timing is still on the GPU: D3D11 sets not yet read, or D3D12 executes whose fence has not passed.
+unsigned bridgeUnread(const FeatureSlot& holder) {
+    unsigned sets = 0, executes = 0;
+    for (const BridgeSet& set : holder.bridge) sets += set.inUse ? 1u : 0u;
+    if (holder.feature)
+        for (const CommandSlot& command : holder.feature->commands) executes += command.timingPending ? 1u : 0u;
+    return sets > executes ? sets : executes;
+}
+
+void pairText(char* text, size_t size, bool has, double median, double p95) {
+    if (has) std::snprintf(text, size, "%.3f/%.3f", median, p95);
+    else std::snprintf(text, size, "n/a");
+}
+
+// Builds the slot's line from its window and starts a new window. Reads still outstanding count as unread and land in
+// the next window. An unavailable part is named, never printed as zero.
+void reportSlot(State& state, unsigned slot, XessBridgeTiming& out) {
+    FeatureSlot& holder = state.slots[slot];
+    BridgeWindow& window = holder.window;
+    double median[kBridgeParts] = {}, p95[kBridgeParts] = {};
+    bool has[kBridgeParts] = {};
+    for (unsigned part = 0; part < kBridgeParts; ++part)
+        has[part] = summarize(window.parts[part], median[part], p95[part]);
+    double executeMedian = 0.0, executeP95 = 0.0;
+    const bool hasExecute = summarize(window.execute, executeMedian, executeP95);
+
+    out = XessBridgeTiming{};
+    out.d11Samples = unsigned(window.parts[kBridgeTotal].size());
+    out.d12Samples = unsigned(window.execute.size());
+    out.evals = out.d11Samples > out.d12Samples ? out.d11Samples : out.d12Samples;
+    out.unread = bridgeUnread(holder);
+    out.copyInMedian = median[kBridgeCopyIn]; out.copyInP95 = p95[kBridgeCopyIn];
+    out.waitMedian = median[kBridgeWait];     out.waitP95 = p95[kBridgeWait];
+    out.executeMedian = executeMedian;        out.executeP95 = executeP95;
+    out.copyOutMedian = median[kBridgeCopyOut]; out.copyOutP95 = p95[kBridgeCopyOut];
+    out.totalMedian = median[kBridgeTotal];   out.totalP95 = p95[kBridgeTotal];
+
+    char copyIn[32], wait[32], execute[32], copyOut[32], total[32];
+    pairText(copyIn, sizeof copyIn, has[kBridgeCopyIn], median[kBridgeCopyIn], p95[kBridgeCopyIn]);
+    pairText(wait, sizeof wait, has[kBridgeWait], median[kBridgeWait], p95[kBridgeWait]);
+    pairText(execute, sizeof execute, hasExecute, executeMedian, executeP95);
+    pairText(copyOut, sizeof copyOut, has[kBridgeCopyOut], median[kBridgeCopyOut], p95[kBridgeCopyOut]);
+    pairText(total, sizeof total, has[kBridgeTotal], median[kBridgeTotal], p95[kBridgeTotal]);
+    std::string reasons;
+    if (window.untimed) reasons += ", d3d11 untimed " + std::to_string(window.untimed);
+    if (window.invalid) reasons += ", invalid " + std::to_string(window.invalid);
+    if (!hasExecute && holder.d12Note[0]) reasons += std::string(", d3d12 ") + holder.d12Note;
+    std::snprintf(out.line, sizeof out.line,
+                  "xess: slot=%u bridge timing over %u evals, ms median/p95: copy-in %s, wait %s, "
+                  "d3d12 execute %s, copy-out %s, d3d11 total %s (unread %u%s)",
+                  slot, out.evals, copyIn, wait, execute, copyOut, total, out.unread, reasons.c_str());
+    Log::get().note("%s", out.line);
+
+    for (std::vector<double>& samples : window.parts) samples.clear();
+    window.execute.clear();
+    window.startedAt = 0;
+    window.executed = 0;
+    window.untimed = 0;
+    window.invalid = 0;
+}
+
+// Starts an evaluation's D3D11 intervals: the whole bridge, then copy-in. A set that cannot begin counts as untimed and the
+// evaluation runs without one. Nothing here waits or flushes.
+BridgeSet* beginBridge(FeatureSlot& holder, ID3D11Device* device, ID3D11DeviceContext* context) {
+    for (BridgeSet& set : holder.bridge) {
+        if (set.inUse) continue;
+        if (!set.timers[kBridgeTotal].begin(device, context)) break;
+        set.inUse = true;
+        set.ready = 0;
+        set.invalid = false;
+        set.timers[kBridgeCopyIn].begin(device, context);   // a refused begin reads back Invalid
+        return &set;
+    }
+    ++holder.window.untimed;
+    return nullptr;
+}
+
+// Cancels an evaluation's D3D11 intervals when it fails before the whole bridge has ended, so no interval stays open on
+// the owner context. Disarmed once the whole bridge has ended; the set is then read by pollBridge.
+class BridgeGuard {
+    BridgeSet* set_;
+    ID3D11DeviceContext* context_;
+public:
+    BridgeGuard(BridgeSet* set, ID3D11DeviceContext* context) noexcept : set_(set), context_(context) {}
+    ~BridgeGuard() {
+        if (!set_) return;
+        for (unsigned part = kBridgeParts; part-- > 0;) set_->timers[part].reset(context_);
+        set_->inUse = false;
+    }
+    BridgeGuard(const BridgeGuard&) = delete;
+    BridgeGuard& operator=(const BridgeGuard&) = delete;
+    void disarm() noexcept { set_ = nullptr; }
+};
+
+// Resets every bridge timer on the owner context. Only a drained backend gets here, so no timer holds an open interval.
+void cancelBridgeTimers(State& state, ID3D11DeviceContext* context) {
+    for (FeatureSlot& holder : state.slots)
+        for (BridgeSet& set : holder.bridge)
+            for (unsigned part = kBridgeParts; part-- > 0;) set.timers[part].reset(context);
+}
+
 bool releaseSlot(State& state, unsigned slot, const char** why) {
     std::unique_ptr<Feature>& feature = state.slots[slot].feature;
     if (!feature) return true;
@@ -211,6 +418,8 @@ bool releaseSlot(State& state, unsigned slot, const char** why) {
         Log::get().note("xess: slot=%u destroy context rc=%d after %u evaluations", slot, int(rc), state.evaluations);
         feature->context = nullptr;
     }
+    // The fence has passed every submission, so their execute timestamps are final; read them before the readback goes.
+    for (CommandSlot& command : feature->commands) collectExecute(state, state.slots[slot].window, command);
     feature.reset();
     return true;
 }
@@ -316,6 +525,51 @@ bool qualityFor(State& state, Feature& feature, const char** why) {
     return true;
 }
 
+// The bridge's D3D12 timestamps for one allocator: a two-entry timestamp heap and a readback buffer for its resolve. A
+// failure leaves the allocator untimed and names the reason in the slot's note. It never fails the feature.
+void makeTiming(State& state, FeatureSlot& holder, CommandSlot& command) {
+    if (!state.d12TimestampHz) {
+        std::snprintf(holder.d12Note, sizeof(holder.d12Note), "queue reports no timestamp frequency");
+        return;
+    }
+    D3D12_QUERY_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heapDesc.Count = 2;
+    ComPtr<ID3D12QueryHeap> heap;
+    HRESULT hr = state.d12->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(heap.GetAddressOf()));
+    if (FAILED(hr)) {
+        std::snprintf(holder.d12Note, sizeof(holder.d12Note), "query heap failed 0x%08X", unsigned(hr));
+        return;
+    }
+    D3D12_HEAP_PROPERTIES readbackHeap{};
+    readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC readbackDesc{};
+    readbackDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readbackDesc.Width = 2 * sizeof(uint64_t);
+    readbackDesc.Height = 1;
+    readbackDesc.DepthOrArraySize = 1;
+    readbackDesc.MipLevels = 1;
+    readbackDesc.SampleDesc.Count = 1;
+    readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;
+    hr = state.d12->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc,
+                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_PPV_ARGS(readback.GetAddressOf()));
+    if (FAILED(hr)) {
+        std::snprintf(holder.d12Note, sizeof(holder.d12Note), "readback buffer failed 0x%08X", unsigned(hr));
+        return;
+    }
+    void* mapped = nullptr;
+    hr = readback->Map(0, nullptr, &mapped);
+    if (FAILED(hr) || !mapped) {
+        std::snprintf(holder.d12Note, sizeof(holder.d12Note), "readback map failed 0x%08X", unsigned(hr));
+        return;
+    }
+    command.timingHeap = heap;
+    command.timingReadback = readback;
+    command.ticks = static_cast<const uint64_t*>(mapped);
+}
+
 bool makeFeature(State& state, unsigned slot, uint32_t w, uint32_t h, uint32_t outW,
                  uint32_t outH, bool hdr, const char** why) {
     auto feature = std::make_unique<Feature>();
@@ -375,6 +629,7 @@ bool makeFeature(State& state, unsigned slot, uint32_t w, uint32_t h, uint32_t o
         }
         Log::get().note("xess: slot=%u HDR R11 matched SDK output -> FP16 target via precompiled copy shader", slot);
     }
+    state.slots[slot].d12Note[0] = '\0';
     for (CommandSlot& command : feature->commands) {
         HRESULT hr = state.d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                         IID_PPV_ARGS(command.allocator.GetAddressOf()));
@@ -394,6 +649,7 @@ bool makeFeature(State& state, unsigned slot, uint32_t w, uint32_t h, uint32_t o
             fail(why, "D3D12 initial command close failed 0x%08X", unsigned(hr));
             return abandon();
         }
+        makeTiming(state, state.slots[slot], command);
     }
     Log::get().note("xess: slot=%u three command allocators ready; backend feature established", slot);
     state.slots[slot].feature = std::move(feature);
@@ -573,6 +829,8 @@ bool xessAvailable(ID3D11Device* device, const char** why) {
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     hr = state->d12->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(state->queue.GetAddressOf()));
     if (FAILED(hr)) return fail(why, "D3D12 queue failed 0x%08X", unsigned(hr));
+    // The queue's timestamp ticks convert to milliseconds for bridge timing. A zero frequency switches that timing off.
+    if (FAILED(state->queue->GetTimestampFrequency(&state->d12TimestampHz))) state->d12TimestampHz = 0;
     hr = state->d12->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
                                 IID_PPV_ARGS(state->fence12.GetAddressOf()));
     if (FAILED(hr)) return fail(why, "D3D12 shared fence failed 0x%08X", unsigned(hr));
@@ -632,6 +890,12 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     ComPtr<ID3D11DeviceContext4> ctx4;
     HRESULT hr = context->QueryInterface(IID_PPV_ARGS(ctx4.GetAddressOf()));
     if (FAILED(hr)) return fail(why, "ID3D11DeviceContext4/Signal/Wait unavailable 0x%08X", unsigned(hr));
+    // Bridge timing is read here, between evaluations, from results the GPU has finished. Its 30 s line is due here too.
+    sweepBridge(state, slot, context);
+    if (holder.window.executed && GetTickCount64() - holder.window.startedAt >= kBridgeReportMs) {
+        XessBridgeTiming line;
+        reportSlot(state, slot, line);
+    }
     const DXGI_FORMAT colorFormat = hdr ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     if (!validateTexture(colour, width, height, colorFormat, "color", why) ||
         !validateTexture(depth, width, height, DXGI_FORMAT_R32_FLOAT, "depth", why) ||
@@ -666,6 +930,8 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     // The wait happens only when a command allocator is about to be reused;
     // normal producer/consumer ordering is entirely GPU-fence based.
     if (!waitFor(state, command.doneValue, why, "allocator reuse")) return false;
+    // The wait above has passed this allocator's last submission, so its timestamps are final before the reset reuses them.
+    collectExecute(state, holder.window, command);
     hr = command.allocator->Reset();
     if (FAILED(hr)) return fail(why, "D3D12 command allocator reset failed 0x%08X", unsigned(hr));
     hr = command.list->Reset(command.allocator.Get(), nullptr);
@@ -677,6 +943,9 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
         holder.failedFeature.record(key, keyWhy);
         return returnLatchedFailure(holder.failedFeature, why);
     }
+    // Bridge timing opens before the input copies: total, then copy-in. The guard cancels them on any failure below.
+    BridgeSet* bridge = beginBridge(holder, device.Get(), context);
+    BridgeGuard guard(bridge, context);
     context->CopyResource(feature.color.d11.Get(), colour);
     context->CopyResource(feature.motion.d11.Get(), motion);
     context->CopyResource(feature.depth.d11.Get(), depth);
@@ -690,6 +959,10 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
         state.untrackedSubmission = true;
         return fail(why, "D3D11 producer Signal(%llu) failed 0x%08X; resources retained",
                     static_cast<unsigned long long>(producer), unsigned(hr));
+    }
+    if (bridge) {   // copy-in ends after the Signal is enqueued; the wait starts there
+        bridge->timers[kBridgeCopyIn].end(context);
+        bridge->timers[kBridgeWait].begin(device.Get(), context);
     }
     context->Flush();
     feature.lastUseValue = producer;
@@ -722,6 +995,8 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     params.resetHistory = reset ? 1u : 0u;
     params.inputWidth = width;
     params.inputHeight = height;
+    // The two timestamps bracket xessD3D12Execute alone; the barriers around it are outside the measured span.
+    if (command.timingHeap.Get()) list->EndQuery(command.timingHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
     const xess_result_t rc = state.api.execute(feature.context, list, &params);
     if (rc != XESS_RESULT_SUCCESS) {
         ++state.failures;
@@ -733,6 +1008,11 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
             return fail(why, "xessD3D12Execute returned %d (frame %u)", int(rc), state.evaluations + 1);
         }
         return fail(why, "xessD3D12Execute returned %d (frame %u)", int(rc), state.evaluations + 1);
+    }
+    if (command.timingHeap.Get()) {
+        list->EndQuery(command.timingHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        list->ResolveQueryData(command.timingHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                               command.timingReadback.Get(), 0);
     }
     transition(list, feature.color.d12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_COMMON);
@@ -746,6 +1026,7 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     if (FAILED(hr)) return fail(why, "D3D12 XeSS command close failed 0x%08X", unsigned(hr));
     ID3D12CommandList* lists[] = {list};
     state.queue->ExecuteCommandLists(1, lists);
+    command.timingPending = command.timingHeap.Get() != nullptr;
     const uint64_t done = ++state.nextFenceValue;
     hr = state.queue->Signal(state.fence12.Get(), done);
     if (FAILED(hr)) {
@@ -758,6 +1039,10 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     hr = ctx4->Wait(state.fence11.Get(), done);
     if (FAILED(hr)) return fail(why, "D3D11 output Wait(%llu) failed 0x%08X",
                                 static_cast<unsigned long long>(done), unsigned(hr));
+    if (bridge) {   // the wait ends once the D3D12 signal has passed; copy-out starts there
+        bridge->timers[kBridgeWait].end(context);
+        bridge->timers[kBridgeCopyOut].begin(device.Get(), context);
+    }
     SharedTexture* const result[] = {&feature.output};
     if (!takeKeys(result, &keyWhy, "D3D11 output copy")) {
         holder.failedFeature.record(key, keyWhy);
@@ -770,6 +1055,11 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     } else {
         context->CopyResource(output, feature.output.d11.Get());
         giveKeys(result);
+    }
+    if (bridge) {   // copy-out and the whole bridge end after the output copy
+        bridge->timers[kBridgeCopyOut].end(context);
+        bridge->timers[kBridgeTotal].end(context);
+        guard.disarm();
     }
     const uint64_t consumer = ++state.nextFenceValue;
     hr = ctx4->Signal(state.fence11.Get(), consumer);
@@ -792,6 +1082,8 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     if (reset) ++holder.resets;
     holder.timeSumMs += ms;
     if (ms > holder.timeMaxMs) holder.timeMaxMs = ms;
+    if (!holder.window.executed) holder.window.startedAt = GetTickCount64();
+    ++holder.window.executed;
     ++state.evaluations;
     if (reset) ++state.resets;
     if (state.evaluations <= 3 || state.evaluations % 300 == 0)
@@ -833,6 +1125,8 @@ void xessShutdown() {
             // them here would be a use-after-free on a hung device.
             Log::get().note("xess: GPU did not drain; retaining backend objects until process exit");
         } else {
+            // A GpuTimer holds its queries and lease until its owner resets it; the owner context is the only one allowed to.
+            if (g_state->ownerContext.Get()) cancelBridgeTimers(*g_state, g_state->ownerContext.Get());
             delete g_state;
         }
         g_state = nullptr;
@@ -874,6 +1168,34 @@ bool xessSlotTotals(unsigned slot, uint32_t* evaluations, uint32_t* resets, doub
     return true;
 #else
     (void)slot; (void)evaluations; (void)resets; (void)avgMs; (void)maxMs;
+    return false;
+#endif
+}
+
+unsigned xessBridgeTimingSweep(ID3D11DeviceContext* context) {
+#if EDVR_HAVE_XESS
+    if (!g_state || !context) return 0;
+    unsigned unread = 0;
+    for (unsigned slot = 0; slot < kUpscalerSlots; ++slot) {
+        sweepBridge(*g_state, slot, context);
+        unread += bridgeUnread(g_state->slots[slot]);
+    }
+    return unread;
+#else
+    (void)context;
+    return 0;
+#endif
+}
+
+bool xessBridgeTimingReport(ID3D11DeviceContext* context, unsigned slot, XessBridgeTiming* out) {
+#if EDVR_HAVE_XESS
+    if (!g_state || !context || !out || slot >= kUpscalerSlots) return false;
+    sweepBridge(*g_state, slot, context);
+    if (!g_state->slots[slot].window.executed) return false;
+    reportSlot(*g_state, slot, *out);
+    return true;
+#else
+    (void)context; (void)slot; (void)out;
     return false;
 #endif
 }
