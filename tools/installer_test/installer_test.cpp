@@ -4871,6 +4871,24 @@ static void testFlatMirror(const std::wstring& scratch) {
         check(restoreFromMirror(wipedDir, basesInfo, "both", &notes), "a both restore of the bases succeeds");
         expectEq(readAll(baseIniPath(wipedDir)), "[base]\r\nshared = 1\r\n", "edvr.ini.base comes back");
         expectEq(readAll(flatBaseIniPath(wipedDir)), "[base]\r\nflat = 1\r\n", "and edvr-flat.ini.base");
+
+        // A folder missing only edvr.ini, with its record and both bases present: the mirror's older copies of those are not put over
+        // the current ones; only the missing settings file comes back.
+        const std::wstring partialDir = joinPath(scratch, L"bases-partial");
+        removeTree(partialDir);
+        makeTree(joinPath(partialDir, L"edvr_install"));
+        writeAll(joinPath(partialDir, L"edvr-flat.ini"), kFlatOwnIni);
+        writeAll(joinPath(partialDir, L"edvr_install\\edvr.ini.base"), "[base]\r\ncurrent = 1\r\n");
+        writeAll(joinPath(partialDir, L"edvr_install\\edvr-flat.ini.base"), "[base]\r\ncurrent flat = 1\r\n");
+        writeAll(joinPath(partialDir, L"edvr_install\\state.ini"), "[edvr]\r\nversion = current\r\n");
+        std::vector<std::string> partialNotes;
+        check(restoreFromMirror(partialDir, basesInfo, "both", &partialNotes),
+              "a both restore into a folder missing only edvr.ini succeeds");
+        expectEq(readAll(joinPath(partialDir, L"edvr.ini")), kSharedIni, "edvr.ini comes back");
+        expectEq(readAll(statePath(partialDir)), "[edvr]\r\nversion = current\r\n", "a present state.ini is kept byte for byte");
+        expectEq(readAll(baseIniPath(partialDir)), "[base]\r\ncurrent = 1\r\n", "a present edvr.ini.base is kept byte for byte");
+        expectEq(readAll(flatBaseIniPath(partialDir)), "[base]\r\ncurrent flat = 1\r\n", "a present edvr-flat.ini.base is kept byte for byte");
+        expectEq(readAll(joinPath(partialDir, L"edvr-flat.ini")), kFlatOwnIni, "and the present edvr-flat.ini is untouched");
     }
 }
 

@@ -106,8 +106,9 @@ MirrorResult updateMirrorIni(const std::wstring& gameDir, const std::wstring& mi
 // Copies the mirror back into a game folder that has lost its settings: the
 // newest copy of each settings file settingsToRestore names for `scope` -- never
 // a file the folder already has -- to the folder's root; edvr.ini.base,
-// edvr-flat.ini.base and state.ini into edvr_install\ (so the next install still
-// merges as an update instead of starting from scratch); and the backup pair into
+// edvr-flat.ini.base and state.ini into edvr_install\ where the folder lacks them
+// (so the next install still merges as an update instead of starting from
+// scratch; a present record or base is the current install's and is kept); and the backup pair into
 // a fresh edvr_backup\restored-<stamp>\ -- exactly where the installer's own scan
 // for a genuine original openvr_api.dll already looks.
 //

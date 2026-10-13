@@ -294,14 +294,18 @@ bool restoreFromMirror(const std::wstring& gameDir, const MirrorInfo& info, cons
     // putting into a folder that could not take its settings.
     if (!restoredAny) return false;
 
+    // The record and the bases are restored only where the folder lacks them. A
+    // present one is the current install's, and a mirror copy of it can be an
+    // older one whose hashes would fail the ownership proofs: a scope-based offer
+    // fires when only one settings file is missing, with the rest still there.
     if (info.hasBaseIni || info.hasFlatBaseIni || info.hasState) {
         if (ensureDirTree(stateDirPath(gameDir))) {
             bool copiedAny = false;
-            if (info.hasBaseIni)
+            if (info.hasBaseIni && !fileExists(baseIniPath(gameDir)))
                 copiedAny |= copyOver(joinPath(info.dir, kBaseIni), baseIniPath(gameDir));
-            if (info.hasFlatBaseIni)
+            if (info.hasFlatBaseIni && !fileExists(flatBaseIniPath(gameDir)))
                 copiedAny |= copyOver(joinPath(info.dir, kFlatBaseIni), flatBaseIniPath(gameDir));
-            if (info.hasState)
+            if (info.hasState && !fileExists(statePath(gameDir)))
                 copiedAny |= copyOver(joinPath(info.dir, kStateIni), statePath(gameDir));
             if (copiedAny) {
                 note("Restored the install record too, so this still merges as an update rather "
