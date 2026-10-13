@@ -9737,11 +9737,19 @@ WATCH_OPENVR_RE = re.compile(r"^mode watch: openvr_api\.dll (?P<state>loaded|unl
 # The eye-submit transitions: a second with none after one with some (stopped), and the reverse (resumed, with that second's count).
 WATCH_SUBMIT_STOP_RE = re.compile(r"^mode watch: eye submits stopped t=(?P<t>\d+)$")
 WATCH_SUBMIT_RESUME_RE = re.compile(r"^mode watch: eye submits resumed t=(?P<t>\d+) \((?P<n>\d+)/s\)$")
+# One kept setting in the switch line: key=value in effect (new: value in the file now), as mode_watch.cpp's commit writes it.
+KEPT_ITEM = r"[\w.]+=\S+ \(new: \S+\)"
 SWITCH_RES = (
+    # The live switch (phase 2). `kept` lists the patched settings whose file value now differs from the launch's, or none.
+    ("switched", re.compile(
+        r"^profile switch: (?P<cur>flat|vr|passthrough) -> (?P<target>flat|vr|passthrough) \(posted (?P<cls>flat|vr) t=(?P<t>\d+) from "
+        r"(?P<src>file|live-rise); settings (?P<ini>[\w.-]+)(?P<missing> \(not found: defaults\))?; kept until restart: "
+        r"(?P<kept>none|" + KEPT_ITEM + r"(?:, " + KEPT_ITEM + r")*)\)$")),
+    ("stays", re.compile(
+        r"^profile switch: none, stays (?P<cur>flat|vr|passthrough) \(posted (?P<cls>flat|vr) t=(?P<t>\d+) from (?P<src>file|live-rise)\)$")),
+    # Phase 1's lines, which an older build wrote: kept so an older log still reads.
     ("passthrough until restart", re.compile(
         r"^profile switch: none, passthrough until restart \(posted (?P<cls>flat|vr) t=(?P<t>\d+) from (?P<src>file|live-rise)\)$")),
-    ("stays", re.compile(
-        r"^profile switch: none, stays (?P<cur>flat|vr) \(posted (?P<cls>flat|vr) t=(?P<t>\d+) from (?P<src>file|live-rise)\)$")),
     ("to passthrough", re.compile(
         r"^profile switch: (?P<cur>flat|vr) -> passthrough \(posted (?P<cls>flat|vr) t=(?P<t>\d+) from (?P<src>file|live-rise);"
         r" this build does not switch live: restart Elite to run the (?P<target>flat|vr|passthrough) profile\)$")),
@@ -9820,7 +9828,14 @@ def _switch_event(body):
     for result, rx in SWITCH_RES:
         m = rx.match(body)
         if m:
-            return {"kind": "switch", "t": int(m.group("t")), "result": result, "posted": m.group("cls"), "src": m.group("src")}
+            ev = {"kind": "switch", "t": int(m.group("t")), "result": result, "posted": m.group("cls"), "src": m.group("src")}
+            if "cur" in rx.groupindex:
+                ev["cur"] = m.group("cur")
+            if "kept" in rx.groupindex:
+                # The live switch's own fields: the target, the settings file it read (and whether it was missing), and the kept settings.
+                ev.update(target=m.group("target"), ini=m.group("ini"), missing=m.group("missing") is not None,
+                          kept=[] if m.group("kept") == "none" else m.group("kept").split(", "))
+            return ev
     if SWAP_RE.match(body):
         return {"kind": "swap", "t": None}
     if body.startswith(("mode watch: ", "profile switch: ")):
@@ -10395,6 +10410,49 @@ def self_test_switches():
             print_switches(submit)
         if "eye submits: 1 stopped, 1 resumed" not in shown.getvalue():
             fail("--switches summary lacks the eye-submit counts: %r" % shown.getvalue()[-300:])
+
+    # The live switch's line (mode_watch.cpp's commit, phase 2): with kept settings, with none and from a live rise, from a missing file, the
+    # stays and refused lines, and a kept list that does not parse (a note, so drift shows in the table).
+    live = "\n".join([
+        "[00:00:00.020] mode watch: started on C:\\Game\\Options\\Graphics; launch file mode 4 (vr); scope both",
+        "[00:00:02.130] mode watch: read t=2130 mode 0 -> posted flat (eye submits last 1 s: 0)",
+        "[00:00:02.130] profile switch: vr -> flat (posted flat t=2130 from file; settings edvr-flat.ini; kept until restart: "
+        "advanced.texture_anisotropy=0 (new: 8), fix.vscreen_res_width=auto (new: 2880))",
+        "[00:00:03.000] mode watch: read t=3000 mode 4 -> posted vr (eye submits last 1 s: 0)",
+        "[00:00:03.000] profile switch: flat -> vr (posted vr t=3000 from live-rise; settings edvr.ini; kept until restart: none)",
+        "[00:00:04.000] mode watch: read t=4000 mode 0 -> posted flat (eye submits last 1 s: 0)",
+        "[00:00:04.000] profile switch: vr -> flat (posted flat t=4000 from file; settings edvr-flat.ini (not found: defaults); "
+        "kept until restart: none)",
+        "[00:00:05.000] profile switch: none, stays passthrough (posted vr t=5000 from file)",
+        "[00:00:06.000] profile switch: flat refused, ResizeBuffers was not hooked this session (posted flat t=6000 from file); the switch runs "
+        "as passthrough",
+        "[00:00:07.000] profile switch: vr -> flat (posted flat t=7000 from file; settings edvr-flat.ini; kept until restart: "
+        "advanced.texture_anisotropy=0)",
+        "",
+    ])
+    lrows = switch_rows(switch_events(live))
+    lkinds = [r["kind"] for r in lrows]
+    if lkinds != ["start", "read", "switch", "read", "switch", "read", "switch", "switch", "note", "note"]:
+        fail("live switch kinds %r" % lkinds)
+    else:
+        first, second, third, stays = lrows[2], lrows[4], lrows[6], lrows[7]
+        if (first["result"], first["cur"], first["target"], first["ini"], first["missing"], first["posted"], first["src"]) != (
+                "switched", "vr", "flat", "edvr-flat.ini", False, "flat", "file") \
+                or first["kept"] != ["advanced.texture_anisotropy=0 (new: 8)", "fix.vscreen_res_width=auto (new: 2880)"]:
+            fail("live switch with kept settings parsed as %r" % first)
+        if second["result"] != "switched" or second["src"] != "live-rise" or second["kept"] != [] or second["ini"] != "edvr.ini":
+            fail("live switch with no kept settings parsed as %r" % second)
+        if third["result"] != "switched" or third["missing"] is not True or third["ini"] != "edvr-flat.ini":
+            fail("live switch from a missing file parsed as %r" % third)
+        if stays["result"] != "stays" or stays["cur"] != "passthrough" or stays["posted"] != "vr":
+            fail("stays passthrough parsed as %r" % stays)
+        if lrows[8]["kind"] != "note" or lrows[9]["kind"] != "note":
+            fail("refused or malformed switch lines parsed as %r and %r" % (lrows[8], lrows[9]))
+        shown = io.StringIO()
+        with contextlib.redirect_stdout(shown):
+            print_switches(live)
+        if "switches: 4 (switched 3, stays 1)" not in shown.getvalue():
+            fail("--switches summary lacks the live switch counts: %r" % shown.getvalue()[-400:])
 
     tmp = tempfile.mkdtemp(prefix="edvr_switches_test_")
     try:

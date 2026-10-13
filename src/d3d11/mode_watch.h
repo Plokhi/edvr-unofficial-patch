@@ -1,7 +1,6 @@
-// The mode watch (docs\design-unified-install-2026-10-12.md section 3.2): Elite's Settings.xml is read when it is written, and a
-// confirmed change to the 3D mode is posted to the render thread, which at the frame boundary drops EDVR to Passthrough and asks the
-// user to restart. Phase 1 is log-only in the sense that it never switches live into the other profile. mode_watch_logic.h holds the
-// rules; mode_watch.cpp holds the worker, the log lines and the commit.
+// The mode watch (docs\design-unified-install-2026-10-12.md sections 3.2 and 3.3): Elite's Settings.xml is read when it is written, and
+// a confirmed change to the 3D mode is posted to the render thread, which at the frame boundary switches EDVR's profile live. mode_watch_logic.h
+// holds the rules; mode_watch.cpp holds the worker, the log lines and the commit.
 #pragma once
 
 #include <cstddef>

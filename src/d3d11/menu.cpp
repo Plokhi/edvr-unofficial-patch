@@ -4247,7 +4247,7 @@ void menuTick(ID3D11Device* dev) {
             }
         }
 
-        // The 3D mode watch (mode_watch.h): a commit that drops EDVR to Passthrough says once, as a toast, that Elite must restart.
+        // The 3D mode watch (mode_watch.h): a commit says once, as a toast, which profile EDVR is running now, or that it is paused.
         {
             char modeToast[160];
             if (modeWatchNoticeDue(modeToast, sizeof(modeToast))) {

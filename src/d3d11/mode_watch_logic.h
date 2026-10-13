@@ -1,6 +1,6 @@
 // The mode watch's decisions: when a read of Settings.xml posts a 3D mode change, and when a live runtime posts Vr. Pure and free of any
-// Windows API, so tools\mode_watch_test drives every rule here; mode_watch.cpp owns the files, the threads and the log. Phase 1 only
-// logs what these decisions say (docs\design-unified-install-2026-10-12.md section 3.2). The one-read-later rule follows the Bindings
+// Windows API, so tools\mode_watch_test drives every rule here; mode_watch.cpp owns the files, the threads and the log. The decisions
+// are what the commit switches on (docs\design-unified-install-2026-10-12.md section 3.2). The one-read-later rule follows the Bindings
 // poll's two-check rule (device_hook.cpp).
 #pragma once
 

@@ -1,15 +1,25 @@
 // The mode watch's worker and its commit (mode_watch.h says what the API is; mode_watch_logic.h holds the rules). The worker owns the
-// files, the wait and the log lines; the rules see none of it. Design: docs\design-unified-install-2026-10-12.md sections 3.2 and 3.3.
+// files, the wait and the log lines; the rules see none of it. The commit switches the profile live, at the frame boundary. Design:
+// docs\design-unified-install-2026-10-12.md sections 3.2 to 3.4.
 #include "mode_watch.h"
 
+#include "device_hook.h"        // flatSwitchAvailable, deviceHookRequestConfigRefresh: the switch's gate and its forced configure sweep
+#include "dlaa.h"               // dlaaReleaseForSwitch: DLSS features released, NGX kept
+#include "engine_velocity.h"    // engineVelocityFlatAbandon: the flat teardown's velocity state
 #include "flat_runtime.h"       // flatRuntimeResize: the flat teardown, run before a commit leaves flat
+#include "fsr3_engine.h"        // fsr3ReleaseFeatures: FSR's features, released at every switch
+#include "menu.h"               // menuProfileSwitch: the menu closes and forgets the outgoing profile's first-time block
 #include "mode_watch_logic.h"
+#include "ui_layer.h"           // uiLayerProfileSwitch: the VR UI layers, torn down before a commit leaves VR
+#include "vr_ssaa_hold.h"       // vrSsaaHoldProfileChanged: the Supersampling hold follows the profile
 
+#include "../common/config.h"
 #include "../common/install_scope.h"
 #include "../common/log.h"
 #include "../common/native_frame.h"           // nativeFrameLatchedFrames: the eye-submit count the watch samples
 #include "../common/native_render_settings.h"  // edvrQueryNativeRenderSizing: the runtime's live VR session
 #include "../common/runtime_profile.h"
+#include "../common/temporal_mode.h"          // temporalModeEnabled: the LOD bias default follows fix.temporal_aa
 
 #include <windows.h>
 
@@ -313,36 +323,97 @@ private:
     bool flowing_ = false;
 };
 
-// The render thread's commit: the posted mode becomes the profile it selects, or a log line and a notice when this build does not
-// switch live. Phase 1 never moves into the other profile; it drops to Passthrough and asks for a restart.
+// The settings patched into the game or the device at creation (design section 3.4, Q7). They keep the launch's values until the next
+// launch, so the switch line names each one whose value in the file now differs from the value in effect.
+constexpr size_t kPatchedCount = 3;
+const char* const kPatchedKeys[kPatchedCount] = {"advanced.texture_anisotropy", "advanced.texture_lod_bias", "fix.vscreen_res_width"};
+// The values in effect, read once in modeWatchStart (after Config::init, before the device exists). Never updated: a switch changes the
+// file's values, not the game's.
+std::string g_inEffect[kPatchedCount];
+
+// The effective value of each patched setting under the active profile, with the defaults of the sites that read them
+// (device_hook.cpp's texture sampler, vscreen_res.cpp's width).
+void readPatched(std::string* out) {
+    const Config& cfg = Config::get();
+    const bool temporal = temporalModeEnabled(cfg.getString("fix.temporal_aa", "off"));
+    out[0] = cfg.getString(kPatchedKeys[0], "0");
+    out[1] = cfg.getString(kPatchedKeys[1], temporal ? "auto" : "0");
+    out[2] = cfg.getString(kPatchedKeys[2], "auto");
+}
+
+// The render thread's commit (design section 3.3): the posted mode becomes the profile it selects. The outgoing profile is torn down while
+// its predicates still answer true, the profile flips, the settings file is re-picked, and the configure sweep is forced for later in
+// this same frame boundary.
 void commitPosted(uint64_t packed) {
     const GameMode mode = (packed & kVrBit) ? GameMode::Vr : GameMode::Flat;
     const bool live = (packed & kLiveBit) != 0;
     const unsigned long long t = static_cast<unsigned long long>(packed >> kTimeShift);
     const char* cls = gameModeName(mode);
     const char* from = live ? "live-rise" : "file";
-    const RuntimeProfile target = activeProfileFor(runtimeInstallScope(), mode);
     RuntimeProfile cur = runtimeProfileValue();
     if (cur == RuntimeProfile::LegacyVr) cur = RuntimeProfile::Vr;
-
-    char line[400];
-    if (cur == RuntimeProfile::Passthrough) {
-        std::snprintf(line, sizeof(line), "profile switch: none, passthrough until restart (posted %s t=%llu from %s)", cls, t, from);
-    } else if (target == cur) {
-        std::snprintf(line, sizeof(line), "profile switch: none, stays %s (posted %s t=%llu from %s)", profileWord(cur), cls, t, from);
-    } else {
-        // Flat's teardown runs while the flat predicate still answers true, before the profile flips (design section 3.3).
-        if (cur == RuntimeProfile::Flat) flatRuntimeResize();
-        runtimeProfileSet(RuntimeProfile::Passthrough);
-        std::snprintf(line, sizeof(line),
-                      "profile switch: %s -> passthrough (posted %s t=%llu from %s; this build does not switch live: restart Elite to run "
-                      "the %s profile)",
-                      profileWord(cur), cls, t, from, profileWord(target));
-        if (target == RuntimeProfile::Passthrough) setNotice("EDVR is paused until Elite restarts");
-        else if (target == RuntimeProfile::Vr) setNotice("Elite's 3D mode changed: restart Elite for EDVR's VR fixes");
-        else setNotice("Elite's 3D mode changed: restart Elite for EDVR's flat fixes");
+    RuntimeProfile target = activeProfileFor(runtimeInstallScope(), mode);
+    // Without the ResizeBuffers hook the flat profile cannot run this session (device_hook.cpp hookSwapChain): the switch runs as passthrough.
+    const bool flatRefused = target == RuntimeProfile::Flat && !flatSwitchAvailable();
+    if (flatRefused) {
+        target = RuntimeProfile::Passthrough;
+        // The "profile switch: " prefix makes --switches show it as a note row beside the switch line (tools\edvr_log.py).
+        Log::get().note("profile switch: flat refused, ResizeBuffers was not hooked this session (posted %s t=%llu from %s); the switch runs "
+                        "as passthrough",
+                        cls, t, from);
     }
+
+    char line[640];
+    if (target == cur) {
+        std::snprintf(line, sizeof(line), "profile switch: none, stays %s (posted %s t=%llu from %s)", profileWord(cur), cls, t, from);
+        Log::get().note("%s", line);
+        return;
+    }
+
+    // Teardown, while the outgoing profile's predicates still answer true (design section 3.3). Every switch releases the DLSS and FSR
+    // features and closes the menu; the flat and VR parts are the outgoing profile's own.
+    if (cur == RuntimeProfile::Flat) {
+        flatRuntimeResize();
+        engineVelocityFlatAbandon();
+    } else if (cur == RuntimeProfile::Vr) {
+        uiLayerProfileSwitch();
+    }
+    dlaaReleaseForSwitch();
+    fsr3ReleaseFeatures();
+    menuProfileSwitch();
+
+    runtimeProfileSet(target);
+    Config::get().switchProfile();
+    vrSsaaHoldProfileChanged();
+    deviceHookRequestConfigRefresh();  // the forced configure sweep runs later in this presentFrameBoundary
+
+    std::string now[kPatchedCount];
+    readPatched(now);
+    std::string kept;
+    for (size_t i = 0; i < kPatchedCount; ++i) {
+        if (now[i] == g_inEffect[i]) continue;
+        if (!kept.empty()) kept += ", ";
+        kept += kPatchedKeys[i];
+        kept += "=" + g_inEffect[i] + " (new: " + now[i] + ")";
+    }
+    // A missing file reads as defaults (Config::switchProfile), which is not what the user's settings say: the line says so.
+    const bool found = GetFileAttributesW(Config::get().path().c_str()) != INVALID_FILE_ATTRIBUTES;
+    std::snprintf(line, sizeof(line), "profile switch: %s -> %s (posted %s t=%llu from %s; settings %s%s; kept until restart: %s)",
+                  profileWord(cur), profileWord(target), cls, t, from, Config::get().iniName(), found ? "" : " (not found: defaults)",
+                  kept.empty() ? "none" : kept.c_str());
     Log::get().note("%s", line);
+
+    if (target == RuntimeProfile::Vr) {
+        setNotice("EDVR switched to its VR fixes");
+    } else if (target == RuntimeProfile::Flat) {
+        setNotice("EDVR switched to its flat fixes");
+    } else if (flatRefused) {
+        setNotice("EDVR is paused: its flat fixes are unavailable this session");
+    } else {
+        char notice[96];
+        std::snprintf(notice, sizeof(notice), "EDVR is paused: this install does not include %s", mode == GameMode::Vr ? "vr" : "flat");
+        setNotice(notice);
+    }
 }
 
 }  // namespace
@@ -350,6 +421,7 @@ void commitPosted(uint64_t packed) {
 void modeWatchStart() {
     if (runtimeProfileValue() == RuntimeProfile::Invalid) return;
     if (g_startCalled.exchange(true)) return;
+    readPatched(g_inEffect);  // the launch's values: what device creation reads, before any switch can change the file's
 
     const ModeRead launch = runtimeLaunchRead();
     const std::wstring& path = runtimeSettingsPathWide();
