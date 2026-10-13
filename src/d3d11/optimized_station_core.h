@@ -995,10 +995,19 @@ inline Cull cullRecordFaultSafe(Mem& m, CullField* failed, uint64_t* value) noex
 // sources), so a frame shift of pad and shell together leaves it unchanged. Lowered pads read about -45 m (small) and -89 m (medium) above the shell;
 // raised pads +35 m and +76 m (the v13.9 data).
 constexpr float kLoweredM = -10.0f;
-// Still: the height above the shell changes less than kSealStillM over kSealDelayMs before the seal. kSealDelayMs is the hatch's close time: a guess
-// (6 s) that the maintainer will measure in flight. Change it here and nowhere else.
+// Still (the first-frame reading against the pad's height above the shell): the height changes less than kSealStillM, not a settle.
 constexpr float kSealStillM = 0.2f;
-constexpr uint64_t kSealDelayMs = 6000;
+// Built v14.10: the bay settles. After a descent the seal waits for the watched records (the structures in the bay) to stay still for kBayStillMs
+// with the pad lowered; a fallback seals kBayStillTimeoutMs after the pad lowered (a bay that never settles). Measured per bay: no timing guess.
+constexpr uint64_t kBayStillMs = 2000;
+constexpr uint64_t kBayStillTimeoutMs = 30000;
+// The watch: a record is watched inside the candidate box with radius >= kBayWatchMinM. It moved when its centre relative to the shell moved more
+// than kBayPosM, or its orientation rotated more than kBayRotDeg. A record moving on most frames of a 10 s window is continuous and ignored.
+constexpr float kBayWatchMinM = 5.0f;
+constexpr float kBayPosM = 0.03f;
+constexpr float kBayRotDeg = 0.5f;
+constexpr uint64_t kContinuousWindowMs = 10000;
+constexpr uint32_t kContinuousMinFrames = 10;
 // The camera has left the held box by more than this: the seal is released (riding the elevator down, an external camera flying out).
 constexpr float kCameraLeaveM = 2.0f;
 // Built v14.7: the camera counts in both directions over this many consecutive frames: it must be outside the held box for this long to release,
@@ -1013,6 +1022,7 @@ struct SealInputs {
     bool docked = false;         // Status.json Flags bit 0
     bool pickOk = false;         // the own pad is found this frame, with a pose
     bool padHeld = false;        // built v14.9: the own pad is absent this frame, held for fewer than kHeldLostFrames: the trigger keeps its state
+    uint64_t bayLastMotionMs = 0;  // built v14.10: the last time a watched, non-continuous record moved (0: none); the bay's quiet time
     float rel = 0.0f;            // the pad's height above the hangar shell along its up axis now (metres; frame-independent)
     bool relOk = false;          // rel is readable this frame (an unreadable frame holds the trigger's state)
     bool sourceChanged = false;  // a centre source changed since the last reading: the still test restarts, the motion reference follows
@@ -1027,13 +1037,10 @@ struct SealInputs {
 };
 
 struct SealState {
-    bool stillValid = false;     // the stillness timer is running
-    float anchor = 0.0f;         // the height above the shell when the timer last restarted
-    uint64_t stillSinceMs = 0;   // when the timer last restarted
-    bool requested = false;      // one engage per still period
-    bool immediate = false;      // the request in force was made at load-in (no descent observed): the delay did not apply
-    // Built v14.3 (the load-in rule): the own pad in hand, its height above the shell when first seen, and whether it has moved off that height since
-    // (a descent observed this session). The memory is per pad and survives a release; a release by motion counts as a descent.
+    bool requested = false;      // one engage per seal (cleared by a release or the trigger lapsing)
+    bool immediate = false;      // the request in force was made at load-in (no descent observed)
+    bool fallback = false;       // the request in force came from the bay fallback (the bay never settled)
+    // Built v14.3 (the load-in rule): the own pad in hand, its height above the shell when first seen, and whether it has moved off that height since.
     bool seen = false;
     uintptr_t padAddr = 0;
     float firstRel = 0.0f;
@@ -1041,13 +1048,18 @@ struct SealState {
     // Built v14.7: consecutive frames the camera has been outside the held box (camOutRun) or inside the bay (camInRun; starts satisfied).
     uint32_t camOutRun = 0;
     uint32_t camInRun = kCameraFrames;
+    // Built v14.10: the pad lowered (the bay clock starts here; cleared when it is not lowered).
+    bool lowerSet = false;
+    uint64_t lowerSinceMs = 0;
 };
 
 // A release, or the trigger lapsing: the trigger starts again, the pad's motion memory stays (a pad that has descended still waits its delay).
 inline void clearTrigger(SealState* st) noexcept {
-    st->stillValid = false;
     st->requested = false;
     st->immediate = false;
+    st->fallback = false;
+    st->lowerSet = false;
+    st->lowerSinceMs = 0;
 }
 
 // Built v14.5: the centre sources a height was read from. A change is a different reading: the still test restarts.
@@ -1107,6 +1119,54 @@ struct ShipWatch {
     }
 };
 
+// Built v14.10: the continuous-mover window. Over a window of kContinuousWindowMs, a record that moved on more than 80% of its compared frames (at least
+// kContinuousMinFrames of them) is continuous. step() returns true once, when the record becomes continuous.
+struct MoverWindow {
+    bool started = false;
+    uint64_t startMs = 0;
+    uint32_t seen = 0;
+    uint32_t moved = 0;
+    bool continuous = false;
+    bool step(bool movedNow, uint64_t nowMs) noexcept {
+        if (continuous) return false;
+        if (!started) {
+            started = true;
+            startMs = nowMs;
+        }
+        ++seen;
+        if (movedNow) ++moved;
+        if (nowMs < startMs + kContinuousWindowMs) return false;
+        const bool cont = seen >= kContinuousMinFrames && moved * 10u > seen * 8u;
+        startMs = nowMs;
+        seen = 0;
+        moved = 0;
+        if (cont) {
+            continuous = true;
+            return true;
+        }
+        return false;
+    }
+};
+
+// Built v14.10: the angle between two unit axes, degrees.
+inline float axisAngleDeg(const float a[3], const float b[3]) noexcept {
+    float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    if (d > 1.0f) d = 1.0f;
+    if (d < -1.0f) d = -1.0f;
+    return std::acos(d) * 57.29578f;
+}
+
+// Built v14.10: a watched record moved between two frames: its centre relative to the shell moved more than kBayPosM, or an axis rotated more than
+// kBayRotDeg. Relative centres, so a frame shift of the record and the shell together is not motion.
+inline bool poseMoved(const float prevRel[3], const float rel[3], const float prevA0[3], const float a0[3], const float prevA2[3],
+                      const float a2[3]) noexcept {
+    const float dx = rel[0] - prevRel[0];
+    const float dy = rel[1] - prevRel[1];
+    const float dz = rel[2] - prevRel[2];
+    if (std::sqrt(dx * dx + dy * dy + dz * dz) > kBayPosM) return true;
+    return axisAngleDeg(prevA0, a0) > kBayRotDeg || axisAngleDeg(prevA2, a2) > kBayRotDeg;
+}
+
 // Advances the state and returns the action. With kRelease, *why says which rule released (the order of the brief: setting off, undocked,
 // Explorer Cam, camera left, pad moved, hangar changed, launch). A pad first seen lowered with no descent observed seals on the first eligible
 // frame (the load-in rule, v14.3); after an observed descent the still delay applies. A raised pad never seals. The camera must be in the bay.
@@ -1149,7 +1209,7 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         clearTrigger(st);
         return SealAction::kNone;
     }
-    if (!in.pickOk) {   // built v14.9: a short absence keeps the last reading and the still clock (the hangar-change rule is unchanged)
+    if (!in.pickOk) {   // built v14.9: a short absence keeps the last reading and the bay clock
         if (in.padHeld) return SealAction::kNone;
         clearTrigger(st);
         return SealAction::kNone;
@@ -1168,26 +1228,26 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         clearTrigger(st);
         return SealAction::kNone;
     }
+    if (!st->lowerSet) {
+        st->lowerSet = true;
+        st->lowerSinceMs = in.nowMs;
+    }
+    if (st->requested) return SealAction::kNone;
     if (!st->moved) {   // load-in: no descent observed, the pad rests lowered: seal at the first eligible frame
-        if (st->requested) return SealAction::kNone;
         st->requested = true;
         st->immediate = true;
         return SealAction::kRequestEngage;
     }
-    if (in.sourceChanged && st->stillValid) st->anchor = in.rel;   // a new centre source re-bases the reading; the still clock keeps running (built v14.8)
-    if (!st->stillValid || std::fabs(in.rel - st->anchor) > kSealStillM) {
-        st->stillValid = true;
-        st->anchor = in.rel;
-        st->stillSinceMs = in.nowMs;
-        st->requested = false;
-        st->immediate = false;
-    }
-    if (!st->requested && in.nowMs - st->stillSinceMs >= kSealDelayMs) {
-        st->requested = true;
-        st->immediate = false;
-        return SealAction::kRequestEngage;
-    }
-    return SealAction::kNone;
+    // After a descent: the bay is settled when no watched record has moved for kBayStillMs with the pad lowered; the fallback seals
+    // kBayStillTimeoutMs after the pad lowered, when the bay never settles.
+    const uint64_t quietSince = in.bayLastMotionMs > st->lowerSinceMs ? in.bayLastMotionMs : st->lowerSinceMs;
+    const bool settled = in.nowMs >= quietSince + kBayStillMs;
+    const bool timedOut = in.nowMs >= st->lowerSinceMs + kBayStillTimeoutMs;
+    if (!settled && !timedOut) return SealAction::kNone;
+    st->requested = true;
+    st->immediate = false;
+    st->fallback = !settled;
+    return SealAction::kRequestEngage;
 }
 
 // Built v14.4 (the flicker fix): the pad's motion against its shell, measured along the shaft. The reference is captured ONCE, at the first sample after
@@ -1340,7 +1400,8 @@ struct WaitView {
     bool lowered = false;       // the pad is lowered: its height above the shell is below kLoweredM (built v14.5)
     float relM = 0.0f;          // the pad's height above the shell along its up axis, metres
     bool relOk = false;         // relM is readable this frame
-    float stillS = 0.0f;        // seconds the stillness timer has run
+    float bayStillS = 0.0f;     // seconds since the watched records last moved (or the pad lowered): the bay's quiet time (built v14.10)
+    char movers[160] = {};      // up to three watched records that moved in the last 2 s
     bool cellBuilt = false;     // the pad's cell can be built (a pad with a radius and a readable height)
     char cellReason[96] = {};   // when not built: why
     // Built v14.2: the evidence (what the gather saw). gathered: store records the observer took last frame; padCount: own-pad records in hand;
@@ -1385,8 +1446,8 @@ inline void waitingLine(const WaitView& w, float delayS, char* out, size_t cap) 
     char lowerText[64] = {};
     if (!w.relOk) std::snprintf(lowerText, sizeof(lowerText), "unknown");
     else std::snprintf(lowerText, sizeof(lowerText), "%s (%.1f m above the shell)", w.lowered ? "yes" : "no", static_cast<double>(w.relM));
-    std::snprintf(out, cap, "optimized station: waiting (docked=%s, pad=%s, lowered=%s, still for %.1f of %.0f s, cell=%s; descent=%s; gathered=%u, camera=%s, pads=%u [%s])",
-                  docked, w.havePad ? w.padName : "none", lowerText, static_cast<double>(w.stillS), static_cast<double>(delayS), cell, w.descent ? "seen" : "none yet",
+    std::snprintf(out, cap, "optimized station: waiting (docked=%s, pad=%s, lowered=%s, bay still for %.1f of %.0f s, movers: %s, cell=%s; descent=%s; gathered=%u, camera=%s, pads=%u [%s])",
+                  docked, w.havePad ? w.padName : "none", lowerText, static_cast<double>(w.bayStillS), static_cast<double>(delayS), w.movers[0] != '\0' ? w.movers : "none", cell, w.descent ? "seen" : "none yet",
                   static_cast<unsigned>(w.gathered), w.cameraKnown ? "yes" : "no", static_cast<unsigned>(w.padCount), pads);
 }
 

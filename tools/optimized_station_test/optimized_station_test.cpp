@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
     {
         // After an observed descent, the still delay still applies: 6 s from the pad settling at its lowest (100 ms).
         se::SealState st = descended();
-        check(firstEngage(&st, quiet(0), 200, 20000) == 100 + se::kSealDelayMs,
+        check(firstEngage(&st, quiet(0), 200, 20000) == 100 + se::kBayStillMs,
               "after an observed descent the delay applies: the seal comes 6 s after the pad settles (6100 ms)");
     }
     {
@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
             in.rel = t == 0 ? 35.0f : ((t >= 3000 && t < 3100) ? -44.5f : -45.0f);   // first seen raised, then lowered; a 0.5 m move at 3 s
             if (se::sealStep(in, &st, &why) == se::SealAction::kRequestEngage && sealedAt == 0) sealedAt = t;
         }
-        check(sealedAt == 9100, "a move of 0.5 m restarts the still period: the seal comes 6 s after the pad settles (9.1 s), not at 6 s");
+        check(sealedAt == 2100, "a height change no longer restarts the bay clock (the bay watch measures motion): the seal comes 2 s after the pad lowers");
     }
     {
         se::SealState st;
@@ -226,7 +226,7 @@ int main(int argc, char** argv) {
         se::sealStep(d1, &st2, &w2);
         se::SealInputs d2 = quiet(20200);
         d2.pad = 0x2000;
-        check(firstEngage(&st2, d2, 20200, 40000) == 20100 + se::kSealDelayMs,
+        check(firstEngage(&st2, d2, 20200, 40000) == 20100 + se::kBayStillMs,
               "ship swap, then the new pad descends: the delay applies after the descent settles");
     }
     {
@@ -240,7 +240,7 @@ int main(int argc, char** argv) {
         rel.padMoved = true;
         se::sealStep(rel, &st, &why);   // released: the state clears
         const uint64_t again = firstEngage(&st, quiet(0), 2000, 12000);
-        check(again == 2000 + se::kSealDelayMs, "re-seal: the same pad, still at its lowest, seals again after the full delay from the release");
+        check(again == 2000 + se::kBayStillMs, "re-seal: the same pad, still at its lowest, seals again after the full delay from the release");
     }
 
     // ---- Built v14: the own pad's near-tie and its stickiness (fix 1); the shell named once, never a gate, ramp or skirt (fix 2) ----------------
@@ -341,15 +341,15 @@ int main(int argc, char** argv) {
         v.lowered = true;
         v.relM = -45.0f;
         v.relOk = true;
-        v.stillS = 2.5f;
+        v.bayStillS = 2.5f;
         v.cellBuilt = true;
-        se::waitingLine(v, 6.0f, line, sizeof(line));
+        se::waitingLine(v, 2.0f, line, sizeof(line));
         check(std::strstr(line, "docked=yes") != nullptr && std::strstr(line, "pad=LandingPadMediumA") != nullptr &&
-                  std::strstr(line, "lowered=yes") != nullptr && std::strstr(line, "still for 2.5 of 6 s") != nullptr &&
+                  std::strstr(line, "lowered=yes") != nullptr && std::strstr(line, "bay still for 2.5 of 2 s") != nullptr &&
                   std::strstr(line, "cell=built") != nullptr,
               "v14.1: the waiting line names docked, the pad, at lowest, the still time of the delay, and the cell");
         se::WaitView v2 = v;
-        v2.stillS = 3.0f;
+        v2.bayStillS = 3.0f;
         check(!se::waitingKeyChanged(v, v2), "v14.1: the still time alone is not a state change (no line per frame)");
         v2 = v;
         v2.lowered = false;
@@ -477,7 +477,81 @@ int main(int argc, char** argv) {
             if (tt == 3000) in.sourceChanged = true;
             if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
         }
-        check(req == 100 + se::kSealDelayMs, "v14.8: a source change re-bases the reading; the seal still comes 6 s after the pad settled (6100 ms)");
+        check(req == 100 + se::kBayStillMs, "v14.8: a source change re-bases the reading; the seal still comes 6 s after the pad settled (6100 ms)");
+    }
+
+    // ---- Built v14.10: the bay settles (the watch's motion, the continuous movers, the fallback, the frame shift) --------------------------------
+    {
+        // A lift and a hatch moving until 9.9 s, then still: the seal comes 2 s after the last motion.
+        se::SealState st = descended();
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        uint64_t lastMove = 0;
+        uint64_t req = 0;
+        for (uint64_t tt = 200; tt <= 20000; tt += 100) {
+            if (tt >= 1000 && tt <= 9900) lastMove = tt;
+            se::SealInputs in = quiet(tt);
+            in.bayLastMotionMs = lastMove;
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
+        }
+        check(req == 9900 + se::kBayStillMs && !st.fallback, "v14.10: a lift and a hatch moving until 9.9 s, then still: sealed 2 s after the last motion");
+    }
+    {
+        // A bay that never settles: the fallback seals 30 s after the pad lowered, and says so.
+        se::SealState st = descended();
+        se::ReleaseWhy wf = se::ReleaseWhy::kNone;
+        uint64_t req = 0;
+        for (uint64_t tt = 200; tt <= 40000; tt += 100) {
+            se::SealInputs in = quiet(tt);
+            in.bayLastMotionMs = tt;
+            if (se::sealStep(in, &st, &wf) == se::SealAction::kRequestEngage && req == 0) req = tt;
+        }
+        check(req == 100 + se::kBayStillTimeoutMs && st.fallback, "v14.10: a bay that never settles seals 30 s after the pad lowered (the fallback)");
+    }
+    {
+        // A continuous mover is ignored: its motion is not counted, so the seal comes 2 s after the pad lowered.
+        se::SealState st = descended();
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        uint64_t req = 0;
+        for (uint64_t tt = 200; tt <= 10000; tt += 100) {
+            se::SealInputs in = quiet(tt);
+            in.bayLastMotionMs = 0;
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
+        }
+        check(req == 100 + se::kBayStillMs, "v14.10: a continuous mover is ignored: sealed 2 s after the pad lowered");
+    }
+    {
+        // The continuous-mover window: a record moving on every frame for 10 s is continuous; a lift moving 8 s of 10 s is not.
+        se::MoverWindow always;
+        bool becameContinuous = false;
+        for (uint64_t tt = 0; tt <= 10000; tt += 100) becameContinuous = always.step(true, tt) || becameContinuous;
+        check(becameContinuous && always.continuous, "v14.10 movers: a record moving on every frame for 10 s is continuous");
+        se::MoverWindow lift;
+        bool liftContinuous = false;
+        for (uint64_t tt = 0; tt <= 10000; tt += 100) liftContinuous = lift.step(tt < 8000, tt) || liftContinuous;
+        check(!liftContinuous && !lift.continuous, "v14.10 movers: a lift moving 8 s of 10 s is not continuous");
+    }
+    {
+        // The watch's motion test: a frame shift of the record and the shell together is not motion; a rotation over 0.5 deg is; so is a 3 cm move.
+        const float a0[3] = {1.0f, 0.0f, 0.0f};
+        const float a2[3] = {0.0f, 0.0f, 1.0f};
+        const float prev[3] = {5.0f, 6.0f, -45.0f};
+        check(!se::poseMoved(prev, prev, a0, a0, a2, a2), "v14.10 watch: a record that does not move is not moved");
+        const float v[3] = {123.0f, -40.0f, 900.0f};
+        const float shell[3] = {0.0f, 0.0f, 0.0f};
+        const float recC[3] = {5.0f, 6.0f, -45.0f};
+        const float shellS[3] = {shell[0] + v[0], shell[1] + v[1], shell[2] + v[2]};
+        const float recS[3] = {recC[0] + v[0], recC[1] + v[1], recC[2] + v[2]};
+        const float rel0[3] = {recC[0] - shell[0], recC[1] - shell[1], recC[2] - shell[2]};
+        const float rel1[3] = {recS[0] - shellS[0], recS[1] - shellS[1], recS[2] - shellS[2]};
+        check(!se::poseMoved(rel0, rel1, a0, a0, a2, a2), "v14.10 watch: a frame shift of the record and the shell together is not motion");
+        const float tilt1[3] = {std::cos(1.0f * 0.0174533f), std::sin(1.0f * 0.0174533f), 0.0f};
+        const float tilt03[3] = {std::cos(0.3f * 0.0174533f), std::sin(0.3f * 0.0174533f), 0.0f};
+        check(se::poseMoved(prev, prev, a0, tilt1, a2, a2), "v14.10 watch: a 1 deg rotation of an axis is motion");
+        check(!se::poseMoved(prev, prev, a0, tilt03, a2, a2), "v14.10 watch: a 0.3 deg rotation is not motion");
+        const float near3[3] = {prev[0] + 0.02f, prev[1], prev[2]};
+        const float far3[3] = {prev[0] + 0.05f, prev[1], prev[2]};
+        check(!se::poseMoved(prev, near3, a0, a0, a2, a2) && se::poseMoved(prev, far3, a0, a0, a2, a2),
+              "v14.10 watch: a 2 cm centre move is not motion; a 5 cm move is");
     }
 
     // ---- Built v14.9: a pad absent for a frame or two keeps the still clock (the flight's 97 s re-seal) --------------------------------------
@@ -494,7 +568,7 @@ int main(int argc, char** argv) {
             }
             if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
         }
-        check(req == 100 + se::kSealDelayMs, "v14.9: a pad missing one frame in five keeps the still clock: sealed at 6100 ms, not never");
+        check(req == 100 + se::kBayStillMs, "v14.9: a pad missing one frame in five keeps the still clock: sealed at 2100 ms, not never");
     }
     {
         // The same absence without the hold resets the clock every time (the flight): no seal.
@@ -667,7 +741,7 @@ int main(int argc, char** argv) {
         check(st.moved && st.seen, "v14.4 sequence: the motion memory survives the release");
         check(se::sealStep(quiet(200), &st, &w) == se::SealAction::kNone && !st.immediate,
               "v14.4 sequence: no immediate re-seal after a motion release (the first frame after it waits)");
-        check(firstEngage(&st, quiet(0), 200, 20000) == 200 + se::kSealDelayMs && !st.immediate,
+        check(firstEngage(&st, quiet(0), 200, 20000) == 200 + se::kBayStillMs && !st.immediate,
               "v14.4 sequence: the re-seal after a motion release comes after the full delay");
     }
     {
@@ -686,8 +760,8 @@ int main(int argc, char** argv) {
     }
 
     // ---- The rules the seal relies on -------------------------------------------------------------------------------------------------------------
-    check(se::kPadMoveReleaseM == 2.0f && se::kCameraLeaveM == 2.0f && se::kSealStillM == 0.2f && se::kSealDelayMs == 6000,
-          "the constants: the pad-move release 2 m, the camera 2 m, the still 0.2 m, the seal delay 6 s");
+    check(se::kPadMoveReleaseM == 2.0f && se::kCameraLeaveM == 2.0f && se::kSealStillM == 0.2f && se::kBayStillMs == 2000,
+          "the constants: the pad-move release 2 m, the camera 2 m, the still 0.2 m, the bay still 2 s");
     {
         float v = -1.0f;
         check(se::parseBelowM("", se::kBelowDefaultsM[0], &v) && v == 85.0f && se::kBelowDefaultsM[0] == 85.0f,

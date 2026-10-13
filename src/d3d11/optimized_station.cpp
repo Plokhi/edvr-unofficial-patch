@@ -870,6 +870,35 @@ uint64_t g_waitLastMs = 0;                // when the waiting line was last writ
 sealed::SealState g_sealState;             // the seal trigger (optimized_station_core.h sealStep)
 bool g_flagHangarChanged = false;          // promote saw the held pad go or another own pad nearest: the tick releases on it
 bool g_engageAtLoadIn = false;             // the seal in force was requested at load-in (built v14.3): the status line says so
+// Built v14.10: the bay watch (after a descent, docked, unsealed): the watched records by address, the bay's last motion, the engage's account.
+struct WatchRec {
+    uintptr_t addr = 0;
+    uint32_t stamp = 0;               // the frame stamp of the last reading
+    float rel[3] = {};                // the centre minus the shell's centre (the frame shift cancels)
+    float ax0[3] = {};
+    float ax2[3] = {};
+    uint8_t ps = 4;                   // the centre sources of that reading
+    uint8_t ss = 4;
+    uint64_t lastMovedMs = 0;
+    bool haveMotion = false;
+    bool continuous = false;
+    char name[48] = {};
+    sealed::MoverWindow win;
+};
+constexpr size_t kWatchSlots = 48;
+WatchRec g_watch[kWatchSlots];
+size_t g_watchN = 0;
+bool g_bayWatching = false;
+uint64_t g_watchNowMs = 0;
+uint64_t g_bayLastMotionMs = 0;
+float g_shellNow[3] = {};
+uint8_t g_shellNowSrc = 4;
+bool g_shellNowValid = false;
+int g_engageVia = 0;                  // 0 load-in, 1 the bay settled, 2 the 30 s fallback
+uint32_t g_engageWatched = 0;
+float g_engageSinceLowerS = 0.0f;
+char g_engageLastMover[48] = {};
+char g_engageMovers[160] = {};
 bool g_flagPadMoved = false;               // promote saw the held pad move along the shaft against the shell: the tick releases on it
 char g_releaseWhy[160] = {};               // the release text for the flags above (the pad move or the hangar change, with its names)
 uint32_t g_settingPoll = 0;                // frames since the setting was last read
@@ -937,11 +966,126 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
     g_sealedFlag.store(false, std::memory_order_release);
 }
 
+// Built v14.10: the bay watch runs while docked, unsealed, after a descent, with the shell read (a pad absent a frame keeps it).
+bool bayWatchOn() noexcept {
+    return g_setting.load(std::memory_order_acquire) && !g_sealedFlag.load(std::memory_order_acquire) &&
+           g_dockedNow.load(std::memory_order_acquire) && g_sealState.moved && g_relOk && g_shellNowValid;
+}
+
+WatchRec* watchFind(uintptr_t addr) noexcept {
+    for (size_t i = 0; i < g_watchN; ++i) {
+        if (g_watch[i].addr == addr) return &g_watch[i];
+    }
+    return nullptr;
+}
+
+// The names of the watched records that moved within the last kBayStillMs (up to maxNames), joined with ", ".
+void moversNow(char* out, size_t cap, uint64_t now, size_t maxNames) noexcept {
+    out[0] = '\0';
+    size_t used = 0;
+    size_t named = 0;
+    for (size_t i = 0; i < g_watchN && named < maxNames; ++i) {
+        const WatchRec& w = g_watch[i];
+        if (w.continuous || !w.haveMotion || now > w.lastMovedMs + sealed::kBayStillMs) continue;
+        if (used + 2 >= cap) break;
+        const int n = std::snprintf(out + used, cap - used, "%s%s", named > 0 ? ", " : "", w.name);
+        if (n < 0) break;
+        used += static_cast<size_t>(n);
+        ++named;
+    }
+}
+
+// Built v14.10: one record of the gather. Watched when inside the candidate box (or sphere) with radius >= kBayWatchMinM, and not the own ship.
+// Its centre relative to the shell and its two axes are compared with the previous frame it was read in; a missing frame or another source re-bases
+// it without counting as motion. A record that moves on most frames of a 10 s window is continuous and ignored (logged once).
+void bayWatchNote(uintptr_t record, const float* centre, float radius, bool containsCam, uint8_t centreSrc) noexcept {
+    if (!g_bayWatching || radius < sealed::kBayWatchMinM) return;
+    if (containsCam && radius < sealed::kOwnShipRadiusM) return;
+    if (record == g_ownRecAddr) return;
+    if (g_pickCell.box) {
+        float x[3] = {};
+        sealed::boxCoordsOf(g_pickCell, centre, x);
+        if (!(std::fabs(x[0]) <= g_pickCell.boxHalf[0] && std::fabs(x[1]) <= g_pickCell.boxHalf[1] && std::fabs(x[2]) <= g_pickCell.boxHalf[2])) return;
+    } else if (sealed::distance(g_pickCell.centre, centre) > g_pickCell.radius) {
+        return;
+    }
+    char nm[48] = {};
+    if (!cachedName(record, nm, sizeof(nm))) return;
+    if (sealed::ownShipExempt(containsCam, radius, nm, g_ownPrefix)) return;
+    float axes[3][3] = {};
+    float ext[3] = {};
+    bool extOk = false;
+    uint8_t src = 4;
+    if (!poseOrientOf(record, axes, ext, &extOk, &src)) return;
+    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+    WatchRec* w = watchFind(record);
+    if (w == nullptr) {
+        if (g_watchN >= kWatchSlots) return;   // the table is full: the record is not watched (fixed size, no allocation)
+        w = &g_watch[g_watchN++];
+        *w = WatchRec{};
+        w->addr = record;
+        std::snprintf(w->name, sizeof(w->name), "%s", nm);
+    }
+    if (w->stamp == stamp) return;   // read this frame already
+    const float rel[3] = {centre[0] - g_shellNow[0], centre[1] - g_shellNow[1], centre[2] - g_shellNow[2]};
+    if (w->stamp != 0 && w->stamp + 1 == stamp && w->ps == centreSrc && w->ss == g_shellNowSrc && !w->continuous) {
+        const bool moved = sealed::poseMoved(w->rel, rel, w->ax0, axes[0], w->ax2, axes[2]);
+        if (w->win.step(moved, g_watchNowMs)) {
+            w->continuous = true;
+            Log::get().note("optimized station: %s moves on most frames over 10 s: ignored as a continuous mover (a drone, a prop or a fixture).", w->name);
+        } else if (moved) {
+            w->lastMovedMs = g_watchNowMs;
+            w->haveMotion = true;
+            if (g_watchNowMs > g_bayLastMotionMs) g_bayLastMotionMs = g_watchNowMs;
+        }
+    }
+    std::memcpy(w->rel, rel, sizeof(rel));
+    std::memcpy(w->ax0, axes[0], sizeof(w->ax0));
+    std::memcpy(w->ax2, axes[2], sizeof(w->ax2));
+    w->stamp = stamp;
+    w->ps = centreSrc;
+    w->ss = g_shellNowSrc;
+}
+
+// Built v14.10: the engage's account for the status line: load-in, the bay settled, or the 30 s fallback, with the watch's numbers.
+void captureEngageInfo(uint64_t now) noexcept {
+    g_engageVia = g_sealState.immediate ? 0 : (g_sealState.fallback ? 2 : 1);
+    uint32_t watched = 0;
+    uint64_t latest = 0;
+    g_engageLastMover[0] = '\0';
+    for (size_t i = 0; i < g_watchN; ++i) {
+        const WatchRec& w = g_watch[i];
+        if (w.continuous) continue;
+        ++watched;
+        if (w.haveMotion && (g_engageLastMover[0] == '\0' || w.lastMovedMs >= latest)) {
+            latest = w.lastMovedMs;
+            std::snprintf(g_engageLastMover, sizeof(g_engageLastMover), "%s", w.name);
+        }
+    }
+    g_engageWatched = watched;
+    g_engageSinceLowerS = (g_sealState.lowerSet && now > g_sealState.lowerSinceMs) ? static_cast<float>(now - g_sealState.lowerSinceMs) / 1000.0f : 0.0f;
+    moversNow(g_engageMovers, sizeof(g_engageMovers), now, 3);
+}
+
+// The seal's account for the status line (built v14.10).
+const char* engageHow() noexcept {
+    static char how[256];
+    if (g_engageVia == 0) return "sealed at load-in";
+    if (g_engageVia == 2) {
+        std::snprintf(how, sizeof(how), "sealed after the 30 s fallback (bay never still: movers %s)", g_engageMovers[0] != '\0' ? g_engageMovers : "none");
+        return how;
+    }
+    std::snprintf(how, sizeof(how), "sealed after the bay settled (%u records watched, last mover %s, %.1f s after the pad lowered)",
+                  static_cast<unsigned>(g_engageWatched), g_engageLastMover[0] != '\0' ? g_engageLastMover : "none",
+                  static_cast<double>(g_engageSinceLowerS));
+    return how;
+}
+
 // The seal's status line, once per seal (called from the engage, after the cell is held and localized).
 void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
     ++g_sealCount;
     Log::get().note("optimized station: sealed in %s hangar (%s, frame %u, seal %u): pad %s, box %.0f x %.0f x %.0f m (length, width, height), "
-                    "floor %.0f m under the pad, shell %s.", sizeWord(cell.size), g_engageAtLoadIn ? "sealed at load-in" : "sealed after the descent settled",
+                    "floor %.0f m under the pad, shell %s.", sizeWord(cell.size), engageHow(),
                     frame, g_sealCount, cell.padName,
                     static_cast<double>(cell.boxHalf[0] * 2.0f), static_cast<double>(cell.boxHalf[1] * 2.0f),
                     static_cast<double>(cell.boxHalf[2] * 2.0f), static_cast<double>(belowFor(cell.size)),
@@ -1293,6 +1437,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         char tn[48] = {};
         if (cachedName(record, tn, sizeof(tn))) tallyShipPrefix(tn);
     }
+    bayWatchNote(record, centre, radius, containsCam, static_cast<uint8_t>(wr.source));   // built v14.10
     if (!judge) return;   // gathering only: the pads and the explicit parts are in hand; the judgement is sealed-only
     const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, record);
     keep = v.keep;
@@ -1420,7 +1565,10 @@ void optimizedStationFrame(uint32_t frame) {
     // freeze, from the gathered parts). The camera in the candidate box is the seal's other condition.
     // Built v14.9: a pad absent for fewer than kHeldLostFrames frames keeps its last reading (no still-clock reset).
     const bool padHeld = !g_pickCell.has && g_ownSticky.pad != 0 && g_ownSticky.unseen > 0 && g_ownSticky.unseen < sealed::kHeldLostFrames;
-    if (!padHeld) g_relOk = false;
+    if (!padHeld) {
+        g_relOk = false;
+        g_shellNowValid = false;
+    }
     g_heightChanged = false;
     if (g_pickCell.has) {
         g_relOk = false;
@@ -1448,6 +1596,11 @@ void optimizedStationFrame(uint32_t frame) {
                     const float up[3] = {axes[2][0], axes[2][1], axes[2][2]};
                     g_relM = sealed::shellRelative(pw.world, sw.world, up);
                     g_relOk = true;
+                    g_shellNow[0] = sw.world[0];
+                    g_shellNow[1] = sw.world[1];
+                    g_shellNow[2] = sw.world[2];
+                    g_shellNowSrc = sw.source;
+                    g_shellNowValid = true;
                     g_heightChanged = g_heightSrc.note(pw.source, sw.source);
                 }
             }
@@ -1463,11 +1616,19 @@ void optimizedStationFrame(uint32_t frame) {
             camIn = sealed::distance(g_pickCell.centre, g_frameCam) <= g_pickCell.radius;
         }
     }
+    // Built v14.10: the bay watch runs only while docked, unsealed, after a descent; otherwise its table is empty.
+    g_watchNowMs = now;
+    g_bayWatching = bayWatchOn();
+    if (!g_bayWatching) {
+        g_watchN = 0;
+        g_bayLastMotionMs = 0;
+    }
     sealed::SealInputs in;
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
     in.pickOk = g_pickCell.has;
     in.padHeld = padHeld;
+    in.bayLastMotionMs = g_bayLastMotionMs;
     in.rel = g_relM;
     in.relOk = g_relOk;
     in.sourceChanged = g_heightChanged;
@@ -1501,6 +1662,7 @@ void optimizedStationFrame(uint32_t frame) {
             g_engagePending = true;
             g_engageTries = 0;
             g_engageAtLoadIn = g_sealState.immediate;
+            captureEngageInfo(now);
         }
     }
     // Built v14.1: while docked and unsealed, one line when the seal's inputs change, and at most every 10 s while docked: the unmet condition.
@@ -1513,7 +1675,11 @@ void optimizedStationFrame(uint32_t frame) {
         w.lowered = g_relOk && g_relM < sealed::kLoweredM;
         w.relM = g_relM;
         w.relOk = g_relOk;
-        w.stillS = g_sealState.stillValid ? static_cast<float>(now - g_sealState.stillSinceMs) / 1000.0f : 0.0f;
+        {
+            const uint64_t quietSince = g_sealState.lowerSinceMs > g_bayLastMotionMs ? g_sealState.lowerSinceMs : g_bayLastMotionMs;
+            w.bayStillS = (g_sealState.lowerSet && now > quietSince) ? static_cast<float>(now - quietSince) / 1000.0f : 0.0f;
+            moversNow(w.movers, sizeof(w.movers), now, 3);
+        }
         w.cellBuilt = g_relOk && sealed::cellInvalidWhy(g_pickCell) == nullptr;
         w.gathered = g_recordsLast;
         w.descent = g_sealState.moved;
@@ -1535,7 +1701,7 @@ void optimizedStationFrame(uint32_t frame) {
         const bool periodic = w.docked && g_waitLastSet && now - g_waitLastMs >= 10000;
         if (changed || periodic) {
             char line[640] = {};
-            sealed::waitingLine(w, static_cast<float>(sealed::kSealDelayMs) / 1000.0f, line, sizeof(line));
+            sealed::waitingLine(w, static_cast<float>(sealed::kBayStillMs) / 1000.0f, line, sizeof(line));
             Log::get().note("%s", line);
             g_waitLast = w;
             g_waitLastSet = true;
