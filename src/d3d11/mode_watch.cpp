@@ -45,6 +45,7 @@ using modewatch::Watch;
 constexpr DWORD kMaxWaitMs = 1000;     // the stat backup and the openvr check run at this interval
 constexpr uint64_t kRetryMs = 100;     // a read that cannot open its file is retried this often
 constexpr int kMaxRetries = 20;        // per write; then the watch waits for the next event
+constexpr uint64_t kIgnoredLogMs = 1000;  // an unknown read repeats while the file stays invalid; its log line comes this often at most
 constexpr size_t kMaxSettingsBytes = 1024 * 1024;
 
 // The posted mode, packed so one exchange takes all of it: bit 0 posted, bit 1 Vr (clear is Flat), bit 2 from a live rise (clear is
@@ -118,7 +119,7 @@ private:
         for (;;) {
             // A timed read (a confirm or a retry) runs as soon as it is due; the wait below ends no later than the next one, and no
             // later than the next eye-submit sample.
-            const uint64_t at = timedReadAt();
+            const uint64_t at = dueReadAt();
             if (at && nowMs() >= at) readFile(retryAt_ != 0);
             uint64_t wake = nextSampleMs_;
             const uint64_t next = timedReadAt();
@@ -147,12 +148,20 @@ private:
         }
     }
 
-    // The next time a read is due by the clock: a pending mode's confirm, or a retry. Zero when none is.
-    uint64_t timedReadAt() const {
+    // The time a timed read (a pending mode's confirm, or a retry) is due, or 0. It can be past: the loop runs an overdue read first.
+    uint64_t dueReadAt() const {
         if (gaveUp_) return 0;
         uint64_t at = watch_.pending() ? watch_.confirmDueMs() : 0;
         if (retryAt_ > at) at = retryAt_;
         return at;
+    }
+
+    // The wake time for the timed read: a future time or 0, never a past one. An overdue read has run before this is asked; if the read
+    // did not move its deadline, the wait is one retry interval, so the loop cannot spin on a zero wait.
+    uint64_t timedReadAt() const {
+        const uint64_t at = dueReadAt();
+        const uint64_t now = nowMs();
+        return at && at <= now ? now + kRetryMs : at;
     }
 
     void handleHints() {
@@ -247,6 +256,14 @@ private:
         }
         retryAt_ = 0;
         const Step s = watch_.onRead(now, r, readAfterWrite_);
+        // An unknown read repeats while the file stays invalid, so its line is logged once a second at most; the next line printed says
+        // how many were skipped.
+        const bool unknownIgnored = s.outcome == Outcome::Ignored && !r.known;
+        if (unknownIgnored && now < nextIgnoredLogMs_) {
+            ++skippedIgnoredLogs_;
+            return;
+        }
+        if (unknownIgnored) nextIgnoredLogMs_ = now + kIgnoredLogMs;
 
         char mode[16];
         if (r.known) std::snprintf(mode, sizeof(mode), "%d", r.value);
@@ -267,8 +284,15 @@ private:
             break;
         default: std::snprintf(result, sizeof(result), "nothing"); break;
         }
-        Log::get().note("mode watch: read t=%llu mode %s -> %s%s", static_cast<unsigned long long>(now), mode, result,
-                        submitSuffix(suffix, sizeof(suffix)));
+        char retryNote[64] = "";
+        if (unknownIgnored && watch_.pending())
+            std::snprintf(retryNote, sizeof(retryNote), " (confirm retry %u of %u)", watch_.unknownRetries(), Watch::kMaxUnknownRetries);
+        char skipped[64] = "";
+        if (skippedIgnoredLogs_)
+            std::snprintf(skipped, sizeof(skipped), " (%u unknown reads not logged)", skippedIgnoredLogs_);
+        skippedIgnoredLogs_ = 0;
+        Log::get().note("mode watch: read t=%llu mode %s -> %s%s%s%s", static_cast<unsigned long long>(now), mode, result, retryNote,
+                        submitSuffix(suffix, sizeof(suffix)), skipped);
         if (s.outcome == Outcome::Posted) postMode(now, s.mode, false);
     }
 
@@ -319,6 +343,8 @@ private:
     uint64_t retryAt_ = 0;
     int retries_ = 0;
     bool gaveUp_ = false;
+    uint64_t nextIgnoredLogMs_ = 0;    // the earliest time the next unknown read's log line is written
+    unsigned skippedIgnoredLogs_ = 0;  // unknown reads not logged since the last line, reported on the next one
     bool openvrLoaded_ = false;
     // The eye-submit sampler: the counter at the last sample, the next sample's time, the last full second's count, and whether that
     // second had any. flowing_ starts false, so the first second with submits logs "resumed".

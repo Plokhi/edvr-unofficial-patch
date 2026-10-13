@@ -10,9 +10,10 @@
 
 namespace edvr::modewatch {
 
-// ignored: the read did not name a mode (absent, half-written, out of range), or the file is stale (staleFile on the Step). same: nothing
-// changed, or a pending mode is still waiting. pending: a change to mode was seen and waits for its confirming read. posted: the committed
-// mode changed. dropped: the pending mode did not survive its confirming read. nothing: a live rise that changes nothing.
+// ignored: the read did not name a mode (absent, half-written, out of range), or the file is stale (staleFile on the Step); an unknown
+// confirm also moves the pending change's deadline by a retry interval. same: nothing changed, or a pending mode is still waiting.
+// pending: a change to mode was seen and waits for its confirming read. posted: the committed mode changed. dropped: the pending mode did
+// not survive its confirming read, or its unknown confirms ran out. nothing: a live rise that changes nothing.
 enum class Outcome { Nothing, Ignored, Same, Pending, Posted, Dropped };
 
 // mode is the pending or posted class for Pending and Posted; for the other outcomes it is not meaningful. staleFile is set for an
@@ -40,7 +41,20 @@ public:
     // rise or a timer read. While the file is stale, a known read without a write is ignored, and a known read after a write clears the
     // staleness and follows the normal rules. A confirm of a pending change (the timer) is unaffected.
     Step onRead(uint64_t nowMs, const ModeRead& r, bool afterWrite) {
-        if (!r.known) return Step{Outcome::Ignored, r.mode};
+        if (!r.known) {
+            // Before the confirm is due an unknown read is ignored. At or after it the file cannot confirm the change yet (absent, cut
+            // off), so the confirm is put off by a bounded retry. After kMaxUnknownRetries of those the change is dropped, and the watch
+            // waits for the next write: no clock keeps reading a file that stays invalid.
+            if (!pending_ || nowMs < due_) return Step{Outcome::Ignored, r.mode};
+            if (unknownRetries_ >= kMaxUnknownRetries) {
+                pending_ = false;
+                unknownRetries_ = 0;
+                return Step{Outcome::Dropped, r.mode};
+            }
+            ++unknownRetries_;
+            due_ = nowMs + kUnknownRetryMs;
+            return Step{Outcome::Ignored, r.mode};
+        }
         if (!pending_) {
             if (fileStale_) {
                 if (!afterWrite) return Step{Outcome::Ignored, r.mode, true};
@@ -50,6 +64,7 @@ public:
             pending_ = true;
             pendingMode_ = r.mode;
             due_ = nowMs + kConfirmMs;
+            unknownRetries_ = 0;
             return Step{Outcome::Pending, pendingMode_};
         }
         if (nowMs < due_) {
@@ -85,8 +100,12 @@ public:
     bool pending() const { return pending_; }
     GameMode committed() const { return committed_; }
     bool stale() const { return fileStale_; }
+    // The unknown confirms the pending change has retried so far, for the log.
+    unsigned unknownRetries() const { return pending_ ? unknownRetries_ : 0; }
 
     static constexpr uint64_t kConfirmMs = 250;
+    static constexpr uint64_t kUnknownRetryMs = 100;
+    static constexpr unsigned kMaxUnknownRetries = 20;
 
 private:
     GameMode committed_;
@@ -95,6 +114,7 @@ private:
     bool pending_ = false;
     GameMode pendingMode_ = GameMode::Vr;
     uint64_t due_ = 0;
+    unsigned unknownRetries_ = 0;
 };
 
 }  // namespace edvr::modewatch

@@ -1,5 +1,6 @@
 // mode_watch_test -- the mode watch's decisions (src\d3d11\mode_watch_logic.h): a change waits for its confirming read 250 ms later, a
-// half-written file is ignored, a flip-flop drops, a live rise posts Vr from a flat commit, the toggles post in order, and a file the
+// half-written file is ignored, an unknown read at a pending confirm retries on a bounded clock and then drops, a flip-flop drops, a live
+// rise posts Vr from a flat commit, the toggles post in order, and a file the
 // launch or a live rise made stale (a /vr or /novr override, a live rise over a flat file) is not evidence until a write. Built from the
 // repo root by build.bat's :rig_mode_watch_test. Windows-free: it includes only the pure headers. --dry-run writes nothing; --self-test
 // runs the checks.
@@ -224,6 +225,72 @@ void novrOverVrFile() {
         "/novr over 4: the confirm posts Vr");
 }
 
+// An unknown read before a pending change's confirm moves nothing. At or after the confirm it is retried on a 100 ms clock, so the loop never
+// computes a zero wait. The review's repro (a change at 1000, an unknown read at the 1250 deadline) leaves a wait above zero.
+void unknownConfirmRetries() {
+    Watch w(GameMode::Flat, GameMode::Flat);
+    afterWrite(w, 1000, readOf(GameMode::Vr));
+    const Step early = w.onRead(1100, unknownRead(), false);
+    check(outcomeIs(early, Outcome::Ignored) && w.pending() && w.confirmDueMs() == 1250 && w.unknownRetries() == 0,
+        "unknown before the deadline (1100): ignored, deadline 1250 unchanged, no retry counted");
+    const Step due = w.onRead(1251, unknownRead(), false);
+    check(outcomeIs(due, Outcome::Ignored) && w.pending() && w.confirmDueMs() == 1351 && w.unknownRetries() == 1,
+        "unknown at 1251 (after the 1250 deadline): ignored, pending kept, deadline moved to 1351");
+
+    Watch repro(GameMode::Flat, GameMode::Flat);
+    afterWrite(repro, 1000, readOf(GameMode::Vr));
+    repro.onRead(1250, unknownRead(), false);
+    const uint64_t wait = repro.confirmDueMs() > 1251 ? repro.confirmDueMs() - 1251 : 0;
+    check(repro.pending() && wait > 0, "review repro: unknown at the 1250 deadline leaves a next wait above zero (99 ms)");
+}
+
+// Unknown, unknown, then a valid read at the moved deadline: the change posts once, and a later read of the same mode posts nothing.
+void unknownConfirmRecovery() {
+    Watch w(GameMode::Flat, GameMode::Flat);
+    afterWrite(w, 1000, readOf(GameMode::Vr));
+    w.onRead(1251, unknownRead(), false);
+    w.onRead(1351, unknownRead(), false);
+    const Step valid = w.onRead(1451, readOf(GameMode::Vr), false);
+    check(outcomeIs(valid, Outcome::Posted) && valid.mode == GameMode::Vr && w.committed() == GameMode::Vr && !w.pending() &&
+              w.unknownRetries() == 0, "unknown, unknown, then valid at the moved deadline (1451): posted Vr");
+    const Step again = w.onRead(1500, readOf(GameMode::Vr), false);
+    check(outcomeIs(again, Outcome::Same) && w.committed() == GameMode::Vr, "after the post, a later read of Vr is same: no second post");
+}
+
+// The worker reads a pending change when its confirm is due, so this runs the reads the worker makes while the file stays invalid. It
+// is the schedule the watch sets, not mode_watch.cpp itself: that loop needs the Windows folder watch and the config, so the rig does not
+// drive it. Twenty retries, then the twenty-first read drops the change; after that no read is due and the watch waits for a write.
+void unknownConfirmDrops() {
+    Watch w(GameMode::Flat, GameMode::Flat);
+    afterWrite(w, 1000, readOf(GameMode::Vr));
+    unsigned reads = 0, inFirstSecond = 0;
+    bool zeroWait = false;
+    Step last{Outcome::Nothing, GameMode::Vr};
+    while (w.pending() && reads < 100) {
+        const uint64_t t = w.confirmDueMs();
+        last = w.onRead(t, unknownRead(), false);
+        ++reads;
+        if (t < 2250) ++inFirstSecond;
+        if (outcomeIs(last, Outcome::Ignored) && w.pending() && w.confirmDueMs() <= t) zeroWait = true;
+    }
+    check(reads == 21 && outcomeIs(last, Outcome::Dropped) && !w.pending() && w.committed() == GameMode::Flat,
+        "unknown confirms: 20 retries, the 21st read drops the change, flat stays committed");
+    check(!zeroWait, "unknown confirms: no read leaves a wait of zero");
+    check(inFirstSecond <= 11, "unknown confirms: at most 11 timed reads in the first second of an invalid file");
+    check(w.confirmDueMs() == 0, "unknown confirms: after the drop nothing is due");
+    check(outcomeIs(afterWrite(w, 5000, readOf(GameMode::Vr)), Outcome::Pending), "after the drop a later write of Vr is pending again");
+}
+
+// An unknown read before the deadline, with a retry already spent, is still ignored and moves nothing.
+void unknownBeforeDeadlineAfterRetry() {
+    Watch w(GameMode::Flat, GameMode::Flat);
+    afterWrite(w, 1000, readOf(GameMode::Vr));
+    w.onRead(1251, unknownRead(), false);   // deadline 1351
+    const Step early = w.onRead(1300, unknownRead(), false);
+    check(outcomeIs(early, Outcome::Ignored) && w.confirmDueMs() == 1351 && w.unknownRetries() == 1,
+        "unknown before the moved deadline (1300): ignored, deadline 1351 unchanged");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -250,6 +317,10 @@ int main(int argc, char** argv) {
     vrOverFlatFlightD();
     vrOverFlatNoWrite();
     novrOverVrFile();
+    unknownConfirmRetries();
+    unknownConfirmRecovery();
+    unknownConfirmDrops();
+    unknownBeforeDeadlineAfterRetry();
     if (g_fails) {
         std::printf("FAIL: mode_watch_test %d of %d checks failed\n", g_fails, g_checks);
         return 1;
