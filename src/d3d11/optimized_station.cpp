@@ -659,6 +659,7 @@ uintptr_t collFind(uintptr_t coll) noexcept {
 
 // The job path's one-entry cache per frame: the last store bucket and the rig it resolved to (a bucket's records come in a run).
 uintptr_t g_rigBucketCache = 0, g_rigBucketRig = 0;
+uintptr_t g_rigBucketColl = 0;   // built v14.24: the collection the cached bucket names (the job path's association check)
 
 uint32_t g_rigBucketStamp = 0;
 
@@ -704,6 +705,7 @@ void rigNoteRecord(uintptr_t bucket, uintptr_t record, const float c[3], float r
     // entry copied from the Submit's entry (decomp_431AFE0 lines 106 to 117: [0] ctx, [2] = collection+0x300, [5] record array), so the rig is the
     // one whose collection is bucket[2] - 0x300. One cache entry per bucket per frame; the lookup is per bucket, not per record.
     uintptr_t rig = kinematicEvalCurrentRig();
+    const bool jobPath = rig == 0;   // built v14.24: a job-path association is checked against the rig's own collection below
     if (rig) {
         ++g_rigTally.assocSync;
     } else {
@@ -718,6 +720,7 @@ void rigNoteRecord(uintptr_t bucket, uintptr_t record, const float c[3], float r
             uintptr_t owner = 0;
             rig = 0;
             if (bucket && readVal(&owner, bucket + 0x10) && owner > 0x300) rig = collFind(owner - 0x300);
+            g_rigBucketColl = (owner > 0x300) ? owner - 0x300 : 0;   // built v14.24: the collection this bucket names
             g_rigBucketCache = bucket;
             g_rigBucketRig = rig;
         }
@@ -727,6 +730,9 @@ void rigNoteRecord(uintptr_t bucket, uintptr_t record, const float c[3], float r
     if (!rig) return;
     RigSlot* s = rigFind(rig, true);
     if (!s) return;
+    // Built v14.24: a job-path association is current only while the rig still holds that collection (a stale table entry names a rig whose
+    // collection has moved on; its records belong to nobody here).
+    if (jobPath && !sealed::collAssociationIs(s->coll, g_rigBucketColl)) return;
     if (s->evalStamp == stamp) ++g_rigTally.matched;
     else ++g_rigTally.unevaluated;
     if (s->curStamp != stamp) {
@@ -828,6 +834,72 @@ bool producerDecide(uintptr_t rec) noexcept {
 
 // The rig verdict's veto (the early veto, 0x431AFE0's entry): a rig whose verdict is outside the cell is skipped while its refresh counter is
 // below sealed::kRigRefreshN. Answers only while sealed; the verdicts are refreshed on the frame tick.
+// ---- Built v14.24 (2026-10-13): the station's own costs, clocked with QPC and reported in the 30 s summary ---------------------------------------
+// The store observer, the producer veto and the rig veto are timed one call in 32 (their p50, p95 and max are per call); the frame tick is timed every
+// frame (per frame). The state lock's wait is timed on every acquisition it guards. The samples sit behind a small leaf lock (g_costMutex), which is
+// never held while the state lock is taken.
+int64_t costTicks() noexcept {
+    LARGE_INTEGER q{};
+    QueryPerformanceCounter(&q);
+    return static_cast<int64_t>(q.QuadPart);
+}
+int64_t costFreq() noexcept {
+    static const int64_t f = [] {
+        LARGE_INTEGER q{};
+        QueryPerformanceFrequency(&q);
+        return static_cast<int64_t>(q.QuadPart);
+    }();
+    return f;
+}
+double costMs(int64_t a, int64_t b) noexcept { return static_cast<double>(b - a) * 1000.0 / static_cast<double>(costFreq()); }
+
+constexpr size_t kCostSamples = 4096;
+struct CostRing {
+    double v[kCostSamples] = {};
+    size_t n = 0;
+    void add(double x) noexcept {
+        v[n % kCostSamples] = x;
+        ++n;
+    }
+    size_t used() const noexcept { return n < kCostSamples ? n : kCostSamples; }
+    void clear() noexcept { n = 0; }
+};
+std::mutex g_costMutex;   // a leaf lock: the samples and the wait totals; never held while the state lock is taken
+CostRing g_costStore;
+CostRing g_costProducer;
+CostRing g_costRig;
+CostRing g_costFrame;
+std::atomic<uint32_t> g_costStoreCalls{0};
+std::atomic<uint32_t> g_costProducerCalls{0};
+std::atomic<uint32_t> g_costRigCalls{0};
+double g_mutexWaitTotalMs = 0.0;
+double g_mutexWaitMaxMs = 0.0;
+uint64_t g_mutexBlocked = 0;          // acquisitions that waited more than 0.1 ms
+uint64_t g_waitingLinesWritten = 0;   // waiting lines written this window (the change-only line)
+
+void costAdd(CostRing& r, double ms) noexcept {
+    std::lock_guard<std::mutex> g(g_costMutex);
+    r.add(ms);
+}
+bool costSampleCall(std::atomic<uint32_t>& calls) noexcept { return (calls.fetch_add(1, std::memory_order_relaxed) & 31u) == 31u; }
+
+// The state lock, with its wait timed. The wait is counted after the lock is held (so the counters are written under the lock they describe).
+class TimedStateLock {
+public:
+    TimedStateLock() noexcept {
+        const int64_t t0 = costTicks();
+        g_sealedMutex.lock();
+        const double waitMs = costMs(t0, costTicks());
+        std::lock_guard<std::mutex> g(g_costMutex);
+        g_mutexWaitTotalMs += waitMs;
+        if (waitMs > g_mutexWaitMaxMs) g_mutexWaitMaxMs = waitMs;
+        if (waitMs > 0.1) ++g_mutexBlocked;
+    }
+    ~TimedStateLock() { g_sealedMutex.unlock(); }
+    TimedStateLock(const TimedStateLock&) = delete;
+    TimedStateLock& operator=(const TimedStateLock&) = delete;
+};
+
 // Built v14.20 (review 4): a lifecycle point (undock, hangar change, ship change, setting toggle, a changed association) moves to a new epoch. Every rig
 // slot, association and verdict of the old epoch is free; a rig forwards until it has a fresh bound. Caller holds g_sealedMutex.
 void bumpRigEpoch() noexcept {
@@ -848,7 +920,7 @@ bool sealedTrialRigVeto(uintptr_t rig, uintptr_t ctx) noexcept {
     (void)ctx;
     // Built v14.20 (review 3): an atomic fast gate before the lock; g_heldValid is read again under it (engage and release write it under the lock).
     if (!g_sealedFlag.load(std::memory_order_acquire) || !rig) return false;
-    std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+    TimedStateLock lock;
     if (!g_heldValid) return false;
     if (!g_rigVerdictsFresh) refreshRigVerdicts();   // review 7a: the first veto after an engage reads verdicts refreshed for the held cell
     const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
@@ -871,15 +943,9 @@ bool sealedTrialRigVeto(uintptr_t rig, uintptr_t ctx) noexcept {
         s->collStamp = stamp;
         uintptr_t coll = 0;
         if (readVal(&coll, rig + 0x348) && coll && coll != s->coll) {
-            // Built v14.20 (review 4): an association change expires the old associations and this rig's bounds: it forwards until a fresh bound exists.
-            bumpRigEpoch();
-            s = rigFind(rig, true);
-            if (!s) {
-                ++g_rigTally.unknown;
-                return false;
-            }
-            s->evalStamp = stamp;
-            s->collStamp = stamp;
+            // Built v14.24 (review 4, per rig): this rig's association changed. Only this rig's bounds and verdict are forgotten, so it forwards until a
+            // fresh bound exists; the other rigs keep theirs (a whole-epoch bump here disabled the early veto: flight 013c6122).
+            sealed::rigForgetBounds(&s->curValid, &s->lastValid, &s->verdict, &s->vetoedRun);
             s->coll = coll;
             collInsert(coll, rig);
             ++g_rigTally.unknown;
@@ -960,6 +1026,34 @@ uintptr_t g_hangarPad = 0;
 // Built v14.12: the bay's mechanism, latched once per descent (core LatchSet). Candidates are gathered only while a latch is pending.
 sealed::LatchSet g_latch;
 sealed::LatchIdentity g_latchId;   // built v14.20 (review 2): the pad and shell the latch was built for
+// Built v14.24: each latched record's pose at the seal. A release by the mechanism (the Lift, a hatch) re-seals on these poses (all back within the
+// tolerance for kPoseBackFrames frames, with r1 1), not only on the r1 edge. Taken when the seal is admitted; the latch is the same set while sealed.
+struct SealPoseRec {
+    uintptr_t addr = 0;
+    char name[48] = {};
+    float rel[3] = {};
+    float ax0[3] = {};
+    float ax2[3] = {};
+};
+SealPoseRec g_sealPose[sealed::kLatchCap];
+size_t g_sealPoseN = 0;
+sealed::ChangeGate g_poseAwayGate;   // the away line, written when its text changes
+sealed::ChangeGate g_poseBackGate;   // the back line, written once per release
+uint64_t g_poseLastLogMs = 0;        // the away line is written at most 2 Hz
+
+void snapshotSealPose() noexcept {
+    g_sealPoseN = 0;
+    for (size_t i = 0; i < g_latch.n && i < sealed::kLatchCap; ++i) {
+        const sealed::LatchRec& r = g_latch.recs[i];
+        SealPoseRec& p = g_sealPose[g_sealPoseN++];
+        p.addr = r.addr;
+        std::snprintf(p.name, sizeof(p.name), "%s", r.name);
+        std::memcpy(p.rel, r.rel, sizeof(p.rel));
+        std::memcpy(p.ax0, r.ax0, sizeof(p.ax0));
+        std::memcpy(p.ax2, r.ax2, sizeof(p.ax2));
+    }
+}
+
 // Built v14.23: the own pad, from the game (the object the docking reader r0 was last called on this dock). Reset at undock and hangar change.
 sealed::GameTrack g_track;
 // The pad in the shell's frame this frame (the sealed line's lateral and yaw).
@@ -1207,6 +1301,44 @@ void summaryLine(uint64_t now) noexcept {
                     static_cast<unsigned>(g_collStats.used), static_cast<unsigned>(kCollSlots), static_cast<unsigned>(g_collStats.maxProbes),
                     static_cast<unsigned long long>(g_collStats.full), static_cast<unsigned long long>(g_rigEpochs),
                     static_cast<unsigned>(g_rigEpoch));
+    // Built v14.24: the station's own costs over the window: the sampled store, producer and rig calls per call (one in 32), the frame tick per frame,
+    // the state lock's wait, and the waiting lines written (change-only).
+    {
+        double s50 = 0.0, s95 = 0.0, smax = 0.0, p50 = 0.0, p95 = 0.0, pmax = 0.0, r50 = 0.0, r95 = 0.0, rmax = 0.0, f50 = 0.0, f95 = 0.0, fmax = 0.0;
+        size_t nStore = 0, nProd = 0, nRig = 0, nFrame = 0;
+        uint64_t blocked = 0, waitingLines = 0;
+        double waitTotal = 0.0, waitMax = 0.0;
+        {
+            std::lock_guard<std::mutex> g(g_costMutex);
+            nStore = g_costStore.used();
+            sealed::samplePercentiles(g_costStore.v, nStore, &s50, &s95, &smax);
+            nProd = g_costProducer.used();
+            sealed::samplePercentiles(g_costProducer.v, nProd, &p50, &p95, &pmax);
+            nRig = g_costRig.used();
+            sealed::samplePercentiles(g_costRig.v, nRig, &r50, &r95, &rmax);
+            nFrame = g_costFrame.used();
+            sealed::samplePercentiles(g_costFrame.v, nFrame, &f50, &f95, &fmax);
+            blocked = g_mutexBlocked;
+            waitTotal = g_mutexWaitTotalMs;
+            waitMax = g_mutexWaitMaxMs;
+            waitingLines = g_waitingLinesWritten;
+            g_costStore.clear();
+            g_costProducer.clear();
+            g_costRig.clear();
+            g_costFrame.clear();
+            g_mutexBlocked = 0;
+            g_mutexWaitTotalMs = 0.0;
+            g_mutexWaitMaxMs = 0.0;
+            g_waitingLinesWritten = 0;
+        }
+        Log::get().note("optimized station: cost last %llu s: store observer %.4f/%.4f/%.4f ms per call (%llu sampled), producer veto %.4f/%.4f/%.4f "
+                        "ms per call (%llu sampled), rig veto %.4f/%.4f/%.4f ms per call (%llu sampled), frame tick %.3f/%.3f/%.3f ms per frame "
+                        "(%llu frames), mutex wait total %.3f ms max %.3f ms (blocked over 0.1 ms: %llu), waiting lines written %llu.",
+                        static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), s50, s95, smax, static_cast<unsigned long long>(nStore), p50,
+                        p95, pmax, static_cast<unsigned long long>(nProd), r50, r95, rmax, static_cast<unsigned long long>(nRig), f50,
+                        f95, fmax, static_cast<unsigned long long>(nFrame), waitTotal, waitMax, static_cast<unsigned long long>(blocked),
+                        static_cast<unsigned long long>(waitingLines));
+    }
     g_prodStats.maxProbes = g_rigStats.maxProbes = g_collStats.maxProbes = 0;
     g_prodStats.full = g_rigStats.full = g_collStats.full = 0;
     g_rigEpochs = 0;
@@ -1216,20 +1348,38 @@ void summaryLine(uint64_t now) noexcept {
 }
 
 // The producer-B and rig vetoes: attached while the setting is on, and they answer only while sealed.
-bool producerVetoHook(uintptr_t rec, uintptr_t owner) noexcept {
+bool producerVetoBody(uintptr_t rec, uintptr_t owner) noexcept {
     (void)owner;
     if (!g_sealedFlag.load(std::memory_order_acquire)) return false;
-    std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+    TimedStateLock lock;
     if (!g_heldValid) return false;
     const bool veto = producerDecide(rec);
     if (veto) ++g_winProducerVetoes;
     return veto;
 }
 
-bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
+// The producer-B veto, timed one call in 32 (built v14.24).
+bool producerVetoHook(uintptr_t rec, uintptr_t owner) noexcept {
+    const bool sample = costSampleCall(g_costProducerCalls);
+    const int64_t t0 = sample ? costTicks() : 0;
+    const bool veto = producerVetoBody(rec, owner);
+    if (sample) costAdd(g_costProducer, costMs(t0, costTicks()));
+    return veto;
+}
+
+bool rigVetoBody(uintptr_t rig, uintptr_t ctx) noexcept {
     if (!g_sealedFlag.load(std::memory_order_acquire)) return false;
     const bool veto = sealedTrialRigVeto(rig, ctx);
     if (veto) ++g_winRigVetoes;
+    return veto;
+}
+
+// The rig early veto, timed one call in 32 (built v14.24).
+bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
+    const bool sample = costSampleCall(g_costRigCalls);
+    const int64_t t0 = sample ? costTicks() : 0;
+    const bool veto = rigVetoBody(rig, ctx);
+    if (sample) costAdd(g_costRig, costMs(t0, costTicks()));
     return veto;
 }
 
@@ -1399,6 +1549,7 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
             pickOwnRecord(frame);
             g_heldCell = next;
             g_heldValid = true;
+            snapshotSealPose();              // built v14.24: each latched record's pose at the seal (the mechanism re-seal compares against it)
             g_rigVerdictsFresh = false;     // built v14.20 (review 7a): the verdicts are refreshed before this seal's first veto
             setHeldFrame(g_heldCell, frame);
             g_engagePending = false;
@@ -1468,7 +1619,7 @@ void setHeldFrame(const sealed::OwnCell& cell, uint32_t frame) {
 // pad and explicit parts, then the cell), the bay keep, the own ship (the prefix, then the live sphere), otherwise culled.
 // judge: the sealed judgement (the keep and the cull); false: gathering only (the frame's camera, pads and explicit parts).
 void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
-    std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+    TimedStateLock lock;
     ++g_recordsFrame;
     if (judge && !g_heldValid) return;
     uintptr_t ctx = 0;
@@ -1627,11 +1778,19 @@ bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps) noexcept {
 
 // The store calls this after it has written a record (bucket = the collection, record = its record). While sealed it judges the record; while
 // docked and unsealed it only gathers the frame's pads, explicit parts and camera for the seal trigger (built v14.1).
-void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept {
+void afterStoreDispatch(uintptr_t bucket, uintptr_t record) noexcept {
     const sealed::StoreMode mode = sealed::storeMode(g_setting.load(std::memory_order_acquire), g_sealedFlag.load(std::memory_order_acquire),
                                                      g_dockedNow.load(std::memory_order_acquire));
     if (mode == sealed::StoreMode::kNone) return;
     afterStoreJudge(bucket, record, mode == sealed::StoreMode::kJudge);
+}
+
+// The store observer's entry (the store hook calls it per record), timed one call in 32 (built v14.24).
+void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept {
+    const bool sample = costSampleCall(g_costStoreCalls);
+    const int64_t t0 = sample ? costTicks() : 0;
+    afterStoreDispatch(bucket, record);
+    if (sample) costAdd(g_costStore, costMs(t0, costTicks()));
 }
 
 // The render thread's frame tick: the setting, the held cell in the pad's frame, the seal and release rules, the rig verdicts, the summary.
@@ -1672,7 +1831,80 @@ void gameStateTick() noexcept {
     g_game.r1Fresh = own.r1 >= 0 && sealed::gameFresh(padStateAgeMs(own.r1Qpc));
 }
 
+// Built v14.24: the mechanism's re-seal on the poses. While the seal is released by the mechanism (the trigger's reseal 1 with the mechanism flag) every
+// latched record is compared with its pose at the seal. Returns true when all of them are back this frame (the core counts the frames). Logs: the away
+// line while the pad is out of the bay with r1 1 (change-only, at most 2 Hz, the largest four first); the back line once when all are back.
+bool mechanismPoseTick(uint64_t now) noexcept {
+    if (!(g_sealState.reseal == 1 && g_sealState.mechanism) || g_sealPoseN == 0 || g_latch.n != g_sealPoseN) {
+        g_poseAwayGate.reset();
+        g_poseBackGate.reset();
+        return false;
+    }
+    const uint32_t frame = g_frameStamp.load(std::memory_order_relaxed);
+    struct Away {
+        char name[48];
+        float dM;
+        float dDeg;
+    };
+    Away away[sealed::kLatchCap];
+    size_t nAway = 0;
+    bool allBack = true;
+    for (size_t i = 0; i < g_sealPoseN; ++i) {
+        const sealed::LatchRec& r = g_latch.recs[i];
+        const SealPoseRec& p = g_sealPose[i];
+        if (r.addr != p.addr || r.stamp != frame) return false;   // a record not read this frame: no comparison, no pose
+        float dM = 0.0f;
+        float dDeg = 0.0f;
+        sealed::latchPoseDelta(r.rel, p.rel, r.ax0, p.ax0, r.ax2, p.ax2, &dM, &dDeg);
+        if (sealed::latchPoseWithin(dM, dDeg)) continue;
+        allBack = false;
+        Away& a = away[nAway++];
+        std::snprintf(a.name, sizeof(a.name), "%s", p.name);
+        a.dM = dM;
+        a.dDeg = dDeg;
+    }
+    const bool r1Up = g_game.r1Fresh && g_game.r1 == sealed::kReaderInHangar;
+    if (allBack) {
+        g_poseAwayGate.reset();
+        if (r1Up && g_poseBackGate.changed(1)) {
+            Log::get().note("optimized station: mechanism back at its sealed pose: all %u latched records within %.2f m and %.0f deg; re-seal allowed "
+                            "after %u frames with r1 1.",
+                            static_cast<unsigned>(g_sealPoseN), static_cast<double>(sealed::kPoseTolM), static_cast<double>(sealed::kPoseTolDeg),
+                            static_cast<unsigned>(sealed::kPoseBackFrames));
+        }
+        return true;
+    }
+    if (!r1Up) return false;
+    // The largest first, at most four.
+    std::sort(away, away + nAway, [](const Away& x, const Away& y) { return x.dM > y.dM; });
+    char text[400] = {};
+    size_t used = 0;
+    const size_t shown = nAway < 4 ? nAway : 4;
+    for (size_t i = 0; i < shown; ++i) {
+        const int w = std::snprintf(text + used, sizeof(text) - used, "%s%s %.2f m %.1f deg", i > 0 ? "; " : "", away[i].name,
+                                    static_cast<double>(away[i].dM), static_cast<double>(away[i].dDeg));
+        if (w < 0 || used + static_cast<size_t>(w) >= sizeof(text)) break;
+        used += static_cast<size_t>(w);
+    }
+    const uint64_t key = sealed::textKey(text);
+    if (now >= g_poseLastLogMs + 500 && g_poseAwayGate.changed(key)) {
+        g_poseLastLogMs = now;
+        Log::get().note("optimized station: mechanism away from its sealed pose: %s (largest first, at most 4)", text);
+    }
+    return false;
+}
+
+void optimizedStationFrameBody(uint32_t frame);
+
+// The frame tick, timed every frame while the setting is on (built v14.24).
 void optimizedStationFrame(uint32_t frame) {
+    const bool on = g_setting.load(std::memory_order_acquire);
+    const int64_t t0 = on ? costTicks() : 0;
+    optimizedStationFrameBody(frame);
+    if (on) costAdd(g_costFrame, costMs(t0, costTicks()));
+}
+
+void optimizedStationFrameBody(uint32_t frame) {
     if (++g_settingPoll >= kSettingPollFrames) {
         g_settingPoll = 0;
         const std::string text = Config::get().getString("fix.optimized_station", "on");
@@ -1690,7 +1922,7 @@ void optimizedStationFrame(uint32_t frame) {
     if (g_summaryStartMs == 0) g_summaryStartMs = now;
     // Built v14.2: the frame advances here, once per tick. The observer's promote and view resolve run once per frame off this stamp.
     g_frameStamp.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+    TimedStateLock lock;
     g_recordsLast = g_recordsFrame;
     g_recordsFrame = 0;
     ++g_winFrames;
@@ -1879,6 +2111,7 @@ void optimizedStationFrame(uint32_t frame) {
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
     in.ownKnown = g_game.ownKnown;
+    in.poseBack = mechanismPoseTick(now);   // built v14.24: the latched records back at their sealed poses (the mechanism re-seal)
     in.r1Fresh = g_game.r1Fresh;
     in.inHangar = g_game.r1 == sealed::kReaderInHangar;
     in.pickOk = g_pickCell.has && g_preShellValid;   // no sized shell: the trigger stays idle (built v14.13)
@@ -1952,6 +2185,7 @@ void optimizedStationFrame(uint32_t frame) {
             sealed::gameWaitingLine(w, line, sizeof(line));
             Log::get().note("%s", line);
             g_waitLast = w;
+            ++g_waitingLinesWritten;   // built v14.24: the waiting lines written this window (the summary's count)
             g_waitLastSet = true;
             g_waitLastMs = now;
         }

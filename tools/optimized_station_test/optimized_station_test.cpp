@@ -977,6 +977,151 @@ int main(int argc, char** argv) {
         check(firstEngage(&st, noPick, 0, 20000) == 0, "v14.1: no pad gathered (pickOk false): the seal is never requested");
     }
 
+    // ---- Built v14.24 (2026-10-13, the review of the 013c6122 flight) -----------------------------------------------------------------------------
+    {
+        // Item 1: a change of rig A's association forgets A's bounds and verdict only; rig B keeps its bound and its verdict (no whole-epoch bump).
+        bool aCur = true, aLast = true, bCur = true, bLast = true;
+        uint8_t aV = 2, bV = 2;
+        uint32_t aRun = 3, bRun = 3;
+        se::rigForgetBounds(&aCur, &aLast, &aV, &aRun);
+        check(!aCur && !aLast && aV == 0 && aRun == 0, "v14.24 rig: a change of rig A's collection forgets rig A's bounds and verdict");
+        check(bCur && bLast && bV == 2 && bRun == 3 && se::rigMayVeto(4, 4, bCur, bV),
+              "v14.24 rig: rig B keeps its bound and its outside verdict, and may still veto (no whole-epoch bump)");
+        check(se::collAssociationIs(0x500, 0x500) && !se::collAssociationIs(0x600, 0x500) && !se::collAssociationIs(0, 0),
+              "v14.24 rig: a table entry names its rig only while the rig still holds that collection");
+    }
+    {
+        // Item 3: the cost summary's percentiles, and the change-only gate.
+        double v[100];
+        for (int i = 0; i < 100; ++i) v[i] = static_cast<double>(100 - i);   // 100 down to 1
+        double p50 = 0.0, p95 = 0.0, mx = 0.0;
+        se::samplePercentiles(v, 100, &p50, &p95, &mx);
+        check(p50 == 50.0 && p95 == 95.0 && mx == 100.0, "v14.24 cost: p50, p95 and max of 1..100 are 50, 95 and 100");
+        se::samplePercentiles(v, 0, &p50, &p95, &mx);
+        check(p50 == 0.0 && p95 == 0.0 && mx == 0.0, "v14.24 cost: no samples read as zeros");
+        se::ChangeGate g;
+        check(g.changed(7) && !g.changed(7) && g.changed(8) && !g.changed(8), "v14.24 log: a change-only gate writes a key once per change");
+        check(se::textKey("pad") == se::textKey("pad") && se::textKey("pad") != se::textKey("pad "),
+              "v14.24 log: a text key is stable for the same text and differs for another");
+        se::SealState st;
+        check(!st.mechanism && st.poseRun == 0, "v14.24: a fresh trigger holds no mechanism release");
+    }
+    {
+        // Item 2: the pose of a latched record against its pose at the seal.
+        const float rel0[3] = {0.0f, 0.0f, 0.0f};
+        const float relOff[3] = {0.0f, 0.0f, 0.3f};
+        const float a0[3] = {1.0f, 0.0f, 0.0f};
+        const float a2[3] = {0.0f, 0.0f, 1.0f};
+        const float c2 = std::cos(2.0f * 3.14159265f / 180.0f), s2 = std::sin(2.0f * 3.14159265f / 180.0f);
+        const float a0Turn[3] = {c2, s2, 0.0f};
+        float dM = -1.0f, dDeg = -1.0f;
+        se::latchPoseDelta(rel0, rel0, a0, a0, a2, a2, &dM, &dDeg);
+        check(dM == 0.0f && dDeg == 0.0f && se::latchPoseWithin(dM, dDeg), "v14.24 pose: a record at its sealed pose is within tolerance");
+        se::latchPoseDelta(relOff, rel0, a0, a0, a2, a2, &dM, &dDeg);
+        check(std::fabs(dM - 0.3f) < 1e-5f && !se::latchPoseWithin(dM, dDeg), "v14.24 pose: a 0.3 m offset is outside the 0.25 m tolerance");
+        se::latchPoseDelta(rel0, rel0, a0Turn, a0, a2, a2, &dM, &dDeg);
+        check(std::fabs(dDeg - 2.0f) < 1e-3f && !se::latchPoseWithin(dM, dDeg), "v14.24 pose: a 2 degree turn is outside the 1 degree tolerance");
+    }
+    {
+        // Item 2, the re-seal on the poses: a Lift that returns to its sealed pose re-seals after kPoseBackFrames frames with r1 1.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::SealInputs in = inHangar(0);
+        check(se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage, "v14.24 pose: the setup seal");
+        in.held = true;
+        in.mechanismMoved = true;
+        in.poseBack = false;
+        in.nowMs = 100;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kMechanism, "v14.24 pose: the Lift moving releases the seal");
+        in.held = false;
+        in.mechanismMoved = false;
+        in.poseBack = true;
+        int frames = 0;
+        for (int k = 1; k <= 60 && frames == 0; ++k) {
+            in.nowMs = 100 + 100 * static_cast<uint64_t>(k);
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage) frames = k;
+        }
+        check(frames == static_cast<int>(se::kPoseBackFrames),
+              "v14.24 pose: a Lift that returns to its sealed pose re-seals after 30 frames (r1 1, camera in)");
+    }
+    {
+        // A Lift that stays away does not re-seal, however long r1 stays 1.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::SealInputs in = inHangar(0);
+        se::sealStep(in, &st, &w);
+        in.held = true;
+        in.mechanismMoved = true;
+        in.nowMs = 100;
+        se::sealStep(in, &st, &w);
+        in.held = false;
+        in.mechanismMoved = false;
+        in.poseBack = false;
+        uint64_t early = 0;
+        for (uint64_t t = 200; t <= 10000; t += 100) {
+            in.nowMs = t;
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && early == 0) early = t;
+        }
+        check(early == 0, "v14.24 pose: a Lift that stays away does not re-seal (100 s with r1 1, the pose never back)");
+    }
+    {
+        // r1 1 to 0 while away keeps the edge rule: the pose does not count while the pad is out; the next seal is the r1 0 to 1 edge.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::SealInputs in = inHangar(0);
+        se::sealStep(in, &st, &w);
+        in.held = true;
+        in.mechanismMoved = true;
+        in.nowMs = 100;
+        se::sealStep(in, &st, &w);
+        in.held = false;
+        in.mechanismMoved = false;
+        in.poseBack = false;
+        in.nowMs = 200;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kNone, "v14.24 edge: with the pose away and r1 1, no re-seal");
+        in.inHangar = false;
+        in.poseBack = true;
+        in.nowMs = 300;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kNone && st.reseal == 2 && !st.mechanism,
+              "v14.24 edge: r1 1 to 0 moves the re-seal to the edge rule and drops the pose count");
+        in.inHangar = true;
+        in.poseBack = false;
+        in.nowMs = 400;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage, "v14.24 edge: r1 back to 1 is the edge: it re-seals at once");
+    }
+    {
+        // The pose rule belongs to the mechanism release only: a pad-moved release does not re-seal on poses.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::SealInputs in = inHangar(0);
+        se::sealStep(in, &st, &w);
+        in.held = true;
+        in.padMoved = true;
+        in.nowMs = 100;
+        se::sealStep(in, &st, &w);
+        in.held = false;
+        in.padMoved = false;
+        in.poseBack = true;
+        uint64_t early = 0;
+        for (uint64_t t = 200; t <= 4000; t += 100) {
+            in.nowMs = t;
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && early == 0) early = t;
+        }
+        check(early == 0, "v14.24 pose: a pad-moved release does not re-seal on the poses (it waits for the r1 edge)");
+    }
+    {
+        // Item 3: the waiting reason carries no per-frame counter: two frames of an absent pad give the same text.
+        se::OwnPadSticky sticky;
+        sticky.pad = 0x1000;
+        const float camera[3] = {0.0f, 0.0f, 0.0f};
+        const float radii[3] = {80.0f, 120.0f, 145.0f};
+        se::OwnCell first, second;
+        se::pickOwnPadSticky(nullptr, 0, camera, radii, &sticky, &first);
+        se::pickOwnPadSticky(nullptr, 0, camera, radii, &sticky, &second);
+        check(std::strcmp(first.reason, second.reason) == 0 && std::strstr(first.reason, "held for up to 30 frames") != nullptr,
+              "v14.24 log: the held-pad reason is the same on every frame (no counter, no line per frame)");
+    }
+
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

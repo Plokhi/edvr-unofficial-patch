@@ -1001,6 +1001,11 @@ constexpr float kCameraLeaveM = 2.0f;
 // The camera counts in both directions over this many consecutive frames: it must be outside the held box for this long to release, and inside the
 // bay for this long to re-seal. Explorer Cam is no condition.
 constexpr uint32_t kCameraFrames = 10;
+// Built v14.24: a mechanism release (the Lift, a hatch) is not a launch unless the bay stays away. The latched records must be back within these of
+// their sealed poses for kPoseBackFrames consecutive frames (with r1 1) before the seal may come back without the r1 0 to 1 edge.
+constexpr float kPoseTolM = 0.25f;
+constexpr float kPoseTolDeg = 1.0f;
+constexpr uint32_t kPoseBackFrames = 30;
 // The game's pad state is fresh when its last call on the own object is within this many milliseconds.
 constexpr uint64_t kPadStateFreshMs = 1000;
 // The reader codes (r0: 0 Ready for landing, 1 Inside_Hangar, 2 Outside_Hangar, 3 other; r1: 1 Inside_Hangar and settled).
@@ -1025,6 +1030,7 @@ struct SealInputs {
     bool cameraOutside = false;  // the camera is outside the held box by more than kCameraLeaveM (only meaningful while held)
     uintptr_t pad = 0;           // the own pad's record (a change withdraws the request)
     bool mechanismMoved = false; // a latched bay mechanism record moved on two frames in a row (the launch)
+    bool poseBack = false;       // built v14.24: every latched record is within kPoseTolM and kPoseTolDeg of its pose at the seal this frame
     bool padMoved = false;       // the pad moved more than kPadMoveReleaseM along the shaft relative to the hangar shell (ShellMotion)
     bool hangarChanged = false;  // the held pad is gone from the store, or another own pad is the nearest for kHeldLostFrames
     bool launched = false;       // not used (no reader for the launch): always false
@@ -1040,6 +1046,10 @@ struct SealState {
     // The re-seal after a release by the mechanism, the pad moving, or the pad leaving the bay: 0 free, 1 wait for the pad to leave the bay
     // (r1 0), 2 wait for it to come back (r1 1 after a 0). Camera, ship and setting releases leave it at 0.
     uint8_t reseal = 0;
+    // Built v14.24: the release was by the mechanism (the latch), and the frames in a row with every latched record back at its sealed pose.
+    // Those frames re-seal without the r1 edge (kPoseBackFrames), when r1 is 1 and fresh and the camera rule holds.
+    bool mechanism = false;
+    uint32_t poseRun = 0;
 };
 
 // A release, or the trigger lapsing: the request starts again.
@@ -1210,6 +1220,79 @@ inline bool rigMayVeto(uint32_t slotEpoch, uint32_t epoch, bool bounded, uint8_t
 // preferred). A missing eye pose alone is not a reason to resolve the view again.
 inline bool viewCentreReady(bool originOk, bool poseOk, bool explorerCam) noexcept {
     return originOk || (poseOk && explorerCam);
+}
+
+// ---- Built v14.24 (2026-10-13, the review of the 013c6122 flight): the rig association per rig, the mechanism pose, the cost summary, the log gate ----
+
+// A change of one rig's collection forgets that rig's bounds and verdict, and no other rig's (review 4, per rig). The global epoch is for the
+// lifecycle events only (undock, hangar change, ship change, setting toggle).
+inline void rigForgetBounds(bool* curValid, bool* lastValid, uint8_t* verdict, uint32_t* vetoedRun) noexcept {
+    *curValid = false;
+    *lastValid = false;
+    *verdict = 0;
+    *vetoedRun = 0;
+}
+
+// A table entry names a rig whose collection is still the one it was filed under (a stale entry names a rig whose collection changed).
+inline bool collAssociationIs(uintptr_t rigColl, uintptr_t key) noexcept { return rigColl != 0 && rigColl == key; }
+
+// The angle in degrees between two unit axes (clamped; a zero axis reads 0).
+inline float axisAngleBetweenDeg(const float a[3], const float b[3]) noexcept {
+    const float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const float c = d > 1.0f ? 1.0f : (d < -1.0f ? -1.0f : d);
+    return std::acos(c) * 57.29577951f;
+}
+
+// A latched record's drift against its sealed pose: the centre's offset (m) and the larger of its two axis angles (deg).
+inline void latchPoseDelta(const float relA[3], const float relB[3], const float a0A[3], const float a0B[3], const float a2A[3], const float a2B[3],
+                           float* dM, float* dDeg) noexcept {
+    const float dx = relA[0] - relB[0];
+    const float dy = relA[1] - relB[1];
+    const float dz = relA[2] - relB[2];
+    *dM = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float g0 = axisAngleBetweenDeg(a0A, a0B);
+    const float g2 = axisAngleBetweenDeg(a2A, a2B);
+    *dDeg = g0 > g2 ? g0 : g2;
+}
+
+// Within the pose tolerance (kPoseTolM, kPoseTolDeg).
+inline bool latchPoseWithin(float dM, float dDeg) noexcept { return dM <= kPoseTolM && dDeg <= kPoseTolDeg; }
+
+// The p50, the p95 and the max of n samples (sorted in place). None: zeros.
+inline void samplePercentiles(double* v, size_t n, double* p50, double* p95, double* maxV) noexcept {
+    if (n == 0) {
+        *p50 = 0.0;
+        *p95 = 0.0;
+        *maxV = 0.0;
+        return;
+    }
+    std::sort(v, v + n);
+    *p50 = v[(n - 1) * 50 / 100];
+    *p95 = v[(n - 1) * 95 / 100];
+    *maxV = v[n - 1];
+}
+
+// A log gate: a line is written only when its key changes. Texts that carry a counter that changes every frame must not be logged per frame.
+struct ChangeGate {
+    bool have = false;
+    uint64_t key = 0;
+    bool changed(uint64_t k) noexcept {
+        if (have && k == key) return false;
+        have = true;
+        key = k;
+        return true;
+    }
+    void reset() noexcept { have = false; }
+};
+
+// FNV-1a of a text: a key for ChangeGate.
+inline uint64_t textKey(const char* s) noexcept {
+    uint64_t h = 1469598103934665603ull;
+    for (const char* p = s; p != nullptr && *p != '\0'; ++p) {
+        h ^= static_cast<uint8_t>(*p);
+        h *= 1099511628211ull;
+    }
+    return h;
 }
 
 // Built v14.18 (2026-10-13, the store hook's identity gate): the admission store's sixteen prologue bytes in build 332841. store_hook.cpp detours
@@ -1649,6 +1732,8 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
             if (w == ReleaseWhy::kMechanism || w == ReleaseWhy::kPadMoved || w == ReleaseWhy::kInHangarLeft || w == ReleaseWhy::kLaunch) {
                 st->reseal = 1;   // a fresh in-hangar edge is needed before the next seal
             }
+            st->mechanism = (w == ReleaseWhy::kMechanism);   // built v14.24: a mechanism release may re-seal on the poses instead of the edge
+            st->poseRun = 0;
             clearTrigger(st);
             st->camOutRun = 0;
             if (w == ReleaseWhy::kCameraLeft) st->camInRun = 0;   // the re-seal waits kCameraFrames inside the bay
@@ -1660,6 +1745,8 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
     if (!in.docked) {
         clearTrigger(st);
         st->reseal = 0;
+        st->mechanism = false;
+        st->poseRun = 0;
         return SealAction::kNone;
     }
     if (in.padHeld) return SealAction::kNone;   // a short absence: the trigger keeps its state
@@ -1676,10 +1763,20 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         clearTrigger(st);
         return SealAction::kNone;
     }
-    if (!in.inHangar) {   // the pad is out of the bay: the re-seal edge advances
+    if (!in.inHangar) {   // the pad is out of the bay: the re-seal edge advances (and the pose count restarts: the edge rule stands)
         clearTrigger(st);
         if (st->reseal == 1) st->reseal = 2;
+        st->mechanism = false;
+        st->poseRun = 0;
         return SealAction::kNone;
+    }
+    if (st->reseal == 1 && st->mechanism) {   // built v14.24: r1 1 and fresh, with the latched poses back, for kPoseBackFrames frames in a row
+        st->poseRun = in.poseBack ? st->poseRun + 1 : 0;
+        if (st->poseRun >= kPoseBackFrames) {
+            st->reseal = 0;
+            st->mechanism = false;
+            st->poseRun = 0;
+        }
     }
     if (st->reseal == 1) return SealAction::kNone;   // in the bay but not yet out since the release: wait for the edge
     if (st->reseal == 2) st->reseal = 0;             // out, then in: the fresh edge
@@ -1774,8 +1871,9 @@ inline void pickOwnPadSticky(const PadObs* obs, size_t n, const float camera[3],
         }
         if (held == nullptr && ++st->unseen < kHeldLostFrames) {
             *out = OwnCell{};
-            std::snprintf(out->reason, sizeof(out->reason), "the own pad is not in the store this frame (%u of %u frames before another can take over)",
-                          static_cast<unsigned>(st->unseen), static_cast<unsigned>(kHeldLostFrames));
+            // Built v14.24: no frame counter in the text (it changed every frame and made the waiting line repeat each frame).
+            std::snprintf(out->reason, sizeof(out->reason), "the own pad is not in the store this frame (held for up to %u frames)",
+                          static_cast<unsigned>(kHeldLostFrames));
             return;
         }
         st->pad = 0;
