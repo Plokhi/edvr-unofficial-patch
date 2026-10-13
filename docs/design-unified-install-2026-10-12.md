@@ -52,11 +52,12 @@
     down; 3D on came back 1280x768 windowed and the game saved it.
 - **Ruled out while designing:** section 9.
 - **Temporary keys:** none. No user-facing key is added.
-- **Phase 2 BUILT, NOT FLOWN:** 190a2a12 `Config::switchProfile`; 113f1eca
-  hooks installed for the scope, gated per call; 0077832a switch entry
-  points; e1262071 the live switch at the frame boundary. No switch rig yet.
-- **Next:** the phase-2 flight on Steam (`/vr` launch, 3D off and on: two
-  switch lines, flat fixes after off, sharp UI after on); then the rig.
+- **Phase 2 BUILT, FLOWN ONCE (F):** 190a2a12 `Config::switchProfile`;
+  113f1eca hooks for the scope; 0077832a entry points; e1262071 the live
+  switch; a6ee51a7 monitor clock; 8473c587 `profile_switch_test` (WARP:
+  mechanics only, 50 cycles, a skipped-teardown control).
+- **Next:** the leak flight on Steam: 10 toggles in one session, VRAM watch
+  read per cycle (the rig cannot see the real pipelines).
 
 ## 1. What exists today
 
