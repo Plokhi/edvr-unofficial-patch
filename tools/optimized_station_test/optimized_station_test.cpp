@@ -669,6 +669,84 @@ int main(int argc, char** argv) {
         check(req == 4000 + se::kBayStillMs, "v14.12: the own pad must be still for 2 s too: sealed 2 s after the pad's last move");
     }
 
+    // ---- Built v14.15: the load-in latch, the reject log, the bay's span, and the own pad's 3D move while sealed ----------------------------
+    {
+        // A load-in seal (immediate) then the pad slides sideways (x, 10 cm each frame from frame 50): released within 2 frames (at 51).
+        const float a0[3] = {1.0f, 0.0f, 0.0f};
+        const float a2[3] = {0.0f, 0.0f, 1.0f};
+        se::LatchSet set;
+        set.latched = true;
+        set.n = 2;
+        std::snprintf(set.recs[0].name, sizeof(set.recs[0].name), "%s", "LandingPadMediumA");
+        set.recs[0].addr = 0x1;
+        std::snprintf(set.recs[1].name, sizeof(set.recs[1].name), "%s", "BlastShieldBase");
+        set.recs[1].addr = 0x7;
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        check(se::sealStep(quiet(100), &st, &w) == se::SealAction::kRequestEngage && st.immediate, "v14.15: the load-in seal (immediate, no descent)");
+        uint64_t relAt = 0;
+        for (uint32_t f = 1; f <= 100 && relAt == 0; ++f) {
+            float padRel[3] = {0.0f, 0.0f, -45.0f};
+            if (f >= 50) padRel[0] = (f % 2 == 0) ? 0.1f : 0.0f;   // the pad slides sideways, every frame
+            const float hatchStill[3] = {5.0f, 0.0f, -45.0f};
+            set.recs[0].step(f, padRel, a0, a2, 1, 1, f * 100ull);
+            set.recs[1].step(f, hatchStill, a0, a2, 1, 1, f * 100ull);
+            se::SealInputs h = quiet(f * 100ull);
+            h.held = true;
+            h.mechanismMoved = set.movedIndex() >= 0;
+            if (se::sealStep(h, &st, &w) == se::SealAction::kRelease) relAt = f;
+        }
+        check(relAt == 51 && w == se::ReleaseWhy::kMechanism && set.movedIndex() == 0,
+              "v14.15: the load-in seal, the pad slides sideways from frame 50: released within 2 frames (at 51), the pad's own move");
+    }
+    {
+        // The span: a BlastShield 268 m along the shaft with no shaft target built (capLen 0) is kept; one 70 m lateral is refused with its reason.
+        se::LatchCand cands[3] = {};
+        std::snprintf(cands[0].name, sizeof(cands[0].name), "%s", "BlastShield_A");
+        cands[0].addr = 0x21;
+        cands[0].centre[0] = 41.0f;
+        cands[0].centre[2] = 268.0f;
+        std::snprintf(cands[1].name, sizeof(cands[1].name), "%s", "BlastShieldBase_B");
+        cands[1].addr = 0x22;
+        cands[1].centre[0] = 70.0f;
+        cands[1].centre[2] = 100.0f;
+        const float origin[3] = {0.0f, 0.0f, 0.0f};
+        const float up[3] = {0.0f, 0.0f, 1.0f};
+        se::LatchRec out[se::kLatchCap];
+        se::LatchReject rej[10];
+        size_t rejN = 0;
+        const float span = std::max(0.0f + 10.0f, se::kLatchSpanM);
+        const size_t k = se::selectMechanism(cands, 1, 0x1, "LandingPadMediumA", se::PadSize::kMedium, origin, up, -85.0f, span, out, rej, 10, &rejN);
+        check(k == 2 && rejN == 0 && std::strcmp(out[1].name, "BlastShield_A") == 0,
+              "v14.15: a BlastShield 41 m lateral and 268 m along (no target built yet) is latched");
+        size_t rejN2 = 0;
+        se::selectMechanism(cands + 1, 1, 0x1, "LandingPadMediumA", se::PadSize::kMedium, origin, up, -85.0f, span, out, rej, 10, &rejN2);
+        check(rejN2 == 1 && std::strstr(rej[0].why, "lateral") != nullptr && std::strcmp(rej[0].name, "BlastShieldBase_B") == 0,
+              "v14.15: a BlastShield 70 m lateral is refused, with its reason logged");
+    }
+    {
+        // A still sealed bay, the own pad still too: no release for a minute.
+        const float a0[3] = {1.0f, 0.0f, 0.0f};
+        const float a2[3] = {0.0f, 0.0f, 1.0f};
+        const float padRel[3] = {0.0f, 0.0f, -45.0f};
+        se::LatchSet set;
+        set.latched = true;
+        set.n = 1;
+        set.recs[0].addr = 0x1;
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::sealStep(quiet(100), &st, &w);
+        bool released = false;
+        for (uint32_t f = 1; f <= 600; ++f) {
+            set.recs[0].step(f, padRel, a0, a2, 1, 1, f * 100ull);
+            se::SealInputs h = quiet(f * 100ull);
+            h.held = true;
+            h.mechanismMoved = set.movedIndex() >= 0;
+            released = released || se::sealStep(h, &st, &w) == se::SealAction::kRelease;
+        }
+        check(!released, "v14.15: a still sealed bay with the pad still: no release for 60 s");
+    }
+
     // ---- Built v14.14: sealed, the latched bay mechanism moves -> the launch releases the seal; still for a minute -> no release; a source change -> no release
     {
         const float a0[3] = {1.0f, 0.0f, 0.0f};
@@ -694,7 +772,7 @@ int main(int argc, char** argv) {
             set.recs[1].step(f, hatch, a0, a2, 1, 1, f * 100ull);
             se::SealInputs h = quiet(f * 100ull);
             h.held = true;
-            h.mechanismMoved = set.movedRecord() != nullptr;
+            h.mechanismMoved = set.movedIndex() >= 0;
             if (se::sealStep(h, &st, &w) == se::SealAction::kRelease) relAt = f;
         }
         check(relAt == 51 && w == se::ReleaseWhy::kMechanism, "v14.14: sealed, the hatch starts moving at frame 50: released within 2 frames (at 51), as the launch");
@@ -712,10 +790,10 @@ int main(int argc, char** argv) {
             still.recs[1].step(f, hatchStill, a0, a2, 1, 1, f * 100ull);
             se::SealInputs h = quiet(f * 100ull);
             h.held = true;
-            h.mechanismMoved = still.movedRecord() != nullptr;
+            h.mechanismMoved = still.movedIndex() >= 0;
             released = released || se::sealStep(h, &st2, &w) == se::SealAction::kRelease;
         }
-        check(!released && still.movedRecord() == nullptr, "v14.14: sealed and still for 60 s: no release");
+        check(!released && still.movedIndex() < 0, "v14.14: sealed and still for 60 s: no release");
         // (3) a centre-source change (the hatch read from another source each frame): re-based, never counted as moving: no release
         se::LatchSet src;
         src.latched = true;
@@ -733,10 +811,10 @@ int main(int argc, char** argv) {
             src.recs[1].step(f, hatch, a0, a2, srcNow, 1, f * 100ull);
             se::SealInputs h = quiet(f * 100ull);
             h.held = true;
-            h.mechanismMoved = src.movedRecord() != nullptr;
+            h.mechanismMoved = src.movedIndex() >= 0;
             srcReleased = srcReleased || se::sealStep(h, &st3, &w) == se::SealAction::kRelease;
         }
-        check(!srcReleased && src.movedRecord() == nullptr, "v14.14: a centre-source change re-bases the record and never counts as a move: no release");
+        check(!srcReleased && src.movedIndex() < 0, "v14.14: a centre-source change re-bases the record and never counts as a move: no release");
     }
 
     // ---- Built v14.13: the sun inside the hangar (its own state), the hangar watch, the no-hangar pad, the names --------------------------

@@ -974,13 +974,13 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
 // Built v14.12: the latch is kept while docked, unsealed, after a descent; it is cleared on a hangar change, a ship change, an undock or a seal.
 bool bayWatchKeep() noexcept {
     return g_setting.load(std::memory_order_acquire) &&   // kept through the seal too (built v14.14)
-           g_dockedNow.load(std::memory_order_acquire) && g_sealState.moved;
+           g_dockedNow.load(std::memory_order_acquire);   // from docking, not only after a descent: a load-in seal latches too (built v14.15)
 }
 
 // Built v14.12: a gathered record that may be a mechanism record (its name from the cache), within 150 m of the camera. Only while a latch is pending.
 void latchCandNote(uintptr_t record, const float* centre) noexcept {
     if (!g_latchPending || g_latchCandN >= sealed::kLatchCandCap) return;
-    if (g_frameCamValid && sealed::distance(centre, g_frameCam) > 150.0f) return;
+    if (g_frameCamValid && sealed::distance(centre, g_frameCam) > 400.0f) return;   // a bay's span reaches ~270 m along the shaft (built v14.15)
     char nm[48] = {};
     if (!cachedName(record, nm, sizeof(nm)) || !sealed::mechanismName(nm)) return;
     sealed::LatchCand& cand = g_latchCands[g_latchCandN++];
@@ -1009,9 +1009,12 @@ void latchNow(uint64_t now) noexcept {
     }
     for (size_t i = 0; i < g_latchCandN; ++i) cands[n++] = g_latchCands[i];
     const float alongMin = -belowFor(g_pickCell.size);
-    const float alongMax = g_pickCell.capLen + 10.0f;
+    // The span: the target's distance when the shaft target is built, and never less than the bay's span (built v14.15).
+    const float alongMax = g_pickCell.capsule ? std::max(g_pickCell.capLen + 10.0f, sealed::kLatchSpanM) : sealed::kLatchSpanM;
+    sealed::LatchReject rej[10];
+    size_t rejN = 0;
     const size_t k = sealed::selectMechanism(cands, n, g_pickCell.pad, g_pickCell.padName, g_pickCell.size, g_pickCell.centre, up, alongMin, alongMax,
-                                             g_latch.recs);
+                                             g_latch.recs, rej, 10, &rejN);
     g_latch.n = k;
     g_latch.latched = true;
     g_latch.lastMotionMs = 0;
@@ -1023,6 +1026,7 @@ void latchNow(uint64_t now) noexcept {
         used += static_cast<size_t>(w);
     }
     Log::get().note("optimized station: watching the bay's mechanism (%u records): %s", static_cast<unsigned>(k), names);
+    for (size_t i = 0; i < rejN; ++i) Log::get().note("optimized station: latch refused %s: %s", rej[i].name, rej[i].why);
 }
 
 // Built v14.12: each latched record is read by address in the tick (its world centre and orientation), against the shell read this frame. A record
@@ -1659,9 +1663,10 @@ void optimizedStationFrame(uint32_t frame) {
     // Built v14.14: a latched mechanism record moved on two frames in a row while sealed: the launch releases the seal.
     g_mechanismMoved = false;
     if (g_sealedFlag.load(std::memory_order_acquire)) {
-        const sealed::LatchRec* mech = g_latch.movedRecord();
-        if (mech != nullptr) {
-            std::snprintf(g_releaseWhy, sizeof(g_releaseWhy), "the bay mechanism moved (%s): launch", mech->name);
+        const int mi = g_latch.movedIndex();
+        if (mi >= 0) {
+            if (mi == 0) std::snprintf(g_releaseWhy, sizeof(g_releaseWhy), "%s", "the pad started moving: launch");
+            else std::snprintf(g_releaseWhy, sizeof(g_releaseWhy), "the bay mechanism moved (%s): launch", g_latch.recs[mi].name);
             g_mechanismMoved = true;
         }
     }
