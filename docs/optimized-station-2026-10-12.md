@@ -16,7 +16,7 @@
 - **Ships:** `fix.optimized_station = on | off`, F8 menu "Optimized station". VR default on. The flat profile is off and not on the flat allow-list (VR first).
 - **Seal:** docked (Status.json Flags bit 0), own pad found and lowered to its lowest seen height and still (within 0.2 m) for `kSealDelayMs` (6 s, a guess), and the cell builds.
 - **Effect while sealed:** records outside the held hangar box are skipped (producer-B pre-forward veto, rig early veto, post-store clear), and the sun pass (VS 7E38A6AA1269C901 / PS 7CECABDE34FFBE9E) is skipped.
-- **Release rules (each on the next frame):** setting off; undocked; Explorer Cam on; camera more than 2 m outside the held box; own pad more than 2 m along the shaft against the reference shell; hangar change (held pad absent for 30 frames). A re-seal needs the full still delay again.
+- **Release rules (each on the next frame):** setting off; undocked; the camera more than 2 m outside the held box for 10 consecutive frames (Explorer Cam is no condition; the re-seal waits 10 frames back inside the bay); own pad more than 2 m along the shaft against the reference shell; hangar change (held pad absent for 30 frames). A re-seal needs the full still delay again.
 - **Launch release: NOT wired.** The pad state object (+0x3C8, readers r0/r1/r3) is not ported and the launch input is always false. The pad-motion rule is the backstop. The pad moves about 2.8 s after its state flips, so launch pop-in is up to that much late. Not measured.
 - **Fix (v13.8 flight, bug 1): own pad sticky.** The medium bay's LandingPadMediumA and B tie within 5 m with antiparallel axes. A tie goes to the pad nearest the camera laterally to its own up axis, then to the name ending in A, then to the lower record address. A chosen pad stays the own pad while its record is seen; a replacement needs 30 unseen frames.
 - **Fix (v13.8 flight, bug 2): reference shell chosen once.** At the freeze: HangerSmall/Medium/Large matching the pad's size first, then the other sized hangers, then the rest. Gate, Ramp and Skirt parts are never the shell. If that record goes, the pad-motion check stands down (logged) and no other shell is taken.
@@ -28,7 +28,7 @@
 
 ## What ships
 
-Core (pure logic, `src/d3d11/optimized_station_core.h`): the seal state machine (`sealStep`), the release priority (setting off, undocked, Explorer Cam, camera left, pad moved, hangar changed, launch), the own-pad pick with the near-tie rule and the sticky state (`pickOwnPad`, `pickOwnPadSticky`), the shell pick (`pickShell`), the held-cell rules (`keepNamedCell`, `heldCellDrops`, `ownSphereKeeps`, `inBayVolume`, `boxCoordsOf`), and the pad-frame release (`padMovedAway`, `localizeCell`, `worldizeCell`).
+Core (pure logic, `src/d3d11/optimized_station_core.h`): the seal state machine (`sealStep`), the release priority (setting off, undocked, camera left (10 frames), pad moved, hangar changed, launch), the own-pad pick with the near-tie rule and the sticky state (`pickOwnPad`, `pickOwnPadSticky`), the shell pick (`pickShell`), the held-cell rules (`keepNamedCell`, `heldCellDrops`, `ownSphereKeeps`, `inBayVolume`, `boxCoordsOf`), and the pad-frame release (`padMovedAway`, `localizeCell`, `worldizeCell`).
 
 Engine (`src/d3d11/optimized_station.cpp`): the store judgement, the rig and producer vetoes, the held-cell refresh each frame, the seal tick, and the two status kinds (one line per state change, a 30 s summary line).
 
