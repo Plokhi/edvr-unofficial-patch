@@ -269,59 +269,94 @@ void padStateSetOn(bool on) noexcept {
 
 void padStateEvent(const char* what) noexcept { g_padEvent.store(what, std::memory_order_release); }
 
-// The tick. Snapshots the changed and first-seen objects under the lock (with the line state updated there), then writes the lines with no lock held.
-void padStateTick(uint64_t nowMs) noexcept {
-    if (!g_attempted) return;   // the install has not run (the setting has never been on)
+// The game's pad state, for the station's trigger (built v14.23). The latest r0 call on any object, and one object's r0 and r1 with their QPC times.
+// Read-only: a copy under the spinlock.
+void padStateLatestR0(PadObjState* out) noexcept {
+    *out = PadObjState{};
+    SpinLock guard;
+    uint64_t best = 0;
+    for (size_t i = 0; i < pad::kObjects; ++i) {
+        const pad::PadObject& o = g_table.slots[i];
+        if (!o.used || o.readerQpc[0] == 0 || o.readerQpc[0] <= best) continue;
+        best = o.readerQpc[0];
+        out->have = true;
+        out->self = o.self;
+        out->r0 = o.code[0];
+        out->r0Qpc = o.readerQpc[0];
+    }
+}
+
+void padStateObject(uintptr_t self, PadObjState* out) noexcept {
+    *out = PadObjState{};
+    out->self = self;
+    SpinLock guard;
+    for (size_t i = 0; i < pad::kObjects; ++i) {
+        const pad::PadObject& o = g_table.slots[i];
+        if (!o.used || o.self != self) continue;
+        out->have = true;
+        out->r0 = o.readerQpc[0] != 0 ? o.code[0] : -1;
+        out->r0Qpc = o.readerQpc[0];
+        out->r1 = o.readerQpc[1] != 0 ? o.code[1] : -1;
+        out->r1Qpc = o.readerQpc[1];
+        return;
+    }
+}
+
+uint64_t padStateAgeMs(uint64_t qpc) noexcept {
+    if (qpc == 0 || g_qpcFreq == 0) return UINT64_MAX;
+    const uint64_t now = padQpcNow();
+    if (now <= qpc) return 0;
+    return (now - qpc) * 1000u / g_qpcFreq;
+}
+
+uint64_t padStateNowQpc() noexcept { return padQpcNow(); }
+
+// The tick (built v14.23). Writes the change lines and the seal or release line for the OWN pad only, and the 30 s summary. The own pad is named by
+// the caller (the station's GameTrack); with no own pad, nothing per object is written.
+void padStateTick(uint64_t nowMs, uintptr_t own) noexcept {
+    if (!g_attempted) return;
     const char* ev = g_padEvent.exchange(nullptr, std::memory_order_acq_rel);
     if (ev != nullptr) {
-        static char evLine[8192];
+        static char evLine[512];
         {
             SpinLock guard;
-            pad::formatPadEvent(evLine, sizeof(evLine), ev, g_table);
+            pad::formatPadEvent(evLine, sizeof(evLine), ev, g_table, own);
         }
         Log::get().note("%s", evLine);
     }
-    struct Pending {
-        pad::PadObject o;
-        double elapsedS;
-        bool first;
-    };
-    static Pending pend[pad::kObjects];
-    size_t n = 0;
+    pad::PadObject snap{};
+    bool have = false;
+    double elapsedS = 0.0;
     {
         SpinLock guard;
         const uint64_t now = padQpcNow();
-        for (size_t i = 0; i < pad::kObjects; ++i) {
-            pad::PadObject& o = g_table.slots[i];
-            if (!o.used) continue;
-            const bool first = !o.announced;
-            const bool changed = !first && pad::padChanged(o);
-            if (!first && !changed) continue;
-            const uint64_t base = o.lineQpc != 0 ? o.lineQpc : o.lastQpc;
-            pend[n].o = o;   // the copy keeps the state as it was (the codes and reading last printed, the calls since)
-            pend[n].elapsedS = qpcSeconds(now > base ? now - base : 0);
-            pend[n].first = first;
-            ++n;
-            o.announced = true;
-            for (size_t k = 0; k < pad::kReaders; ++k) {
-                o.lineCode[k] = o.code[k];
-                o.calledSinceLine[k] = false;
+        if (own != 0) {
+            for (size_t i = 0; i < pad::kObjects; ++i) {
+                pad::PadObject& o = g_table.slots[i];
+                if (!o.used || o.self != own) continue;
+                const bool first = !o.announced;
+                if (!first && !pad::padChanged(o)) break;
+                snap = o;   // the copy keeps the state as it was: the codes and reading last printed, the calls since
+                have = true;
+                const uint64_t base = o.lineQpc != 0 ? o.lineQpc : o.lastQpc;
+                elapsedS = qpcSeconds(now > base ? now - base : 0);
+                o.announced = true;
+                for (size_t k = 0; k < pad::kReaders; ++k) {
+                    o.lineCode[k] = o.code[k];
+                    o.calledSinceLine[k] = false;
+                }
+                o.lineReading = o.reading;
+                o.callsSinceLine = 0;
+                o.lineQpc = now;
+                break;
             }
-            o.lineReading = o.reading;
-            o.callsSinceLine = 0;
-            o.lineQpc = now;
         }
     }
-    for (size_t k = 0; k < n; ++k) {
-        char line[512];
-        if (pend[k].first) {
-            pad::formatPadFirst(line, sizeof(line), pend[k].o);
-            Log::get().note("%s", line);
-            continue;
-        }
+    if (have) {
         const pad::ChangeLine verdict = pad::padAllowChangeLine(g_table);
+        char line[512];
         if (verdict == pad::ChangeLine::kWrite) {
-            pad::formatPadChange(line, sizeof(line), pend[k].o, pend[k].elapsedS);
+            pad::formatPadChange(line, sizeof(line), snap, elapsedS);
             Log::get().note("%s", line);
         } else if (verdict == pad::ChangeLine::kSuppressedFirst) {
             Log::get().note("pad state: %u change lines logged this session; further changes are counted in the 30 s summary, not logged.",

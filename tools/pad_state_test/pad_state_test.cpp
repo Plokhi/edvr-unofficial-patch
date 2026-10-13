@@ -137,24 +137,14 @@ int main(int argc, char** argv) {
         check(std::strcmp(line,
                           "pad state: obj @0abc40 r0=1 r1=- r2=- r3=- byte=2 occ=5 o2c=0 o2f=1 calls/s=2.0 (was r0=0 byte=0 occ=0)") == 0,
               "the change line text: the codes (- for a reader not called since the last line), the reading, calls/s, and the 'was' values");
-        char first[512] = {};
-        pad::PadTable t2;
-        pad::padNoteCall(t2, 2, self, reading(1, 0, 0, 0), 3, 100);
-        pad::PadObject* f = nullptr;
-        for (size_t i = 0; i < pad::kObjects; ++i) {
-            if (t2.slots[i].used && t2.slots[i].self == self) f = &t2.slots[i];
-        }
-        pad::formatPadFirst(first, sizeof(first), *f);
-        check(std::strcmp(first, "pad state: first seen obj @0abc40 r0=- r1=- r2=3 r3=- byte=1 occ=0 o2c=0 o2f=0") == 0,
-              "the first-seen line text: the codes read so far and the reading");
         char ev[2048] = {};
-        pad::formatPadEvent(ev, sizeof(ev), "seal", t);
-        check(std::strstr(ev, "pad state at seal: obj @0abc40 r0=1 r1=- r2=- r3=- byte=2 occ=5 o2c=0 o2f=1;") != nullptr,
+        pad::formatPadEvent(ev, sizeof(ev), "seal", t, 0x7FF0000ABC40u);
+        check(std::strstr(ev, "pad state at seal: own pad obj @0abc40 r0=1 r1=- r2=- r3=- byte=2 occ=5 o2c=0 o2f=1") != nullptr,
               "the seal line lists the object with occ>0 and its tuple");
         pad::PadTable empty;
         char none[2048] = {};
-        pad::formatPadEvent(none, sizeof(none), "release", empty);
-        check(std::strcmp(none, "pad state at release: none with occ>0") == 0, "a release with no occupied object says so");
+        pad::formatPadEvent(none, sizeof(none), "release", empty, 0);
+        check(std::strcmp(none, "pad state at release: own pad unknown (no r0 on this dock)") == 0, "a release with no occupied object says so");
         char sum[512] = {};
         pad::formatPadSummary(sum, sizeof(sum), t, 30.0);
         check(std::strstr(sum, "objects seen 1") != nullptr && std::strstr(sum, "objects with occ>0 1") != nullptr,

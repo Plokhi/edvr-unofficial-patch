@@ -54,8 +54,6 @@ uint32_t g_engageTries = 0;
 bool g_relOk = false;
 sealed::ShipWatch g_shipWatch;   // the own ship's type prefix, read every tick: a change is a ship change (built v14.6)
 float g_relM = 0.0f;
-bool g_heightChanged = false;
-sealed::ShellHeightSources g_heightSrc;
 bool g_preShellValid = false;
 uintptr_t g_preShellAddr = 0;
 uintptr_t g_preShellPad = 0;
@@ -939,12 +937,11 @@ bool g_storeWanted = false;                // the store observer is wanted (the 
 std::atomic<bool> g_dockedNow{false};     // Status.json Flags bit 0 (Docked), read at each tick while known (the store thread reads it)
 bool g_dockedWasNow = false;               // built v14.20 (review 4): the docked flag at the last tick (an undock is a lifecycle point)
 std::atomic<bool> g_dockedKnownNow{false};// Status.json has a Flags sample (the waiting line says unknown until then)
-sealed::WaitView g_waitLast;              // the waiting line last written (built v14.1)
+sealed::GameView g_waitLast;              // the waiting line last written (built v14.23: the game's pad state)
 bool g_waitLastSet = false;
 uint64_t g_waitLastMs = 0;                // when the waiting line was last written (at most every 10 s while docked)
 sealed::SealState g_sealState;             // the seal trigger (optimized_station_core.h sealStep)
 bool g_flagHangarChanged = false;          // promote saw the held pad go or another own pad nearest: the tick releases on it
-bool g_engageAtLoadIn = false;             // the seal in force was requested at load-in (built v14.3): the status line says so
 // Built v14.13: the sun inside the hangar (its own state, the skip read by the draw), the hangar watch, the names near a pad with no sized shell.
 sealed::SunState g_sun;
 std::atomic<bool> g_sunOff{false};
@@ -963,10 +960,9 @@ uintptr_t g_hangarPad = 0;
 // Built v14.12: the bay's mechanism, latched once per descent (core LatchSet). Candidates are gathered only while a latch is pending.
 sealed::LatchSet g_latch;
 sealed::LatchIdentity g_latchId;   // built v14.20 (review 2): the pad and shell the latch was built for
-// Built v14.17: the dock's arrival and this dock's seal (the lock: g_sealedMutex); the pad's turn and the shell's change as still motion; the pad
-// in the shell's frame this frame (the temporary track line and the sealed line).
-sealed::DockWatch g_dock;
-sealed::PadStillWatch g_padStill;
+// Built v14.23: the own pad, from the game (the object the docking reader r0 was last called on this dock). Reset at undock and hangar change.
+sealed::GameTrack g_track;
+// The pad in the shell's frame this frame (the sealed line's lateral and yaw).
 sealed::ShellFrame g_frameShell;
 sealed::LatchCand g_latchCands[sealed::kLatchCandCap];
 size_t g_latchCandN = 0;
@@ -977,11 +973,6 @@ uint64_t g_watchNowMs = 0;
 float g_shellNow[3] = {};
 uint8_t g_shellNowSrc = 4;
 bool g_shellNowValid = false;
-int g_engageVia = 0;                 // 0 load-in, 1 the bay settled, 2 the 30 s fallback
-uint32_t g_engageWatched = 0;
-float g_engageSinceLowerS = 0.0f;
-char g_engageLastMover[48] = {};
-char g_engageMovers[160] = {};
 bool g_mechanismMoved = false;             // built v14.14: a latched bay mechanism moved while sealed
 bool g_flagPadMoved = false;               // promote saw the held pad move along the shaft against the shell: the tick releases on it
 char g_releaseWhy[160] = {};               // the release text for the flags above (the pad move or the hangar change, with its names)
@@ -1029,6 +1020,7 @@ const char* releaseText(sealed::ReleaseWhy w) noexcept {
         case sealed::ReleaseWhy::kHangarChanged: return g_releaseWhy;
         case sealed::ReleaseWhy::kLaunch: return "launch (the pad's state object flipped)";
         case sealed::ReleaseWhy::kMechanism: return g_releaseWhy;
+        case sealed::ReleaseWhy::kInHangarLeft: return "the own pad left the hangar (the game's r1 went from 1 to 0)";
         default: return "released";
     }
 }
@@ -1134,30 +1126,11 @@ void latchRead(uint64_t now) noexcept {
     g_latch.recomputeMotion();
 }
 
-// Built v14.12: the engage's account for the status line: load-in, the bay settled, or the 30 s fallback, with the latch's numbers.
-void captureEngageInfo(uint64_t now) noexcept {
-    g_engageVia = g_sealState.immediate ? 0 : (g_sealState.fallback ? 2 : 1);
-    g_engageWatched = static_cast<uint32_t>(g_latch.n);
-    g_latch.lastMover(g_engageLastMover, sizeof(g_engageLastMover));
-    g_engageSinceLowerS = (g_sealState.lowerSet && now > g_sealState.lowerSinceMs) ? static_cast<float>(now - g_sealState.lowerSinceMs) / 1000.0f : 0.0f;
-    g_latch.movers(now, g_engageMovers, sizeof(g_engageMovers), 3);
-}
-
-// The own pad's still time for the seal: the pad's last motion (its latch record).
-// Built v14.17: the pad's turn and the shell's change restart it too (PadStillWatch).
-uint64_t padLastMotion() noexcept { return std::max(g_latch.padLastMotionMs(), g_padStill.motionMs()); }
-
-// The seal's account for the status line (built v14.10).
+// The seal's account for the status line (built v14.23): the game's pad state said the own pad was in the hangar (r1 1). The codes are the last
+// read at the seal (the seal line prints them with the own pad's key).
 const char* engageHow() noexcept {
-    static char how[256];
-    if (g_engageVia == 0) return "sealed at load-in";
-    if (g_engageVia == 2) {
-        std::snprintf(how, sizeof(how), "sealed after the 30 s fallback (bay never still: movers %s)", g_engageMovers[0] != '\0' ? g_engageMovers : "none");
-        return how;
-    }
-    std::snprintf(how, sizeof(how), "sealed after the bay settled (%u records watched, last mover %s, %.1f s after the pad lowered)",
-                  static_cast<unsigned>(g_engageWatched), g_engageLastMover[0] != '\0' ? g_engageLastMover : "none",
-                  static_cast<double>(g_engageSinceLowerS));
+    static char how[160];
+    std::snprintf(how, sizeof(how), "sealed on the game's pad state: own pad r1 1 (in the hangar)");
     return how;
 }
 
@@ -1200,12 +1173,6 @@ void numOrNa(char* out, size_t cap, bool ok, float v) noexcept {
     else std::snprintf(out, cap, "n/a");
 }
 
-// Built v14.17: a whole-millisecond log value, or "n/a" when it is unreadable.
-void msOrNa(char* out, size_t cap, bool ok, uint64_t ms) noexcept {
-    if (ok) std::snprintf(out, cap, "%llu", static_cast<unsigned long long>(ms));
-    else std::snprintf(out, cap, "n/a");
-}
-
 // The seal's status line, once per seal (called from the engage, after the cell is held and localized).
 void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
     ++g_sealCount;
@@ -1220,39 +1187,6 @@ void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
                     static_cast<double>(cell.boxHalf[0] * 2.0f), static_cast<double>(cell.boxHalf[1] * 2.0f),
                     static_cast<double>(cell.boxHalf[2] * 2.0f), static_cast<double>(belowFor(cell.size)),
                     g_shellValid ? g_shellName : "none (the pad's motion is not checked)", lat, yaw);
-}
-
-// Built v14.17 (TEMPORARY instrument: remove when the outpost flight confirms the rule). While docked, unsealed, after an arrival, at 4 Hz, at most
-// 240 lines per dock: the pad's track in the shell's frame and its still times. The position and turn still times run from the later of their last
-// motion and the dock's first line (so a pad that never moved reads as still for the time observed); the bay quiet time is the seal's own clock.
-void padTrackLine(uint64_t now) noexcept {
-    sealed::DockWatch& d = g_dock;
-    if (d.trackLines >= 240) return;
-    if (d.trackLastMs != 0 && now - d.trackLastMs < 250) return;
-    if (d.trackStartMs == 0) d.trackStartMs = now;
-    d.trackLastMs = now;
-    ++d.trackLines;
-    const uint64_t floorMs = d.trackStartMs;
-    char rel[24] = {}, x[24] = {}, y[24] = {}, z[24] = {}, lat[24] = {}, yaw[24] = {};
-    char stillS[24] = {}, stillT[24] = {}, quiet[24] = {}, shell[96] = {};
-    numOrNa(rel, sizeof(rel), g_relOk, g_relM);
-    if (g_preShellValid) {
-        std::snprintf(shell, sizeof(shell), "%s@%06llx", g_preShellName, static_cast<unsigned long long>(g_preShellAddr & 0xFFFFFFu));
-    } else {
-        std::snprintf(shell, sizeof(shell), "n/a");
-    }
-    numOrNa(x, sizeof(x), g_frameShell.ok, g_frameShell.x);
-    numOrNa(y, sizeof(y), g_frameShell.ok, g_frameShell.y);
-    numOrNa(z, sizeof(z), g_frameShell.ok, g_frameShell.z);
-    numOrNa(lat, sizeof(lat), g_frameShell.ok, g_frameShell.lateral);
-    numOrNa(yaw, sizeof(yaw), g_frameShell.yawOk, g_frameShell.yawDeg);
-    msOrNa(stillS, sizeof(stillS), g_pickCell.has, now - std::max(g_latch.padLastMotionMs(), floorMs));
-    msOrNa(stillT, sizeof(stillT), g_pickCell.has, now - std::max(g_padStill.turnMs, floorMs));
-    const uint64_t quietSince = std::max(std::max(g_sealState.lowerSinceMs, g_latch.lastMotionMs), padLastMotion());
-    msOrNa(quiet, sizeof(quiet), g_sealState.lowerSet && now >= quietSince, now - quietSince);
-    Log::get().note("optimized station: pad track: rel %s m, shell %s, pad in shell frame (x %s, y %s, z %s along the shaft) m, "
-                    "lateral %s m from the shell axis, yaw %s deg against the shell, still %s ms (position), %s ms (turn), bay quiet %s ms",
-                    rel, shell, x, y, z, lat, yaw, stillS, stillT, quiet);
 }
 
 // The 30 s summary: what the station did in the window. A user's log shows the station's work here.
@@ -1315,8 +1249,7 @@ void applySetting(bool on, uint32_t frame) noexcept {
     }
     {
         std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
-        g_sealState = sealed::SealState{};   // a setting toggle starts the trigger and its memory afresh (built v14.4)
-        g_heightSrc = sealed::ShellHeightSources{};
+        g_sealState = sealed::SealState{};   // a setting toggle starts the trigger afresh; the own pad (GameTrack) is kept (built v14.23)
         g_preShellValid = false;
         g_sealGuard = sealed::SealRateGuard{};
         bumpRigEpoch();                      // built v14.20 (review 4): the rig and collection tables start afresh
@@ -1460,14 +1393,13 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
         // Built v14.20 (review 1): the freeze needs the request still in force for this pad and shell, a lowered pad in the bay, and a valid cell.
         const sealed::EngageRequest req{g_engagePending, g_engagePad, g_engageShell};
         const bool cellValid = next.has && next.radius > 0.0f && sealed::cellInvalidWhy(next) == nullptr;
-        const bool admitted = sealed::engageAdmitted(req, g_sealState, next.pad, g_preShellValid ? g_preShellAddr : 0, g_relOk, g_relM, cellValid);
+        const bool admitted = sealed::engageAdmitted(req, g_sealState, next.pad, g_preShellValid ? g_preShellAddr : 0, cellValid);
         if (admitted) {
             setOwnPrefixAtEngage(frame);
             pickOwnRecord(frame);
             g_heldCell = next;
             g_heldValid = true;
             g_rigVerdictsFresh = false;     // built v14.20 (review 7a): the verdicts are refreshed before this seal's first veto
-            g_dock.sealedThisDock = true;   // built v14.17: this dock has sealed (the sun's arrival hold ends)
             setHeldFrame(g_heldCell, frame);
             g_engagePending = false;
             g_sealedFlag.store(true, std::memory_order_release);
@@ -1703,13 +1635,44 @@ void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept {
 }
 
 // The render thread's frame tick: the setting, the held cell in the pad's frame, the seal and release rules, the rig verdicts, the summary.
-void optimizedStationFrame(uint32_t frame) {
-    {
-        // Built v14.17: the dock's arrival is read before the setting gate, so a toggle while undocked never misses the undock (DockWatch).
-        std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
-        // Built v14.21: an undocked reading counts for the arrival only in a vehicle (Flags bits 24-26): never the menu or the load.
-        g_dock.step(journalDockedKnown(), journalDocked(), journalLoadGames(), journalUndocks(), journalVehicleKnown() && journalVehicle());
+// The game's pad state for this tick (built v14.23): the own pad (the object r0 was last called on this dock, GameTrack), its latest r0 and r1 codes,
+// and whether each was called fresh (kPadStateFreshMs). Set by gameStateTick, read by the sun, the trigger and the waiting line.
+struct GameNow {
+    bool ownKnown = false;
+    uintptr_t own = 0;
+    int r0 = -1;
+    bool r0Fresh = false;
+    int r1 = -1;
+    bool r1Fresh = false;
+};
+GameNow g_game;
+
+// The own pad from the game, once per tick (built v14.23). The own pad changes only when r0 is called on another object (logged once); it is reset at
+// undock and hangar change (GameTrack). Reads the probe; takes no lock of the station.
+void gameStateTick() noexcept {
+    PadObjState latest;
+    padStateLatestR0(&latest);
+    const sealed::GameTrackEvent ev = g_track.observe(latest.have, latest.self, latest.r0Qpc);
+    if (ev == sealed::GameTrackEvent::kFirst) {
+        Log::get().note("optimized station: own pad is obj @%06llx (the game's docking reader r0 was called on it this dock)",
+                        static_cast<unsigned long long>(static_cast<uint64_t>(g_track.own) & 0xFFFFFFull));
+    } else if (ev == sealed::GameTrackEvent::kSwitched) {
+        Log::get().note("optimized station: own pad switched to obj @%06llx (r0 was called on it; the previous own pad is no longer the one)",
+                        static_cast<unsigned long long>(static_cast<uint64_t>(g_track.own) & 0xFFFFFFull));
     }
+    g_game = GameNow{};
+    if (!g_track.have) return;
+    PadObjState own;
+    padStateObject(g_track.own, &own);
+    g_game.ownKnown = true;
+    g_game.own = g_track.own;
+    g_game.r0 = own.r0;
+    g_game.r0Fresh = own.r0 >= 0 && sealed::gameFresh(padStateAgeMs(own.r0Qpc));
+    g_game.r1 = own.r1;
+    g_game.r1Fresh = own.r1 >= 0 && sealed::gameFresh(padStateAgeMs(own.r1Qpc));
+}
+
+void optimizedStationFrame(uint32_t frame) {
     if (++g_settingPoll >= kSettingPollFrames) {
         g_settingPoll = 0;
         const std::string text = Config::get().getString("fix.optimized_station", "on");
@@ -1735,10 +1698,13 @@ void optimizedStationFrame(uint32_t frame) {
     g_dockedKnownNow.store(journalDockedKnown(), std::memory_order_release);
     g_dockedNow.store(journalDockedKnown() && journalDocked(), std::memory_order_release);
     // Built v14.20 (review 4): an undock is a lifecycle point: the rig and collection tables start afresh.
-    if (g_dockedWasNow && !g_dockedNow.load(std::memory_order_acquire)) bumpRigEpoch();
+    if (g_dockedWasNow && !g_dockedNow.load(std::memory_order_acquire)) {
+        bumpRigEpoch();
+        g_track.reset(padStateNowQpc());   // built v14.23: an undock ends the dock's own pad (the game names a new one on the next dock)
+    }
     g_dockedWasNow = g_dockedNow.load(std::memory_order_acquire);
     storeHookGate();   // built v14.20 (review 7b): the store observer gathers only while docked (an atomic gate: no hook is installed here)
-    padStateTick(now);   // built v14.22: the pad-state probe's lines (temporary, log only)
+    gameStateTick();   // built v14.23: the own pad from the game, before the sun and the trigger read it
     refreshHeldWorld();
     // The camera against the held box: outside it by more than kCameraLeaveM releases the seal.
     bool cameraOutside = false;
@@ -1770,13 +1736,11 @@ void optimizedStationFrame(uint32_t frame) {
             }
             g_sealState = sealed::SealState{};
             g_sealGuard = sealed::SealRateGuard{};
-            g_heightSrc = sealed::ShellHeightSources{};
             g_preShellValid = false;
             setOwnPrefixAtEngage(frame);
             g_ownRecAddr = 0;
             g_ownLiveValid = false;
             g_latch.reset();   // a new ship: the mechanism is latched again
-            g_padStill = sealed::PadStillWatch{};
             bumpRigEpoch();    // built v14.20 (review 4): a ship change is a lifecycle point
         }
     }
@@ -1788,7 +1752,6 @@ void optimizedStationFrame(uint32_t frame) {
         g_relOk = false;
         g_shellNowValid = false;
     }
-    g_heightChanged = false;
     g_frameShell = sealed::ShellFrame{};   // built v14.17: the pad in the shell's frame, read when the height is
     if (g_pickCell.has) {
         g_relOk = false;
@@ -1821,8 +1784,7 @@ void optimizedStationFrame(uint32_t frame) {
                     g_shellNow[2] = sw.world[2];
                     g_shellNowSrc = sw.source;
                     g_shellNowValid = true;
-                    g_heightChanged = g_heightSrc.note(pw.source, sw.source);
-                    // Built v14.17: the pad's turn and the shell's change (the still clock), and the pad in the shell's frame (the instrument).
+                    // The pad in the shell's frame (the sealed line's lateral and yaw).
                     float shAxes[3][3] = {};
                     float shExt[3] = {};
                     bool shExtOk = false;
@@ -1830,9 +1792,6 @@ void optimizedStationFrame(uint32_t frame) {
                     if (poseOrientOf(g_preShellAddr, shAxes, shExt, &shExtOk, &shSrc)) {
                         g_frameShell = sealed::shellFrameOf(pw.world, sw.world, up, shAxes[0], axes[0]);
                     }
-                    // Built v14.20 (review 6): the turn is the pad's yaw against its SHELL. A rotation the pad and its shell share (the station turning)
-                    // is no turn; an unreadable yaw gives no turn signal (the world axis is never used).
-                    g_padStill.step(g_pickCell.pad, g_frameShell.yawOk, g_frameShell.yawDeg, pw.source, g_preShellAddr, now);
                 }
             }
         }
@@ -1889,52 +1848,57 @@ void optimizedStationFrame(uint32_t frame) {
         sealed::SunInputs su;
         su.setting = g_setting.load(std::memory_order_acquire);
         su.docked = g_dockedNow.load(std::memory_order_acquire);
-        su.hangar = shellFound;
+        su.ownKnown = g_game.ownKnown;
+        su.r0Fresh = g_game.r0Fresh;
+        su.r0 = static_cast<uint8_t>(g_game.r0 < 0 ? 0 : g_game.r0);
+        su.r1Fresh = g_game.r1Fresh;
+        su.inHangar = g_game.r1 == sealed::kReaderInHangar;
         su.relOk = g_relOk;
         su.rel = g_relM;
         su.hangarChanged = g_flagHangarChanged;
-        su.holdForSeal = g_dock.arrived && !g_dock.sealedThisDock;   // built v14.17: an arrival's sun waits for its first seal
-        su.descentPending = g_dock.arrived && !g_sealState.dockDescended;   // built v14.19: and the arrival's skip waits for its descent
         const char* why = "";
         if (sealed::sunStep(su, &g_sun, &why)) {
             g_sunOff.store(g_sun.off, std::memory_order_release);
-            // Built v14.20 (review 8): the Status docked flag is on both lines, so the sun transition is read against Elite's own docked state.
+            // Built v14.23: the sun line carries the own pad's r0 and r1 and the Status docked flag.
             const char* dockedText = g_dockedNow.load(std::memory_order_acquire) ? "yes" : "no";
-            if (g_sun.off) Log::get().note("optimized station: sun light inside the hangar off (pad lowered; Status docked=%s)", dockedText);
-            else Log::get().note("optimized station: sun light inside the hangar back on (%s; Status docked=%s)", why, dockedText);
+            char r0Text[16];
+            char r1Text[16];
+            if (g_game.r0 < 0) std::snprintf(r0Text, sizeof(r0Text), "-");
+            else std::snprintf(r0Text, sizeof(r0Text), "%d", g_game.r0);
+            if (g_game.r1 < 0) std::snprintf(r1Text, sizeof(r1Text), "-");
+            else std::snprintf(r1Text, sizeof(r1Text), "%d", g_game.r1);
+            if (g_sun.off) {
+                Log::get().note("optimized station: sun light inside the hangar off (%s; r0=%s r1=%s; Status docked=%s)", why, r0Text, r1Text, dockedText);
+            } else {
+                Log::get().note("optimized station: sun light inside the hangar back on (%s; r0=%s r1=%s; Status docked=%s)", why, r0Text, r1Text,
+                                dockedText);
+            }
         }
     }
     sealed::SealInputs in;
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
-    in.arrived = g_dock.arrived;   // built v14.17: an arrived dock expects its descent (no load-in rule)
-    in.shellAddr = g_preShellValid ? g_preShellAddr : 0;   // built v14.19: the dock reference is per shell record
-    in.lateral = g_frameShell.lateral;                     // built v14.19: the pad's lateral from the shell's shaft (the reference's second measure)
-    in.latOk = g_frameShell.ok;
+    in.ownKnown = g_game.ownKnown;
+    in.r1Fresh = g_game.r1Fresh;
+    in.inHangar = g_game.r1 == sealed::kReaderInHangar;
     in.pickOk = g_pickCell.has && g_preShellValid;   // no sized shell: the trigger stays idle (built v14.13)
     in.padHeld = padHeld;
     in.mechanismMoved = g_mechanismMoved;
-    in.bayLastMotionMs = g_latch.lastMotionMs;
-    in.padLastMotionMs = padLastMotion();
-    in.rel = g_relM;
-    in.relOk = g_relOk;
-    in.sourceChanged = g_heightChanged;
     in.cameraInBox = camIn;
     in.pad = g_pickCell.has ? g_pickCell.pad : 0;
     in.held = g_heldValid;
     in.cameraOutside = cameraOutside;
     in.padMoved = g_flagPadMoved;
     if (g_flagHangarChanged) g_sealGuard = sealed::SealRateGuard{};   // a new hangar: the safety net starts afresh
-    if (g_flagHangarChanged) {   // a new hangar: the trigger and its memory start afresh (built v14.5)
+    if (g_flagHangarChanged) {   // a new hangar: the trigger, the latch and the own pad start afresh (built v14.23)
         g_sealState = sealed::SealState{};
-        g_heightSrc = sealed::ShellHeightSources{};
         g_preShellValid = false;
         g_latch.reset();
-        g_padStill = sealed::PadStillWatch{};
+        g_track.reset(padStateNowQpc());
         bumpRigEpoch();   // built v14.20 (review 4): a hangar change is a lifecycle point
     }
     in.hangarChanged = g_flagHangarChanged;
-    in.launched = false;   // the pad state object's reader is not in this build (optimized-station doc, "Not yet")
+    in.launched = false;   // the pad state object's reader is not in this build: the launch is the r1 edge and the mechanism
     in.nowMs = now;
     sealed::ReleaseWhy why = sealed::ReleaseWhy::kNone;
     const sealed::SealAction act = sealed::sealStep(in, &g_sealState, &why);
@@ -1957,52 +1921,35 @@ void optimizedStationFrame(uint32_t frame) {
         } else {
             g_engagePending = true;
             g_engagePad = in.pad;          // built v14.20 (review 1): bound to the pad and the shell this request was made for
-            g_engageShell = in.shellAddr;
+            g_engageShell = g_preShellValid ? g_preShellAddr : 0;   // the shell the request is bound to (built v14.20)
             g_engageTries = 0;
-            g_engageAtLoadIn = g_sealState.immediate;
-            captureEngageInfo(now);
         }
     }
-    // Built v14.17 (temporary instrument): the pad's track while an arrived dock waits for its first seal.
-    if (g_dockedNow.load(std::memory_order_acquire) && g_dock.arrived && !g_dock.sealedThisDock && !g_heldValid) padTrackLine(now);
-    // Built v14.1: while docked and unsealed, one line when the seal's inputs change, and at most every 10 s while docked: the unmet condition.
+    padStateTick(now, g_track.have ? g_track.own : 0);   // built v14.23: the own pad's change lines and the seal or release line (log only)
+    // Built v14.23: the waiting line, while docked and unsealed: one line when a key changes, and at most every 10 s while docked.
     if (!g_heldValid) {
-        sealed::WaitView w;
+        sealed::GameView w;
         w.dockedKnown = g_dockedKnownNow.load(std::memory_order_acquire);
         w.docked = g_dockedNow.load(std::memory_order_acquire);
-        w.havePad = g_pickCell.has;
-        if (g_pickCell.has) std::snprintf(w.padName, sizeof(w.padName), "%s", g_pickCell.padName);
-        w.lowered = g_relOk && g_relM < sealed::kLoweredM;
-        w.relM = g_relM;
-        w.relOk = g_relOk;
-        {
-            const uint64_t quietSince = std::max(std::max(g_sealState.lowerSinceMs, g_latch.lastMotionMs), padLastMotion());
-            w.bayStillS = (g_sealState.lowerSet && now > quietSince) ? static_cast<float>(now - quietSince) / 1000.0f : 0.0f;
-            g_latch.movers(now, w.movers, sizeof(w.movers), 3);
-        }
-        w.cellBuilt = g_relOk && sealed::cellInvalidWhy(g_pickCell) == nullptr;
-        w.gathered = g_recordsLast;
-        w.descent = g_sealState.moved;
+        w.ownKnown = g_game.ownKnown;
+        w.own = g_game.own;
+        w.r0 = g_game.r0;
+        w.r1 = g_game.r1;
+        w.r0Fresh = g_game.r0Fresh;
+        w.r1Fresh = g_game.r1Fresh;
         w.cameraKnown = g_frameCamValid;
-        w.padCount = static_cast<uint32_t>(g_padCount);
-        for (size_t i = 0; i < g_padCount && i < 3; ++i) {
-            const sealed::PadObs& p = g_pads[i];
-            sealed::WaitView::PadEvidence& ev = w.padEv[i];
-            std::snprintf(ev.name, sizeof(ev.name), "%s", p.name);
-            ev.d = g_frameCamValid ? sealed::distance(p.centre, g_frameCam) : -1.0f;
-            ev.contains = g_frameCamValid && ev.d <= p.radius;
-        }
+        w.cameraIn = camIn;
+        w.cellBuilt = g_pickCell.has && g_preShellValid && sealed::cellInvalidWhy(g_pickCell) == nullptr;
         if (!w.cellBuilt) {
             if (!g_preShellValid) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_hangarWhy);
-            else if (!g_relOk) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", "no shell height (the pad or the shell pose is unreadable)");
             else if (!g_pickCell.has) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_pickCell.reason);
             else std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", sealed::cellInvalidWhy(g_pickCell));
         }
-        const bool changed = !g_waitLastSet || sealed::waitingKeyChanged(g_waitLast, w);
+        const bool changed = !g_waitLastSet || sealed::gameKeyChanged(g_waitLast, w);
         const bool periodic = w.docked && g_waitLastSet && now - g_waitLastMs >= 10000;
         if (changed || periodic) {
-            char line[640] = {};
-            sealed::waitingLine(w, static_cast<float>(sealed::kBayStillMs) / 1000.0f, line, sizeof(line));
+            char line[480] = {};
+            sealed::gameWaitingLine(w, line, sizeof(line));
             Log::get().note("%s", line);
             g_waitLast = w;
             g_waitLastSet = true;

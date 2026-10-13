@@ -59,7 +59,8 @@ struct PadObject {
     int code[kReaders] = {-1, -1, -1, -1};          // the last code each reader returned for this object (-1: never called)
     bool calledSinceLine[kReaders] = {};            // a reader was called on this object since the last printed line
     uint32_t callsSinceLine = 0;                     // all readers together, since the last printed line
-    uint64_t lastQpc = 0;                            // the QPC time of the last call
+    uint64_t lastQpc = 0;                            // the QPC time of the last call (any reader)
+    uint64_t readerQpc[kReaders] = {};               // the QPC time of each reader's last call on this object (0: never)
     PadReading reading;                              // the latest read
     bool announced = false;                          // the first-seen line has been printed
     int lineCode[kReaders] = {-1, -1, -1, -1};      // the codes as last printed
@@ -110,6 +111,7 @@ inline bool padNoteCall(PadTable& t, size_t reader, uintptr_t self, const PadRea
     PadObject* o = padClaim(t, self);
     if (o == nullptr || reader >= kReaders) return o != nullptr;
     o->code[reader] = code;
+    o->readerQpc[reader] = qpc;
     o->calledSinceLine[reader] = true;
     ++o->callsSinceLine;
     o->reading = r;
@@ -181,40 +183,25 @@ inline void formatPadChange(char* out, size_t cap, const PadObject& o, double el
                   padKey(o.self), r[0], r[1], r[2], r[3], byteT, occT, o2cT, o2fT, rate, wasR0, wasByte, wasOcc);
 }
 
-// The first-seen line: the object's tuple as read now, once per object.
-inline void formatPadFirst(char* out, size_t cap, const PadObject& o) noexcept {
-    char r[kReaders][12];
-    for (size_t i = 0; i < kReaders; ++i) padCodeText(r[i], sizeof(r[i]), o.code[i], o.calledSinceLine[i]);
-    char byteT[12], occT[16], o2cT[12], o2fT[12];
-    padValueText(byteT, sizeof(byteT), o.reading.ok, o.reading.byte);
-    padValueText(occT, sizeof(occT), o.reading.ok, o.reading.occ);
-    padValueText(o2cT, sizeof(o2cT), o.reading.ok, o.reading.o2c);
-    padValueText(o2fT, sizeof(o2fT), o.reading.ok, o.reading.o2f);
-    std::snprintf(out, cap, "pad state: first seen obj @%06llx r0=%s r1=%s r2=%s r3=%s byte=%s occ=%s o2c=%s o2f=%s", padKey(o.self), r[0], r[1],
-                  r[2], r[3], byteT, occT, o2cT, o2fT);
-}
-
-// The seal or release line: the tuples of every object with occupancy above zero (the player's own pad is the one that shows it, S4).
-// `cap` must hold the whole line: the caller passes at least 2048 bytes.
-inline void formatPadEvent(char* out, size_t cap, const char* what, const PadTable& t) noexcept {
-    size_t used = static_cast<size_t>(std::snprintf(out, cap, "pad state at %s:", what));
-    bool any = false;
-    for (size_t i = 0; i < kObjects; ++i) {
-        const PadObject& o = t.slots[i];
-        if (!o.used || !o.reading.ok || o.reading.occ == 0) continue;
-        if (used + 96 >= cap) break;
-        char r[kReaders][12];
-        for (size_t k = 0; k < kReaders; ++k) padCodeText(r[k], sizeof(r[k]), o.code[k], o.code[k] >= 0);
-        const int w = std::snprintf(out + used, cap - used, " obj @%06llx r0=%s r1=%s r2=%s r3=%s byte=%u occ=%u o2c=%u o2f=%u;", padKey(o.self), r[0],
-                                    r[1], r[2], r[3], static_cast<unsigned>(o.reading.byte), o.reading.occ, static_cast<unsigned>(o.reading.o2c),
-                                    static_cast<unsigned>(o.reading.o2f));
-        if (w < 0) break;
-        used += static_cast<size_t>(w);
-        any = true;
+// The seal or release line, for the OWN pad only (built v14.23): the own object's tuple, or "own pad unknown" when the game has not named one this dock.
+// `cap` must hold the line: the caller passes at least 256 bytes.
+inline void formatPadEvent(char* out, size_t cap, const char* what, const PadTable& t, uintptr_t own) noexcept {
+    const PadObject* o = nullptr;
+    if (own != 0) {
+        for (size_t i = 0; i < kObjects; ++i) {
+            if (t.slots[i].used && t.slots[i].self == own) o = &t.slots[i];
+        }
     }
-    if (!any) std::snprintf(out + used, cap - used, " none with occ>0");
+    if (o == nullptr || !o->reading.ok) {
+        std::snprintf(out, cap, "pad state at %s: own pad unknown (no r0 on this dock)", what);
+        return;
+    }
+    char r[kReaders][12];
+    for (size_t k = 0; k < kReaders; ++k) padCodeText(r[k], sizeof(r[k]), o->code[k], o->code[k] >= 0);
+    std::snprintf(out, cap, "pad state at %s: own pad obj @%06llx r0=%s r1=%s r2=%s r3=%s byte=%u occ=%u o2c=%u o2f=%u", what, padKey(o->self), r[0],
+                  r[1], r[2], r[3], static_cast<unsigned>(o->reading.byte), o->reading.occ, static_cast<unsigned>(o->reading.o2c),
+                  static_cast<unsigned>(o->reading.o2f));
 }
-
 // The 30 s summary: objects seen, objects with occ>0, calls per second of each reader, the lines suppressed, and the table's state.
 inline void formatPadSummary(char* out, size_t cap, const PadTable& t, double windowS) noexcept {
     uint32_t withOcc = 0;

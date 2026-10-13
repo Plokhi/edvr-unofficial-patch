@@ -987,192 +987,89 @@ inline Cull cullRecordFaultSafe(Mem& m, CullField* failed, uint64_t* value) noex
     return Cull::kCulled;
 }
 
-// ---- The seal's trigger (the station's state machine). Pure: the engine feeds the inputs each tick and acts on the result. ----------------------
-
-// The pad is LOWERED when its height above the hangar shell along the pad's up axis is below kLoweredM. Built v14.5: this replaces the lowest
-// height seen (the v14.4 flight never re-sealed: the origin rebase on foot and in Explorer Cam shifted the frame, so a static pad was never "at its
-// lowest" again, and the toggles did not reset it). The height is the shell-relative quantity the motion check uses (same function, same centre
-// sources), so a frame shift of pad and shell together leaves it unchanged. Lowered pads read about -45 m (small) and -89 m (medium) above the shell;
-// raised pads +35 m and +76 m (the v13.9 data).
+// ---- The seal's trigger: the game's pad state (built v14.23, 2026-10-13). Pure: the engine feeds the inputs each tick and acts on the result. -------
+// The station seals when the game says the own pad is in the hangar: r1 = 1 on the own pad object, read fresh. The own object is the one the
+// docking reader r0 was last called on this dock (GameTrack). No geometry decides the seal: no height, no stillness clock, no descent observation,
+// no fallback. The shell-relative height (kLoweredM) is kept only for the sun's "pad raised" test.
 constexpr float kLoweredM = -10.0f;
-// Still (the first-frame reading against the pad's height above the shell): the height changes less than kSealStillM, not a settle.
-constexpr float kSealStillM = 0.2f;
-// Built v14.10: the bay settles. After a descent the seal waits for the watched records (the structures in the bay) to stay still for kBayStillMs
-// with the pad lowered; a fallback seals kBayStillTimeoutMs after the pad lowered (a bay that never settles). Measured per bay: no timing guess.
-constexpr uint64_t kBayStillMs = 2000;
-constexpr uint64_t kBayStillTimeoutMs = 30000;
-// The watch: a record is watched inside the candidate box with radius >= kBayWatchMinM. It moved when its centre relative to the shell moved more
-// than kBayPosM, or its orientation rotated more than kBayRotDeg. A record moving on most frames of a 10 s window is continuous and ignored.
 constexpr float kBayWatchMinM = 5.0f;
-constexpr float kBayPosM = 0.03f;
+constexpr float kBayPosM = 0.03f;     // the latch's motion limits (poseMoved)
 constexpr float kBayRotDeg = 0.5f;
+constexpr uint64_t kBayStillMs = 2000;   // the latch's movers window (the records that moved lately): not a seal clock any more
 // The camera has left the held box by more than this: the seal is released (riding the elevator down, an external camera flying out).
 constexpr float kCameraLeaveM = 2.0f;
-// Built v14.7: the camera counts in both directions over this many consecutive frames: it must be outside the held box for this long to release,
-// and inside the bay for this long to re-seal (a free camera skimming a wall must not flicker the seal). Explorer Cam is no condition.
+// The camera counts in both directions over this many consecutive frames: it must be outside the held box for this long to release, and inside the
+// bay for this long to re-seal. Explorer Cam is no condition.
 constexpr uint32_t kCameraFrames = 10;
+// The game's pad state is fresh when its last call on the own object is within this many milliseconds.
+constexpr uint64_t kPadStateFreshMs = 1000;
+// The reader codes (r0: 0 Ready for landing, 1 Inside_Hangar, 2 Outside_Hangar, 3 other; r1: 1 Inside_Hangar and settled).
+constexpr uint8_t kReaderInHangar = 1;
+constexpr uint8_t kReaderMoving = 1;    // r0 1: moving in or locked in
+constexpr uint8_t kReaderDescent = 3;   // r0 3: the descent has started
 
 enum class SealAction : uint8_t { kNone = 0, kRequestEngage = 1, kRelease = 2 };
-enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kCameraLeft, kPadMoved, kHangarChanged, kLaunch, kMechanism };
+enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kCameraLeft, kPadMoved, kHangarChanged, kLaunch, kMechanism, kInHangarLeft };
 
+// The own pad's game state this tick (the caller fills it from the probe and GameTrack): freshness is decided by the caller in milliseconds.
 struct SealInputs {
     bool setting = false;        // fix.optimized_station is on
     bool docked = false;         // Status.json Flags bit 0
-    bool arrived = false;        // built v14.17: this dock was reached in flight (DockWatch): the descent is expected, so no load-in rule
-    uintptr_t shellAddr = 0;     // built v14.19: the shell record rel is measured against (0: none); a change re-takes the dock's reference
-    float lateral = 0.0f;        // built v14.19: the pad's distance from the shell's shaft line this frame (the dock reference's second measure)
-    bool latOk = false;          // lateral is readable this frame
-    bool pickOk = false;         // the own pad is found this frame, with a pose
-    bool padHeld = false;        // built v14.9: the own pad is absent this frame, held for fewer than kHeldLostFrames: the trigger keeps its state
-    bool mechanismMoved = false;  // built v14.14: a latched bay mechanism record moved on two frames in a row (sealed: the launch)
-    uint64_t bayLastMotionMs = 0;  // built v14.10: the last time a watched, non-continuous record moved (0: none); the bay's quiet time
-    uint64_t padLastMotionMs = 0;  // built v14.11: the last time the own pad moved (its own still watch)
-    float rel = 0.0f;            // the pad's height above the hangar shell along its up axis now (metres; frame-independent)
-    bool relOk = false;          // rel is readable this frame (an unreadable frame holds the trigger's state)
-    bool sourceChanged = false;  // a centre source changed since the last reading: the still test restarts, the motion reference follows
-    bool cameraInBox = false;    // the camera is inside the candidate box: the seal needs the camera in the bay (not used while held)
-    uintptr_t pad = 0;           // the own pad's record: its motion memory is kept per pad (built v14.3)
+    bool ownKnown = false;       // the game has named the own pad this dock (r0 was called on it)
+    bool r1Fresh = false;        // the own pad's r1 was called within kPadStateFreshMs
+    bool inHangar = false;       // the own pad's r1 is 1 (meaningful only with r1Fresh)
+    bool pickOk = false;         // the pad pick and its cell are valid this frame
+    bool padHeld = false;        // the own pad is absent this frame, held for fewer than kHeldLostFrames: the trigger keeps its state
+    bool cameraInBox = false;    // the camera is inside the candidate box (the seal needs the camera in the bay)
     bool held = false;           // sealed now
     bool cameraOutside = false;  // the camera is outside the held box by more than kCameraLeaveM (only meaningful while held)
-    bool padMoved = false;       // the pad moved more than kPadMoveReleaseM along the shaft relative to the hangar shell
+    uintptr_t pad = 0;           // the own pad's record (a change withdraws the request)
+    bool mechanismMoved = false; // a latched bay mechanism record moved on two frames in a row (the launch)
+    bool padMoved = false;       // the pad moved more than kPadMoveReleaseM along the shaft relative to the hangar shell (ShellMotion)
     bool hangarChanged = false;  // the held pad is gone from the store, or another own pad is the nearest for kHeldLostFrames
-    bool launched = false;       // the pad's state object flipped at launch (the reader is not in this build yet: always false)
+    bool launched = false;       // not used (no reader for the launch): always false
     uint64_t nowMs = 0;
 };
 
 struct SealState {
     bool requested = false;      // one engage per seal (cleared by a release or the trigger lapsing)
-    bool immediate = false;      // the request in force was made at load-in (no descent observed)
-    bool fallback = false;       // the request in force came from the bay fallback (the bay never settled)
-    // Built v14.3 (the load-in rule): the own pad in hand, its height above the shell when first seen, and whether it has moved off that height since.
-    bool seen = false;
-    uintptr_t padAddr = 0;
-    float firstRel = 0.0f;
-    bool moved = false;
-    // Built v14.7: consecutive frames the camera has been outside the held box (camOutRun) or inside the bay (camInRun; starts satisfied).
+    uintptr_t padAddr = 0;       // the pad the request is for (a change withdraws it)
+    // Consecutive frames the camera has been outside the held box (camOutRun) or inside the bay (camInRun; starts satisfied).
     uint32_t camOutRun = 0;
     uint32_t camInRun = kCameraFrames;
-    // Built v14.10: the pad lowered (the bay clock starts here; cleared when it is not lowered).
-    bool lowerSet = false;
-    uint64_t lowerSinceMs = 0;
-    // Built v14.19: an arrived dock's descent reference, kept per DOCK (not per pad record): the pad's rel and lateral at the dock's first reading,
-    // the shell it was read against, and whether the pad has since moved more than kDockDescentM from it (dockDescended: the descent is observed).
-    bool refOk = false;
-    float refRel = 0.0f;
-    float refLat = 0.0f;
-    uintptr_t refShell = 0;
-    bool dockDescended = false;
-    // Built v14.19: a release by the bay mechanism moving (the launch) holds the seal off until the pad is raised or the ship undocks.
-    bool noReseal = false;
+    // The re-seal after a release by the mechanism, the pad moving, or the pad leaving the bay: 0 free, 1 wait for the pad to leave the bay
+    // (r1 0), 2 wait for it to come back (r1 1 after a 0). Camera, ship and setting releases leave it at 0.
+    uint8_t reseal = 0;
 };
 
-// A release, or the trigger lapsing: the trigger starts again, the pad's motion memory stays (a pad that has descended still waits its delay).
+// A release, or the trigger lapsing: the request starts again.
 inline void clearTrigger(SealState* st) noexcept {
     st->requested = false;
-    st->immediate = false;
-    st->fallback = false;
-    st->lowerSet = false;
-    st->lowerSinceMs = 0;
 }
 
-// Built v14.17 (2026-10-13): the dock's arrival. The glue steps this on every tick, before the setting gate, so a toggle never misses an undock.
-// A dock is "arrived" when a docked reading follows an undocked one since the process started: the pad is then expected to descend, so the
-// load-in rule does not apply to it. A session that starts docked (its first reading is docked) is not arrived and keeps the load-in rule.
-// Not cleared by a setting toggle or by clearTrigger.
-struct DockWatch {
-    bool haveFlag = false;        // a Status docked reading has been seen
-    bool prevDocked = false;      // the last reading's docked flag
-    bool sawUndocked = false;     // an undocked reading has been seen since the process started
-    bool arrived = false;         // this dock was reached in flight
-    bool sealedThisDock = false;  // a seal engaged during this dock (the sun holds for an arrival until one does)
-    uint32_t trackLines = 0;      // pad track lines written this dock (the temporary instrument)
-    uint64_t trackStartMs = 0;    // when the first pad track line of this dock was written (0: none yet)
-    uint64_t trackLastMs = 0;     // when the last pad track line was written (the 4 Hz gate)
-    uint32_t lastLoads = 0;       // the journal's LoadGame count at the last step (built v14.19)
-    uint32_t lastUndocks = 0;     // the journal's Undocked count at the last step
-    // One tick. known: the Status reading exists. loads and undocks: the journal's LoadGame and Undocked counts (journalLoadGames, journalUndocks).
-    // Built v14.19: a load is never an arrival. A LoadGame clears sawUndocked (the menu's undocked reading is no undock of this session) and the
-    // arrival; an undocked Status reading or a journal Undocked after it sets sawUndocked again. The arrival stays the docked rising edge.
-    // Built v14.21: an undocked Status reading counts only when Flags show the player in a vehicle (inVehicle: bits 24-26). Flags 0 (the menu and
-    // the load, where Status reads undocked) never counts, so a load-in is never an arrival.
-    void step(bool known, bool docked, uint32_t loads = 0, uint32_t undocks = 0, bool inVehicle = false) noexcept {
-        if (loads != lastLoads) {
-            lastLoads = loads;
-            sawUndocked = false;
-            arrived = false;
-        }
-        if (undocks != lastUndocks) {
-            lastUndocks = undocks;
-            sawUndocked = true;
-        }
-        if (!known) return;
-        if (!docked && inVehicle) sawUndocked = true;   // built v14.21: an undocked reading in a vehicle only
-        if (haveFlag && docked == prevDocked) return;
-        if (haveFlag) {
-            sealedThisDock = false;
-            trackLines = 0;
-            trackStartMs = 0;
-            trackLastMs = 0;
-            if (docked) arrived = sawUndocked;   // a rising edge: arrived in flight when an undocked reading came before it
-        }
-        haveFlag = true;
-        prevDocked = docked;
-    }
-};
+// The own pad's game state is fresh for the trigger when its last call was within kPadStateFreshMs.
+inline bool gameFresh(uint64_t ageMs) noexcept { return ageMs <= kPadStateFreshMs; }
 
-// Built v14.17: the pad's turn and its shell's change count as motion for the bay's still clock. The flight at -45.7 m sat still in height while
-// turning, and the nearest shell changed under it, yet neither restarted the clock. The turn is measured against an anchor (the pad's forward axis
-// at the last turn or re-anchor), so a slow turn adds up. The latch's own check compares each frame with the last at kBayRotDeg (0.5 deg) and
-// misses a turn slower than that per frame.
-constexpr float kPadTurnDeg = 1.0f;
-
-// An angle in degrees folded into (-180, 180].
-inline float wrapDeg(float d) noexcept {
-    while (d > 180.0f) d -= 360.0f;
-    while (d <= -180.0f) d += 360.0f;
-    return d;
-}
-
-struct PadStillWatch {
+// The own pad, from the game (built v14.23): the object r0 was called on most recently this dock. Reset at undock and at a hangar change: only an r0
+// call after the reset (its QPC time is later) names an own pad. A different object on r0 switches the own pad. The caller logs the event once.
+enum class GameTrackEvent : uint8_t { kNone = 0, kFirst, kSwitched };
+struct GameTrack {
     bool have = false;
-    uintptr_t pad = 0;            // the pad the anchor belongs to
-    uint8_t posSrc = 4;           // the centre source of the pad's position at the anchor (a change re-anchors without counting)
-    uintptr_t shell = 0;          // the shell record the pad's height is measured against
-    float anchorYaw = 0.0f;       // built v14.20: the pad's yaw against its SHELL (shellFrameOf) at the anchor; the world axis is never used
-    bool anchorOk = false;        // the anchor holds a readable yaw
-    uint64_t turnMs = 0;          // the last turn beyond kPadTurnDeg (0: none)
-    uint64_t shellMs = 0;         // the last change of the shell record (0: none)
-    // One reading: the pad, its shell-relative yaw (yawOk false when unreadable: no turn signal), its position's centre source, and the shell record.
-    // Built v14.20: a rotation shared by the pad and its shell (the station turning) is no turn: the yaw is relative. Returns true when this reading
-    // restarted the still clock.
-    bool step(uintptr_t padAddr, bool yawOk, float yawDeg, uint8_t src, uintptr_t shellAddr, uint64_t nowMs) noexcept {
-        bool moved = false;
-        if (have && shellAddr != shell) {   // the shell the height is read against changed: a new reference is motion
-            shellMs = nowMs;
-            moved = true;
-        }
-        shell = shellAddr;
-        const bool same = have && padAddr == pad && src == posSrc;
-        if (!same) {   // a new pad or centre source: a new anchor, no turn counted
-            have = true;
-            pad = padAddr;
-            posSrc = src;
-            anchorOk = false;
-        }
-        if (!yawOk) return moved;   // unreadable: no turn signal this reading, and the anchor stands
-        if (!anchorOk) {
-            anchorYaw = yawDeg;
-            anchorOk = true;
-            return moved;
-        }
-        if (std::fabs(wrapDeg(yawDeg - anchorYaw)) > kPadTurnDeg) {   // a turn of the pad against its shell beyond the limit
-            turnMs = nowMs;
-            anchorYaw = yawDeg;
-            moved = true;
-        }
-        return moved;
+    uintptr_t own = 0;
+    uint64_t resetQpc = 0;
+    GameTrackEvent observe(bool haveR0, uintptr_t obj, uint64_t r0Qpc) noexcept {
+        if (!haveR0 || obj == 0 || r0Qpc <= resetQpc) return GameTrackEvent::kNone;
+        if (have && obj == own) return GameTrackEvent::kNone;
+        const GameTrackEvent e = have ? GameTrackEvent::kSwitched : GameTrackEvent::kFirst;
+        have = true;
+        own = obj;
+        return e;
     }
-    uint64_t motionMs() const noexcept { return std::max(turnMs, shellMs); }
+    void reset(uint64_t qpc) noexcept {
+        have = false;
+        own = 0;
+        resetQpc = qpc;
+    }
 };
 
 // Built v14.17 (instrument): the pad in the hangar shell's frame. The shaft is the pad's up axis, the one shellRelative measures along, so z is the
@@ -1268,11 +1165,10 @@ inline void engageTrigger(EngageRequest* r, const SealState& st) noexcept {
     if (!st.requested) r->pending = false;
 }
 
-// A pending engage may freeze a cell only while the trigger still asks for the seal, for the same pad and shell, with the lowered pad in the bay and
-// a valid cell for that identity.
-inline bool engageAdmitted(const EngageRequest& r, const SealState& st, uintptr_t pad, uintptr_t shell, bool relOk, float relM, bool cellValid) noexcept {
-    return r.pending && st.requested && pad != 0 && r.pad == pad && r.shell == shell && relOk && relM < kLoweredM && st.camInRun >= kCameraFrames &&
-           cellValid;
+// A pending engage may freeze a cell only while the trigger still asks for the seal (the request in force), for the same pad and shell, with a valid cell
+// for that identity and the camera in the bay (built v14.23: the game's pad state decided the request; no height is read here).
+inline bool engageAdmitted(const EngageRequest& r, const SealState& st, uintptr_t pad, uintptr_t shell, bool cellValid) noexcept {
+    return r.pending && st.requested && pad != 0 && r.pad == pad && r.shell == shell && st.camInRun >= kCameraFrames && cellValid;
 }
 
 // Review 2: the mechanism latch's identity, the own pad and its shell. step() reports a genuine change (another pad record, or another shell record
@@ -1331,21 +1227,6 @@ inline StoreInstall storeInstallDecision(bool identityRead, uint32_t stamp, uint
     if (std::memcmp(got, pin, n) != 0) return StoreInstall::kWrongPrologue;
     return StoreInstall::kInstall;
 }
-
-// Built v14.5: the centre sources a height was read from. A change is a different reading: the still test restarts.
-struct ShellHeightSources {
-    bool have = false;
-    uint8_t pad = 4;
-    uint8_t shell = 4;
-    // Notes the sources of this reading; returns true when they differ from the last reading's.
-    bool note(uint8_t p, uint8_t s) noexcept {
-        const bool changed = have && (p != pad || s != shell);
-        have = true;
-        pad = p;
-        shell = s;
-        return changed;
-    }
-};
 
 // Built v14.8: a prefix names a ship only with kShipRecordsMin records within kShipRecordsM of the camera, and never GUI_ or BoardingVolume prefixes.
 inline bool shipPrefixNamesShip(const char* prefix, uint32_t records) noexcept {
@@ -1635,31 +1516,34 @@ inline size_t selectMechanism(const LatchCand* cands, size_t n, uintptr_t ownAdd
     return k;
 }
 
-// Built v14.13: the sun inside the hangar. The sun pass is skipped while the setting is on, docked, a sized hangar shell is found near the pad, and the
-// own pad is lowered (below kLoweredM above the shell). It does not wait for the seal. It comes back on when the pad rises (launch), on undock, on setting
-// off, on a hangar change, or when the shell is lost; while the pad height is unreadable it holds.
+// Built v14.23: the sun inside the hangar, from the game's pad state. The skip is off while the own pad's latest r0 is 1 (moving in) or 3 (the descent),
+// read fresh. It comes back on when the pad is out (not r1 1 fresh), r0 is neither 1 nor 3 (or stale), and the pad is raised (the geometric test),
+// or on undock, setting off, or a hangar change. An outpost surface (r0 0) never turns it off.
 struct SunInputs {
     bool setting = false;
     bool docked = false;
-    bool hangar = false;         // a sized hangar shell is found near the pad
-    bool relOk = false;          // the pad's height above the shell is readable this frame
+    bool ownKnown = false;       // the game has named the own pad this dock
+    bool r0Fresh = false;        // the own pad's r0 was called within kPadStateFreshMs
+    uint8_t r0 = 0;              // the own pad's latest r0 code (meaningful with r0Fresh)
+    bool r1Fresh = false;        // the own pad's r1 was called within kPadStateFreshMs
+    bool inHangar = false;       // the own pad's r1 is 1 (meaningful with r1Fresh)
+    bool relOk = false;          // the pad's height above the shell is readable this frame (the raised test)
     float rel = 0.0f;
     bool hangarChanged = false;
-    bool holdForSeal = false;    // built v14.17: an arrived dock that has not sealed yet: a pad raised (launch) does not turn the sun back on
-    bool descentPending = false; // built v14.19: an arrived dock whose descent is not observed yet: the skip does not turn on at all
 };
 
 struct SunState {
     bool off = false;
 };
 
-// Returns true when the skip changed. *why names the change for the state line ("pad lowered" for off, the reason for back on).
+// Returns true when the skip changed. *why names the change for the state line.
 inline bool sunStep(const SunInputs& in, SunState* st, const char** why) noexcept {
     *why = "";
+    const bool moving = in.ownKnown && in.r0Fresh && (in.r0 == kReaderMoving || in.r0 == kReaderDescent);
     if (!st->off) {
-        if (in.setting && in.docked && in.hangar && in.relOk && in.rel < kLoweredM && !in.descentPending) {
+        if (in.setting && in.docked && moving) {
             st->off = true;
-            *why = "pad lowered";
+            *why = "pad moving in or locked in (r0)";
             return true;
         }
         return false;
@@ -1679,14 +1563,10 @@ inline bool sunStep(const SunInputs& in, SunState* st, const char** why) noexcep
         *why = "hangar changed";
         return true;
     }
-    if (!in.hangar) {
-        st->off = false;
-        *why = "no hangar shell";
-        return true;
-    }
-    if (!in.relOk) return false;   // unreadable this frame: hold
+    if (moving) return false;                              // still moving in, or the descent
+    if (in.r1Fresh && in.inHangar) return false;           // the game still says the pad is in the bay
+    if (!in.relOk) return false;                           // unreadable this frame: hold
     if (in.rel >= kLoweredM) {
-        if (in.holdForSeal) return false;   // built v14.17: the arrival's sun stays off until the station has sealed in this dock
         st->off = false;
         *why = "pad raised (launch)";
         return true;
@@ -1733,31 +1613,11 @@ inline bool hangarLikeName(const char* name) noexcept {
            containsNoCase(name, "BlastShield") || containsNoCase(name, "Bay") || containsNoCase(name, "Elevator");
 }
 
-// Built v14.19: an arrived dock's descent reference, kept per dock. The reference is the pad's rel and lateral (its shell-frame reading) at the dock's
-// first reading. A change of the shell record or of the centre source re-takes it without counting as a descent. A move of more than kDockDescentM
-// in rel or in lateral from the reference is the observed descent (dockDescended); moved then follows it and the settled rule applies unchanged.
-// The reference is not reset by a pad record change: a pad flicker must not restart the dock.
-constexpr float kDockDescentM = 3.0f;
-inline void updateDockReference(const SealInputs& in, SealState* st) noexcept {
-    if (!in.latOk) {   // the shell frame is unreadable this frame: no reference, no count
-        st->moved = st->dockDescended;
-        return;
-    }
-    if (st->refOk && (in.shellAddr != st->refShell || in.sourceChanged)) st->refOk = false;   // a different reading: re-taken, not counted
-    if (!st->refOk) {
-        st->refOk = true;
-        st->refShell = in.shellAddr;
-        st->refRel = in.rel;
-        st->refLat = in.lateral;
-    } else if (!st->dockDescended && (std::fabs(in.rel - st->refRel) > kDockDescentM || std::fabs(in.lateral - st->refLat) > kDockDescentM)) {
-        st->dockDescended = true;
-    }
-    st->moved = st->dockDescended;
-}
-
-// Advances the state and returns the action. With kRelease, *why says which rule released (the order of the brief: setting off, undocked,
-// Explorer Cam, camera left, pad moved, hangar changed, launch). A pad first seen lowered with no descent observed seals on the first eligible
-// frame (the load-in rule, v14.3); after an observed descent the still delay applies. A raised pad never seals. The camera must be in the bay.
+// Advances the state and returns the action (built v14.23: the game's pad state decides). Seal when the own pad is in the hangar by the game (r1 1,
+// fresh), the setting is on, Status says docked, the pad pick and cell are valid, and the camera is in the bay for kCameraFrames. Seal at once: no
+// stillness clock, no load-in or arrival rule, no fallback. Releases: setting off, undocked, the camera left, the mechanism moved, the pad moved,
+// the hangar changed, and the own pad leaving the hangar (the r1 1 to 0 edge). A release by the mechanism, the pad moving or the pad leaving the
+// hangar needs a fresh in-hangar edge (0 then 1 of r1) before the next seal; a camera or setting release does not.
 inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why) noexcept {
     *why = ReleaseWhy::kNone;
     if (!in.setting) {
@@ -1768,7 +1628,7 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         }
         return SealAction::kNone;
     }
-    // The camera's runs (built v14.7): the camera rule is the only camera condition, and it needs kCameraFrames frames either way.
+    // The camera's runs: the camera rule is the only camera condition, and it needs kCameraFrames frames either way.
     if (in.cameraOutside) ++st->camOutRun;
     else st->camOutRun = 0;
     if (in.cameraInBox) {
@@ -1780,13 +1640,15 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         ReleaseWhy w = ReleaseWhy::kNone;
         if (!in.docked) w = ReleaseWhy::kUndocked;
         else if (st->camOutRun >= kCameraFrames) w = ReleaseWhy::kCameraLeft;
-        else if (in.mechanismMoved) w = ReleaseWhy::kMechanism;   // the hatch or the lift moved: the launch (built v14.14)
+        else if (in.mechanismMoved) w = ReleaseWhy::kMechanism;   // the hatch or the lift moved: the launch
         else if (in.padMoved) w = ReleaseWhy::kPadMoved;
         else if (in.hangarChanged) w = ReleaseWhy::kHangarChanged;
         else if (in.launched) w = ReleaseWhy::kLaunch;
+        else if (in.r1Fresh && !in.inHangar) w = ReleaseWhy::kInHangarLeft;   // the game's r1 1 to 0: the pad left the bay
         if (w != ReleaseWhy::kNone) {
-            if (in.padMoved || in.launched || in.mechanismMoved) st->moved = true;   // a release by motion is a descent (built v14.16)
-            if (w == ReleaseWhy::kMechanism) st->noReseal = true;   // built v14.19: no re-seal mid-launch until the pad is raised or the ship undocks
+            if (w == ReleaseWhy::kMechanism || w == ReleaseWhy::kPadMoved || w == ReleaseWhy::kInHangarLeft || w == ReleaseWhy::kLaunch) {
+                st->reseal = 1;   // a fresh in-hangar edge is needed before the next seal
+            }
             clearTrigger(st);
             st->camOutRun = 0;
             if (w == ReleaseWhy::kCameraLeft) st->camInRun = 0;   // the re-seal waits kCameraFrames inside the bay
@@ -1797,62 +1659,36 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
     }
     if (!in.docked) {
         clearTrigger(st);
-        st->refOk = false;          // built v14.19: the dock's reference and its hold end with the dock
-        st->dockDescended = false;
-        st->noReseal = false;
+        st->reseal = 0;
         return SealAction::kNone;
     }
-    if (!in.pickOk) {   // built v14.9: a short absence keeps the last reading and the bay clock
-        if (in.padHeld) return SealAction::kNone;
+    if (in.padHeld) return SealAction::kNone;   // a short absence: the trigger keeps its state
+    if (!in.pickOk) {
         clearTrigger(st);
         return SealAction::kNone;
     }
-    if (!in.relOk) return SealAction::kNone;   // unreadable this frame: the trigger keeps its state
-    if (!st->seen || st->padAddr != in.pad) {  // a pad first in hand: its height is the reference for a descent
-        st->seen = true;
+    if (st->padAddr != in.pad) {   // another pad: a request made for the old one is withdrawn
+        clearTrigger(st);
         st->padAddr = in.pad;
-        st->firstRel = in.rel;
-        if (!in.arrived) st->moved = false;   // an arrived dock's moved is its dock reference's (updateDockReference), across a pad change too
-        // Built v14.20 (review 1): a request made for the old pad is withdrawn; the new pad asks for its own seal.
-        if (st->requested) clearTrigger(st);
     }
-    if (in.arrived) {
-        updateDockReference(in, st);          // built v14.19: the arrival expects a descent, observed against the dock's reference
-    } else {
-        if (in.sourceChanged) st->firstRel = in.rel;   // a different centre source is a different reading: the motion reference follows it
-        if (std::fabs(in.rel - st->firstRel) > kSealStillM) st->moved = true;
-    }
-    const bool lowered = in.rel < kLoweredM;
-    if (!lowered) st->noReseal = false;       // built v14.19: the pad raised: the mid-launch hold ends
-    if (!lowered || st->camInRun < kCameraFrames) {
+    // The game's pad state. Unknown (no r0 on this dock) or stale r1: no seal.
+    if (!in.ownKnown || !in.r1Fresh) {
         clearTrigger(st);
         return SealAction::kNone;
     }
-    if (st->noReseal) {                       // built v14.19: after a mechanism release, no re-seal until the pad is raised or the ship undocks
+    if (!in.inHangar) {   // the pad is out of the bay: the re-seal edge advances
         clearTrigger(st);
+        if (st->reseal == 1) st->reseal = 2;
         return SealAction::kNone;
     }
-    if (!st->lowerSet) {
-        st->lowerSet = true;
-        st->lowerSinceMs = in.nowMs;
+    if (st->reseal == 1) return SealAction::kNone;   // in the bay but not yet out since the release: wait for the edge
+    if (st->reseal == 2) st->reseal = 0;             // out, then in: the fresh edge
+    if (st->camInRun < kCameraFrames) {
+        clearTrigger(st);
+        return SealAction::kNone;
     }
     if (st->requested) return SealAction::kNone;
-    // Built v14.19: an arrived dock seals only after its descent is observed: no load-in path, no settled path, and no 30 s fallback before it.
-    if (in.arrived && !st->dockDescended) return SealAction::kNone;
-    if (!st->moved) {   // load-in: no descent observed, the pad rests lowered: seal at the first eligible frame
-        st->requested = true;
-        st->immediate = true;
-        return SealAction::kRequestEngage;
-    }
-    // After a descent: the bay is settled when no watched record has moved for kBayStillMs with the pad lowered; the fallback seals
-    // kBayStillTimeoutMs after the pad lowered, when the bay never settles.
-    const uint64_t quietSince = std::max(std::max(st->lowerSinceMs, in.bayLastMotionMs), in.padLastMotionMs);   // the pad too (built v14.11)
-    const bool settled = in.nowMs >= quietSince + kBayStillMs;
-    const bool timedOut = in.nowMs >= st->lowerSinceMs + kBayStillTimeoutMs;
-    if (!settled && !timedOut) return SealAction::kNone;
     st->requested = true;
-    st->immediate = false;
-    st->fallback = !settled;
     return SealAction::kRequestEngage;
 }
 
@@ -1998,64 +1834,53 @@ inline StoreMode storeMode(bool setting, bool isSealed, bool docked) noexcept {
     return docked ? StoreMode::kGather : StoreMode::kNone;
 }
 
-// Built v14.1: the waiting line's inputs, as they stand this frame. The still time is not a state change (it runs every frame).
-struct WaitView {
+// Built v14.23: the waiting line's inputs, as they stand this frame: the Status docked flag, the own pad from the game, its codes and freshness, the
+// camera, and the cell. The line changes when a key changes (not per frame) and at most every 10 s while docked.
+struct GameView {
     bool dockedKnown = false;   // Status.json has a Flags sample
     bool docked = false;        // Flags bit 0
-    bool havePad = false;       // the own pad is picked this frame
-    char padName[64] = {};      // when havePad
-    bool lowered = false;       // the pad is lowered: its height above the shell is below kLoweredM (built v14.5)
-    float relM = 0.0f;          // the pad's height above the shell along its up axis, metres
-    bool relOk = false;         // relM is readable this frame
-    float bayStillS = 0.0f;     // seconds since the watched records last moved (or the pad lowered): the bay's quiet time (built v14.10)
-    char movers[160] = {};      // up to three watched records that moved in the last 2 s
-    bool cellBuilt = false;     // the pad's cell can be built (a pad with a radius and a readable height)
+    bool ownKnown = false;      // the game has named the own pad this dock
+    uintptr_t own = 0;          // its record (the probe's key is its low six hex digits)
+    int r0 = -1;                // its latest r0 code (-1: never)
+    int r1 = -1;                // its latest r1 code (-1: never)
+    bool r0Fresh = false;
+    bool r1Fresh = false;
+    bool cameraKnown = false;   // the frame has a camera
+    bool cameraIn = false;      // the camera is inside the candidate box
+    bool cellBuilt = false;     // the pad's cell can be built
     char cellReason[96] = {};   // when not built: why
-    // Built v14.2: the evidence (what the gather saw). gathered: store records the observer took last frame; padCount: own-pad records in hand;
-    // padEv: the first three of them, with the distance from the camera and whether their own sphere contains it.
-    uint32_t gathered = 0;
-    bool cameraKnown = false;
-    bool descent = false;       // the held pad has moved since first seen (the delay applies to its seal)
-    uint32_t padCount = 0;
-    struct PadEvidence {
-        char name[64] = {};
-        float d = -1.0f;
-        bool contains = false;
-    };
-    PadEvidence padEv[3];
 };
 
-// True when the seal's state changed: docked, the pad, at lowest, the cell.
-inline bool waitingKeyChanged(const WaitView& a, const WaitView& b) noexcept {
-    return a.dockedKnown != b.dockedKnown || a.docked != b.docked || a.havePad != b.havePad || std::strcmp(a.padName, b.padName) != 0 ||
-           a.lowered != b.lowered || a.cellBuilt != b.cellBuilt || std::strcmp(a.cellReason, b.cellReason) != 0;
+// True when a key of the line changed: docked, the own pad, its codes or freshness, the camera, the cell.
+inline bool gameKeyChanged(const GameView& a, const GameView& b) noexcept {
+    return a.dockedKnown != b.dockedKnown || a.docked != b.docked || a.ownKnown != b.ownKnown || a.own != b.own || a.r0 != b.r0 || a.r1 != b.r1 ||
+           a.r0Fresh != b.r0Fresh || a.r1Fresh != b.r1Fresh || a.cameraIn != b.cameraIn || a.cellBuilt != b.cellBuilt ||
+           std::strcmp(a.cellReason, b.cellReason) != 0;
 }
 
-// The waiting line, with the unmet condition in its words: docked, pad, at lowest, still for X of the delay, cell.
-inline void waitingLine(const WaitView& w, float delayS, char* out, size_t cap) noexcept {
+// The waiting line, with the unmet condition in its words:
+//   optimized station: waiting (docked=yes, own pad @0abc40, r0=1 r1=1 in hangar=yes, camera=yes, cell=built)
+//   optimized station: waiting (docked=yes, game pad state unknown (no r0 on this dock), cell=built)
+inline void gameWaitingLine(const GameView& w, char* out, size_t cap) noexcept {
     const char* docked = !w.dockedKnown ? "unknown" : (w.docked ? "yes" : "no");
     char cell[128];
     if (w.cellBuilt) std::snprintf(cell, sizeof(cell), "built");
     else std::snprintf(cell, sizeof(cell), "failed:%s", w.cellReason[0] != '\0' ? w.cellReason : "no cell");
-    char pads[400] = {};
-    if (w.padCount == 0) {
-        std::snprintf(pads, sizeof(pads), "none");
-    } else {
-        size_t used = 0;
-        for (uint32_t i = 0; i < w.padCount && i < 3; ++i) {
-            if (used >= sizeof(pads) - 1) break;
-            const int n = std::snprintf(pads + used, sizeof(pads) - used, "%s%s d=%.1f contains=%s", i > 0 ? "; " : "", w.padEv[i].name,
-                                        static_cast<double>(w.padEv[i].d), w.padEv[i].contains ? "yes" : "no");
-            if (n < 0) break;
-            used += static_cast<size_t>(n);
-        }
+    const char* camera = !w.cameraKnown ? "unknown" : (w.cameraIn ? "yes" : "no");
+    if (!w.ownKnown) {
+        std::snprintf(out, cap, "optimized station: waiting (docked=%s, game pad state unknown (no r0 on this dock), camera=%s, cell=%s)", docked,
+                      camera, cell);
+        return;
     }
-    char lowerText[64] = {};
-    if (!w.relOk) std::snprintf(lowerText, sizeof(lowerText), "unknown");
-    else std::snprintf(lowerText, sizeof(lowerText), "%s (%.1f m above the shell)", w.lowered ? "yes" : "no", static_cast<double>(w.relM));
-    std::snprintf(out, cap, "optimized station: waiting (docked=%s, pad=%s, lowered=%s, bay still for %.1f of %.0f s, movers: %s, cell=%s; descent=%s; gathered=%u, camera=%s, pads=%u [%s])",
-                  docked, w.havePad ? w.padName : "none", lowerText, static_cast<double>(w.bayStillS), static_cast<double>(delayS), w.movers[0] != '\0' ? w.movers : "none", cell, w.descent ? "seen" : "none yet",
-                  static_cast<unsigned>(w.gathered), w.cameraKnown ? "yes" : "no", static_cast<unsigned>(w.padCount), pads);
+    char r0[24];
+    char r1[24];
+    if (w.r0 < 0) std::snprintf(r0, sizeof(r0), "-");
+    else std::snprintf(r0, sizeof(r0), "%d%s", w.r0, w.r0Fresh ? "" : " (stale)");
+    if (w.r1 < 0) std::snprintf(r1, sizeof(r1), "-");
+    else std::snprintf(r1, sizeof(r1), "%d%s", w.r1, w.r1Fresh ? "" : " (stale)");
+    const char* inHangar = !w.r1Fresh ? "unknown" : (w.r1 == kReaderInHangar ? "yes" : "no");
+    std::snprintf(out, cap, "optimized station: waiting (docked=%s, own pad @%06llx, r0=%s r1=%s, in hangar=%s, camera=%s, cell=%s)", docked,
+                  static_cast<unsigned long long>(static_cast<uint64_t>(w.own) & 0xFFFFFFull), r0, r1, inHangar, camera, cell);
 }
 
 // Built v14.2: promoteFrame runs once per frame, at the frame's first record. The frame stamp advances at each tick; it never did (the v14.1
