@@ -8,6 +8,8 @@ namespace edvr {
 void optimizedStationInstall(bool flatProfile);
 // The setting, as last read (one atomic load).
 bool optimizedStationOn() noexcept;
+// Built v14.20 (review 7b): the setting is on and the commander is docked: the only time the store observer gathers (the store gate follows it).
+bool optimizedStationGathers() noexcept;
 // Whether the station is sealed in a hangar this frame (one atomic load). The draw path and the hooks read it.
 bool optimizedStationSealed() noexcept;
 // The draw path asks: true skips the draw (the sun pair, while sealed).

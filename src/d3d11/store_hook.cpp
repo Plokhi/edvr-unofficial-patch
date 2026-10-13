@@ -183,9 +183,15 @@ void installOnce() noexcept {
 }  // namespace
 
 void storeHookRecompute() noexcept {
-    const bool want = optimizedStationOn();
-    if (want) installOnce();
-    g_storeGate.store(want && g_store.ready.load(std::memory_order_acquire) ? 1u : 0u, std::memory_order_release);
+    if (optimizedStationOn()) installOnce();
+    storeHookGate();
+}
+
+// Built v14.20 (review 7b): the observer runs only while the station gathers (setting on, docked) and the detour is installed. Closing the gate
+// only stops new calls; a call already inside takes the station's state lock, which the toggle and the release take too.
+void storeHookGate() noexcept {
+    const bool open = optimizedStationGathers() && g_store.ready.load(std::memory_order_acquire);
+    g_storeGate.store(open ? 1u : 0u, std::memory_order_release);
 }
 
 const char* storeHookStatus() noexcept { return g_store.status.load(std::memory_order_acquire); }

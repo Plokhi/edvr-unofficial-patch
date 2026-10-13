@@ -1330,16 +1330,12 @@ int main(int argc, char** argv) {
 
         // A turn in place: the pad's centre fixed at -45 m, its forward axis turned 2 deg at 1 s. The still clock restarts: the seal comes 2 s after
         // the turn (3 s), where a pad that never turns seals at 2 s.
-        const float kDeg = 3.14159265f / 180.0f;
-        const float fwd0[3] = {1.0f, 0.0f, 0.0f};
-        const float fwd2[3] = {std::cos(2.0f * kDeg), std::sin(2.0f * kDeg), 0.0f};
         {
             se::PadStillWatch pw;
             se::SealState stT;
             uint64_t sealedT = 0;
             for (uint64_t t = 0; t <= 5000; t += 100) {
-                const float* axis = t >= 1000 ? fwd2 : fwd0;
-                pw.step(0x1000, axis, 1, 0x5000, t);
+                pw.step(0x1000, true, t >= 1000 ? 2.0f : 0.0f, 1, 0x5000, t);   // the pad's yaw against its shell: 2 deg from 1 s on
                 se::SealInputs in = quiet(t);
                 in.rel = t == 0 ? 14.0f : -45.0f;   // v14.19: a descent from raised to lowered at 100 ms, then still (the load-in rule is not in play)
                 in.pad = 0x1000;
@@ -1354,7 +1350,7 @@ int main(int argc, char** argv) {
             se::SealState stT;
             uint64_t sealedT = 0;
             for (uint64_t t = 0; t <= 5000; t += 100) {
-                pw.step(0x1000, fwd0, 1, 0x5000, t);
+                pw.step(0x1000, true, 0.0f, 1, 0x5000, t);
                 se::SealInputs in = quiet(t);
                 in.rel = t == 0 ? 14.0f : -45.0f;   // v14.19: the descent as above
                 in.pad = 0x1000;
@@ -1367,13 +1363,10 @@ int main(int argc, char** argv) {
         {
             // A slow turn: 0.4 deg a reading (under the latch's 0.5 deg per-frame limit) adds up; the anchor sees 1.2 deg at the third reading.
             se::PadStillWatch pw;
-            bool m1 = pw.step(0x1000, fwd0, 1, 0x5000, 0);
-            const float a4[3] = {std::cos(0.4f * kDeg), std::sin(0.4f * kDeg), 0.0f};
-            const float a8[3] = {std::cos(0.8f * kDeg), std::sin(0.8f * kDeg), 0.0f};
-            const float a12[3] = {std::cos(1.2f * kDeg), std::sin(1.2f * kDeg), 0.0f};
-            const bool m2 = pw.step(0x1000, a4, 1, 0x5000, 100);
-            const bool m3 = pw.step(0x1000, a8, 1, 0x5000, 200);
-            const bool m4 = pw.step(0x1000, a12, 1, 0x5000, 300);
+            const bool m1 = pw.step(0x1000, true, 0.0f, 1, 0x5000, 0);
+            const bool m2 = pw.step(0x1000, true, 0.4f, 1, 0x5000, 100);
+            const bool m3 = pw.step(0x1000, true, 0.8f, 1, 0x5000, 200);
+            const bool m4 = pw.step(0x1000, true, 1.2f, 1, 0x5000, 300);
             check(!m1 && !m2 && !m3 && m4 && pw.turnMs == 300,
                   "v14.17 turn: slow turns add up against the anchor: 0.4 deg steps restart the clock only at 1.2 deg (the third step)");
         }
@@ -1384,7 +1377,7 @@ int main(int argc, char** argv) {
             se::SealState stS;
             uint64_t sealedS = 0;
             for (uint64_t t = 0; t <= 5000; t += 100) {
-                pw.step(0x1000, fwd0, 1, t >= 1000 ? 0x6000 : 0x5000, t);
+                pw.step(0x1000, true, 0.0f, 1, t >= 1000 ? 0x6000 : 0x5000, t);
                 se::SealInputs in = quiet(t);
                 in.rel = t == 0 ? 14.0f : -45.0f;   // v14.19: the descent as above
                 in.pad = 0x1000;
@@ -1565,6 +1558,169 @@ int main(int argc, char** argv) {
             }
             check(pmReleased && pmSeal == 2200,
                   "v14.19 mechanism: a 'pad started moving' release still allows the re-seal (2 s after the pad lowers, 2.2 s)");
+        }
+
+        // ---- Built v14.20 (2026-10-13, the review of 670864ca): the five P2 fixes, the shell-relative turn, the view's centre ------------------------
+        {
+            // Review 1: a pending engage is bound to the pad and the shell it was asked for. Driver: the request, the box invalid, the pad rising (the
+            // trigger withdraws), the box made valid afterwards: the request is cancelled and the cell is never frozen.
+            se::SealState st;
+            se::ReleaseWhy w = se::ReleaseWhy::kNone;
+            se::SealInputs in = quiet(0);
+            in.pad = 0x1000;
+            in.shellAddr = 0x5000;
+            const bool asked = se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage;
+            se::EngageRequest req;
+            req.pending = asked;
+            req.pad = in.pad;
+            req.shell = in.shellAddr;
+            check(asked && se::engageAdmitted(req, st, 0x1000, 0x5000, true, -45.0f, true),
+                  "v14.20 engage: a request for a valid lowered pad, in the bay, is admitted to freeze its cell (control)");
+            check(!se::engageAdmitted(req, st, 0x1000, 0x5000, true, -45.0f, false),
+                  "v14.20 engage: an invalid box is not frozen; the request stays pending for another frame");
+            in.rel = 5.0f;
+            in.nowMs = 100;
+            se::sealStep(in, &st, &w);
+            se::engageTrigger(&req, st);
+            in.rel = -45.0f;
+            in.nowMs = 200;
+            se::sealStep(in, &st, &w);
+            check(!req.pending && !se::engageAdmitted(req, st, 0x1000, 0x5000, true, -45.0f, true),
+                  "v14.20 engage: the pad rising withdraws the request; a box made valid afterwards does not freeze the cell");
+
+            // The pad is replaced: the trigger asks again for the new pad; the request bound to the old pad is never admitted for it.
+            se::SealState stB;
+            se::ReleaseWhy wB = se::ReleaseWhy::kNone;
+            se::SealInputs a = quiet(0);
+            a.pad = 0x1000;
+            a.shellAddr = 0x5000;
+            se::sealStep(a, &stB, &wB);
+            se::EngageRequest reqA{true, 0x1000, 0x5000};
+            se::SealInputs b = quiet(100);
+            b.pad = 0x2000;
+            b.shellAddr = 0x5000;
+            const bool askedB = se::sealStep(b, &stB, &wB) == se::SealAction::kRequestEngage;
+            se::engageTrigger(&reqA, stB);
+            const se::EngageRequest reqB{true, 0x2000, 0x5000};
+            check(askedB && !se::engageAdmitted(reqA, stB, 0x2000, 0x5000, true, -45.0f, true) && se::engageAdmitted(reqB, stB, 0x2000, 0x5000, true, -45.0f, true),
+                  "v14.20 engage: a request bound to pad A is never admitted for pad B; the trigger's own new request for B is");
+
+            // Review 2: a genuine change of the bay's pad or shell is a change of identity; a brief miss of the same pad is not.
+            se::LatchIdentity id;
+            id.bind(0xB0, 0x5000);
+            check(!id.step(false, 0, true, 0x5000), "v14.20 latch: a sample that misses the pad keeps the identity: no change");
+            check(!id.step(true, 0xB0, true, 0x5000), "v14.20 latch: the same pad and shell: no change");
+            check(id.step(true, 0xA0, true, 0x5000) && id.pad == 0xA0, "v14.20 latch: pad B replaced by pad A (the preferred pad) is a genuine change: rebuild");
+            check(!id.step(true, 0xA0, true, 0x5000), "v14.20 latch: after the rebuild the same pad is no change");
+            check(id.step(true, 0xA0, true, 0x6000) && id.shell == 0x6000, "v14.20 latch: a shell replacement is a genuine change: rebuild");
+            se::LatchSet ls;
+            ls.n = 2;
+            ls.latched = true;
+            ls.lastMotionMs = 900;
+            ls.recs[0].movedRun = 2;
+            ls.recs[0].haveMotion = true;
+            ls.recs[0].lastMovedMs = 800;
+            ls.recs[1].movedRun = 3;
+            ls.recs[1].haveMotion = true;
+            ls.recs[1].lastMovedMs = 900;
+            ls.reset();
+            check(ls.movedIndex() == -1 && ls.lastMotionMs == 0 && !ls.recs[0].haveMotion && ls.recs[1].movedRun == 0 && !ls.latched,
+                  "v14.20 latch: a reset clears the records' motion references, so a rebuilt latch inherits no old run or clock");
+
+            // Review 4: a rig's verdict may skip its body only in the epoch it was read in, with a bound read there.
+            const uint8_t outside = static_cast<uint8_t>(se::RigVerdict::kOutside);
+            check(se::verdictCode(se::RigVerdict::kOutside) == outside && outside == 2, "v14.20 rig: the outside verdict code is 2");
+            check(se::rigMayVeto(3, 3, true, outside), "v14.20 rig: an outside bound read in the current epoch may veto (control)");
+            check(!se::rigMayVeto(3, 4, true, outside), "v14.20 rig: after a lifecycle point (a new epoch) the old verdict forwards");
+            check(!se::rigMayVeto(4, 4, false, outside),
+                  "v14.20 rig: a reused address claimed in the new epoch has no bound: its first evaluation forwards");
+            check(se::rigMayVeto(4, 4, true, outside) && !se::rigMayVeto(4, 4, true, static_cast<uint8_t>(se::RigVerdict::kMixed)),
+                  "v14.20 rig: once a fresh bound reads outside it may veto; a mixed verdict never does");
+
+            // Review 5: a bounded probe. At capacity, beyond the bound: a miss or a refused put after the bound, never a walk of the whole table.
+            struct Slot {
+                uintptr_t key = 0;
+                uint32_t gen = 0;
+            };
+            constexpr size_t kCap = 64;
+            Slot table[kCap] = {};
+            uint32_t cur = 1;
+            auto matchesKey = [&](size_t i, uintptr_t key) { return table[i].gen == cur && table[i].key == key; };
+            auto staleSlot = [&](size_t i) { return table[i].gen != cur; };
+            size_t inserted = 0;
+            for (uintptr_t k = 1; k <= se::kTableProbeMax; ++k) {
+                const se::ProbeResult p = se::boundedProbe(0, kCap, se::kTableProbeMax, [&](size_t i) { return matchesKey(i, k); }, staleSlot);
+                if (p.empty) {
+                    table[p.index].key = k;
+                    table[p.index].gen = cur;
+                    ++inserted;
+                }
+            }
+            check(inserted == se::kTableProbeMax, "v14.20 table: 32 keys sharing a home slot fill the 32-probe run");
+            const se::ProbeResult miss = se::boundedProbe(0, kCap, se::kTableProbeMax, [&](size_t i) { return matchesKey(i, 99); }, staleSlot);
+            check(miss.exhausted && !miss.found && miss.probes == se::kTableProbeMax,
+                  "v14.20 table: at capacity a missing key is a miss after the bound (32 probes), not a walk of all 64 slots");
+            const se::ProbeResult refused = se::boundedProbe(0, kCap, se::kTableProbeMax, [&](size_t i) { return matchesKey(i, 99); }, staleSlot);
+            check(refused.exhausted && !refused.empty, "v14.20 table: at capacity beyond the bound a put is refused (uncached), not forced in");
+            const se::ProbeResult hit = se::boundedProbe(0, kCap, se::kTableProbeMax, [&](size_t i) { return matchesKey(i, 20); }, staleSlot);
+            check(hit.found && hit.index == 19 && hit.probes == 20, "v14.20 table: a key inside the bound is found at its probe");
+            cur = 2;   // a new generation: every slot is stale, so the run is free again
+            const se::ProbeResult fresh = se::boundedProbe(0, kCap, se::kTableProbeMax, [&](size_t i) { return matchesKey(i, 99); }, staleSlot);
+            check(fresh.empty && fresh.probes == 1 && fresh.index == 0, "v14.20 table: a stale slot of an earlier epoch is free: the insert takes the first probe");
+            const se::ProbeResult tiny = se::boundedProbe(0, 8, se::kTableProbeMax, [](size_t) { return false; }, [](size_t) { return false; });
+            check(tiny.exhausted && tiny.probes == 8, "v14.20 table: a table smaller than the bound is bounded by its size");
+
+            // Review 6: the turn is the pad's yaw against its SHELL. The station's rotation (the pad and its shell turn together at 1 deg/s) is no turn;
+            // a relative turn of 2 deg restarts the clock; an unreadable yaw gives no turn signal.
+            auto rot = [](float x, float y, float deg, float* ox, float* oy) {
+                const float r = deg * 0.01745329252f;
+                *ox = x * std::cos(r) - y * std::sin(r);
+                *oy = x * std::sin(r) + y * std::cos(r);
+            };
+            const float shellOrigin[3] = {0.0f, 0.0f, 0.0f};
+            const float upAxis[3] = {0.0f, 0.0f, 1.0f};
+            auto frameAt = [&](uint64_t t, float extraPadDeg) {
+                const float th = static_cast<float>(t) / 1000.0f;   // 1 deg per second
+                float sx = 0.0f, sy = 0.0f, fx = 0.0f, fy = 0.0f, px = 0.0f, py = 0.0f;
+                rot(1.0f, 0.0f, th, &sx, &sy);
+                rot(0.0f, 1.0f, th + extraPadDeg, &fx, &fy);
+                rot(3.0f, 4.0f, th, &px, &py);
+                const float shellFwd[3] = {sx, sy, 0.0f};
+                const float padFwd[3] = {fx, fy, 0.0f};
+                const float padPos[3] = {px, py, -45.0f};
+                return se::shellFrameOf(padPos, shellOrigin, upAxis, shellFwd, padFwd);
+            };
+            check(std::fabs(frameAt(0, 0.0f).yawDeg - frameAt(5000, 0.0f).yawDeg) < 1e-2f && frameAt(5000, 0.0f).yawOk,
+                  "v14.20 turn: a common pad and shell rotation leaves the shell-relative yaw unchanged");
+            auto sealWith = [&](float extraAfter1s, bool yawReadable) -> uint64_t {
+                se::PadStillWatch pw;
+                se::SealState s;
+                uint64_t sealedAt = 0;
+                for (uint64_t t = 0; t <= 10000; t += 100) {
+                    const se::ShellFrame f = frameAt(t, t >= 1000 ? extraAfter1s : 0.0f);
+                    pw.step(0x1000, f.yawOk && yawReadable, f.yawDeg, 1, 0x5000, t);
+                    se::SealInputs in2 = quiet(t);
+                    in2.rel = t == 0 ? 14.0f : -45.0f;   // raised, then lowered and still from 100 ms
+                    in2.pad = 0x1000;
+                    in2.padLastMotionMs = pw.motionMs();
+                    se::ReleaseWhy w2 = se::ReleaseWhy::kNone;
+                    if (se::sealStep(in2, &s, &w2) == se::SealAction::kRequestEngage && sealedAt == 0) sealedAt = t;
+                }
+                return sealedAt;
+            };
+            check(sealWith(0.0f, true) == 2100, "v14.20 turn: a common pad and shell rotation of 1 deg/s seals 2 s after the pad rests (2.1 s), not at the fallback");
+            check(sealWith(2.0f, true) == 3000, "v14.20 turn: a relative pad turn of 2 deg at 1 s restarts the still clock: the seal comes at 3 s");
+            check(sealWith(2.0f, false) == 2100, "v14.20 turn: an unreadable yaw gives no turn signal: the 2 deg turn is not seen");
+            se::PadStillWatch wrapWatch;
+            wrapWatch.step(0x1000, true, 179.0f, 1, 0x5000, 0);
+            const bool crossed = wrapWatch.step(0x1000, true, -179.0f, 1, 0x5000, 100);
+            check(crossed && wrapWatch.turnMs == 100, "v14.20 turn: a yaw of 179 deg then -179 deg is a 2 deg turn across the seam: counted");
+
+            // Review 7c: the view's centre is the origin (or the explorer cam's rows); an eye pose alone is not the centre the station uses.
+            check(se::viewCentreReady(true, false, false) && se::viewCentreReady(true, true, false),
+                  "v14.20 view: the origin is the centre the station uses");
+            check(!se::viewCentreReady(false, true, false), "v14.20 view: an eye pose alone (not the explorer cam) is not the centre: the retry continues");
+            check(se::viewCentreReady(false, true, true), "v14.20 view: the explorer cam's rows are the centre");
         }
 
         // The shell frame: the pad 3 m along x and 4 m along y from the shell, 45 m below it; its forward axis along +y: yaw +90 deg about up.

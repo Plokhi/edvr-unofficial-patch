@@ -1123,18 +1123,27 @@ struct DockWatch {
 // at the last turn or re-anchor), so a slow turn adds up. The latch's own check compares each frame with the last at kBayRotDeg (0.5 deg) and
 // misses a turn slower than that per frame.
 constexpr float kPadTurnDeg = 1.0f;
-inline float axisAngleDeg(const float a[3], const float b[3]) noexcept;   // defined with the bay watch below
+
+// An angle in degrees folded into (-180, 180].
+inline float wrapDeg(float d) noexcept {
+    while (d > 180.0f) d -= 360.0f;
+    while (d <= -180.0f) d += 360.0f;
+    return d;
+}
 
 struct PadStillWatch {
     bool have = false;
     uintptr_t pad = 0;            // the pad the anchor belongs to
     uint8_t posSrc = 4;           // the centre source of the pad's position at the anchor (a change re-anchors without counting)
     uintptr_t shell = 0;          // the shell record the pad's height is measured against
-    float fwd[3] = {};            // the orientation anchor: the pad's forward axis
+    float anchorYaw = 0.0f;       // built v14.20: the pad's yaw against its SHELL (shellFrameOf) at the anchor; the world axis is never used
+    bool anchorOk = false;        // the anchor holds a readable yaw
     uint64_t turnMs = 0;          // the last turn beyond kPadTurnDeg (0: none)
     uint64_t shellMs = 0;         // the last change of the shell record (0: none)
-    // One reading (the pad's forward axis from the same pose as its position). Returns true when this reading restarted the still clock.
-    bool step(uintptr_t padAddr, const float axis[3], uint8_t src, uintptr_t shellAddr, uint64_t nowMs) noexcept {
+    // One reading: the pad, its shell-relative yaw (yawOk false when unreadable: no turn signal), its position's centre source, and the shell record.
+    // Built v14.20: a rotation shared by the pad and its shell (the station turning) is no turn: the yaw is relative. Returns true when this reading
+    // restarted the still clock.
+    bool step(uintptr_t padAddr, bool yawOk, float yawDeg, uint8_t src, uintptr_t shellAddr, uint64_t nowMs) noexcept {
         bool moved = false;
         if (have && shellAddr != shell) {   // the shell the height is read against changed: a new reference is motion
             shellMs = nowMs;
@@ -1142,18 +1151,23 @@ struct PadStillWatch {
         }
         shell = shellAddr;
         const bool same = have && padAddr == pad && src == posSrc;
-        if (!same || axisAngleDeg(fwd, axis) > kPadTurnDeg) {
-            if (same) {   // a turn beyond the limit, not a new pad
-                turnMs = nowMs;
-                moved = true;
-            }
-            fwd[0] = axis[0];
-            fwd[1] = axis[1];
-            fwd[2] = axis[2];
+        if (!same) {   // a new pad or centre source: a new anchor, no turn counted
+            have = true;
+            pad = padAddr;
+            posSrc = src;
+            anchorOk = false;
         }
-        have = true;
-        pad = padAddr;
-        posSrc = src;
+        if (!yawOk) return moved;   // unreadable: no turn signal this reading, and the anchor stands
+        if (!anchorOk) {
+            anchorYaw = yawDeg;
+            anchorOk = true;
+            return moved;
+        }
+        if (std::fabs(wrapDeg(yawDeg - anchorYaw)) > kPadTurnDeg) {   // a turn of the pad against its shell beyond the limit
+            turnMs = nowMs;
+            anchorYaw = yawDeg;
+            moved = true;
+        }
         return moved;
     }
     uint64_t motionMs() const noexcept { return std::max(turnMs, shellMs); }
@@ -1200,6 +1214,104 @@ inline ShellFrame shellFrameOf(const float pad[3], const float shell[3], const f
         f.yawOk = true;
     }
     return f;
+}
+
+// ---- Built v14.20 (2026-10-13, the review of 670864ca): the pure parts of the P2 fixes ----------------------------------------------------
+
+// Review 5: a bounded probe. Walks at most maxProbes slots from home. A matching slot is a hit; a stale or free slot is the insertion point and the end
+// of a lookup. Exhausting the bound is a miss for a lookup and a skipped insert for a put: never a walk of the whole table.
+constexpr uint32_t kTableProbeMax = 32;
+struct ProbeResult {
+    size_t index = 0;
+    uint32_t probes = 0;     // slots examined
+    bool found = false;
+    bool empty = false;      // stopped at a stale or free slot
+    bool exhausted = false;  // the bound was reached first
+};
+template <typename Matches, typename Stale>
+inline ProbeResult boundedProbe(size_t home, size_t cap, uint32_t maxProbes, Matches matches, Stale stale) noexcept {
+    ProbeResult r;
+    if (cap == 0) {
+        r.exhausted = true;
+        return r;
+    }
+    const uint32_t limit = maxProbes < cap ? maxProbes : static_cast<uint32_t>(cap);
+    size_t i = home % cap;
+    for (uint32_t n = 1; n <= limit; ++n) {
+        r.probes = n;
+        r.index = i;
+        if (matches(i)) {
+            r.found = true;
+            return r;
+        }
+        if (stale(i)) {
+            r.empty = true;
+            return r;
+        }
+        i = (i + 1) % cap;
+    }
+    r.exhausted = true;
+    return r;
+}
+
+// Review 1: a pending engage is bound to the pad and the shell it was requested for. A zero pad is never bound.
+struct EngageRequest {
+    bool pending = false;
+    uintptr_t pad = 0;
+    uintptr_t shell = 0;
+};
+
+// The trigger withdrew its request (the pad rose, the camera left, the pad changed, the trigger lapsed): the pending engage is cancelled.
+inline void engageTrigger(EngageRequest* r, const SealState& st) noexcept {
+    if (!st.requested) r->pending = false;
+}
+
+// A pending engage may freeze a cell only while the trigger still asks for the seal, for the same pad and shell, with the lowered pad in the bay and
+// a valid cell for that identity.
+inline bool engageAdmitted(const EngageRequest& r, const SealState& st, uintptr_t pad, uintptr_t shell, bool relOk, float relM, bool cellValid) noexcept {
+    return r.pending && st.requested && pad != 0 && r.pad == pad && r.shell == shell && relOk && relM < kLoweredM && st.camInRun >= kCameraFrames &&
+           cellValid;
+}
+
+// Review 2: the mechanism latch's identity, the own pad and its shell. step() reports a genuine change (another pad record, or another shell record
+// while the shell is read) so the latch is cleared and regathered. A sample that misses the pad keeps the identity: a brief miss is not a change.
+struct LatchIdentity {
+    bool have = false;
+    uintptr_t pad = 0;
+    uintptr_t shell = 0;
+    void bind(uintptr_t p, uintptr_t s) noexcept {
+        have = true;
+        pad = p;
+        shell = s;
+    }
+    bool step(bool padOk, uintptr_t padAddr, bool shellOk, uintptr_t shellAddr) noexcept {
+        if (!padOk) return false;
+        if (!have) {
+            bind(padAddr, shellOk ? shellAddr : 0);
+            return false;
+        }
+        if (padAddr != pad) {
+            bind(padAddr, shellOk ? shellAddr : shell);
+            return true;
+        }
+        if (shellOk && shellAddr != shell) {
+            shell = shellAddr;
+            return true;
+        }
+        return false;
+    }
+};
+
+// Review 4: a rig's cached verdict may skip its body only when it belongs to the current lifecycle epoch and a bound was read in that epoch. Anything
+// else forwards: a reused address, a new rig, a changed collection, an absence.
+inline bool rigMayVeto(uint32_t slotEpoch, uint32_t epoch, bool bounded, uint8_t verdict) noexcept {
+    return slotEpoch == epoch && bounded && verdict == static_cast<uint8_t>(RigVerdict::kOutside);
+}
+
+// Review 7c: the view's centre is ready when the origin the station prefers is read, or the explorer cam's rows are (the only case the rows are
+// preferred). A missing eye pose alone is not a reason to resolve the view again.
+inline bool viewCentreReady(bool originOk, bool poseOk, bool explorerCam) noexcept {
+    return originOk || (poseOk && explorerCam);
 }
 
 // Built v14.18 (2026-10-13, the store hook's identity gate): the admission store's sixteen prologue bytes in build 332841. store_hook.cpp detours
@@ -1377,7 +1489,14 @@ struct LatchSet {
     bool latched = false;
     uint64_t lastMotionMs = 0;
 
+    // Built v14.20 (review 2): a reset clears every record's motion references too, so a rebuilt latch never inherits an old run or an old clock.
     void reset() noexcept {
+        for (LatchRec& r : recs) {
+            r.stamp = 0;
+            r.haveMotion = false;
+            r.lastMovedMs = 0;
+            r.movedRun = 0;
+        }
         n = 0;
         latched = false;
         lastMotionMs = 0;
@@ -1692,6 +1811,8 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         st->padAddr = in.pad;
         st->firstRel = in.rel;
         if (!in.arrived) st->moved = false;   // an arrived dock's moved is its dock reference's (updateDockReference), across a pad change too
+        // Built v14.20 (review 1): a request made for the old pad is withdrawn; the new pad asks for its own seal.
+        if (st->requested) clearTrigger(st);
     }
     if (in.arrived) {
         updateDockReference(in, st);          // built v14.19: the arrival expects a descent, observed against the dock's reference

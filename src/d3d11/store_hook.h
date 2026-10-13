@@ -14,6 +14,8 @@ namespace edvr {
 // The consumer (the optimized station) says whether it wants the store observed (its setting on). The detour
 // is installed on the first true; the gate follows the union of the consumers.
 void storeHookRecompute() noexcept;
+// Built v14.20 (review 7b): sets the gate from the station's state (setting on and docked, and the detour installed). Installs nothing.
+void storeHookGate() noexcept;
 // The detour's status, for the consumers' lines ("installed", or why not).
 const char* storeHookStatus() noexcept;
 

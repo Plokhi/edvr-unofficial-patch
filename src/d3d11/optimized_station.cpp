@@ -44,7 +44,10 @@ struct RigTally {
 RigTally g_rigTally;
 sealed::OwnCell g_heldCell;                // the sealed cell, in the world frame of the frame that reads it (refreshed each frame)
 bool g_heldValid = false;                  // sealed
+std::atomic<bool> g_sealedFlag{false};     // mirror of g_heldValid for the draw path and the hooks (atomic: read on the render thread)
 bool g_engagePending = false;
+uintptr_t g_engagePad = 0;     // built v14.20 (review 1): the pad a pending engage was requested for
+uintptr_t g_engageShell = 0;   // built v14.20 (review 1): the shell it was requested against (0: none)
 uint32_t g_engageTries = 0;
 // Built v14.5: the pad's height above the hangar shell, read live each tick (frame-independent). The shell is picked once per pad.
 bool g_relOk = false;
@@ -328,11 +331,28 @@ uint32_t g_prodGen = 1;          // the generation the slots are valid for (0 is
 
 uint32_t g_prodStampSeen = 0;
 
+// Built v14.20 (review 5): the occupancy and the longest probe of each table this window (the 30 s summary reports them and resets the maximum), and
+// the lookups or inserts that reached the probe bound (a full table is a miss, never a walk of every slot).
+struct TableStats {
+    uint32_t used = 0;
+    uint32_t maxProbes = 0;
+    uint64_t full = 0;
+};
+TableStats g_prodStats;
+TableStats g_collStats;
+TableStats g_rigStats;
+
+void noteProbe(TableStats& t, const sealed::ProbeResult& p) noexcept {
+    if (p.probes > t.maxProbes) t.maxProbes = p.probes;
+    if (p.exhausted) ++t.full;
+}
+
 void prodSync() noexcept {
     const uint32_t s = g_frameStamp.load(std::memory_order_relaxed);
     if (s != g_prodStampSeen) {
         g_prodStampSeen = s;
         ++g_prodGen;
+        g_prodStats.used = 0;   // every slot is stale now
     }
 }
 
@@ -341,35 +361,35 @@ size_t prodIndex(uintptr_t rec) noexcept {
 }
 
 void prodPut(uintptr_t rec, const float c[3], float r) noexcept {
-    size_t i = prodIndex(rec);
-    for (size_t n = 0; n < kProdSlots; ++n, i = (i + 1) & (kProdSlots - 1)) {
-        ProdSlot& s = g_prodSlots[i];
-        if (s.gen != g_prodGen || s.rec == rec) {
-            s.rec = rec;
-            s.gen = g_prodGen;
-            s.c[0] = c[0];
-            s.c[1] = c[1];
-            s.c[2] = c[2];
-            s.r = r;
-            return;
-        }
-    }
+    const sealed::ProbeResult p = sealed::boundedProbe(
+        prodIndex(rec), kProdSlots, sealed::kTableProbeMax,
+        [rec](size_t i) { const ProdSlot& s = g_prodSlots[i]; return s.gen == g_prodGen && s.rec == rec; },
+        [](size_t i) { return g_prodSlots[i].gen != g_prodGen; });
+    noteProbe(g_prodStats, p);
+    if (p.exhausted) return;   // uncached: a later lookup misses it, as a record the producer never offered (the same centre rules apply)
+    ProdSlot& s = g_prodSlots[p.index];
+    if (p.empty) ++g_prodStats.used;
+    s.rec = rec;
+    s.gen = g_prodGen;
+    s.c[0] = c[0];
+    s.c[1] = c[1];
+    s.c[2] = c[2];
+    s.r = r;
 }
 
 bool prodGet(uintptr_t rec, float c[3], float* r) noexcept {
-    size_t i = prodIndex(rec);
-    for (size_t n = 0; n < kProdSlots; ++n, i = (i + 1) & (kProdSlots - 1)) {
-        const ProdSlot& s = g_prodSlots[i];
-        if (s.gen != g_prodGen) return false;
-        if (s.rec == rec) {
-            c[0] = s.c[0];
-            c[1] = s.c[1];
-            c[2] = s.c[2];
-            *r = s.r;
-            return true;
-        }
-    }
-    return false;
+    const sealed::ProbeResult p = sealed::boundedProbe(
+        prodIndex(rec), kProdSlots, sealed::kTableProbeMax,
+        [rec](size_t i) { const ProdSlot& s = g_prodSlots[i]; return s.gen == g_prodGen && s.rec == rec; },
+        [](size_t i) { return g_prodSlots[i].gen != g_prodGen; });
+    noteProbe(g_prodStats, p);
+    if (!p.found) return false;
+    const ProdSlot& s = g_prodSlots[p.index];
+    c[0] = s.c[0];
+    c[1] = s.c[1];
+    c[2] = s.c[2];
+    *r = s.r;
+    return true;
 }
 
 struct WorldRead {
@@ -574,6 +594,7 @@ constexpr size_t kRigSlots = 4096;
 
 struct RigSlot {
     uintptr_t rig = 0;               // 0: an empty slot
+    uint32_t epoch = 0;              // built v14.20 (review 4): the lifecycle epoch the slot was claimed in; an older one is free and forwards
     uint32_t evalStamp = 0;          // the frame stamp of the rig's last decision
     uint32_t curStamp = 0;           // the frame stamp the current box was accumulated in
     bool curValid = false;
@@ -596,9 +617,16 @@ RigSlot g_rigSlots[kRigSlots];
 // collection is read, read per bucket by the store's observer. Under the trial's lock.
 constexpr size_t kCollSlots = 1024;
 
+// Built v14.20 (review 4): every association carries the lifecycle epoch it was made in. An association from an earlier epoch is free: a lookup misses
+// it and an insert reuses it. The epoch is bumped at undock, hangar change, ship change, setting toggle and an association change (bumpRigEpoch).
+uint32_t g_rigEpoch = 1;
+bool g_rigVerdictsFresh = false;   // the verdicts were refreshed for the held cell this frame (review 7a)
+uint64_t g_rigEpochs = 0;          // the lifecycle bumps this window (the summary's count)
+
 struct CollSlot {
     uintptr_t coll = 0;
     uintptr_t rig = 0;
+    uint32_t epoch = 0;
 };
 
 CollSlot g_collSlots[kCollSlots];
@@ -608,25 +636,26 @@ size_t collIndex(uintptr_t coll) noexcept {
 }
 
 void collInsert(uintptr_t coll, uintptr_t rig) noexcept {
-    size_t i = collIndex(coll);
-    for (size_t n = 0; n < kCollSlots; ++n, i = (i + 1) & (kCollSlots - 1)) {
-        CollSlot& s = g_collSlots[i];
-        if (s.coll == coll || s.coll == 0) {
-            s.coll = coll;
-            s.rig = rig;
-            return;
-        }
-    }
+    const sealed::ProbeResult p = sealed::boundedProbe(
+        collIndex(coll), kCollSlots, sealed::kTableProbeMax,
+        [coll](size_t i) { const CollSlot& s = g_collSlots[i]; return s.epoch == g_rigEpoch && s.coll == coll; },
+        [](size_t i) { return g_collSlots[i].epoch != g_rigEpoch; });
+    noteProbe(g_collStats, p);
+    if (p.exhausted) return;   // not associated: the record forwards its rig's own rules, the same as a rig with no association
+    CollSlot& s = g_collSlots[p.index];
+    if (p.empty) ++g_collStats.used;
+    s.coll = coll;
+    s.rig = rig;
+    s.epoch = g_rigEpoch;
 }
 
 uintptr_t collFind(uintptr_t coll) noexcept {
-    size_t i = collIndex(coll);
-    for (size_t n = 0; n < kCollSlots; ++n, i = (i + 1) & (kCollSlots - 1)) {
-        const CollSlot& s = g_collSlots[i];
-        if (s.coll == coll) return s.rig;
-        if (s.coll == 0) return 0;
-    }
-    return 0;
+    const sealed::ProbeResult p = sealed::boundedProbe(
+        collIndex(coll), kCollSlots, sealed::kTableProbeMax,
+        [coll](size_t i) { const CollSlot& s = g_collSlots[i]; return s.epoch == g_rigEpoch && s.coll == coll; },
+        [](size_t i) { return g_collSlots[i].epoch != g_rigEpoch; });
+    noteProbe(g_collStats, p);
+    return p.found ? g_collSlots[p.index].rig : 0;
 }
 
 // The job path's one-entry cache per frame: the last store bucket and the rig it resolved to (a bucket's records come in a run).
@@ -634,26 +663,35 @@ uintptr_t g_rigBucketCache = 0, g_rigBucketRig = 0;
 
 uint32_t g_rigBucketStamp = 0;
 
-size_t g_rigSlotsUsed = 0;
-
 uint64_t g_rigNamesLogged = 0;
 
 size_t rigIndex(uintptr_t rig) noexcept {
     return static_cast<size_t>((static_cast<uint64_t>(rig) >> 4) * 0x9E3779B97F4A7C15ull >> 52) & (kRigSlots - 1);
 }
 
+// Built v14.20 (review 4): claims a slot for a rig in the current epoch: its bounds, its name and its verdict start empty, so the first evaluation
+// forwards until a fresh bound exists.
+RigSlot* rigClaim(RigSlot& s, uintptr_t rig) noexcept {
+    s = RigSlot{};
+    s.rig = rig;
+    s.epoch = g_rigEpoch;
+    ++g_rigStats.used;
+    return &s;
+}
+
+// Built v14.20 (review 5): a bounded probe. A slot of an earlier epoch is free; a full bound returns null (the rig forwards: its records are not
+// bounded, the same as a rig the table never saw).
 RigSlot* rigFind(uintptr_t rig, bool insert) noexcept {
-    size_t i = rigIndex(rig);
-    for (size_t n = 0; n < kRigSlots; ++n, i = (i + 1) & (kRigSlots - 1)) {
-        RigSlot& s = g_rigSlots[i];
-        if (s.rig == rig) return &s;
-        if (s.rig == 0) {
-            if (!insert) return nullptr;
-            s.rig = rig;
-            ++g_rigSlotsUsed;
-            return &s;
-        }
+    const sealed::ProbeResult p = sealed::boundedProbe(
+        rigIndex(rig), kRigSlots, sealed::kTableProbeMax,
+        [rig](size_t i) { return g_rigSlots[i].rig == rig; },
+        [](size_t i) { const RigSlot& s = g_rigSlots[i]; return s.rig == 0 || s.epoch != g_rigEpoch; });
+    noteProbe(g_rigStats, p);
+    if (p.found) {
+        RigSlot& s = g_rigSlots[p.index];
+        return s.epoch == g_rigEpoch ? &s : rigClaim(s, rig);
     }
+    if (p.empty && insert) return rigClaim(g_rigSlots[p.index], rig);
     return nullptr;
 }
 
@@ -726,9 +764,14 @@ void rigNoteRecord(uintptr_t bucket, uintptr_t record, const float c[3], float r
 // records' spheres in the last frame that had records. The cell is the one in force. The decision then reads one slot per rig.
 void refreshRigVerdicts() noexcept {
     std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+    // Built v14.20 (review 7a): no cell held, no verdict is read (the veto answers only while sealed): no work. The first veto after an engage refreshes.
+    if (!g_heldValid) {
+        g_rigVerdictsFresh = false;
+        return;
+    }
     const bool allMode = false;
     for (RigSlot& s : g_rigSlots) {
-        if (s.rig == 0) continue;
+        if (s.rig == 0 || s.epoch != g_rigEpoch) continue;
         const float* mn = nullptr;
         const float* mx = nullptr;
         if (s.curValid) {
@@ -758,6 +801,7 @@ void refreshRigVerdicts() noexcept {
         if (!allMode && !ownRig && g_ownPrefix[0] != '\0') ownRig = sealed::ownShipExempt(false, 0.0f, s.name, g_ownPrefix);
         s.verdict = ownRig ? kVerdictUnknown : sealed::verdictCode(v);   // 2 outside, 1 mixed, 0 unknown
     }
+    g_rigVerdictsFresh = true;
 }
 
 
@@ -785,14 +829,33 @@ bool producerDecide(uintptr_t rec) noexcept {
 
 // The rig verdict's veto (the early veto, 0x431AFE0's entry): a rig whose verdict is outside the cell is skipped while its refresh counter is
 // below sealed::kRigRefreshN. Answers only while sealed; the verdicts are refreshed on the frame tick.
+// Built v14.20 (review 4): a lifecycle point (undock, hangar change, ship change, setting toggle, a changed association) moves to a new epoch. Every rig
+// slot, association and verdict of the old epoch is free; a rig forwards until it has a fresh bound. Caller holds g_sealedMutex.
+void bumpRigEpoch() noexcept {
+    ++g_rigEpoch;
+    ++g_rigEpochs;
+    g_rigStats.used = 0;
+    g_collStats.used = 0;
+    g_rigVerdictsFresh = false;
+    g_rigCacheStamp = 0;
+    g_rigCacheRig = 0;
+    g_rigCacheSlot = nullptr;
+    g_rigBucketCache = 0;
+    g_rigBucketRig = 0;
+    g_rigBucketStamp = 0;
+}
+
 bool sealedTrialRigVeto(uintptr_t rig, uintptr_t ctx) noexcept {
     (void)ctx;
-    if (!g_heldValid || !rig) return false;
+    // Built v14.20 (review 3): an atomic fast gate before the lock; g_heldValid is read again under it (engage and release write it under the lock).
+    if (!g_sealedFlag.load(std::memory_order_acquire) || !rig) return false;
     std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+    if (!g_heldValid) return false;
+    if (!g_rigVerdictsFresh) refreshRigVerdicts();   // review 7a: the first veto after an engage reads verdicts refreshed for the held cell
     const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
     ++g_rigTally.seen;
     RigSlot* s = nullptr;
-    if (rig == g_rigCacheRig && g_rigCacheStamp == stamp && g_rigCacheSlot && g_rigCacheSlot->rig == rig) {
+    if (rig == g_rigCacheRig && g_rigCacheStamp == stamp && g_rigCacheSlot && g_rigCacheSlot->rig == rig && g_rigCacheSlot->epoch == g_rigEpoch) {
         s = g_rigCacheSlot;
     } else {
         s = rigFind(rig, true);
@@ -809,8 +872,19 @@ bool sealedTrialRigVeto(uintptr_t rig, uintptr_t ctx) noexcept {
         s->collStamp = stamp;
         uintptr_t coll = 0;
         if (readVal(&coll, rig + 0x348) && coll && coll != s->coll) {
+            // Built v14.20 (review 4): an association change expires the old associations and this rig's bounds: it forwards until a fresh bound exists.
+            bumpRigEpoch();
+            s = rigFind(rig, true);
+            if (!s) {
+                ++g_rigTally.unknown;
+                return false;
+            }
+            s->evalStamp = stamp;
+            s->collStamp = stamp;
             s->coll = coll;
             collInsert(coll, rig);
+            ++g_rigTally.unknown;
+            return false;
         }
     }
     bool veto = false;
@@ -859,10 +933,10 @@ bool cullCounted(uintptr_t record, bool containing) noexcept {
 }
 // ---- The product's state: the setting, the seal, the release, the window counts ----------------------------------------------------------------
 std::atomic<bool> g_setting{false};        // fix.optimized_station is on (read at install and every kSettingPollFrames frames)
-std::atomic<bool> g_sealedFlag{false};     // mirror of g_heldValid for the draw path and the hooks (atomic: read on the render thread)
 bool g_vetoesAttached = false;             // the producer and rig vetoes are attached (under g_installMutex-free single writer: the render tick)
 bool g_storeWanted = false;                // the store observer is wanted (the setting is on)
 std::atomic<bool> g_dockedNow{false};     // Status.json Flags bit 0 (Docked), read at each tick while known (the store thread reads it)
+bool g_dockedWasNow = false;               // built v14.20 (review 4): the docked flag at the last tick (an undock is a lifecycle point)
 std::atomic<bool> g_dockedKnownNow{false};// Status.json has a Flags sample (the waiting line says unknown until then)
 sealed::WaitView g_waitLast;              // the waiting line last written (built v14.1)
 bool g_waitLastSet = false;
@@ -887,6 +961,7 @@ float g_namesPadC[3] = {};
 uintptr_t g_hangarPad = 0;
 // Built v14.12: the bay's mechanism, latched once per descent (core LatchSet). Candidates are gathered only while a latch is pending.
 sealed::LatchSet g_latch;
+sealed::LatchIdentity g_latchId;   // built v14.20 (review 2): the pad and shell the latch was built for
 // Built v14.17: the dock's arrival and this dock's seal (the lock: g_sealedMutex); the pad's turn and the shell's change as still motion; the pad
 // in the shell's frame this frame (the temporary track line and the sealed line).
 sealed::DockWatch g_dock;
@@ -958,10 +1033,13 @@ const char* releaseText(sealed::ReleaseWhy w) noexcept {
 }
 
 void releaseSeal(const char* why, uint32_t frame) noexcept {
+    // Built v14.20 (review 3): the release is a state change: it runs under the state lock, serialized with the store callbacks.
+    std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
     if (!g_heldValid) return;
     Log::get().note("optimized station: released (frame %u): %s. Everything is drawn as without the station until the seal conditions hold again.",
                     frame, why);
     g_heldValid = false;
+    g_rigVerdictsFresh = false;   // built v14.20 (review 7a): the next engage refreshes the verdicts before its first veto
     g_heldCell = sealed::OwnCell{};
     g_heldLocalValid = false;
     g_shellValid = false;
@@ -1022,6 +1100,7 @@ void latchNow(uint64_t now) noexcept {
                                              g_latch.recs, rej, 10, &rejN);
     g_latch.n = k;
     g_latch.latched = true;
+    g_latchId.bind(g_pickCell.pad, g_preShellValid ? g_preShellAddr : 0);   // built v14.20 (review 2)
     g_latch.lastMotionMs = 0;
     char names[200] = {};
     size_t used = 0;
@@ -1181,6 +1260,19 @@ void summaryLine(uint64_t now) noexcept {
                     static_cast<unsigned long long>(g_winFrames), static_cast<unsigned long long>(g_winRigVetoes),
                     static_cast<unsigned long long>(g_winProducerVetoes), static_cast<unsigned long long>(g_winCulled),
                     static_cast<unsigned long long>(g_winKeptUnknown), static_cast<unsigned long long>(g_winFaults));
+    // Built v14.20 (review 5): the tables' occupancy now, the longest probe and the bounded (full) count this window, and the rig epoch count.
+    Log::get().note("optimized station: last %llu s tables: producer %u of %u used, longest probe %u, bounded %llu; rigs %u of %u, longest %u, "
+                    "bounded %llu; collections %u of %u, longest %u, bounded %llu; rig epochs %llu (epoch %u).",
+                    static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned>(g_prodStats.used),
+                    static_cast<unsigned>(kProdSlots), static_cast<unsigned>(g_prodStats.maxProbes),
+                    static_cast<unsigned long long>(g_prodStats.full), static_cast<unsigned>(g_rigStats.used),
+                    static_cast<unsigned>(kRigSlots), static_cast<unsigned>(g_rigStats.maxProbes), static_cast<unsigned long long>(g_rigStats.full),
+                    static_cast<unsigned>(g_collStats.used), static_cast<unsigned>(kCollSlots), static_cast<unsigned>(g_collStats.maxProbes),
+                    static_cast<unsigned long long>(g_collStats.full), static_cast<unsigned long long>(g_rigEpochs),
+                    static_cast<unsigned>(g_rigEpoch));
+    g_prodStats.maxProbes = g_rigStats.maxProbes = g_collStats.maxProbes = 0;
+    g_prodStats.full = g_rigStats.full = g_collStats.full = 0;
+    g_rigEpochs = 0;
     g_summaryStartMs = now;
     g_winFrames = g_winSealedFrames = g_winRigVetoes = g_winProducerVetoes = 0;
     g_winCulled = g_winKeptUnknown = g_winFaults = 0;
@@ -1205,16 +1297,33 @@ bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
 }
 
 // Attaches or detaches the vetoes and the store observer to the setting. Attach is refused (logged once) when a hook stands down.
+// Built v14.20 (review 3): the toggle's hook operations run OUTSIDE the state lock (a detach may wait for callbacks, and a callback needs the lock).
+// Off: the callbacks are detached and the gate closed first, so no new callback starts; then the state changes under the lock, which waits for a
+// callback already inside. On: the state resets under the lock, then the hooks attach. Either way the rig and collection epoch moves on.
 void applySetting(bool on, uint32_t frame) noexcept {
     if (on == g_vetoesAttached) return;
-    g_sealState = sealed::SealState{};   // a setting toggle starts the trigger and its memory afresh (built v14.4)
-    g_heightSrc = sealed::ShellHeightSources{};
-    g_preShellValid = false;
-    g_sealGuard = sealed::SealRateGuard{};
-    if (!on && g_sun.off) {   // setting off: the sun comes back on (built v14.13)
-        g_sun.off = false;
-        g_sunOff.store(false, std::memory_order_release);
-        Log::get().note("optimized station: sun light inside the hangar back on (setting off)");
+    if (!on) {
+        kinematicEvalSetDirectVeto(nullptr);
+        kinematicEvalSetRigVeto(nullptr);
+        kinematicEvalDirectVetoDetach();
+        kinematicEvalRigVetoDetach();
+        g_storeWanted = false;
+        storeHookRecompute();   // closes the gate before the state changes
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+        g_sealState = sealed::SealState{};   // a setting toggle starts the trigger and its memory afresh (built v14.4)
+        g_heightSrc = sealed::ShellHeightSources{};
+        g_preShellValid = false;
+        g_sealGuard = sealed::SealRateGuard{};
+        bumpRigEpoch();                      // built v14.20 (review 4): the rig and collection tables start afresh
+        if (!on && g_sun.off) {   // setting off: the sun comes back on (built v14.13)
+            g_sun.off = false;
+            g_sunOff.store(false, std::memory_order_release);
+            Log::get().note("optimized station: sun light inside the hangar back on (setting off; Status docked=%s)",
+                            g_dockedNow.load(std::memory_order_acquire) ? "yes" : "no");
+        }
+        if (!on) releaseSeal("setting off", frame);
     }
     if (on) {
         const char* direct = kinematicEvalDirectVetoAttach();
@@ -1226,13 +1335,6 @@ void applySetting(bool on, uint32_t frame) noexcept {
         Log::get().note("optimized station: on (frame %u). Producer veto: %s; rig veto: %s; store observer: %s.", frame, direct, rig,
                         storeHookStatus());
     } else {
-        kinematicEvalSetDirectVeto(nullptr);
-        kinematicEvalSetRigVeto(nullptr);
-        kinematicEvalDirectVetoDetach();
-        kinematicEvalRigVetoDetach();
-        g_storeWanted = false;
-        storeHookRecompute();
-        releaseSeal("setting off", frame);
         Log::get().note("optimized station: off (frame %u).", frame);
     }
     g_vetoesAttached = on;
@@ -1351,16 +1453,25 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
     // The engage: the cell is frozen from the pad when the seal rule asked for it. Held frames take the held cell.
     if (g_engagePending) {
         ++g_engageTries;
-        if (next.has && next.radius > 0.0f && g_relOk && sealed::cellInvalidWhy(next) == nullptr) {
+        // Built v14.20 (review 1): the freeze needs the request still in force for this pad and shell, a lowered pad in the bay, and a valid cell.
+        const sealed::EngageRequest req{g_engagePending, g_engagePad, g_engageShell};
+        const bool cellValid = next.has && next.radius > 0.0f && sealed::cellInvalidWhy(next) == nullptr;
+        const bool admitted = sealed::engageAdmitted(req, g_sealState, next.pad, g_preShellValid ? g_preShellAddr : 0, g_relOk, g_relM, cellValid);
+        if (admitted) {
             setOwnPrefixAtEngage(frame);
             pickOwnRecord(frame);
             g_heldCell = next;
             g_heldValid = true;
+            g_rigVerdictsFresh = false;     // built v14.20 (review 7a): the verdicts are refreshed before this seal's first veto
             g_dock.sealedThisDock = true;   // built v14.17: this dock has sealed (the sun's arrival hold ends)
             setHeldFrame(g_heldCell, frame);
             g_engagePending = false;
             g_sealedFlag.store(true, std::memory_order_release);
             sealStatus(g_heldCell, frame);
+        } else if (!g_sealState.requested || (next.has && next.pad != g_engagePad)) {
+            // The request was withdrawn, or it belongs to another pad: cancelled, and never frozen later (built v14.20, review 1).
+            g_engagePending = false;
+            g_engageTries = 0;
         } else if (g_engageTries >= kEngageTries) {
             // Built v14.8: the cell is not valid (no box, a zero box, no target), so no seal. The seal is requested again (the pad may gain a target);
             // the note is written once per distinct reason.
@@ -1437,7 +1548,8 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         g_viewTries = 0;
         g_viewReady = false;
     }
-    if (!g_viewReady || (!g_view.poseOk && g_viewTries < kViewTries)) {
+    // Built v14.20 (review 7c): retry while the centre the consumer uses is missing (the origin, or the explorer cam's rows), not on a missing eye pose.
+    if (!g_viewReady || (!sealed::viewCentreReady(g_view.originOk, g_view.poseOk, g_view.source == view::Source::kExplorerCam) && g_viewTries < kViewTries)) {
         ++g_viewTries;
         view::resolveView(ctx, &g_view);
         g_viewReady = true;
@@ -1569,6 +1681,7 @@ void optimizedStationInstall(bool flatProfile) {
 }
 
 bool optimizedStationOn() noexcept { return g_setting.load(std::memory_order_acquire); }
+bool optimizedStationGathers() noexcept { return g_setting.load(std::memory_order_acquire) && g_dockedNow.load(std::memory_order_acquire); }
 bool optimizedStationSealed() noexcept { return g_sealedFlag.load(std::memory_order_acquire); }
 
 // The draw path asks: while sealed, the sun pair is not drawn.
@@ -1616,6 +1729,10 @@ void optimizedStationFrame(uint32_t frame) {
     if (g_heldValid) ++g_winSealedFrames;
     g_dockedKnownNow.store(journalDockedKnown(), std::memory_order_release);
     g_dockedNow.store(journalDockedKnown() && journalDocked(), std::memory_order_release);
+    // Built v14.20 (review 4): an undock is a lifecycle point: the rig and collection tables start afresh.
+    if (g_dockedWasNow && !g_dockedNow.load(std::memory_order_acquire)) bumpRigEpoch();
+    g_dockedWasNow = g_dockedNow.load(std::memory_order_acquire);
+    storeHookGate();   // built v14.20 (review 7b): the store observer gathers only while docked (an atomic gate: no hook is installed here)
     refreshHeldWorld();
     // The camera against the held box: outside it by more than kCameraLeaveM releases the seal.
     bool cameraOutside = false;
@@ -1654,6 +1771,7 @@ void optimizedStationFrame(uint32_t frame) {
             g_ownLiveValid = false;
             g_latch.reset();   // a new ship: the mechanism is latched again
             g_padStill = sealed::PadStillWatch{};
+            bumpRigEpoch();    // built v14.20 (review 4): a ship change is a lifecycle point
         }
     }
     // Built v14.5: the height above the shell along the pad's own up axis, read live, with the shell picked once per pad (the same pick as the
@@ -1699,7 +1817,6 @@ void optimizedStationFrame(uint32_t frame) {
                     g_shellNowValid = true;
                     g_heightChanged = g_heightSrc.note(pw.source, sw.source);
                     // Built v14.17: the pad's turn and the shell's change (the still clock), and the pad in the shell's frame (the instrument).
-                    g_padStill.step(g_pickCell.pad, axes[0], pw.source, g_preShellAddr, now);
                     float shAxes[3][3] = {};
                     float shExt[3] = {};
                     bool shExtOk = false;
@@ -1707,6 +1824,9 @@ void optimizedStationFrame(uint32_t frame) {
                     if (poseOrientOf(g_preShellAddr, shAxes, shExt, &shExtOk, &shSrc)) {
                         g_frameShell = sealed::shellFrameOf(pw.world, sw.world, up, shAxes[0], axes[0]);
                     }
+                    // Built v14.20 (review 6): the turn is the pad's yaw against its SHELL. A rotation the pad and its shell share (the station turning)
+                    // is no turn; an unreadable yaw gives no turn signal (the world axis is never used).
+                    g_padStill.step(g_pickCell.pad, g_frameShell.yawOk, g_frameShell.yawDeg, pw.source, g_preShellAddr, now);
                 }
             }
         }
@@ -1727,6 +1847,13 @@ void optimizedStationFrame(uint32_t frame) {
     g_bayNoting = g_bayWatching && g_shellNowValid;
     if (!g_bayWatching) {
         g_latch.reset();
+    }
+    // Built v14.20 (review 2): a genuine change of the unsealed bay's pad or shell clears the latch and its motion references; it is regathered below.
+    // A sample that misses the pad keeps the identity (a brief miss is no change).
+    if (g_latch.latched && !g_sealedFlag.load(std::memory_order_acquire) &&
+        g_latchId.step(g_pickCell.has, g_pickCell.pad, g_preShellValid, g_preShellAddr)) {
+        g_latch.reset();
+        Log::get().note("optimized station: the bay changed (pad %s): its mechanism is latched again", g_pickCell.padName);
     }
     g_latchPending = g_bayWatching && !g_latch.latched;
     if (g_latchPending && g_pickCell.has) latchNow(now);
@@ -1765,8 +1892,10 @@ void optimizedStationFrame(uint32_t frame) {
         const char* why = "";
         if (sealed::sunStep(su, &g_sun, &why)) {
             g_sunOff.store(g_sun.off, std::memory_order_release);
-            if (g_sun.off) Log::get().note("optimized station: sun light inside the hangar off (pad lowered)");
-            else Log::get().note("optimized station: sun light inside the hangar back on (%s)", why);
+            // Built v14.20 (review 8): the Status docked flag is on both lines, so the sun transition is read against Elite's own docked state.
+            const char* dockedText = g_dockedNow.load(std::memory_order_acquire) ? "yes" : "no";
+            if (g_sun.off) Log::get().note("optimized station: sun light inside the hangar off (pad lowered; Status docked=%s)", dockedText);
+            else Log::get().note("optimized station: sun light inside the hangar back on (%s; Status docked=%s)", why, dockedText);
         }
     }
     sealed::SealInputs in;
@@ -1796,6 +1925,7 @@ void optimizedStationFrame(uint32_t frame) {
         g_preShellValid = false;
         g_latch.reset();
         g_padStill = sealed::PadStillWatch{};
+        bumpRigEpoch();   // built v14.20 (review 4): a hangar change is a lifecycle point
     }
     in.hangarChanged = g_flagHangarChanged;
     in.launched = false;   // the pad state object's reader is not in this build (optimized-station doc, "Not yet")
@@ -1804,6 +1934,12 @@ void optimizedStationFrame(uint32_t frame) {
     const sealed::SealAction act = sealed::sealStep(in, &g_sealState, &why);
     g_flagPadMoved = false;
     g_flagHangarChanged = false;
+    {
+        // Built v14.20 (review 1): the trigger withdrew its request (the pad rose, the camera left, the pad changed): the pending engage is cancelled.
+        sealed::EngageRequest er{g_engagePending, g_engagePad, g_engageShell};
+        sealed::engageTrigger(&er, g_sealState);
+        g_engagePending = er.pending;
+    }
     if (act == sealed::SealAction::kRelease) {
         releaseSeal(releaseText(why), frame);
     } else if (act == sealed::SealAction::kRequestEngage) {
@@ -1814,6 +1950,8 @@ void optimizedStationFrame(uint32_t frame) {
                             "It resumes at a hangar change or a setting toggle.", static_cast<unsigned>(sealed::kSealRateMax));
         } else {
             g_engagePending = true;
+            g_engagePad = in.pad;          // built v14.20 (review 1): bound to the pad and the shell this request was made for
+            g_engageShell = in.shellAddr;
             g_engageTries = 0;
             g_engageAtLoadIn = g_sealState.immediate;
             captureEngageInfo(now);
