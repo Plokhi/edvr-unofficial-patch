@@ -56,8 +56,11 @@
   over 12 switches (10-13), the headset panel while flat (45c51b0f, flown
   OK on Pimax's runtime). Review f519b1d7: three findings fixed (8f13cddf,
   9edf70c7, d410c3dc). Main (XeSS) merged; XeSS in VR in its own doc.
-- **Next:** phase 3 (one installer with the scope prompt, section 4), then
-  Sean's approval to merge and push. Nothing is on main.
+- **Phase 3 BUILT, the installer NOT YET RUN for real** (section 13):
+  a7a2c916, 756fb251, 9b642c02, f30817fa, 31b96980, 7ce8a77d, af948bcb.
+- **Next:** a real Update through the installer GUI on Epic plus a flat
+  flight; a Frontier VR launch; then Sean's approval, merge, CI and the
+  release notes. Nothing is on main.
 
 ## 1. What exists today
 
