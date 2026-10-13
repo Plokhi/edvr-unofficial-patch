@@ -61,6 +61,7 @@ const UINT kMsgFirstScan = WM_APP + 1;
 const wchar_t* kTipUrl = L"https://ko-fi.com/seancharacterecho";
 const wchar_t* kDiscordUrl = L"https://discord.gg/ynkdf6Gdua";
 const wchar_t* kTipText = L"EDVR is free. If it makes your flight more enjoyable, you can";
+constexpr int kTipTop = 658;  // the tip line's top: the painted sentence and both links share it
 
 // The client area and every control position below are in 96-dpi units, scaled
 // once at layout time.
@@ -279,11 +280,19 @@ void applyLayout() {
     // The tip link finishes a sentence that is painted, not a control, so where
     // it goes depends on how wide that sentence renders -- which changes with
     // the font, the scale and the language of the machine it is running on.
-    if (g.tip) {
+    // Both links are sized to their measured labels and sit on the sentence's own line (its rect's top, kTipTop), so the
+    // link continues the sentence after one ordinary space, and "Ask on Discord" ends at the right margin.
+    if (g.tip || g.discord) {
         HDC dc = GetDC(g.window);
-        const int prefix = ui::textWidth(dc, kTipText, ui::fonts().caption);
+        const HFONT caption = ui::fonts().caption;
+        const int prefix = ui::textWidth(dc, kTipText, caption);
+        const int space = ui::textWidth(dc, L" ", caption);
+        const int tipWidth = ui::textWidth(dc, L"leave a tip", caption) + dp(2);
+        const int discordWidth = ui::textWidth(dc, L"Ask on Discord", caption) + dp(2);
         ReleaseDC(g.window, dc);
-        MoveWindow(g.tip, dp(kMargin) + prefix + dp(5), dp(657), dp(76), dp(20), TRUE);
+        if (g.tip) MoveWindow(g.tip, dp(kMargin) + prefix + space, dp(kTipTop), tipWidth, dp(20), TRUE);
+        if (g.discord)
+            MoveWindow(g.discord, dp(kClientWidth - kMargin) - discordWidth, dp(kTipTop), discordWidth, dp(20), TRUE);
     }
 
     // A combo's field height is its item height plus its own frame, not
@@ -314,7 +323,7 @@ void applyLayout() {
         const int frameTop = dp(250);
         const int frameH = dp(282) - frameTop;
         const int y = frameTop + (frameH > textH ? (frameH - textH) / 2 : 0);
-        MoveWindow(g.search, dp(kMargin + kCardPad), y, dp(318), textH, TRUE);
+        MoveWindow(g.search, dp(kMargin + kCardPad), y, dp(310), textH, TRUE);
     }
 
     // Shown or hidden by the scope, not by the screen alone, so it runs after the loop above.
@@ -613,7 +622,8 @@ void paintSettingsScreen(HDC dc) {
 
     // The search box is a real edit control with its 3D border taken off, so
     // the frame around it is drawn here to match everything else.
-    RECT search{dp(kMargin + kCardPad) - dp(6), dp(250), dp(kMargin + kCardPad) + dp(326),
+    // Its right edge stops 8 units short of the VR/Flat selector at x=370, so the two read as separate controls.
+    RECT search{dp(kMargin + kCardPad) - dp(6), dp(250), dp(kMargin + kCardPad) + dp(318),
                 dp(282)};
     ui::fillRounded(dc, search, dp(6), t.control);
     ui::strokeRounded(dc, search, dp(6), t.controlBorder);
@@ -650,7 +660,7 @@ void paintWindow(HWND window) {
     else
         paintSettingsScreen(dc);
 
-    RECT tip{dp(kMargin), dp(658), dp(kClientWidth - kMargin), dp(678)};
+    RECT tip{dp(kMargin), dp(kTipTop), dp(kClientWidth - kMargin), dp(kTipTop + 20)};
     ui::drawText(dc, kTipText, tip, f.caption, t.subtext, DT_LEFT | DT_SINGLELINE);
 
     BitBlt(screenDc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -1108,7 +1118,7 @@ void createControls(HWND window) {
     SendMessageW(g.search, WM_SETFONT, reinterpret_cast<WPARAM>(f.body), TRUE);
     SendMessageW(g.search, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search settings"));
     // 318 wide, so the box ends 8 units short of the VR button at x=370.
-    place(g.search, kMargin + kCardPad, 252, 318, 28, Screen::Settings);
+    place(g.search, kMargin + kCardPad, 252, 310, 28, Screen::Settings);
 
     g.settingsList = createSettingsList(window, kIdSettingsList, g.dpi);
     place(g.settingsList, kMargin + 2, 292, kClientWidth - 2 * kMargin - 4, 350, Screen::Settings);
@@ -1123,11 +1133,11 @@ void createControls(HWND window) {
     place(g.report, kMargin + kCardPad - 4, 536, 636, 102, Screen::Install);
 
     g.tip = ui::makeButton(window, L"leave a tip", kIdKofi, ui::ButtonStyle::Link, f.caption);
-    place(g.tip, kMargin, 657, 76, 20, Screen::Install, true);  // x fixed up in applyLayout
+    place(g.tip, kMargin, kTipTop, 76, 20, Screen::Install, true);  // x and width fixed up in applyLayout
 
     g.discord = ui::makeButton(window, L"Ask on Discord", kIdDiscord, ui::ButtonStyle::Link,
                                f.caption);
-    place(g.discord, kClientWidth - kMargin - 110, 657, 110, 20, Screen::Install, true);
+    place(g.discord, kClientWidth - kMargin - 110, kTipTop, 110, 20, Screen::Install, true);  // sized in applyLayout
 
     // Dark mode does not reach the native controls on its own. These two theme
     // names are what File Explorer uses for exactly this, and on a light theme
