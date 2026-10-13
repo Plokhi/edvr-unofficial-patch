@@ -59,19 +59,18 @@ with PimaxXR, it shows a notice in the headset.
 ## Install
 
 **Download `edvr-installer-<version>.zip` from the release, unzip it, and run
-`edvr-installer.exe`.** It is a single file once unzipped, with nothing else
-to extract or put in the right folder, and it carries the native
-graphics/runtime pair, the bundled OpenXR loader and its notice, `edvr.ini`,
+`edvr-installer.exe`.** It is a single file once unzipped, with nothing else to
+extract or put in the right folder, and it carries the native graphics/runtime
+pair, the bundled OpenXR loader and its notice, `edvr.ini`, `edvr-flat.ini`,
 and the optional DLSS runtime. It finds the game and keeps your settings and
 other mods working. Before it changes anything, it shows you exactly what it is
 about to do and waits for a yes, and it copies every file it replaces into
 `edvr_backup\` first. [docs/installer.md](docs/installer.md) covers its buttons
 and explains what it decides and why.
 
-Players on a flat screen, with no headset, use
-`edvr-flat-installer-<version>.zip` the same way: unzip it and run
-`edvr-flat-installer.exe`. It installs the flat edition only and carries no VR
-support.
+The same installer serves flat-screen players. Under "Install EDVR for:",
+choose "VR and flat" (the default), "VR only" or "Flat only"; the choice can be
+changed later with an ordinary Update, and no settings file is deleted by it.
 
 Because the installer is unsigned, Windows will say the program is
 unrecognised; choose **More info → Run anyway**. Every release lists the
@@ -206,9 +205,9 @@ first person 3D** and does not try; the flat screen stays flat.
 
 It gives you no capability you do not already have: inside the camera you
 cannot act, and Explorer Cam changes only where the camera is and what you see
-from it. While it is on, it writes the free camera's pose, the camera's own
-key presses, and how your commander's avatar is drawn, on your machine only,
-and gives them back when you leave; it touches nothing shared.
+from it. While it is on, it writes the free camera's pose, the camera's own key
+presses, and how your commander's avatar is drawn, on your machine only, and
+gives them back when you leave; it touches nothing shared.
 [docs/explorer-cam.md](docs/explorer-cam.md) covers setting it up and what it
 does under the hood, safeguards included.
 
