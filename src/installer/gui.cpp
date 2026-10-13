@@ -861,6 +861,14 @@ void saveLogs() {
         }
         text += "\r\nAttach it to a GitHub issue, or drop it on Discord. It holds EDVR's own "
                 "logs and settings and nothing else.\r\n";
+        if (!bundle.dumpZipPath.empty()) {
+            // The dump is a separate file for a reason: it is a copy of the game's
+            // memory, which is not for a public issue.
+            text += "\r\nThe game crashed in that session, so its crash dump is saved apart from the logs: " +
+                    toUtf8(bundle.dumpZipPath) +
+                    "\r\nIt holds a copy of the game's memory. Do not attach it to a public issue; "
+                    "send it to the developer privately if asked.\r\n";
+        }
     } else {
         text = bundle.error + "\r\n";
         for (const std::string& note : bundle.notes) text += "  " + note + "\r\n";

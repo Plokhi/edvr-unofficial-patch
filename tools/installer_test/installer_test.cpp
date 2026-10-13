@@ -1998,6 +1998,102 @@ static Survey installedFlatSurvey(const std::wstring& dir, const PayloadInfo& in
     return s;
 }
 
+static void testXessPlanner() {
+    printf("\noptional XeSS files: planning and ownership\n");
+    const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+    PayloadInfo p = flatPayloadFor(kFlatTemplate);
+    p.haveXess = true;
+    p.xessSha = "xess-runtime-new";
+    p.xessLicenseSha = "xess-license-new";
+    p.xessThirdPartySha = "xess-third-party-new";
+    const Options options = testOptions();
+    auto current = [&](const wchar_t* leaf, const std::string& hash, DllKind kind = DllKind::Foreign) {
+        return fakeDll(kind, joinPath(dir, leaf), hash);
+    };
+    auto installed = [&]() {
+        Survey s = installedFlatSurvey(dir, p);
+        s.d3d11.sha256 = p.d3d11Sha;
+        s.state.d3d11Sha = p.d3d11Sha;
+        s.flatIniPresent = true;
+        s.flatIniText = p.iniText;
+        s.baseIniText = p.iniText;
+        s.xess = current(L"libxess.dll", p.xessSha);
+        s.xessLicense = current(L"INTEL-XESS-LICENSE.txt", p.xessLicenseSha);
+        s.xessThirdParty = current(L"INTEL-XESS-THIRD-PARTY.txt", p.xessThirdPartySha);
+        return s;
+    };
+
+    {   // All three identical files can have arrived manually. Record their
+        // ownership without replacing any payload, settings, or base INI.
+        Survey s = installed();
+        const Plan plan = planInstall(s, options, p);
+        check(!plan.blocked && !plan.nothingToDo, "identical XeSS files need a metadata-only adoption");
+        check(plan.steps.size() == 2 &&
+              hasStep(plan, Action::MakeDir, nullptr, L"edvr_install") &&
+              hasStep(plan, Action::WriteText, nullptr, L"state.ini") &&
+              !hasStep(plan, Action::WriteText, nullptr, L"edvr.ini.base") &&
+              !hasStep(plan, Action::WriteText, nullptr, L"edvr-flat.ini") &&
+              !hasStep(plan, Action::WritePayload, nullptr, L"libxess.dll"),
+              "adoption writes only the ownership record, not existing files");
+        const InstallState adopted = parseState(plannedText(plan, L"state.ini"));
+        check(adopted.xessSha == p.xessSha && adopted.xessLicenseSha == p.xessLicenseSha &&
+              adopted.xessThirdPartySha == p.xessThirdPartySha,
+              "[xess] hashes survive the planned state round-trip");
+        s.state = adopted;
+        const Plan removal = planUninstall(s, options);
+        check(hasStep(removal, Action::Delete, L"libxess.dll", nullptr) &&
+              hasStep(removal, Action::Delete, L"INTEL-XESS-LICENSE.txt", nullptr) &&
+              hasStep(removal, Action::Delete, L"INTEL-XESS-THIRD-PARTY.txt", nullptr),
+              "uninstall removes each adopted file by its recorded hash");
+    }
+    {   // A foreign runtime is left alone, even when the notices are ours.
+        Survey s = installed();
+        s.xess.sha256 = "foreign-runtime";
+        s.state.xessSha = "old-ours";
+        const Plan plan = planInstall(s, options, p);
+        check(!plan.blocked && !hasStep(plan, Action::WritePayload, nullptr, L"libxess.dll") &&
+              notesMention(plan, "different libxess.dll"), "foreign XeSS runtime is preserved");
+        check(plan.nextState.xessSha.empty() && plan.nextState.xessLicenseSha == p.xessLicenseSha,
+              "foreign runtime ownership is cleared while identical notice is adopted");
+        s.state = plan.nextState;
+        const Plan removal = planUninstall(s, options);
+        check(!hasStep(removal, Action::Delete, L"libxess.dll", nullptr),
+              "uninstall leaves the foreign runtime alone");
+    }
+    {   // An old runtime whose hash matches our record can be replaced.
+        Survey s = installed();
+        s.xess.sha256 = "old-ours";
+        s.state.xessSha = "old-ours";
+        const Plan plan = planInstall(s, options, p);
+        check(hasStep(plan, Action::Backup, L"libxess.dll", L"libxess.dll") &&
+              hasStep(plan, Action::WritePayload, nullptr, L"libxess.dll") &&
+              plan.nextState.xessSha == p.xessSha,
+              "stale XeSS file that EDVR placed is backed up and updated");
+    }
+    {   // A scanner may make only the optional runtime unreadable. Core
+        // graphics and other XeSS files must still proceed.
+        Survey s = installed();
+        s.d3d11.sha256 = "old-graphics";
+        s.state.d3d11Sha = "old-graphics";
+        s.xess = current(L"libxess.dll", "", DllKind::Unreadable);
+        s.state.xessSha = "previous-ownership";
+        const Plan plan = planInstall(s, options, p);
+        check(!plan.blocked && hasStep(plan, Action::WritePayload, nullptr, L"d3d11.dll") &&
+              !hasStep(plan, Action::WritePayload, nullptr, L"libxess.dll") &&
+              notesMention(plan, "libxess.dll cannot be read"),
+              "unreadable optional runtime does not block graphics update");
+        check(plan.nextState.xessSha == "previous-ownership",
+              "unreadable destination retains previous ownership evidence");
+    }
+    {   // A broken installer payload is still rejected before any writes.
+        PayloadInfo missing = p;
+        missing.xessLicenseSha.clear();
+        const Plan plan = planInstall(installed(), options, missing);
+        check(plan.blocked && plan.steps.empty() && notesMention(plan, "license notices"),
+              "XeSS payload missing a license notice is rejected");
+    }
+}
+
 static void testFlatSettingsPlanner() {
     printf("\nthe flat edition's settings file: planning\n");
     const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
@@ -4863,7 +4959,9 @@ static void testLogBundle(const std::wstring& scratch) {
     for(unsigned i=0;i<25;++i){const auto path=joinPath(budget,L"chunk_"+std::to_wstring(i)+L".bin");
         check(bundleSparse(path,64ull<<20),"atomic-budget fixture is sparse");bundleStamp(path,27,11);}
 
-    const LogBundle bundle = collectLogs(dir, scratch);
+    // Hermetic: a run must never pick up a dump from whatever this machine crashed on last.
+    const DumpSearch noDumps{joinPath(scratch, L"nodumps_local"), joinPath(scratch, L"nodumps_temp")};
+    const LogBundle bundle = collectLogs(dir, scratch, &noDumps);
     check(bundle.ok, "the bundle is written", bundle.error);
     if (!bundle.ok) return;
     check(fileExists(bundle.zipPath), "the zip is on disk");
@@ -4912,6 +5010,83 @@ static void testLogBundle(const std::wstring& scratch) {
         check(!fileExists(out),"packet read failure removes ZIP after an earlier member was written");
     }
 
+    {   // The game's crash dump. The session ended at 14:12:30 (the breadcrumbs'
+        // last write, a half minute after the logs' last). Elite's reporter and
+        // Windows Error Reporting each wrote one inside the window; older and
+        // later ones, and an older one of the same kind inside the window, are
+        // not the session's.
+        const std::wstring local = joinPath(scratch, L"dumplocal");
+        removeTree(local);
+        const std::wstring elite = joinPath(local, L"Temp\\Frontier Developments\\EliteDangerous\\CrashDumps");
+        const std::string body(3u << 20, 'd');   // compresses to almost nothing
+        auto dumpFile = [&](const std::wstring& path, WORD minute, WORD second) {
+            makeTree(path.substr(0, path.find_last_of(L'\\')));
+            writeAll(path, body);
+            bundleStamp(path, 27, minute, second);
+        };
+        dumpFile(joinPath(elite, L"111\\20260827_140000_MiniDump.dmp"), 0, 0);       // an older crash
+        dumpFile(joinPath(elite, L"222\\20260827_141245_MiniDump.dmp"), 12, 45);     // this one
+        dumpFile(joinPath(elite, L"333\\20260827_141232_MiniDump.dmp"), 12, 32);     // older, in the window
+        dumpFile(joinPath(local, L"CrashDumps\\EliteDangerous64.exe.4242.dmp"), 12, 44);
+        dumpFile(joinPath(local, L"CrashDumps\\EliteDangerous64.exe.99.dmp"), 20, 0);  // a later session's
+        dumpFile(joinPath(local, L"CrashDumps\\ctl.exe.7.dmp"), 12, 40);               // not the game
+        bundleStamp(joinPath(dir, L"edvr_breadcrumbs.txt"), 27, 12, 30);
+
+        SYSTEMTIME at{}; at.wYear = 2026; at.wMonth = 8; at.wDay = 27; at.wHour = 14; at.wMinute = 12; at.wSecond = 30;
+        FILETIME around{}; SystemTimeToFileTime(&at, &around);
+        std::vector<std::string> left;
+        const std::vector<CrashDump> found = findCrashDumps(local, joinPath(scratch, L"no_such_temp"), around, 180, 64ull << 20, &left);
+        check(found.size() == 2 && found[0].eliteOwn && found[0].zipName == L"20260827_141245_MiniDump.dmp" &&
+                  !found[1].eliteOwn && found[1].zipName == L"EliteDangerous64.exe.4242.dmp",
+              "the newest dump of each kind inside the session's window is found, and no other");
+        check(left.empty(), "and none is reported as left out");
+        std::vector<std::string> big;
+        check(findCrashDumps(local, L"", around, 180, 1u << 20, &big).empty() && big.size() == 2 &&
+                  big[0].find("over the") != std::string::npos,
+              "a dump over the size limit is named, not taken");
+        check(!findCrashDumps(local, L"", around, 20, 64ull << 20).empty() &&
+                  findCrashDumps(local, L"", around, 1, 64ull << 20).empty(),
+              "the window is the caller's: a tighter one finds nothing");
+
+        const DumpSearch search{local, joinPath(scratch, L"no_such_temp")};
+        const LogBundle crashed = collectLogs(dir, scratch, &search);
+        check(crashed.ok && !crashed.dumpZipPath.empty() && fileExists(crashed.dumpZipPath),
+              "a session that ended in a crash writes the dump zip beside the logs");
+        check(crashed.dumpEntries.size() == 2, "with both dumps in it");
+        const std::vector<std::string> dumpNames = zipEntryNames(crashed.dumpZipPath);
+        check(bundleHas(dumpNames, "20260827_141245_MiniDump.dmp") && bundleHas(dumpNames, "EliteDangerous64.exe.4242.dmp"),
+              "named by their own file names");
+        const std::vector<std::string> logNames = zipEntryNames(crashed.zipPath);
+        check(!bundleHas(logNames, "20260827_141245_MiniDump.dmp") && !bundleHas(logNames, "EliteDangerous64.exe.4242.dmp"),
+              "and absent from the log zip, which stays the one safe to post");
+        check(crashed.dumpZipPath != crashed.zipPath, "the two zips are two files");
+        bool noteSaid = false;
+        for (const std::string& note : crashed.notes) noteSaid |= note.find("crash dump") != std::string::npos && note.find("privately") != std::string::npos;
+        check(noteSaid, "the notes say a dump was saved and that it is private");
+
+        bool deflated = false;
+        std::string zipError;
+        const std::wstring packed = joinPath(scratch, L"deflate-probe.zip");
+        DeleteFileW(packed.c_str());
+        check(writeDumpZip(packed, {joinPath(elite, L"222\\20260827_141245_MiniDump.dmp")}, {L"20260827_141245_MiniDump.dmp"}, &zipError, &deflated),
+              "a dump zip is written", zipError);
+        check(bundleHas(zipEntryNames(packed), "20260827_141245_MiniDump.dmp"), "with the entry in its central directory");
+        WIN32_FILE_ATTRIBUTE_DATA packedInfo{};
+        GetFileAttributesExW(packed.c_str(), GetFileExInfoStandard, &packedInfo);
+        check(deflated ? packedInfo.nFileSizeLow < body.size() / 4 : packedInfo.nFileSizeLow > body.size(),
+              "it is deflated when tar.exe did it and stored when it did not");
+        // Names that are not the files' own cannot go through tar; they are stored.
+        const std::wstring renamed = joinPath(scratch, L"rename-probe.zip");
+        DeleteFileW(renamed.c_str());
+        bool renamedDeflated = true;
+        check(writeDumpZip(renamed, {joinPath(elite, L"222\\20260827_141245_MiniDump.dmp")}, {L"other.dmp"}, &zipError, &renamedDeflated) &&
+                  !renamedDeflated && bundleHas(zipEntryNames(renamed), "other.dmp"),
+              "an entry under another name falls back to a stored zip rather than being mislabelled");
+
+        const DumpSearch none{joinPath(scratch, L"nobody_home"), joinPath(scratch, L"nobody_home_temp")};
+        check(collectLogs(dir, scratch, &none).dumpZipPath.empty(), "no dump on the machine, no dump zip");
+    }
+
     {   // A flat install's logs are found where ITS settings file says: edvr-flat.ini
         // (edvr.ini only while it has none). The VR profile's log.dir, which the
         // flat runtime never reads, does not send the bundle to the wrong folder.
@@ -4924,7 +5099,7 @@ static void testLogBundle(const std::wstring& scratch) {
         writeAll(joinPath(flat, L"edvr.ini"), "[log]\r\ndir = " + toUtf8(joinPath(flat, L"vr_logs_nowhere")) + "\r\n");
         writeAll(joinPath(flat, L"edvr-flat.ini"), "[log]\r\ndir = " + toUtf8(flatLogs) + "\r\n");
         writeAll(joinPath(flatLogs, L"edvr_gfx_20260827_140000.log"), "the flat session");
-        const LogBundle flatBundle = collectLogs(flat, scratch);
+        const LogBundle flatBundle = collectLogs(flat, scratch, &noDumps);
         check(flatBundle.ok, "a flat install's bundle is written", flatBundle.error);
         const std::vector<std::string> flatNames = zipEntryNames(flatBundle.zipPath);
         check(bundleHas(flatNames, "edvr_gfx_20260827_140000.log"),
@@ -4935,7 +5110,7 @@ static void testLogBundle(const std::wstring& scratch) {
         // where log.dir comes from.
         DeleteFileW(joinPath(flat, L"edvr-flat.ini").c_str());
         writeAll(joinPath(flat, L"edvr.ini"), "[log]\r\ndir = " + toUtf8(flatLogs) + "\r\n");
-        const LogBundle legacyBundle = collectLogs(flat, scratch);
+        const LogBundle legacyBundle = collectLogs(flat, scratch, &noDumps);
         check(legacyBundle.ok, "a legacy flat install's bundle is written", legacyBundle.error);
         check(bundleHas(zipEntryNames(legacyBundle.zipPath), "edvr_gfx_20260827_140000.log"),
               "with the log from the folder the shared edvr.ini names");
@@ -4945,7 +5120,7 @@ static void testLogBundle(const std::wstring& scratch) {
     const std::wstring bare = joinPath(scratch, L"barelogs");
     removeTree(bare);
     makeTree(bare);
-    const LogBundle nothing = collectLogs(bare, scratch);
+    const LogBundle nothing = collectLogs(bare, scratch, &noDumps);
     check(!nothing.ok, "a folder with no logs and no settings collects nothing");
 }
 
@@ -4964,6 +5139,9 @@ static void testState() {
     state.openvrOrigName = L"openvr_api_orig.dll";
     state.openvrOrigSha = "9abc";
     state.iniSha = "def0";
+    state.xessSha = "xess-runtime";
+    state.xessLicenseSha = "xess-license";
+    state.xessThirdPartySha = "xess-notices";
 
     const InstallState back = parseState(serializeState(state));
     check(back.present, "a written record reads back as present");
@@ -4971,6 +5149,9 @@ static void testState() {
     expectEq(toUtf8(back.chainTarget), "d3d11_edhm.dll", "the chain target survives");
     expectEq(toUtf8(back.openvrDir), "Openvr\\win64", "the openvr folder survives");
     expectEq(back.openvrOrigSha, "9abc", "the original runtime's hash survives");
+    expectEq(back.xessSha, state.xessSha, "the XeSS runtime ownership survives");
+    expectEq(back.xessLicenseSha, state.xessLicenseSha, "the XeSS license ownership survives");
+    expectEq(back.xessThirdPartySha, state.xessThirdPartySha, "the XeSS third-party ownership survives");
     check(!parseState("").present, "an empty record is not a record");
     check(!parseState("[edvr]\r\nsomething = else\r\n").present,
           "a file that merely parses is not a record either");
@@ -4996,6 +5177,7 @@ int wmain(int argc, wchar_t** argv) {
     testPlanner();
     testNativePlanner();
     testFlatPlanner();
+    testXessPlanner();
     testFlatSettingsPlanner();
     testApply(scratch);
     testMirror(scratch);

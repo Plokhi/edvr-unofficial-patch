@@ -300,6 +300,10 @@ int runConsole(const AppArgs& args) {
         }
         writeOut("\r\nSaved " + toUtf8(bundle.zipPath) + "\r\n");
         for (const std::wstring& name : bundle.included) writeOut("  " + toUtf8(name) + "\r\n");
+        if (!bundle.dumpZipPath.empty()) {
+            writeOut("\r\nCrash dump (private; not for a public issue): " + toUtf8(bundle.dumpZipPath) + "\r\n");
+            for (const std::wstring& name : bundle.dumpEntries) writeOut("  " + toUtf8(name) + "\r\n");
+        }
         return 0;
     }
 

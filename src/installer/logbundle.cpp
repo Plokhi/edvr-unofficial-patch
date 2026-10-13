@@ -374,7 +374,133 @@ bool writeZip(const std::wstring& zipPath, const std::vector<std::wstring>& file
     return true;
 }
 
-LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) try {
+std::vector<CrashDump> findCrashDumps(const std::wstring& localAppData, const std::wstring& tempDir,
+                                      const FILETIME& around, long long windowSeconds,
+                                      unsigned long long maxBytes,
+                                      std::vector<std::string>* skippedOut) {
+    CrashDump ownBest, werBest;
+    bool haveOwn = false, haveWer = false;
+
+    // The newest .dmp in `dir` that was written inside the window, into `best`.
+    auto scan = [&](const std::wstring& dir, const wchar_t* pattern, bool own, CrashDump& best, bool& have) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW(joinPath(dir, pattern).c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+            if (secondsBetween(fd.ftLastWriteTime, around) > windowSeconds) continue;
+            if (have && CompareFileTime(&fd.ftLastWriteTime, &best.written) <= 0) continue;
+            best.path = joinPath(dir, fd.cFileName);
+            best.zipName = fd.cFileName;
+            best.size = (static_cast<unsigned long long>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+            best.written = fd.ftLastWriteTime;
+            best.eliteOwn = own;
+            have = true;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    };
+
+    // Elite's reporter keeps one folder per crash id under CrashDumps\. The
+    // temp folder is asked for twice -- the process's, and LocalAppData\Temp --
+    // since an elevated or redirected TEMP is not where the game ran from.
+    std::vector<std::wstring> roots;
+    if (!tempDir.empty()) roots.push_back(edvr::eliteCrashDumpsFolderUnder(tempDir));
+    if (!localAppData.empty()) {
+        const std::wstring second = edvr::eliteCrashDumpsFolderUnder(joinPath(localAppData, L"Temp"));
+        if (roots.empty() || _wcsicmp(roots.front().c_str(), second.c_str()) != 0) roots.push_back(second);
+    }
+    for (const std::wstring& root : roots) {
+        scan(root, L"*.dmp", true, ownBest, haveOwn);
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW(joinPath(root, L"*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            scan(joinPath(root, fd.cFileName), L"*.dmp", true, ownBest, haveOwn);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    // Windows Error Reporting's LocalDumps, where the machine has it turned on.
+    if (!localAppData.empty())
+        scan(joinPath(localAppData, L"CrashDumps"), L"EliteDangerous64.exe.*.dmp", false, werBest, haveWer);
+
+    std::vector<CrashDump> found;
+    for (const CrashDump* dump : {haveOwn ? &ownBest : nullptr, haveWer ? &werBest : nullptr}) {
+        if (!dump) continue;
+        if (dump->size > maxBytes) {
+            if (skippedOut) {
+                char line[192];
+                sprintf_s(line, "Crash dump left out (%.0f MB is over the %.0f MB limit): ",
+                          static_cast<double>(dump->size) / 1048576.0, static_cast<double>(maxBytes) / 1048576.0);
+                skippedOut->push_back(line + toUtf8(dump->path));
+            }
+            continue;
+        }
+        found.push_back(*dump);
+    }
+    return found;
+}
+
+namespace {
+
+// Deflates through Windows' own tar.exe (bsdtar: `-a` picks zip from the file
+// name). Every entry is named by its file's own name, so the caller's names must
+// be those. False, with nothing left at zipPath, for any reason it did not work.
+bool deflateWithTar(const std::wstring& zipPath, const std::vector<std::wstring>& files,
+                    const std::vector<std::wstring>& names) {
+    if (files.empty() || files.size() != names.size()) return false;
+    wchar_t system[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(system, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return false;
+    const std::wstring exe = joinPath(system, L"tar.exe");
+    if (!fileExists(exe)) return false;
+
+    std::wstring command = L"\"" + exe + L"\" -a -c -f \"" + zipPath + L"\"";
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::wstring leaf = leafOf(files[i]);
+        if (leaf.empty() || leaf != names[i] || files[i].size() <= leaf.size() + 1) return false;
+        command += L" -C \"" + files[i].substr(0, files[i].size() - leaf.size() - 1) + L"\" \"" + leaf + L"\"";
+    }
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(0);
+    if (!CreateProcessW(exe.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &startup, &process)) {
+        return false;
+    }
+    CloseHandle(process.hThread);
+    DWORD exitCode = 1;
+    if (WaitForSingleObject(process.hProcess, 5 * 60 * 1000) != WAIT_OBJECT_0) {
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, 5000);
+    } else {
+        GetExitCodeProcess(process.hProcess, &exitCode);
+    }
+    CloseHandle(process.hProcess);
+    if (exitCode == 0 && fileExists(zipPath)) return true;
+    DeleteFileW(zipPath.c_str());
+    return false;
+}
+
+}  // namespace
+
+bool writeDumpZip(const std::wstring& zipPath, const std::vector<std::wstring>& files,
+                  const std::vector<std::wstring>& names, std::string* error, bool* deflatedOut) {
+    if (deflatedOut) *deflatedOut = false;
+    if (deflateWithTar(zipPath, files, names)) {
+        if (deflatedOut) *deflatedOut = true;
+        return true;
+    }
+    return writeZip(zipPath, files, names, error);
+}
+
+LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir,
+                      const DumpSearch* dumpSearch) try {
     LogBundle bundle;
     if (gameDir.empty()) {
         bundle.error = "No game folder chosen.";
@@ -700,7 +826,8 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
     if (where.empty()) where = desktopFolder();
     if (where.empty() || !dirExists(where)) where = gameDir;
 
-    bundle.zipPath = joinPath(where, L"edvr-logs-" + timestampName() + L".zip");
+    const std::wstring stamp = timestampName();
+    bundle.zipPath = joinPath(where, L"edvr-logs-" + stamp + L".zip");
 
     std::vector<std::wstring> files, names;
     for (const Found& found : take) {
@@ -719,6 +846,76 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
         bundle.notes.push_back(toUtf8(name) +
                                " could not be read consistently (unreadable or changed during collection) and is not in the zip -- it is probably still "
                                "being written to.");
+    }
+
+    // ---- the game's crash dump -----------------------------------------
+    //
+    // When the session ended in a crash, Elite's own reporter (or Windows
+    // Error Reporting, where LocalDumps is on) has written a minidump of the
+    // game seconds after EDVR's last line. It holds what the logs cannot: the
+    // memory at the fault, the threads, the modules that were unloaded. It goes
+    // in a zip of its own, not the log zip: it is tens of MB and holds a copy
+    // of the game's memory, so the log zip stays the one that is safe to
+    // attach to a public issue. The end of the session is the later of the
+    // last log write and the breadcrumbs' last write: the gfx log can hit its
+    // size cap long before a crash, and the breadcrumb heartbeat runs to it.
+    if (haveNewestLog) {
+        FILETIME end = sessionEnd;
+        WIN32_FILE_ATTRIBUTE_DATA crumbs{};
+        if (GetFileAttributesExW(joinPath(gameDir, L"edvr_breadcrumbs.txt").c_str(),
+                                 GetFileExInfoStandard, &crumbs) &&
+            CompareFileTime(&crumbs.ftLastWriteTime, &end) > 0) {
+            end = crumbs.ftLastWriteTime;
+        }
+        std::wstring localAppData, tempDir;
+        if (dumpSearch) {
+            localAppData = dumpSearch->localAppData;
+            tempDir = dumpSearch->tempDir;
+        } else {
+            PWSTR known = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &known)) && known) {
+                localAppData = known;
+                CoTaskMemFree(known);
+            }
+            wchar_t tempBuffer[MAX_PATH]{};
+            const DWORD tempLength = GetTempPathW(MAX_PATH, tempBuffer);
+            if (tempLength > 0 && tempLength < MAX_PATH) tempDir = tempBuffer;
+            while (!tempDir.empty() && (tempDir.back() == L'\\' || tempDir.back() == L'/')) tempDir.pop_back();
+        }
+
+        const unsigned long long kDumpFileBytes = 512ull << 20;
+        std::vector<std::string> leftOut;
+        const std::vector<CrashDump> dumps =
+            findCrashDumps(localAppData, tempDir, end, kSessionWindowSeconds, kDumpFileBytes, &leftOut);
+        for (const std::string& note : leftOut) bundle.notes.push_back(note);
+        if (!dumps.empty()) {
+            std::vector<std::wstring> dumpFiles, dumpNames;
+            unsigned long long total = 0;
+            for (const CrashDump& dump : dumps) {
+                dumpFiles.push_back(dump.path);
+                dumpNames.push_back(dump.zipName);
+                total += dump.size;
+            }
+            const std::wstring dumpZip = joinPath(where, L"edvr-crash-dump-" + stamp + L".zip");
+            std::string dumpError;
+            bool deflated = false;
+            if (writeDumpZip(dumpZip, dumpFiles, dumpNames, &dumpError, &deflated)) {
+                bundle.dumpZipPath = dumpZip;
+                bundle.dumpEntries = dumpNames;
+                char line[256];
+                sprintf_s(line,
+                          "%d crash dump%s of the game from this session (%.0f MB%s) saved separately as %s; "
+                          "it holds a copy of the game's memory, so send it privately and not on a public issue",
+                          static_cast<int>(dumps.size()), dumps.size() == 1 ? "" : "s",
+                          static_cast<double>(total) / 1048576.0, deflated ? ", compressed" : ", not compressed",
+                          toUtf8(leafOf(dumpZip)).c_str());
+                bundle.notes.push_back(line);
+            } else {
+                bundle.notes.push_back("A crash dump from this session was found but could not be zipped (" +
+                                       dumpError + "); it is still where the game wrote it: " +
+                                       toUtf8(dumps.front().path));
+            }
+        }
     }
     bundle.ok = true;
     return bundle;

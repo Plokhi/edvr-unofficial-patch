@@ -63,6 +63,10 @@ void menuProfileSwitch();
 // Whether the menu has run its configure block for the profile now active (tools\profile_switch_test reads it).
 bool menuIsConfigured();
 
+// Raw pad hotkeys are read independently of Elite's XInput door. While the
+// drawn flat panel owns navigation, suppress conflicting existing ini bindings.
+bool menuFlatPadOwnsHotkey(uint16_t buttons, uint8_t trigger);
+
 // The reload poll re-read edvr.ini: refresh every row's value, diff the
 // restart snapshot, and toast what changed from outside the menu.
 void menuNoteConfigReloaded();

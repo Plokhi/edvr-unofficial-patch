@@ -4491,7 +4491,8 @@ void temporalPassConfigure(Config& cfg) {
     ++g_configGeneration;
     const std::string mode = cfg.getString("fix.temporal_aa", "off");
     const bool wasWanted = detail::g_temporalPassWantedFssChrome;
-    detail::g_temporalPassWantedFssChrome = temporalModeEnabled(mode);
+    detail::g_temporalPassWantedFssChrome = temporalModeEnabled(mode) &&
+        (runtimeFlatProfile() || _stricmp(mode.c_str(), "xess") != 0);
     if (detail::g_temporalPassWantedFssChrome != wasWanted) {
         memset(g_rowsObserved, 0, sizeof(g_rowsObserved));
         g_rowsObservedWrites = 0;
@@ -5419,6 +5420,8 @@ void temporalPassShutdown() {
     { std::lock_guard<std::mutex> lock(g_temporalHistoryMutex);g_temporalHistory.clear(); }
     dlaaShutdown();
     fsr3Shutdown();
+    // No xessShutdown here: it signals, flushes and waits on the GPU, and this teardown can run under the loader lock
+    // (device_hook.cpp, shutdownDeviceHooks). The XeSS bridge is left for the process, as at exit (xess_engine.cpp, g_state).
     if (g_csMv) { g_csMv->Release(); g_csMv = nullptr; }
     if (g_csMvFast) { g_csMvFast->Release(); g_csMvFast = nullptr; }
     if (g_csMvTrace) { g_csMvTrace->Release(); g_csMvTrace = nullptr; }
