@@ -19,6 +19,7 @@
 #include "journal_watch.h"
 #include "kinematic_eval_hook.h"
 #include "optimized_station_core.h"
+#include "station_lockfree_core.h"
 #include "pad_state_probe.h"
 #include "store_hook.h"
 #include "view_source.h"
@@ -313,31 +314,34 @@ bool poseOrientOf(uintptr_t rec, float axes[3][3], float ext[3], bool* extOk, ui
     return false;
 }
 
-// The producer B cache: per record, the centre and radius B's veto decision used this frame. A generation per frame (the stamp moves at Present)
-// makes a stale slot empty; under the lock.
+// The producer B cache: per record, the centre and radius B's veto decision used, in a generation (the frame). Built v14.25: lock-free. Each cell is a
+// seqlock (station_lockfree_core.h): an insert claims a cell by compare-and-swap and retries on a contended cell, and a lookup copies the cell and
+// checks it. When the bounded probe finds no cell the record runs uncached (counted). The generation advances on the tick, under the lock.
 constexpr size_t kProdSlots = 8192;
+sealed::SeqCell g_prodCells[kProdSlots];
+std::atomic<uint32_t> g_prodGenA{1};   // the generation the cells are valid for (0 is never valid)
+uint32_t g_prodStampSeen = 0;          // the tick's: the stamp the generation last moved for
 
-struct ProdSlot {
-    uintptr_t rec = 0;
-    uint32_t gen = 0;
-    float c[3] = {};
-    float r = 0.0f;
+// The producer table's probe statistics, atomic (the producer path writes them without the lock).
+struct ProdStats {
+    std::atomic<uint32_t> maxProbes{0};
+    std::atomic<uint64_t> full{0};
 };
+ProdStats g_prodStats;
 
-ProdSlot g_prodSlots[kProdSlots];
+void noteProdProbe(uint32_t probes) noexcept {
+    uint32_t m = g_prodStats.maxProbes.load(std::memory_order_relaxed);
+    while (probes > m && !g_prodStats.maxProbes.compare_exchange_weak(m, probes, std::memory_order_relaxed)) {
+    }
+}
 
-uint32_t g_prodGen = 1;          // the generation the slots are valid for (0 is never valid)
-
-uint32_t g_prodStampSeen = 0;
-
-// Built v14.20 (review 5): the occupancy and the longest probe of each table this window (the 30 s summary reports them and resets the maximum), and
-// the lookups or inserts that reached the probe bound (a full table is a miss, never a walk of every slot).
+// Built v14.20 (review 5): the occupancy and the longest probe of each locked table this window (the 30 s summary reports them and resets the maximum),
+// and the lookups or inserts that reached the probe bound (a full table is a miss, never a walk of every slot).
 struct TableStats {
     uint32_t used = 0;
     uint32_t maxProbes = 0;
     uint64_t full = 0;
 };
-TableStats g_prodStats;
 TableStats g_collStats;
 TableStats g_rigStats;
 
@@ -346,12 +350,12 @@ void noteProbe(TableStats& t, const sealed::ProbeResult& p) noexcept {
     if (p.exhausted) ++t.full;
 }
 
+// The tick's: moves the generation when the frame moved on (under the lock).
 void prodSync() noexcept {
     const uint32_t s = g_frameStamp.load(std::memory_order_relaxed);
     if (s != g_prodStampSeen) {
         g_prodStampSeen = s;
-        ++g_prodGen;
-        g_prodStats.used = 0;   // every slot is stale now
+        g_prodGenA.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -359,35 +363,108 @@ size_t prodIndex(uintptr_t rec) noexcept {
     return static_cast<size_t>((static_cast<uint64_t>(rec) >> 4) * 0x9E3779B97F4A7C15ull >> 51) & (kProdSlots - 1);
 }
 
-void prodPut(uintptr_t rec, const float c[3], float r) noexcept {
-    const sealed::ProbeResult p = sealed::boundedProbe(
-        prodIndex(rec), kProdSlots, sealed::kTableProbeMax,
-        [rec](size_t i) { const ProdSlot& s = g_prodSlots[i]; return s.gen == g_prodGen && s.rec == rec; },
-        [](size_t i) { return g_prodSlots[i].gen != g_prodGen; });
-    noteProbe(g_prodStats, p);
-    if (p.exhausted) return;   // uncached: a later lookup misses it, as a record the producer never offered (the same centre rules apply)
-    ProdSlot& s = g_prodSlots[p.index];
-    if (p.empty) ++g_prodStats.used;
-    s.rec = rec;
-    s.gen = g_prodGen;
-    s.c[0] = c[0];
-    s.c[1] = c[1];
-    s.c[2] = c[2];
-    s.r = r;
+// Lock-free insert for the producer path (any thread), in the generation the snapshot carries.
+void prodPutGen(uintptr_t rec, const float c[3], float r, uint32_t gen) noexcept {
+    const float v[4] = {c[0], c[1], c[2], r};
+    uint32_t probes = 0;
+    const bool ok = sealed::seqTableInsert(g_prodCells, kProdSlots, prodIndex(rec), rec, gen, v, &probes);
+    noteProdProbe(probes);
+    if (!ok) g_prodStats.full.fetch_add(1, std::memory_order_relaxed);   // uncached: a later lookup misses it, as any record the producer never offered
 }
 
+// Lookup in the current generation (the locked callers: the world read).
 bool prodGet(uintptr_t rec, float c[3], float* r) noexcept {
-    const sealed::ProbeResult p = sealed::boundedProbe(
-        prodIndex(rec), kProdSlots, sealed::kTableProbeMax,
-        [rec](size_t i) { const ProdSlot& s = g_prodSlots[i]; return s.gen == g_prodGen && s.rec == rec; },
-        [](size_t i) { return g_prodSlots[i].gen != g_prodGen; });
-    noteProbe(g_prodStats, p);
-    if (!p.found) return false;
-    const ProdSlot& s = g_prodSlots[p.index];
-    c[0] = s.c[0];
-    c[1] = s.c[1];
-    c[2] = s.c[2];
-    *r = s.r;
+    float v[4] = {};
+    uint32_t probes = 0;
+    const bool ok = sealed::seqTableFind(g_prodCells, kProdSlots, prodIndex(rec), rec, g_prodGenA.load(std::memory_order_relaxed), v, &probes);
+    noteProdProbe(probes);
+    if (!ok) return false;
+    c[0] = v[0];
+    c[1] = v[1];
+    c[2] = v[2];
+    *r = v[3];
+    return true;
+}
+
+// The view the per-record path reads (built v14.25): published by the tick, and by the first store callback of a frame, under the lock. Read by
+// pinning the ring; never under the lock. The frame's first callbacks may read the previous frame's view: at most one frame old.
+struct PadSnapshot {
+    uint32_t frameStamp = 0;
+    uint32_t prodGen = 0;
+    bool held = false;
+    bool camValid = false;
+    float cam[3] = {};
+    sealed::OwnCell cell;
+    size_t explicitCount = 0;
+    uintptr_t explicitPrev[sealed::kExplicitNodes] = {};
+    char ownPrefix[32] = {};
+};
+sealed::SnapshotRing<PadSnapshot, 4> g_snapRing;
+uint32_t g_snapStamp = 0xFFFFFFFFu;   // the frame stamp of the last publish (under the lock)
+
+// Publishes the view (under g_sealedMutex; the single publisher). Writes no shared state a reader can see until publish().
+void publishSnapshot() noexcept {
+    prodSync();
+    PadSnapshot& s = g_snapRing.beginWrite();
+    s.frameStamp = g_frameStamp.load(std::memory_order_relaxed);
+    s.prodGen = g_prodGenA.load(std::memory_order_relaxed);
+    s.held = g_heldValid;
+    s.camValid = g_frameCamValid;
+    std::memcpy(s.cam, g_frameCam, sizeof(s.cam));
+    s.cell = g_cellPrev;
+    s.explicitCount = g_explicitPrevCount < sealed::kExplicitNodes ? g_explicitPrevCount : sealed::kExplicitNodes;
+    std::memcpy(s.explicitPrev, g_explicitPrev, sizeof(s.explicitPrev));
+    std::memcpy(s.ownPrefix, g_ownPrefix, sizeof(s.ownPrefix));
+    g_snapRing.publish();
+    g_snapStamp = s.frameStamp;
+}
+
+// The record's name for the producer path, cached per thread (built v14.25): the same name rule as cachedName, with no lock.
+bool cachedNameLocal(uintptr_t record, char* out, size_t cap) noexcept {
+    if (!out || cap == 0) return false;
+    out[0] = '\0';
+    uintptr_t node = 0;
+    if (!record || !readVal(&node, record + kRecName) || !node) return false;
+    struct NameSlot {
+        uintptr_t node = 0;
+        uint32_t stamp = 0;
+        bool ok = false;
+        char name[64] = {};
+    };
+    thread_local NameSlot names[kNameSlots];
+    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+    NameSlot& slot = names[(node >> 4) % kNameSlots];
+    if (slot.node != node || slot.stamp != stamp) {
+        slot.node = node;
+        slot.stamp = stamp;
+        slot.ok = false;
+        slot.name[0] = '\0';
+        uintptr_t text = 0;
+        uint8_t bytes[sealed::kNameBytes] = {};
+        std::string name;
+        if (readVal(&text, node) && text && readMem(bytes, text, sizeof(bytes)) &&
+            (sealed::textName(bytes, sizeof(bytes), false, &name) || sealed::textName(bytes, sizeof(bytes), true, &name))) {
+            std::snprintf(slot.name, sizeof(slot.name), "%s", name.c_str());
+            slot.ok = true;
+        }
+    }
+    if (!slot.ok) return false;
+    std::snprintf(out, cap, "%s", slot.name);
+    return true;
+}
+
+// The producer-B decision from the published view (built v14.25; was producerDecide under the lock). Caches the record's sphere in the snapshot's
+// generation. True skips the record: outside the cell, and not the own ship.
+bool producerDecideSnap(uintptr_t rec, const PadSnapshot& s) noexcept {
+    float centre[3] = {};
+    float radius = 0.0f;
+    const bool ok = storeSphereOf(rec, centre, &radius);
+    if (ok) prodPutGen(rec, centre, radius, s.prodGen);
+    if (!ok || !s.camValid) return false;
+    if (sealed::keepNamedCell(centre, radius, s.cam, kFallbackSphereM, s.cell, s.explicitPrev, s.explicitCount, rec).keep) return false;
+    char nm[48] = {};
+    if (s.ownPrefix[0] != '\0') cachedNameLocal(rec, nm, sizeof(nm));
+    if (sealed::ownShipExempt(sealed::containsCamera(centre, radius, s.cam), radius, nm, s.ownPrefix)) return false;
     return true;
 }
 
@@ -814,23 +891,7 @@ uint32_t g_rigCacheStamp = 0;
 uintptr_t g_rigCacheRig = 0;
 RigSlot* g_rigCacheSlot = nullptr;
 
-// The producer-B decision (FUN_144312E00's entry): true skips the record. The record's sphere is cached for the named rule (as the trial did);
-// an unreadable record is kept; otherwise the cell keeps it, or the own ship's prefix does.
-bool producerDecide(uintptr_t rec) noexcept {
-    float centre[3] = {};
-    float radius = 0.0f;
-    const bool ok = storeSphereOf(rec, centre, &radius);
-    if (ok) {
-        prodSync();
-        prodPut(rec, centre, radius);
-    }
-    if (!ok || !g_frameCamValid) return false;
-    if (sealed::keepNamedCell(centre, radius, g_frameCam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, rec).keep) return false;
-    char nm[48] = {};
-    if (g_ownPrefix[0] != '\0') cachedName(rec, nm, sizeof(nm));
-    if (sealed::ownShipExempt(sealed::containsCamera(centre, radius, g_frameCam), radius, nm, g_ownPrefix)) return false;
-    return true;
-}
+
 
 // The rig verdict's veto (the early veto, 0x431AFE0's entry): a rig whose verdict is outside the cell is skipped while its refresh counter is
 // below sealed::kRigRefreshN. Answers only while sealed; the verdicts are refreshed on the frame tick.
@@ -872,6 +933,31 @@ CostRing g_costFrame;
 std::atomic<uint32_t> g_costStoreCalls{0};
 std::atomic<uint32_t> g_costProducerCalls{0};
 std::atomic<uint32_t> g_costRigCalls{0};
+std::atomic<uint64_t> g_callsStore{0};      // built v14.25: every call (the per-frame counts)
+std::atomic<uint64_t> g_callsProducer{0};
+std::atomic<uint64_t> g_callsRig{0};
+
+// The per-thread-safe mean of a ring's samples (under g_costMutex).
+double ringMean(const CostRing& r) noexcept {
+    const size_t n = r.used();
+    if (n == 0) return 0.0;
+    double sum = 0.0;
+    for (size_t i = 0; i < n; ++i) sum += r.v[i];
+    return sum / static_cast<double>(n);
+}
+
+// The producer cache's occupancy: the cells of the current generation (read under the lock, once per summary).
+uint32_t prodOccupancy() noexcept {
+    const uint32_t gen = g_prodGenA.load(std::memory_order_relaxed);
+    uint32_t n = 0;
+    for (size_t i = 0; i < kProdSlots; ++i) {
+        uintptr_t r = 0;
+        uint32_t g = 0;
+        float tmp[4];
+        if (sealed::seqCellRead(g_prodCells[i], &r, &g, tmp) && g == gen && r != 0) ++n;
+    }
+    return n;
+}
 double g_mutexWaitTotalMs = 0.0;
 double g_mutexWaitMaxMs = 0.0;
 uint64_t g_mutexBlocked = 0;          // acquisitions that waited more than 0.1 ms
@@ -1075,7 +1161,7 @@ uint64_t g_summaryStartMs = 0;             // the 30 s summary's window
 uint64_t g_winFrames = 0;                  // ticks in the window
 uint64_t g_winSealedFrames = 0;            // ticks in the window while sealed
 uint64_t g_winRigVetoes = 0;               // rig vetoes (before the forward) in the window
-uint64_t g_winProducerVetoes = 0;          // records the producer-B veto skipped in the window
+std::atomic<uint64_t> g_winProducerVetoes{0};          // records the producer-B veto skipped in the window
 uint64_t g_winCulled = 0;                  // records culled after the store in the window
 uint64_t g_winKeptUnknown = 0;             // records kept because their centre could not be read, in the window
 uint32_t g_sealCount = 0;                  // seals since the setting was turned on (for the status lines)
@@ -1294,27 +1380,35 @@ void summaryLine(uint64_t now) noexcept {
     // Built v14.20 (review 5): the tables' occupancy now, the longest probe and the bounded (full) count this window, and the rig epoch count.
     Log::get().note("optimized station: last %llu s tables: producer %u of %u used, longest probe %u, bounded %llu; rigs %u of %u, longest %u, "
                     "bounded %llu; collections %u of %u, longest %u, bounded %llu; rig epochs %llu (epoch %u).",
-                    static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned>(g_prodStats.used),
+                    static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned>(prodOccupancy()),
                     static_cast<unsigned>(kProdSlots), static_cast<unsigned>(g_prodStats.maxProbes),
                     static_cast<unsigned long long>(g_prodStats.full), static_cast<unsigned>(g_rigStats.used),
                     static_cast<unsigned>(kRigSlots), static_cast<unsigned>(g_rigStats.maxProbes), static_cast<unsigned long long>(g_rigStats.full),
                     static_cast<unsigned>(g_collStats.used), static_cast<unsigned>(kCollSlots), static_cast<unsigned>(g_collStats.maxProbes),
                     static_cast<unsigned long long>(g_collStats.full), static_cast<unsigned long long>(g_rigEpochs),
                     static_cast<unsigned>(g_rigEpoch));
-    // Built v14.24: the station's own costs over the window: the sampled store, producer and rig calls per call (one in 32), the frame tick per frame,
-    // the state lock's wait, and the waiting lines written (change-only).
+    // Built v14.25: the station's own costs over the window. Per call (one in 32 sampled): p50, p95 and max. Per frame: the calls each callback made, and
+    // the estimated ms per frame (the sampled mean times the calls, over the frames). The frame tick per frame. The state lock's wait. Change-only waits.
     {
         double s50 = 0.0, s95 = 0.0, smax = 0.0, p50 = 0.0, p95 = 0.0, pmax = 0.0, r50 = 0.0, r95 = 0.0, rmax = 0.0, f50 = 0.0, f95 = 0.0, fmax = 0.0;
+        double meanStore = 0.0, meanProd = 0.0, meanRig = 0.0;
         size_t nStore = 0, nProd = 0, nRig = 0, nFrame = 0;
         uint64_t blocked = 0, waitingLines = 0;
         double waitTotal = 0.0, waitMax = 0.0;
+        const uint64_t frames = g_winFrames;
+        const uint64_t callsStore = g_callsStore.exchange(0, std::memory_order_relaxed);
+        const uint64_t callsProd = g_callsProducer.exchange(0, std::memory_order_relaxed);
+        const uint64_t callsRig = g_callsRig.exchange(0, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> g(g_costMutex);
             nStore = g_costStore.used();
+            meanStore = ringMean(g_costStore);
             sealed::samplePercentiles(g_costStore.v, nStore, &s50, &s95, &smax);
             nProd = g_costProducer.used();
+            meanProd = ringMean(g_costProducer);
             sealed::samplePercentiles(g_costProducer.v, nProd, &p50, &p95, &pmax);
             nRig = g_costRig.used();
+            meanRig = ringMean(g_costRig);
             sealed::samplePercentiles(g_costRig.v, nRig, &r50, &r95, &rmax);
             nFrame = g_costFrame.used();
             sealed::samplePercentiles(g_costFrame.v, nFrame, &f50, &f95, &fmax);
@@ -1331,16 +1425,25 @@ void summaryLine(uint64_t now) noexcept {
             g_mutexWaitMaxMs = 0.0;
             g_waitingLinesWritten = 0;
         }
-        Log::get().note("optimized station: cost last %llu s: store observer %.4f/%.4f/%.4f ms per call (%llu sampled), producer veto %.4f/%.4f/%.4f "
-                        "ms per call (%llu sampled), rig veto %.4f/%.4f/%.4f ms per call (%llu sampled), frame tick %.3f/%.3f/%.3f ms per frame "
-                        "(%llu frames), mutex wait total %.3f ms max %.3f ms (blocked over 0.1 ms: %llu), waiting lines written %llu.",
-                        static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), s50, s95, smax, static_cast<unsigned long long>(nStore), p50,
-                        p95, pmax, static_cast<unsigned long long>(nProd), r50, r95, rmax, static_cast<unsigned long long>(nRig), f50,
-                        f95, fmax, static_cast<unsigned long long>(nFrame), waitTotal, waitMax, static_cast<unsigned long long>(blocked),
-                        static_cast<unsigned long long>(waitingLines));
+        const double fr = frames > 0 ? static_cast<double>(frames) : 1.0;
+        Log::get().note("optimized station: cost last %llu s: store observer %llu calls (%.1f per frame, ~%.4f ms per frame; p50/p95/max %.4f/%.4f/%.4f "
+                        "ms per call, %llu sampled), producer veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu "
+                        "sampled), rig veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu sampled), frame tick "
+                        "%.3f/%.3f/%.3f ms per frame (%llu frames), mutex wait total %.3f ms max %.3f ms (blocked over 0.1 ms: %llu), waiting lines "
+                        "written %llu.",
+                        static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(callsStore),
+                        static_cast<double>(callsStore) / fr, meanStore * static_cast<double>(callsStore) / fr, s50, s95, smax,
+                        static_cast<unsigned long long>(nStore), static_cast<unsigned long long>(callsProd), static_cast<double>(callsProd) / fr,
+                        meanProd * static_cast<double>(callsProd) / fr, p50, p95, pmax, static_cast<unsigned long long>(nProd),
+                        static_cast<unsigned long long>(callsRig), static_cast<double>(callsRig) / fr, meanRig * static_cast<double>(callsRig) / fr,
+                        r50, r95, rmax, static_cast<unsigned long long>(nRig), f50, f95, fmax, static_cast<unsigned long long>(nFrame), waitTotal,
+                        waitMax, static_cast<unsigned long long>(blocked), static_cast<unsigned long long>(waitingLines));
     }
-    g_prodStats.maxProbes = g_rigStats.maxProbes = g_collStats.maxProbes = 0;
-    g_prodStats.full = g_rigStats.full = g_collStats.full = 0;
+
+    g_prodStats.maxProbes.store(0, std::memory_order_relaxed);
+    g_rigStats.maxProbes = g_collStats.maxProbes = 0;
+    g_prodStats.full.store(0, std::memory_order_relaxed);
+    g_rigStats.full = g_collStats.full = 0;
     g_rigEpochs = 0;
     g_summaryStartMs = now;
     g_winFrames = g_winSealedFrames = g_winRigVetoes = g_winProducerVetoes = 0;
@@ -1351,15 +1454,18 @@ void summaryLine(uint64_t now) noexcept {
 bool producerVetoBody(uintptr_t rec, uintptr_t owner) noexcept {
     (void)owner;
     if (!g_sealedFlag.load(std::memory_order_acquire)) return false;
-    TimedStateLock lock;
-    if (!g_heldValid) return false;
-    const bool veto = producerDecide(rec);
-    if (veto) ++g_winProducerVetoes;
+    // Built v14.25: no lock. The decision reads the published view (pinned), and the producer cache is lock-free.
+    size_t idx = 0;
+    const PadSnapshot* s = g_snapRing.pin(&idx);
+    const bool veto = s->held && producerDecideSnap(rec, *s);
+    g_snapRing.unpin(idx);
+    if (veto) g_winProducerVetoes.fetch_add(1, std::memory_order_relaxed);
     return veto;
 }
 
 // The producer-B veto, timed one call in 32 (built v14.24).
 bool producerVetoHook(uintptr_t rec, uintptr_t owner) noexcept {
+    g_callsProducer.fetch_add(1, std::memory_order_relaxed);
     const bool sample = costSampleCall(g_costProducerCalls);
     const int64_t t0 = sample ? costTicks() : 0;
     const bool veto = producerVetoBody(rec, owner);
@@ -1376,6 +1482,7 @@ bool rigVetoBody(uintptr_t rig, uintptr_t ctx) noexcept {
 
 // The rig early veto, timed one call in 32 (built v14.24).
 bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
+    g_callsRig.fetch_add(1, std::memory_order_relaxed);
     const bool sample = costSampleCall(g_costRigCalls);
     const int64_t t0 = sample ? costTicks() : 0;
     const bool veto = rigVetoBody(rig, ctx);
@@ -1652,6 +1759,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     if (sealed::framePromoteDue(g_cellStamp, stamp)) promoteFrame(stamp, stamp);
     std::memcpy(g_frameCam, cam, sizeof(g_frameCam));
     g_frameCamValid = true;
+    if (g_snapStamp != stamp) publishSnapshot();   // built v14.25: the first callback of a frame publishes the view (under the lock)
     const WorldRead wr = worldOfRecord(record);
     if (judge) {
         ++g_worldSrc[wr.source];
@@ -1787,6 +1895,7 @@ void afterStoreDispatch(uintptr_t bucket, uintptr_t record) noexcept {
 
 // The store observer's entry (the store hook calls it per record), timed one call in 32 (built v14.24).
 void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept {
+    g_callsStore.fetch_add(1, std::memory_order_relaxed);
     const bool sample = costSampleCall(g_costStoreCalls);
     const int64_t t0 = sample ? costTicks() : 0;
     afterStoreDispatch(bucket, record);
@@ -2191,6 +2300,7 @@ void optimizedStationFrameBody(uint32_t frame) {
         }
     }
     refreshRigVerdicts();
+    publishSnapshot();   // built v14.25: the tick's view for the per-record path (under the lock)
     if (now - g_summaryStartMs >= kSummaryMs) summaryLine(now);
     (void)frame;
 }

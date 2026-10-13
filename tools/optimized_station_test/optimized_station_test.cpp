@@ -3,7 +3,12 @@
 // shell, a hangar change, launch), the pad-local frame's round trip and the release's threshold, the parse of the per-size floors, the own-ship
 // prefix and sphere, the bay's volume, and the unreadable rule. No DLL and no game.
 #include "../../src/d3d11/optimized_station_core.h"
-#include "../../src/d3d11/explorer_cam_core.h"   // the build-332841 PE identity constants (store hook gate)
+#include "../../src/d3d11/explorer_cam_core.h"
+#include "../../src/d3d11/station_lockfree_core.h"
+
+#include <atomic>
+#include <thread>
+#include <vector>   // the build-332841 PE identity constants (store hook gate)
 
 #include <cmath>
 #include <cstdio>
@@ -1120,6 +1125,146 @@ int main(int argc, char** argv) {
         se::pickOwnPadSticky(nullptr, 0, camera, radii, &sticky, &second);
         check(std::strcmp(first.reason, second.reason) == 0 && std::strstr(first.reason, "held for up to 30 frames") != nullptr,
               "v14.24 log: the held-pad reason is the same on every frame (no counter, no line per frame)");
+    }
+
+    // ---- Built v14.25 (2026-10-13): the lock-free pieces, driven from several threads ---------------------------------------------------------------
+    {
+        // The snapshot ring, one thread: the value pinned is the one published.
+        struct Snap {
+            uint64_t seq = 0;
+            uint64_t a = 0;
+            uint64_t b = 0;
+            uint64_t check = 0;
+        };
+        se::SnapshotRing<Snap, 4> ring;
+        Snap& w = ring.beginWrite();
+        w.seq = 1;
+        w.a = 3;
+        w.b = 5;
+        w.check = 9;
+        ring.publish();
+        size_t idx = 0;
+        const Snap* p = ring.pin(&idx);
+        check(p->seq == 1 && p->check == 9, "v14.25 ring: the value pinned is the value published");
+        ring.unpin(idx);
+    }
+    {
+        // Eight readers and one publisher. A pinned value is never torn (check = seq + a + b), a reader's sequence never goes back, and the last
+        // publish is the one read at the end (no lost epoch).
+        struct Snap {
+            uint64_t seq = 0;
+            uint64_t a = 0;
+            uint64_t b = 0;
+            uint64_t check = 0;
+        };
+        se::SnapshotRing<Snap, 4> ring;
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> torn{0};
+        std::atomic<uint64_t> backwards{0};
+        std::atomic<uint64_t> reads{0};
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 8; ++t) {
+            readers.emplace_back([&] {
+                uint64_t last = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    size_t idx2 = 0;
+                    const Snap* q = ring.pin(&idx2);
+                    if (q->check != q->seq + q->a + q->b) torn.fetch_add(1);
+                    if (q->seq < last) backwards.fetch_add(1);
+                    last = q->seq;
+                    ring.unpin(idx2);
+                    reads.fetch_add(1);
+                }
+            });
+        }
+        const uint64_t kPublishes = 20000;
+        while (reads.load() == 0) std::this_thread::yield();   // the readers are running before the first publish
+        for (uint64_t k = 1; k <= kPublishes; ++k) {
+            Snap& wr = ring.beginWrite();
+            wr.seq = k;
+            wr.a = 3 * k;
+            wr.b = 5 * k;
+            wr.check = k + 3 * k + 5 * k;
+            ring.publish();
+        }
+        stop.store(true);
+        for (auto& th : readers) th.join();
+        check(torn.load() == 0, "v14.25 ring, threads: no torn snapshot across 8 readers and 20000 publishes");
+        check(backwards.load() == 0, "v14.25 ring, threads: no reader sees the epoch go backwards");
+        size_t idx3 = 0;
+        const Snap* last = ring.pin(&idx3);
+        check(last->seq == kPublishes && ring.publishes() == kPublishes, "v14.25 ring, threads: the last publish is the one read (no lost epoch)");
+        ring.unpin(idx3);
+        check(reads.load() > 0, "v14.25 ring, threads: the readers did read");
+    }
+    {
+        // The seqlock table: a single-threaded reference, then eight writers inserting the same records concurrently into a fresh table. Every
+        // record must read back its exact payload in both; readers running during the writes never see a torn payload.
+        constexpr size_t kCap = 1024;
+        static se::SeqCell ref[kCap];
+        static se::SeqCell par[kCap];
+        const size_t kRecs = 160;
+        auto homeOf = [&](uintptr_t rec) { return static_cast<size_t>((static_cast<uint64_t>(rec) >> 4) * 0x9E3779B97F4A7C15ull >> 54) & (kCap - 1); };
+        auto valueOf = [](uintptr_t rec, float out[4]) {
+            out[0] = static_cast<float>(rec % 997);
+            out[1] = static_cast<float>(rec % 31);
+            out[2] = static_cast<float>(rec % 17);
+            out[3] = static_cast<float>(rec % 11) + 1.0f;
+        };
+        for (size_t k = 0; k < kRecs; ++k) {
+            const uintptr_t rec = 0x7000 + 16 * static_cast<uintptr_t>(k);
+            float v[4];
+            valueOf(rec, v);
+            se::seqTableInsert(ref, kCap, homeOf(rec), rec, 1, v, nullptr);
+        }
+        size_t refFound = 0;
+        for (size_t k = 0; k < kRecs; ++k) {
+            const uintptr_t rec = 0x7000 + 16 * static_cast<uintptr_t>(k);
+            float got[4] = {};
+            float want[4];
+            valueOf(rec, want);
+            if (se::seqTableFind(ref, kCap, homeOf(rec), rec, 1, got, nullptr) && std::memcmp(got, want, sizeof(want)) == 0) ++refFound;
+        }
+        check(refFound == kRecs, "v14.25 table, reference: every record reads back its payload (single thread)");
+        std::atomic<uint64_t> badHits{0};
+        std::vector<std::thread> writers;
+        for (int t = 0; t < 8; ++t) {
+            writers.emplace_back([&, t] {
+                for (size_t k = 0; k < kRecs; ++k) {
+                    const size_t j = (k * 7 + static_cast<size_t>(t) * 13) % kRecs;   // each thread inserts all records, in its own order
+                    const uintptr_t rec = 0x7000 + 16 * static_cast<uintptr_t>(j);
+                    float v[4];
+                    valueOf(rec, v);
+                    se::seqTableInsert(par, kCap, homeOf(rec), rec, 1, v, nullptr);
+                }
+            });
+        }
+        std::thread checker([&] {
+            for (int round = 0; round < 200; ++round) {
+                for (size_t k = 0; k < kRecs; ++k) {
+                    const uintptr_t rec = 0x7000 + 16 * static_cast<uintptr_t>(k);
+                    float got[4] = {};
+                    float want[4];
+                    valueOf(rec, want);
+                    if (se::seqTableFind(par, kCap, homeOf(rec), rec, 1, got, nullptr) && std::memcmp(got, want, sizeof(want)) != 0) badHits.fetch_add(1);
+                }
+            }
+        });
+        for (auto& th : writers) th.join();
+        checker.join();
+        size_t parFound = 0;
+        for (size_t k = 0; k < kRecs; ++k) {
+            const uintptr_t rec = 0x7000 + 16 * static_cast<uintptr_t>(k);
+            float got[4] = {};
+            float want[4];
+            valueOf(rec, want);
+            if (se::seqTableFind(par, kCap, homeOf(rec), rec, 1, got, nullptr) && std::memcmp(got, want, sizeof(want)) == 0) ++parFound;
+        }
+        check(badHits.load() == 0, "v14.25 table, threads: a reader during concurrent inserts never sees a torn payload");
+        check(parFound == refFound && parFound == kRecs,
+              "v14.25 table, threads: eight writers inserting the same records give the same decisions as the single-thread reference");
+        float got[4] = {};
+        check(!se::seqTableFind(par, kCap, homeOf(0x7000), 0x7000, 2, got, nullptr), "v14.25 table: a record of another generation is not found");
     }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);
