@@ -535,3 +535,16 @@ launches. The phase-1 build switches to Passthrough rather than live.
     Borrowed-device mode keeps N1's empty frames.
 - Hypothesis N-H1: SteamVR shows its own environment, not the frozen frame, while the app submits zero-layer frames. A flight
   decides it before N2 builds on it.
+### 2026-10-13, Steam, phase 2 and the headset clear (Sean)
+
+- Leak flight, 05:26 (build 72b1182f, N1 in): 12 switches, all committed, 6 off/on cycles. VRAM in VR 6582 -> 5977 -> 5967 MB, in flat
+  8099 / 7631 / 7977 MB: flat holds about 2 GB more while active and returns it at the switch. ruled out: a per-switch leak, because
+  the VR samples fell across the cycles (the earlier +300-400 MB per cycle over 3 cycles was the game streaming).
+- Timing over the 12 toggles: Settings.xml written 110-340 ms after the Supersampling setter call; the switch committed 360-600 ms
+  after it. Flight D's 4.6 s gap was a one-off. The file watch is a change notification landing within about half a second.
+- The clear: `flat_clear,start,quiet_ms=359` about 360 ms after each vr -> flat; 800-4100 empty frames each stretch at about 90 Hz;
+  `stop,reason=game_frame` at each 3D on. What the headset showed is Sean's report (N-H1).
+- Offline disassembly (build 332841, Steam exe; scripts in the session scratchpad re3d): the mode is parsed into the options block at
+  +0x00 (clamped 0..6) and saved from +0x30 of the saved object (fn 0x2871130); the Supersampling vtable (0x52E9000) has a per-mode
+  table of 7 counters at ctx+0x3678 (acquire 0x280DED0 `lock inc`, release 0x2866480 `lock dec`, query 0x2845E10). The apply site
+  was not found. e18abf76 logs the table read-only each frame (the probe) to see whether it moves at the apply.
