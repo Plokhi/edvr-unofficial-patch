@@ -583,3 +583,16 @@ Units, one at a time behind the full build (Haiku implementers, reviewed):
   Pimax OpenXR (Crystal Super) for D, E, F, the leak flights, the 06:40 empty-frame refutation, the XeSS flights and the 11:21 panel
   flight. The panel also flew OK on SteamVR in this session (`panel=ready,size=1803x832,format=29`, 6831 frames, Sean: "the panel
   works"), so it is confirmed on both runtimes.
+### 2026-10-13, installer runs (phase 3)
+
+- Real run 1 (Sean, Steam, GUI, before 504c5e20): Uninstall over a dev-tool `both` install with a stale flat record left the
+  descriptor, the OpenXR loader files and XeSS behind; the next "Flat only" install refused ("Cannot prove EDVR's VR runtime and the
+  game's original"). Fixed in 504c5e20, then corrected after review 2 (provenance before removal: c07ac898; the tool's original
+  adopted from its receipt: f6ffb13a). Real run 2 (Sean, Steam, "Flat only" then "VR and flat" then "Flat only"): worked; the "VR and
+  flat" merge kept every value of the old edvr.ini (77 keys, 0 changed, 9 user values kept); the report did not mention XeSS though
+  it was placed (fixed 78a88b8a).
+- Throwaway-folder run (build 456b69f5, an isolated copy of the exe and the stock openvr_api.dll): dev-tool install `both --xess` ->
+  GUI update `--scope both` ("Adopting the game's original VR library from the backup the tool made"; openvr_api_orig.dll = stock
+  sha) -> `--scope flat` (stock runtime back, loader, licence and edvr_openxr.ini removed, both inis kept) -> `--scope both` (runtime
+  back) -> `--uninstall` (d3d11.dll, XeSS trio, DLSS runtime, record and descriptor removed; stock runtime back; both inis kept). Every
+  step exit 0, none blocked. %LOCALAPPDATA%\EDVR: only a new edvr-throwaway-test-* mirror; the real mirrors untouched.
