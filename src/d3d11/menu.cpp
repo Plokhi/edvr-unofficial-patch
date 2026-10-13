@@ -3797,6 +3797,8 @@ void menuProfileSwitch() {
     s.configured = false;
 }
 
+bool menuIsConfigured() { return g_s.configured; }
+
 // ---------------------------------------------------------------------------
 
 void menuAdoptGameBindings(bool enabled, const char* why) {

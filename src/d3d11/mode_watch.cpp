@@ -15,6 +15,7 @@
 #include "vr_ssaa_hold.h"       // vrSsaaHoldProfileChanged: the Supersampling hold follows the profile
 
 #include "../common/config.h"
+#include "../common/ini_name.h"
 #include "../common/install_scope.h"
 #include "../common/log.h"
 #include "../common/native_frame.h"           // nativeFrameLatchedFrames: the eye-submit count the watch samples
@@ -27,6 +28,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -342,6 +344,12 @@ void readPatched(std::string* out) {
     out[2] = cfg.getString(kPatchedKeys[2], "auto");
 }
 
+// The rig's view of the switch (tools\profile_switch_test): real switches committed and teardowns run. The skip is the rig's control
+// and is never set in production (edvr_selftest_profile_skip_teardown).
+std::atomic<uint32_t> g_switches{0};
+std::atomic<uint32_t> g_teardowns{0};
+std::atomic<bool> g_skipTeardown{false};
+
 // The render thread's commit (design section 3.3): the posted mode becomes the profile it selects. The outgoing profile is torn down while
 // its predicates still answer true, the profile flips, the settings file is re-picked, and the configure sweep is forced for later in
 // this same frame boundary.
@@ -373,15 +381,19 @@ void commitPosted(uint64_t packed) {
 
     // Teardown, while the outgoing profile's predicates still answer true (design section 3.3). Every switch releases the DLSS and FSR
     // features and closes the menu; the flat and VR parts are the outgoing profile's own.
-    if (cur == RuntimeProfile::Flat) {
-        flatRuntimeResize();
-        engineVelocityFlatAbandon();
-    } else if (cur == RuntimeProfile::Vr) {
-        uiLayerProfileSwitch();
+    if (!g_skipTeardown.load(std::memory_order_relaxed)) {
+        if (cur == RuntimeProfile::Flat) {
+            flatRuntimeResize();
+            engineVelocityFlatAbandon();
+        } else if (cur == RuntimeProfile::Vr) {
+            uiLayerProfileSwitch();
+        }
+        dlaaReleaseForSwitch();
+        fsr3ReleaseFeatures();
+        menuProfileSwitch();
+        g_teardowns.fetch_add(1, std::memory_order_relaxed);
     }
-    dlaaReleaseForSwitch();
-    fsr3ReleaseFeatures();
-    menuProfileSwitch();
+    g_switches.fetch_add(1, std::memory_order_relaxed);
 
     runtimeProfileSet(target);
     Config::get().switchProfile();
@@ -486,3 +498,37 @@ bool modeWatchNoticeDue(char* out, size_t size) {
 }
 
 }  // namespace edvr
+
+// Test-only exports, read by tools\profile_switch_test (build.bat's rig). Production never calls them. The rig's own header says what
+// it covers: the switch's mechanics on WARP, not the flat or VR runtimes, which key on Elite's shaders and never engage here.
+
+// Posts a mode exactly as the watch posts one from the file (source "file"); the commit happens at the next frame boundary.
+extern "C" void edvr_selftest_profile_post(unsigned int vr) {
+    edvr::postMode(edvr::nowMs(), vr ? edvr::GameMode::Vr : edvr::GameMode::Flat, false);
+}
+
+// out[0] the active profile (RuntimeProfile), [1] 1 when Config's file is edvr-flat.ini (0: edvr.ini), [2] Config's generation (low 32
+// bits), [3] real switches committed, [4] the menu configured, [5] the Supersampling hold held, [6] the flat runtime live, [7] teardowns
+// run. Returns how many it wrote.
+extern "C" unsigned int edvr_selftest_profile_state(uint32_t* out, unsigned int count) {
+    if (!out) return 0;
+    const edvr::Config& cfg = edvr::Config::get();
+    const uint32_t values[8] = {
+        static_cast<uint32_t>(edvr::runtimeProfileValue()),
+        std::strcmp(cfg.iniName(), edvr::kIniNameFlat) == 0 ? 1u : 0u,
+        cfg.generation(),
+        edvr::g_switches.load(std::memory_order_relaxed),
+        edvr::menuIsConfigured() ? 1u : 0u,
+        edvr::vrSsaaHoldActive() ? 1u : 0u,
+        edvr::g_flatRuntimeLive.load(std::memory_order_relaxed) ? 1u : 0u,
+        edvr::g_teardowns.load(std::memory_order_relaxed),
+    };
+    const unsigned int n = std::min(count, 8u);
+    for (unsigned int i = 0; i < n; ++i) out[i] = values[i];
+    return n;
+}
+
+// The control: when on, a commit skips its teardown. The rig's second process sets it; production never does.
+extern "C" void edvr_selftest_profile_skip_teardown(unsigned int on) {
+    edvr::g_skipTeardown.store(on != 0, std::memory_order_relaxed);
+}

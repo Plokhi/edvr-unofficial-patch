@@ -326,6 +326,9 @@ python "tools\gen_exports.py" --source "%SystemRoot%\System32\d3d11.dll" ^
     --extra-export edvr_selftest_flat_sdk_owner_view ^
     --extra-export edvr_selftest_flat_sdk_foreground_map ^
     --extra-export edvr_selftest_binding ^
+    --extra-export edvr_selftest_profile_post ^
+    --extra-export edvr_selftest_profile_state ^
+    --extra-export edvr_selftest_profile_skip_teardown ^
     --extra-export edvrAcquireGraphicsBridge ^
     --extra-export edvrAcquireRenderBoundary ^
     --extra-export edvrAcquireNativeGraphics ^
@@ -1691,6 +1694,26 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: journal_unload_test build failed & exit /b 1 )
 "%BUILD%\journal_unload_test.exe" "%BUILD%\d3d11.dll" || (
     echo [edvr] ERROR: the graphics DLL's pin does not keep its code mapped under a running worker
+    exit /b 1
+)
+exit /b 0
+
+:rig_profile_switch_test
+echo [edvr] === profile_switch_test.exe ===
+REM The live profile switch's mechanics (src\d3d11\mode_watch.cpp commitPosted; docs\design-unified-install-2026-10-12.md section 6). The rig
+REM loads a copy of the real build\d3d11.dll on WARP and presents synthetic frames through its real Present hook, so each flip is committed
+REM at a real frame boundary. It pins the state each switch leaves, the log lines, the 50-cycle count and memory, the settings-file
+REM fallback, and a control in a second process that skips the teardown and must be detected. It cannot reach the flat runtime or the VR
+REM UI layers under real draws (they key on Elite's shaders); that is a flight's job. The exe sits in obj, not build: a build\ exe would
+REM read build\edvr-flat.ini as the settings file's fallback.
+if not exist "%OBJ%\profileswitch" mkdir "%OBJ%\profileswitch"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\profileswitch\\" /Fe"%OBJ%\profileswitch\profile_switch_test.exe" ^
+    "tools\profile_switch_test\profile_switch_test.cpp" ^
+    /link /INCREMENTAL:NO user32.lib psapi.lib
+if errorlevel 1 ( echo [edvr] ERROR: profile_switch_test build failed & exit /b 1 )
+"%OBJ%\profileswitch\profile_switch_test.exe" "%BUILD%\d3d11.dll" || (
+    echo [edvr] ERROR: the live profile switch's mechanics failed their test
     exit /b 1
 )
 exit /b 0

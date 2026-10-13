@@ -60,6 +60,8 @@ void menuFlatResize();
 // Called at a profile switch, render thread, frame boundary: closes the menu, releases the flat panel's raster, and makes the
 // next menuConfigure run the first-time block of the profile now active.
 void menuProfileSwitch();
+// Whether the menu has run its configure block for the profile now active (tools\profile_switch_test reads it).
+bool menuIsConfigured();
 
 // The reload poll re-read edvr.ini: refresh every row's value, diff the
 // restart snapshot, and toast what changed from outside the menu.
