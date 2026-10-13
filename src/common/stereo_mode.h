@@ -7,7 +7,8 @@
 namespace edvr {
 
 // The value of <StereoscopicMode> in Settings.xml's text. True with *mode = N when the tag holds a whole number from 0 to 6 (the
-// game clamps it to that range), with whitespace allowed around it; false when the tag is absent or holds anything else.
+// game clamps it to that range), with whitespace allowed around it and the complete </StereoscopicMode> closing tag after it; false
+// when the tag is absent or holds anything else, a truncated or mismatched closing tag included.
 inline bool parseStereoscopicMode(const char* xml, int* mode) {
     static const char kTag[] = "<StereoscopicMode>";
     const char* at = xml ? std::strstr(xml, kTag) : nullptr;
@@ -22,7 +23,10 @@ inline bool parseStereoscopicMode(const char* xml, int* mode) {
         ++p;
     }
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
-    if (*p != '<') return false;
+    // The closing tag must follow in full. Settings.xml is read while the game may be rewriting it, so a cut-off "0<" or "0</Stereo" is
+    // not a value; strncmp stops at the end of the text, so a short read cannot run past it.
+    static const char kClose[] = "</StereoscopicMode>";
+    if (std::strncmp(p, kClose, sizeof(kClose) - 1) != 0) return false;
     *mode = v;
     return true;
 }

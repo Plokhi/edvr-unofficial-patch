@@ -140,6 +140,45 @@ void settingsCases() {
     check(!empty.known && empty.mode == GameMode::Vr && empty.fileRead, "settings: empty text is unknown, file read");
 }
 
+// The closing tag must follow the number in full (stereo_mode.h). A cut-off or mismatched tag reads unknown, and an unknown mode runs Vr
+// through the launch decision (Q2), so a half-written Settings.xml cannot pick the Flat profile.
+void closingTagCases() {
+    const ScopeRead both = parseInstallDescriptor("[install]\r\nschema = 2\r\nscope = both\r\n");
+    for (int m = 0; m <= 6; ++m) {
+        const std::string xml = "<Settings>\r\n  <StereoscopicMode>\r\n\t" + std::to_string(m) + " \r\n</StereoscopicMode>\r\n</Settings>";
+        const ModeRead r = readGameMode(xml.c_str());
+        const GameMode want = m <= 1 ? GameMode::Flat : GameMode::Vr;
+        const RuntimeProfile wantActive = m <= 1 ? RuntimeProfile::Flat : RuntimeProfile::Vr;
+        const LaunchDecision d = decideLaunch(both, r, VrSwitch::None, false, false);
+        char name[120];
+        std::snprintf(name, sizeof name, "closing tag: complete mode %d with CRLF and whitespace reads %s", m, gameModeName(want));
+        check(r.known && r.value == m && r.mode == want && d.active == wantActive, name);
+    }
+    // The bare values, with no whitespace or wrapper: the closing tag directly after the digit.
+    for (int m = 0; m <= 6; ++m) {
+        const std::string xml = "<StereoscopicMode>" + std::to_string(m) + "</StereoscopicMode>";
+        const ModeRead r = readGameMode(xml.c_str());
+        check(r.known && r.value == m, ("closing tag: bare mode " + std::to_string(m) + " reads known").c_str());
+    }
+    const char* truncated[] = {
+        "<StereoscopicMode>0<",
+        "<StereoscopicMode>0</Stereo",
+        "<StereoscopicMode>0</StereoscopicModeX>",
+        "<StereoscopicMode>0</Other>",
+        "<StereoscopicMode>0",
+        "<StereoscopicMode>0\r\n</Settings>",
+    };
+    int index = 0;
+    for (const char* xml : truncated) {
+        ++index;
+        const ModeRead r = readGameMode(xml);
+        const LaunchDecision d = decideLaunch(both, r, VrSwitch::None, false, false);
+        char name[120];
+        std::snprintf(name, sizeof name, "closing tag: incomplete or mismatched case %d is unknown, Vr at launch", index);
+        check(!r.known && r.mode == GameMode::Vr && r.fileRead && d.effective == GameMode::Vr && d.active == RuntimeProfile::Vr, name);
+    }
+}
+
 void profileCases() {
     struct Row {
         InstallScope scope;
@@ -316,6 +355,7 @@ int main(int argc, char** argv) {
     descriptorCases();
     legacyCases();
     settingsCases();
+    closingTagCases();
     profileCases();
     switchCases();
     decisionCases();

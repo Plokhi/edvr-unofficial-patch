@@ -68,7 +68,10 @@ void parseCases() {
     int m = -1;
     check(parseStereoscopicMode("<StereoscopicMode>3</StereoscopicMode>", &m) && m == 3, "mode 3 parses");
     check(parseStereoscopicMode("<A/>\r\n  <StereoscopicMode>\t5 \r\n</StereoscopicMode>", &m) && m == 5, "mode 5 with whitespace parses");
-    check(parseStereoscopicMode("<StereoscopicMode>0<", &m) && m == 0, "mode 0 parses (off)");
+    check(parseStereoscopicMode("<StereoscopicMode>0</StereoscopicMode>", &m) && m == 0, "mode 0 parses (off)");
+    m = -7;
+    check(!parseStereoscopicMode("<StereoscopicMode>0<", &m) && m == -7, "a lone '<' after the number is refused (no closing tag)");
+    check(!parseStereoscopicMode("<StereoscopicMode>0</Stereo", &m) && m == -7, "a partial closing tag is refused");
     check(parseStereoscopicMode("<StereoscopicMode>6</StereoscopicMode>", &m) && m == 6, "mode 6 (the top of the game's clamp) parses");
     m = -7;
     check(!parseStereoscopicMode("<StereoscopicMode>7</StereoscopicMode>", &m) && m == -7, "mode 7 is refused and *mode is untouched");
