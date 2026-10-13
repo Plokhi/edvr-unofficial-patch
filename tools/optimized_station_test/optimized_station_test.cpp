@@ -46,6 +46,18 @@ uint64_t firstEngage(se::SealState* st, se::SealInputs in, uint64_t t0, uint64_t
     return 0;
 }
 
+// Built v14.3: a real descent this session. The pad is first seen 4 m up, then at its lowest from t = 100 ms (the still period starts there).
+se::SealState descended() {
+    se::SealState st;
+    se::ReleaseWhy w = se::ReleaseWhy::kNone;
+    se::SealInputs a = quiet(0);
+    a.along = 14.0f;
+    a.lowest = 10.0f;
+    se::sealStep(a, &st, &w);
+    se::sealStep(quiet(100), &st, &w);
+    return st;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -56,10 +68,24 @@ int main(int argc, char** argv) {
 
     // ---- The seal trigger -----------------------------------------------------------------------------------------------------------------------
     {
+        // Built v14.3, the load-in rule: a pad first seen at rest with no descent seals on the first eligible frame.
         se::SealState st;
-        const uint64_t t = firstEngage(&st, quiet(0), 0, 10000);
-        check(t == se::kSealDelayMs, "a docked, still pad at its lowest seals after kSealDelayMs (6 s): the engage is requested at 6000 ms");
-        check(firstEngage(&st, quiet(0), 0, 10000) == 0, "one engage per still period: the request is not repeated while the period stands");
+        const uint64_t t = firstEngage(&st, quiet(0), 100, 10000);
+        check(t == 100, "load-in: a docked pad first seen at its lowest, with no descent, seals on the first eligible frame (100 ms)");
+        check(st.immediate && firstEngage(&st, quiet(0), 100, 10000) == 0, "one engage per seal: the request is not repeated while the seal stands");
+    }
+    {
+        // After an observed descent, the still delay still applies: 6 s from the pad settling at its lowest (100 ms).
+        se::SealState st = descended();
+        check(firstEngage(&st, quiet(0), 200, 20000) == 100 + se::kSealDelayMs,
+              "after an observed descent the delay applies: the seal comes 6 s after the pad settles (6100 ms)");
+    }
+    {
+        // A different own pad starts its own motion memory: at rest, it seals on the first eligible frame.
+        se::SealState st = descended();
+        se::SealInputs other = quiet(30000);
+        other.pad = 0x3000;
+        check(firstEngage(&st, other, 30000, 30000) == 30000, "a different own pad: its motion memory starts fresh and it seals at once at rest");
     }
     {
         se::SealState st;
@@ -93,7 +119,7 @@ int main(int argc, char** argv) {
         uint64_t sealedAt = 0;
         for (uint64_t t = 0; t <= 12000; t += 100) {
             in.nowMs = t;
-            in.along = (t >= 3000 && t < 3100) ? 10.5f : 10.0f;
+            in.along = t == 0 ? 14.0f : ((t >= 3000 && t < 3100) ? 10.5f : 10.0f);   // first seen 4 m up, then descends
             if (se::sealStep(in, &st, &why) == se::SealAction::kRequestEngage && sealedAt == 0) sealedAt = t;
         }
         check(sealedAt == 9100, "a move of 0.5 m restarts the still period: the seal comes 6 s after the pad settles (9.1 s), not at 6 s");
@@ -103,7 +129,7 @@ int main(int argc, char** argv) {
         se::SealInputs in = quiet(0);
         in.along = 10.1f;   // within 0.2 m of its lowest and still: seals
         in.lowest = 10.0f;
-        check(firstEngage(&st, in, 0, 10000) == se::kSealDelayMs, "a pad within 0.2 m of its lowest, and still, seals");
+        check(firstEngage(&st, in, 100, 10000) == 100, "load-in: a pad first seen within 0.2 m of its lowest, with no descent, seals on the first eligible frame");
     }
     {
         se::SealState st;
@@ -170,8 +196,9 @@ int main(int argc, char** argv) {
         in.padMoved = true;
         in.cameraOutside = true;
         se::ReleaseWhy why = se::ReleaseWhy::kNone;
-        check(se::sealStep(in, &st, &why) == se::SealAction::kNone && why == se::ReleaseWhy::kNone,
-              "the release rules do not fire while not sealed");
+        const se::SealAction a = se::sealStep(in, &st, &why);
+        check(a != se::SealAction::kRelease && why == se::ReleaseWhy::kNone,
+              "the release rules do not fire while not sealed (a pad at rest may request the load-in seal)");
     }
     {
         // Priority: the first rule that holds names the release (undocking while the pad moves says undocked).
@@ -193,11 +220,25 @@ int main(int argc, char** argv) {
         swap.hangarChanged = true;
         check(se::sealStep(swap, &st, &why) == se::SealAction::kRelease && why == se::ReleaseWhy::kHangarChanged,
               "ship swap: the hangar change releases");
-        se::SealInputs fresh = quiet(0);
-        fresh.nowMs = 20000;
-        check(firstEngage(&st, fresh, 20000, 20000) == 0, "after a release the seal waits: no engage at the release");
-        check(firstEngage(&st, fresh, 20000, 30000) == 20000 + se::kSealDelayMs,
-              "after a release, a re-seal needs the whole still period again: 6 s of stillness at the lowest");
+        // The new pad, shut in a closed bay, at rest: the load-in rule seals it on the first eligible frame.
+        se::SealInputs fresh = quiet(20000);
+        fresh.pad = 0x2000;
+        check(firstEngage(&st, fresh, 20000, 30000) == 20000,
+              "ship swap into a closed bay: the new pad at rest seals on the first eligible frame (load-in)");
+        // The new pad that then descends: the delay applies.
+        se::SealState st2;
+        se::ReleaseWhy w2 = se::ReleaseWhy::kNone;
+        se::SealInputs d0 = quiet(20000);
+        d0.pad = 0x2000;
+        d0.along = 14.0f;
+        se::sealStep(d0, &st2, &w2);
+        se::SealInputs d1 = quiet(20100);
+        d1.pad = 0x2000;
+        se::sealStep(d1, &st2, &w2);
+        se::SealInputs d2 = quiet(20200);
+        d2.pad = 0x2000;
+        check(firstEngage(&st2, d2, 20200, 40000) == 20100 + se::kSealDelayMs,
+              "ship swap, then the new pad descends: the delay applies after the descent settles");
     }
     {
         // Re-seal after a release: the pad is still at the lowest for the delay, the station seals again.
@@ -295,8 +336,8 @@ int main(int argc, char** argv) {
         noPad.pickOk = false;
         check(firstEngage(&stNoPad, noPad, 0, 20000) == 0, "v14.1: no pad gathered (pickOk false): the seal is never requested");
         se::SealState stGathered;
-        check(firstEngage(&stGathered, quiet(0), 0, 20000) == se::kSealDelayMs,
-              "v14.1: with the pad gathered while docked, the still pad requests the seal after the delay");
+        check(firstEngage(&stGathered, quiet(0), 100, 20000) == 100,
+              "v14.1: with the pad gathered while docked, the pad at rest requests the load-in seal on the first eligible frame");
 
         char line[320] = {};
         se::WaitView unknownNoPad;
@@ -331,6 +372,50 @@ int main(int argc, char** argv) {
         se::waitingLine(v2, 6.0f, line, sizeof(line));
         check(se::waitingKeyChanged(v, v2) && std::strstr(line, "cell=failed:no pad height") != nullptr,
               "v14.1: a cell that fails names its reason, and is a state change");
+
+        // Built v14.2: the evidence in the line (records gathered, camera, the pads with distance and containment).
+        se::WaitView ev = v;
+        ev.gathered = 5;
+        ev.cameraKnown = true;
+        ev.padCount = 1;
+        std::snprintf(ev.padEv[0].name, sizeof(ev.padEv[0].name), "%s", "LandingPadLargeA");
+        ev.padEv[0].d = 140.2f;
+        ev.padEv[0].contains = true;
+        se::waitingLine(ev, 6.0f, line, sizeof(line));
+        check(std::strstr(line, "gathered=5") != nullptr && std::strstr(line, "camera=yes") != nullptr &&
+                  std::strstr(line, "LandingPadLargeA d=140.2 contains=yes") != nullptr,
+              "v14.2: the waiting line names the records gathered, the camera, and each pad's distance and containment");
+        se::WaitView none = v;
+        none.padCount = 0;
+        none.cameraKnown = false;
+        se::waitingLine(none, 6.0f, line, sizeof(line));
+        check(std::strstr(line, "camera=no") != nullptr && std::strstr(line, "pads=0 [none]") != nullptr,
+              "v14.2: with no pads and no camera the line says so");
+
+        // The v14.1 flight's fault: the frame stamp never advanced, so no promote ever ran. The stamp must advance each tick.
+        {
+            uint32_t cellStampStuck = 0, frameStuck = 0;
+            int promotesStuck = 0;
+            for (int r = 0; r < 3; ++r) {
+                if (se::framePromoteDue(cellStampStuck, frameStuck)) {
+                    cellStampStuck = frameStuck;
+                    ++promotesStuck;
+                }
+            }
+            check(promotesStuck == 0, "v14.2: with the stamp never advanced (the flight's fault), no promote is ever due");
+            uint32_t cellStamp = 0, frame = 0;
+            int promotes = 0;
+            for (int f = 0; f < 3; ++f) {
+                ++frame;   // the tick advances the stamp
+                for (int r = 0; r < 4; ++r) {
+                    if (se::framePromoteDue(cellStamp, frame)) {
+                        cellStamp = frame;
+                        ++promotes;
+                    }
+                }
+            }
+            check(promotes == 3, "v14.2: the stamp advanced once per tick: one promote per frame, at its first record");
+        }
     }
 
     // ---- The rules the seal relies on -------------------------------------------------------------------------------------------------------------

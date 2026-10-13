@@ -967,6 +967,7 @@ struct SealInputs {
     bool pickOk = false;         // the own pad is found this frame, with a pose
     float along = 0.0f;          // the pad's height along its up axis now
     float lowest = 0.0f;         // the lowest height seen for this pad record
+    uintptr_t pad = 0;           // the own pad's record: its motion memory is kept per pad (built v14.3)
     bool held = false;           // sealed now
     bool cameraOutside = false;  // the camera is outside the held box by more than kCameraLeaveM (only meaningful while held)
     bool padMoved = false;       // the pad moved more than kPadMoveReleaseM along the shaft relative to the hangar shell
@@ -980,10 +981,26 @@ struct SealState {
     float anchor = 0.0f;         // the pad's height when the timer last restarted
     uint64_t stillSinceMs = 0;   // when the timer last restarted
     bool requested = false;      // one engage per still period
+    bool immediate = false;      // the request in force was made at load-in (no descent observed): the delay did not apply
+    // Built v14.3 (the load-in rule): the own pad in hand, its height when first seen, and whether it has moved off that height since (a descent
+    // observed this session). The memory is per pad and survives a release; a release by motion counts as a descent.
+    bool seen = false;
+    uintptr_t padAddr = 0;
+    float firstAlong = 0.0f;
+    bool moved = false;
 };
 
+// A release, or the trigger lapsing: the trigger starts again, the pad's motion memory stays (a pad that has descended still waits its delay).
+inline void clearTrigger(SealState* st) noexcept {
+    st->stillValid = false;
+    st->requested = false;
+    st->immediate = false;
+}
+
 // Advances the state and returns the action. With kRelease, *why says which rule released (the order of the brief: setting off, undocked,
-// Explorer Cam, camera left, pad moved, hangar changed, launch). A release clears the state: the next seal needs the whole condition again.
+// Explorer Cam, camera left, pad moved, hangar changed, launch). Built v14.3 (the load-in rule): a pad first seen at rest, with no descent
+// observed, seals on the first eligible frame, because the hatch is already shut when the game loads into a closed bay. After an observed
+// descent the still delay applies (kSealDelayMs from the pad settling at its lowest).
 inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why) noexcept {
     *why = ReleaseWhy::kNone;
     if (!in.setting) {
@@ -1003,25 +1020,41 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         else if (in.hangarChanged) w = ReleaseWhy::kHangarChanged;
         else if (in.launched) w = ReleaseWhy::kLaunch;
         if (w != ReleaseWhy::kNone) {
-            *st = SealState{};
+            if (in.padMoved || in.launched) st->moved = true;   // a release by motion is a descent
+            clearTrigger(st);
             *why = w;
             return SealAction::kRelease;
         }
         return SealAction::kNone;
     }
     if (!in.docked || in.explorerOn || !in.pickOk) {
-        *st = SealState{};
+        clearTrigger(st);
         return SealAction::kNone;
     }
+    if (!st->seen || st->padAddr != in.pad) {   // a pad first in hand: its height is the reference for a descent
+        st->seen = true;
+        st->padAddr = in.pad;
+        st->firstAlong = in.along;
+        st->moved = false;
+    }
+    if (std::fabs(in.along - st->firstAlong) > kSealStillM) st->moved = true;
     const bool atLowest = (in.along - in.lowest) <= kSealStillM;
+    if (!st->moved && atLowest) {   // load-in: no descent observed, the pad rests at its height: seal at the first eligible frame
+        if (st->requested) return SealAction::kNone;
+        st->requested = true;
+        st->immediate = true;
+        return SealAction::kRequestEngage;
+    }
     if (!st->stillValid || std::fabs(in.along - st->anchor) > kSealStillM || !atLowest) {
         st->stillValid = true;
         st->anchor = in.along;
         st->stillSinceMs = in.nowMs;
         st->requested = false;
+        st->immediate = false;
     }
     if (!st->requested && in.nowMs - st->stillSinceMs >= kSealDelayMs) {
         st->requested = true;
+        st->immediate = false;
         return SealAction::kRequestEngage;
     }
     return SealAction::kNone;
@@ -1114,6 +1147,18 @@ struct WaitView {
     float stillS = 0.0f;        // seconds the stillness timer has run
     bool cellBuilt = false;     // the pad's cell can be built (a pad with a radius and a readable height)
     char cellReason[96] = {};   // when not built: why
+    // Built v14.2: the evidence (what the gather saw). gathered: store records the observer took last frame; padCount: own-pad records in hand;
+    // padEv: the first three of them, with the distance from the camera and whether their own sphere contains it.
+    uint32_t gathered = 0;
+    bool cameraKnown = false;
+    bool descent = false;       // the held pad has moved since first seen (the delay applies to its seal)
+    uint32_t padCount = 0;
+    struct PadEvidence {
+        char name[64] = {};
+        float d = -1.0f;
+        bool contains = false;
+    };
+    PadEvidence padEv[3];
 };
 
 // True when the seal's state changed: docked, the pad, at lowest, the cell.
@@ -1128,9 +1173,27 @@ inline void waitingLine(const WaitView& w, float delayS, char* out, size_t cap) 
     char cell[128];
     if (w.cellBuilt) std::snprintf(cell, sizeof(cell), "built");
     else std::snprintf(cell, sizeof(cell), "failed:%s", w.cellReason[0] != '\0' ? w.cellReason : "no cell");
-    std::snprintf(out, cap, "optimized station: waiting (docked=%s, pad=%s, at lowest=%s, still for %.1f of %.0f s, cell=%s)", docked,
-                  w.havePad ? w.padName : "none", w.atLowest ? "yes" : "no", static_cast<double>(w.stillS), static_cast<double>(delayS), cell);
+    char pads[400] = {};
+    if (w.padCount == 0) {
+        std::snprintf(pads, sizeof(pads), "none");
+    } else {
+        size_t used = 0;
+        for (uint32_t i = 0; i < w.padCount && i < 3; ++i) {
+            if (used >= sizeof(pads) - 1) break;
+            const int n = std::snprintf(pads + used, sizeof(pads) - used, "%s%s d=%.1f contains=%s", i > 0 ? "; " : "", w.padEv[i].name,
+                                        static_cast<double>(w.padEv[i].d), w.padEv[i].contains ? "yes" : "no");
+            if (n < 0) break;
+            used += static_cast<size_t>(n);
+        }
+    }
+    std::snprintf(out, cap, "optimized station: waiting (docked=%s, pad=%s, at lowest=%s, still for %.1f of %.0f s, cell=%s; descent=%s; gathered=%u, camera=%s, pads=%u [%s])",
+                  docked, w.havePad ? w.padName : "none", w.atLowest ? "yes" : "no", static_cast<double>(w.stillS), static_cast<double>(delayS), cell, w.descent ? "seen" : "none yet",
+                  static_cast<unsigned>(w.gathered), w.cameraKnown ? "yes" : "no", static_cast<unsigned>(w.padCount), pads);
 }
+
+// Built v14.2: promoteFrame runs once per frame, at the frame's first record. The frame stamp advances at each tick; it never did (the v14.1
+// flight: the stamp stayed 0 and the cell stamp started at 0, so no promote ever ran, and no pad was ever picked).
+inline bool framePromoteDue(uint32_t cellStamp, uint32_t frameStamp) noexcept { return cellStamp != frameStamp; }
 
 // The position of p along the cell box's own axes (u, v, w), when the cell is a box. False otherwise.
 inline bool boxCoordsOf(const OwnCell& c, const float p[3], float coords[3]) noexcept {

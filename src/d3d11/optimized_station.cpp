@@ -60,6 +60,7 @@ sealed::ExplicitObs g_explicits[sealed::kExplicitSlots];
 size_t g_explicitCount = 0;
 float g_frameCam[3] = {};
 bool g_frameCamValid = false;
+uint32_t g_recordsFrame = 0, g_recordsLast = 0;   // store records the observer took this frame, and last frame (the waiting line's evidence)
 sealed::OwnCell g_pickCell;                // the frame's pick before the seal (what the seal rule reads)
 sealed::OwnCell g_cellPrev;                // the cell the observer judges against this frame
 uintptr_t g_explicitPrev[sealed::kExplicitNodes] = {};
@@ -817,6 +818,7 @@ bool g_waitLastSet = false;
 uint64_t g_waitLastMs = 0;                // when the waiting line was last written (at most every 10 s while docked)
 sealed::SealState g_sealState;             // the seal trigger (optimized_station_core.h sealStep)
 bool g_flagHangarChanged = false;          // promote saw the held pad go or another own pad nearest: the tick releases on it
+bool g_engageAtLoadIn = false;             // the seal in force was requested at load-in (built v14.3): the status line says so
 bool g_flagPadMoved = false;               // promote saw the held pad move along the shaft against the shell: the tick releases on it
 char g_releaseWhy[160] = {};               // the release text for the flags above (the pad move or the hangar change, with its names)
 uint32_t g_settingPoll = 0;                // frames since the setting was last read
@@ -888,8 +890,9 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
 // The seal's status line, once per seal (called from the engage, after the cell is held and localized).
 void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
     ++g_sealCount;
-    Log::get().note("optimized station: sealed in %s hangar (frame %u, seal %u): pad %s, box %.0f x %.0f x %.0f m (length, width, height), "
-                    "floor %.0f m under the pad, shell %s.", sizeWord(cell.size), frame, g_sealCount, cell.padName,
+    Log::get().note("optimized station: sealed in %s hangar (%s, frame %u, seal %u): pad %s, box %.0f x %.0f x %.0f m (length, width, height), "
+                    "floor %.0f m under the pad, shell %s.", sizeWord(cell.size), g_engageAtLoadIn ? "sealed at load-in" : "sealed after the descent settled",
+                    frame, g_sealCount, cell.padName,
                     static_cast<double>(cell.boxHalf[0] * 2.0f), static_cast<double>(cell.boxHalf[1] * 2.0f),
                     static_cast<double>(cell.boxHalf[2] * 2.0f), static_cast<double>(belowFor(cell.size)),
                     g_shellValid ? g_shellName : "none (the pad's motion is not checked)");
@@ -1133,6 +1136,7 @@ void setHeldFrame(const sealed::OwnCell& cell, uint32_t frame) {
 // judge: the sealed judgement (the keep and the cull); false: gathering only (the frame's camera, pads and explicit parts).
 void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+    ++g_recordsFrame;
     if (judge && !g_heldValid) return;
     uintptr_t ctx = 0;
     uint32_t count = 0;
@@ -1160,7 +1164,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         return;
     }
     g_cameraKnown.store(true, std::memory_order_relaxed);
-    if (g_cellStamp != stamp) promoteFrame(stamp, stamp);
+    if (sealed::framePromoteDue(g_cellStamp, stamp)) promoteFrame(stamp, stamp);
     std::memcpy(g_frameCam, cam, sizeof(g_frameCam));
     g_frameCamValid = true;
     const WorldRead wr = worldOfRecord(record);
@@ -1306,7 +1310,11 @@ void optimizedStationFrame(uint32_t frame) {
         return;
     }
     if (g_summaryStartMs == 0) g_summaryStartMs = now;
+    // Built v14.2: the frame advances here, once per tick. The observer's promote and view resolve run once per frame off this stamp.
+    g_frameStamp.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+    g_recordsLast = g_recordsFrame;
+    g_recordsFrame = 0;
     ++g_winFrames;
     if (g_heldValid) ++g_winSealedFrames;
     g_dockedKnownNow.store(journalDockedKnown(), std::memory_order_release);
@@ -1332,6 +1340,7 @@ void optimizedStationFrame(uint32_t frame) {
     in.pickOk = g_pickCell.has && g_padAlongValid;
     in.along = g_padAlong;
     in.lowest = g_padLowest;
+    in.pad = g_pickCell.has ? g_pickCell.pad : 0;
     in.held = g_heldValid;
     in.cameraOutside = cameraOutside;
     in.padMoved = g_flagPadMoved;
@@ -1347,6 +1356,7 @@ void optimizedStationFrame(uint32_t frame) {
     } else if (act == sealed::SealAction::kRequestEngage) {
         g_engagePending = true;
         g_engageTries = 0;
+        g_engageAtLoadIn = g_sealState.immediate;
     }
     // Built v14.1: while docked and unsealed, one line when the seal's inputs change, and at most every 10 s while docked: the unmet condition.
     if (!g_heldValid) {
@@ -1358,6 +1368,17 @@ void optimizedStationFrame(uint32_t frame) {
         w.atLowest = g_padAlongValid && (g_padAlong - g_padLowest) <= sealed::kSealStillM;
         w.stillS = g_sealState.stillValid ? static_cast<float>(now - g_sealState.stillSinceMs) / 1000.0f : 0.0f;
         w.cellBuilt = g_pickCell.has && g_pickCell.radius > 0.0f && g_padAlongValid;
+        w.gathered = g_recordsLast;
+        w.descent = g_sealState.moved;
+        w.cameraKnown = g_frameCamValid;
+        w.padCount = static_cast<uint32_t>(g_padCount);
+        for (size_t i = 0; i < g_padCount && i < 3; ++i) {
+            const sealed::PadObs& p = g_pads[i];
+            sealed::WaitView::PadEvidence& ev = w.padEv[i];
+            std::snprintf(ev.name, sizeof(ev.name), "%s", p.name);
+            ev.d = g_frameCamValid ? sealed::distance(p.centre, g_frameCam) : -1.0f;
+            ev.contains = g_frameCamValid && ev.d <= p.radius;
+        }
         if (!w.cellBuilt) {
             if (!g_pickCell.has) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_pickCell.reason);
             else std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", "no pad height (the pad's pose is unreadable)");
@@ -1365,7 +1386,7 @@ void optimizedStationFrame(uint32_t frame) {
         const bool changed = !g_waitLastSet || sealed::waitingKeyChanged(g_waitLast, w);
         const bool periodic = w.docked && g_waitLastSet && now - g_waitLastMs >= 10000;
         if (changed || periodic) {
-            char line[320] = {};
+            char line[640] = {};
             sealed::waitingLine(w, static_cast<float>(sealed::kSealDelayMs) / 1000.0f, line, sizeof(line));
             Log::get().note("%s", line);
             g_waitLast = w;
