@@ -303,6 +303,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   std::atomic<uint64_t> gameFrameCallMs{0};
   FlatClearState flatClear;
   uint64_t flatClearFrames=0,flatClearStretchFrames=0,flatClearSummaryMs=0;
+  // Set when the owner ends a game frame the game left open at the switch: a Submit that arrives before the game's next WaitGetPoses
+  // is for that frame and is dropped (submitEyeAdmitted). Cleared by the next WaitGetPoses.
+  bool staleFrameEnded=false;
+  uint64_t lateSubmitsDropped=0;
   SeatedSpace seated;ReferenceChanges changes;ResetEvents resetEvents;
   XrSpace frameSpace=XR_NULL_HANDLE;
   uint64_t recenters=0,resetPolls=0,referenceChanges=0;
@@ -949,11 +953,31 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     const uint64_t quiet=now>last?now-last:0;
     const bool vrProfile=vrProfileActive();
     const bool running=state.running()&&!state.terminal();
+    // A game frame left open at the switch would block clearing for good: the owner ends it empty once the game has been silent for
+    // a second (the next pump then starts normally). Ending it is not a fatal path either; a failure only latches clearing off.
+    if(FlatClearState::staleGameFrame(vrProfile,state.frameOpen(),quiet)){
+      timingInvalidate();invalidateEyeTreatments(); // the game's partial pair and its timing context never reach the runtime
+      const XrResult r=boundary.clear();
+      if(r!=XR_SUCCESS){
+        flatClear.fail();
+        nativeTracePrintf("flat_clear,error,result=%d,frames=%llu\n",int(r),(unsigned long long)flatClearStretchFrames);
+        return;
+      }
+      staleFrameEnded=true;
+      nativeTracePrintf("flat_clear,ended_stale_game_frame,quiet_ms=%llu\n",(unsigned long long)quiet);
+      return;
+    }
     const auto step=flatClear.decide(vrProfile,state.frameOpen(),running,quiet);
     if(step.started){flatClearStretchFrames=0;nativeTracePrintf("flat_clear,start,quiet_ms=%llu\n",(unsigned long long)quiet);}
     if(step.run){
       const XrResult r=flatClearFrame();
-      if(r!=XR_SUCCESS){publishFatalFailure(boundary.failed()?boundary.lastResult():r,"flat_clear_frame");return;}
+      if(r!=XR_SUCCESS){
+        // Not publishFatalFailure: that is the runtime's quit path, and an empty frame is optional. A terminal session is pumpEvents'
+        // own check on its next pump; this only stops clearing until the graphics half reads VR again.
+        flatClear.fail();
+        nativeTracePrintf("flat_clear,error,result=%d,frames=%llu\n",int(r),(unsigned long long)flatClearStretchFrames);
+        return;
+      }
       ++flatClearFrames;++flatClearStretchFrames;
     }
     if(step.stopped)nativeTracePrintf("flat_clear,stop,reason=%s,frames=%llu\n",
@@ -1112,6 +1136,8 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     auto operation=gate.tryEnter(runtimeGeneration);
     if(!operation||generation!=compositorGeneration||!poses.read().connected||!state.running()||state.terminal()||serviceStopped||serviceFailed||!seated.space()||!changes.active())
       return vr::VRCompositorError_InvalidTexture;
+    // The game is calling again: any Submit from here on belongs to a frame it begins, not to the one flatClearTick ended.
+    staleFrameEnded=false;
     // No frame of ours is open yet at this point in WaitGetPoses, which is
     // exactly what applyIntroRecentre requires. Cleared only on success, so
     // a poll that cannot act this frame (a frame happens to be open, or the
@@ -1379,6 +1405,12 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(GetCurrentThreadId()!=ownerThread)return vr::VRCompositorError_InvalidTexture;
     auto operation=gate.tryEnter(runtimeGeneration);
     if(!operation||generation!=compositorGeneration||serviceStopped||serviceFailed)return vr::VRCompositorError_InvalidTexture;
+    // A Submit for the game frame flatClearTick ended: no frame is open for it, and it is dropped here, before the timing and GPU-marker
+    // work below. Traced for the first eight only, like the other per-event lines.
+    if(staleFrameEnded&&!state.frameOpen()) {
+      if(lateSubmitsDropped++<8)nativeTracePrintf("flat_clear,late_submit_dropped,eye=%u,count=%llu\n",unsigned(eye),(unsigned long long)lateSubmitsDropped);
+      return vr::VRCompositorError_InvalidTexture;
+    }
     // Close the initial game interval at Submit admission, before any
     // producer rendezvous. The treatment callback below opens its own
     // interval so its native GPU/CPU work remains part of application time.

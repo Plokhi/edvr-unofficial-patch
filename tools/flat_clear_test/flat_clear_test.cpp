@@ -139,6 +139,29 @@ void vrFromTheStart() {
     check(!step.started && !step.stopped && step.reason == Stop::None, "a session that never went flat has no transitions");
 }
 
+void staleEdges() {
+    check(!FlatClearState::staleGameFrame(false, true, 999), "a frame open 999 ms after the game's last call is not yet stale");
+    check(FlatClearState::staleGameFrame(false, true, 1000), "a frame open 1000 ms after the game's last call is stale");
+    check(!FlatClearState::staleGameFrame(true, true, 5000), "VR never ends a game frame, however silent the game");
+    check(!FlatClearState::staleGameFrame(false, false, 5000), "no open frame, nothing to end");
+}
+
+void failureLatch() {
+    FlatClearState s;
+    pump(s, flatQuiet());
+    s.fail();
+    check(!s.active(), "a failed empty frame ends the stretch without an active flag");
+    const auto stillFlat = pump(s, flatQuiet());
+    check(!stillFlat.run && !stillFlat.started && !stillFlat.stopped,
+          "after a failure, still flat: nothing runs and no transition is reported");
+    check(!pump(s, flatQuiet()).run, "the failure holds over later flat pumps");
+    Pump vr = flatQuiet();
+    vr.vrProfile = true;
+    check(!pump(s, vr).run, "VR runs nothing while the failure is latched");
+    const auto again = pump(s, flatQuiet());
+    check(again.run && again.started, "VR then flat again re-arms clearing and runs");
+}
+
 void defaultWordReadsVr() {
     check(edvr::kVrProfileWordVr == 1 && edvr::kVrProfileWordNotVr == 2, "the word's values are 1 for VR and 2 for not VR");
     check(edvr::vrProfileWordIsVr(0), "a fresh word (nobody wrote) reads as VR, so an absent graphics half changes nothing");
@@ -167,12 +190,14 @@ int main(int argc, char** argv) {
     vrBeatsOtherReasons();
     restartAfterStop();
     vrFromTheStart();
+    staleEdges();
+    failureLatch();
     defaultWordReadsVr();
     if (g_fails) {
         std::printf("FAIL: flat_clear_test %d of %d checks failed\n", g_fails, g_checks);
         return 1;
     }
     std::printf("PASS: flat_clear_test %d checks (quiet edges 249/250 ms, gates, start and stop transitions with reasons, "
-                "restart, default word reads VR)\n", g_checks);
+                "restart, stale game frame edges 999/1000 ms, failure latch re-armed by VR, default word reads VR)\n", g_checks);
     return 0;
 }
