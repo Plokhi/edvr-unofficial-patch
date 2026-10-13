@@ -4905,6 +4905,11 @@ static void testLogBundle(const std::wstring& scratch) {
     writeAll(joinPath(dir, L"edvr.ini"), "[fix]\r\nshare_exposure = 1\r\n");
     writeAll(joinPath(dir, L"edvr_breadcrumbs.txt"), "d3d11 attached");
     writeAll(joinPath(dir, L"edvr_FATAL.txt"), "could not load the real openvr");
+    // The native runtime's startup file sits beside its openvr_api.dll.
+    const std::string nativeIni = "[openxr]\r\nversion=1\r\nseparate_device=1\r\npose_cache=off\r\n";
+    makeTree(joinPath(dir, L"Openvr\\win64"));
+    writeAll(joinPath(dir, L"Openvr\\win64\\openvr_api.dll"), "not really a runtime");
+    writeAll(joinPath(dir, L"Openvr\\win64\\edvr_openxr.ini"), nativeIni);
 
     // Two sessions: an old pair and a new pair. Only the new pair belongs in
     // the zip -- an attachment with six launches in it is harder to read, not
@@ -4978,6 +4983,8 @@ static void testLogBundle(const std::wstring& scratch) {
     check(bundleHas(names, "edvr_breadcrumbs.txt"), "the breadcrumbs are in");
     check(bundleHas(names, "edvr_FATAL.txt"), "the fatal note is in");
     check(bundleHas(names, "edvr.ini"), "the settings file is in");
+    check(zipPayloadEquals(bundle.zipPath, "edvr_openxr.ini", nativeIni),
+          "the native runtime's startup file is in, byte for byte (its pose_cache and overlap keys are in no log)");
     check(bundleHas(names,"flat_draw_packets/late/manifest.json")&&bundleHas(names,"flat_draw_packets/late/payload.bin"),
           "packet capture ten minutes into a flight retains its whole folder across member timestamp boundaries");
     check(bundleHas(names,"flat_pixels/resolve_inputs_late/manifest.json") &&
@@ -5114,6 +5121,58 @@ static void testLogBundle(const std::wstring& scratch) {
         check(legacyBundle.ok, "a legacy flat install's bundle is written", legacyBundle.error);
         check(bundleHas(zipEntryNames(legacyBundle.zipPath), "edvr_gfx_20260827_140000.log"),
               "with the log from the folder the shared edvr.ini names");
+    }
+
+    {   // The runtime's startup file is read from the folder the installer resolves for
+        // the runtime, for the VR edition only, and its absence is not a fault.
+        auto makeGame = [&](const wchar_t* leaf) {
+            const std::wstring game = joinPath(scratch, leaf);
+            removeTree(game);
+            makeTree(joinPath(game, L"edvr_logs"));
+            writeAll(joinPath(game, L"EliteDangerous64.exe"), "not really the game");
+            writeAll(joinPath(game, L"edvr_logs\\edvr_gfx_20260827_140000.log"), "a session");
+            return game;
+        };
+        auto namesFor = [&](const std::wstring& game, LogBundle* out) {
+            *out = collectLogs(game, scratch, &noDumps);
+            check(out->ok, "the bundle is written", out->error);
+            return out->ok ? zipEntryNames(out->zipPath) : std::vector<std::string>();
+        };
+        LogBundle b;
+
+        // The older layout, Openvr\ with the renamed original as the only openvr file.
+        const std::wstring older = makeGame(L"nativeini_older");
+        makeTree(joinPath(older, L"Openvr"));
+        writeAll(joinPath(older, L"Openvr\\openvr_api_orig.dll"), "the game's own");
+        writeAll(joinPath(older, L"Openvr\\edvr_openxr.ini"), "older layout");
+        check(bundleHas(namesFor(older, &b), "edvr_openxr.ini") &&
+                  zipPayloadEquals(b.zipPath, "edvr_openxr.ini", "older layout"),
+              "the startup file is found beside the runtime in the older Openvr\\ layout");
+
+        // No openvr dll to search by: the installer's own default folder.
+        const std::wstring noDll = makeGame(L"nativeini_nodll");
+        makeTree(joinPath(noDll, L"Openvr\\win64"));
+        writeAll(joinPath(noDll, L"Openvr\\win64\\edvr_openxr.ini"), "default folder");
+        check(bundleHas(namesFor(noDll, &b), "edvr_openxr.ini") &&
+                  zipPayloadEquals(b.zipPath, "edvr_openxr.ini", "default folder"),
+              "with no openvr dll to go by, the startup file is taken from Openvr\\win64");
+
+        // A VR install on the packaged defaults has no such file; that is not reported as a fault.
+        const std::wstring absent = makeGame(L"nativeini_absent");
+        const std::vector<std::string> absentNames = namesFor(absent, &b);
+        bool absentNoted = false;
+        for (const std::string& note : b.notes) absentNoted |= note.find("openxr") != std::string::npos;
+        check(!bundleHas(absentNames, "edvr_openxr.ini") && !absentNoted,
+              "a VR install without the startup file adds no entry and no note");
+
+        // A flat install has no such runtime: a leftover file is not collected.
+        const std::wstring flatGame = makeGame(L"nativeini_flat");
+        writeAll(joinPath(flatGame, L"edvr_profile.ini"), "[install]\r\nschema = 1\r\nprofile = flat\r\n");
+        makeTree(joinPath(flatGame, L"Openvr\\win64"));
+        writeAll(joinPath(flatGame, L"Openvr\\win64\\openvr_api.dll"), "a leftover");
+        writeAll(joinPath(flatGame, L"Openvr\\win64\\edvr_openxr.ini"), "a leftover");
+        check(!bundleHas(namesFor(flatGame, &b), "edvr_openxr.ini"),
+              "a flat install does not collect a leftover startup file");
     }
 
     // A folder with nothing to collect says so rather than writing an empty zip.

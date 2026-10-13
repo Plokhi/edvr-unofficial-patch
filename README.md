@@ -100,8 +100,9 @@ EDVR detected the flash and let it through or never detected it at all.
 
 **Run `edvr-installer.exe` and press Save logs.** It writes one zip to your
 Desktop with the last session's two logs, `edvr_breadcrumbs.txt`, any
-`edvr_FATAL.txt` and your `edvr.ini`. That is everything listed below, all from
-the right session. Then **open an issue** and attach the zip.
+`edvr_FATAL.txt`, your `edvr.ini` and, on a VR install, the OpenXR runtime's
+`edvr_openxr.ini`. That is everything listed below, all from the right session.
+Then **open an issue** and attach the zip.
 
 If the game crashed in that session, Save logs also writes a second zip,
 `edvr-crash-dump-<time>.zip`, with the game's crash dump. The dump holds a copy
