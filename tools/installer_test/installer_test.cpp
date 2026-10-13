@@ -2304,6 +2304,170 @@ static void testXessPlanner() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EDVR's files proved by their content when the record does not list them
+//
+// A record from an older install, or a tool's install whose record is gone, leaves EDVR's files in the folder with nothing to say so.
+// Each is EDVR's by what it is: the descriptor by its canonical bytes, the loader, licence and XeSS files by the bytes the payload
+// carries, the startup config by its text naming this folder's loader and graphics. A file that matches none of these is kept.
+// ---------------------------------------------------------------------------
+
+static const char kTestLoaderBytes[] = "TEST-OPENXR-LOADER-PAYLOAD";
+static const char kTestLoaderChanged[] = "TEST-OPENXR-LOADER-PAYLOAD!";   // one byte longer: a different file
+static const char kTestLicenseBytes[] = "TEST-OPENXR-LICENSE-PAYLOAD";
+static const char kTestXessBytes[] = "TEST-XESS-PAYLOAD";
+static const char kTestXessLicenseBytes[] = "TEST-XESS-LICENSE-PAYLOAD";
+static const char kTestXessThirdBytes[] = "TEST-XESS-THIRD-PAYLOAD";
+
+static std::string shaOfText(const std::string& text) { return sha256Bytes(text.data(), text.size()); }
+
+// The VR edition's payload with the native and XeSS files it carries, each by the bytes this test gives it.
+static PayloadInfo contentPayload() {
+    PayloadInfo p = testPayload(kNextIni);
+    p.openxrLoaderSha = shaOfText(kTestLoaderBytes);
+    p.openxrLicenseSha = shaOfText(kTestLicenseBytes);
+    p.haveXess = true;
+    p.xessSha = shaOfText(kTestXessBytes);
+    p.xessLicenseSha = shaOfText(kTestXessLicenseBytes);
+    p.xessThirdPartySha = shaOfText(kTestXessThirdBytes);
+    return p;
+}
+
+// The startup config the planner writes for a folder: the text install_edvr.py and the installer both produce.
+static std::string startupConfigFor(const std::wstring& dir) {
+    return "[openxr]\r\nversion=1\r\nloader=" + toUtf8(joinPath(joinPath(dir, L"Openvr\\win64"), L"openxr_loader.dll")) +
+           "\r\ngraphics=" + toUtf8(joinPath(dir, L"d3d11.dll")) + "\r\nruntime=system\r\nseparate_device=1\r\n";
+}
+
+// A VR install's leftovers with no record: a `scope = both` descriptor, the OpenXR files and the XeSS trio in EDVR's bytes, and the
+// runtime either EDVR's (runtimeIsEdvr) or the game's own openvr_api.dll.
+static Survey leftoverSurvey(const std::wstring& dir, const PayloadInfo& p, bool runtimeIsEdvr, const std::string& loaderSha) {
+    Survey s = baseSurvey(dir);
+    const std::wstring nativeDir = s.game.openvrDir;
+    const std::string config = startupConfigFor(dir);
+    s.openvrCurrent = runtimeIsEdvr
+        ? fakeDll(DllKind::Edvr, joinPath(nativeDir, L"openvr_api.dll"), p.openvrSha)
+        : fakeDll(DllKind::OpenVrRuntime, joinPath(nativeDir, L"openvr_api.dll"), "game-vr");
+    s.openxrLoader = fakeDll(DllKind::Foreign, joinPath(nativeDir, L"openxr_loader.dll"), loaderSha);
+    s.openxrLicense = fakeDll(DllKind::Foreign, joinPath(nativeDir, L"OPENXR-LOADER-LICENSE.txt"), p.openxrLicenseSha);
+    s.nativeConfig = fakeDll(DllKind::Foreign, joinPath(nativeDir, L"edvr_openxr.ini"), shaOfText(config));
+    s.nativeConfigText = config;
+    s.xess = fakeDll(DllKind::Foreign, joinPath(dir, L"libxess.dll"), p.xessSha);
+    s.xessLicense = fakeDll(DllKind::Foreign, joinPath(dir, L"INTEL-XESS-LICENSE.txt"), p.xessLicenseSha);
+    s.xessThirdParty = fakeDll(DllKind::Foreign, joinPath(dir, L"INTEL-XESS-THIRD-PARTY.txt"), p.xessThirdPartySha);
+    s.descriptorPresent = true;
+    s.descriptorSha = descriptorShaFor("both");
+    return s;
+}
+
+// The game's own runtime kept beside EDVR's, as the tool and the installer leave it.
+static void keepOriginalRuntime(Survey& s) {
+    s.openvrOrig = fakeDll(DllKind::OpenVrRuntime, joinPath(s.game.openvrDir, L"openvr_api_orig.dll"), "game-vr");
+}
+
+static std::string listing(const std::wstring& dir);   // defined with the scratch-folder tests below
+
+static void testContentOwnership(const std::wstring& scratch) {
+    printf("\nEDVR's files proved by content when the record does not list them\n");
+    const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+    const std::string flat2 = "[install]\r\nschema = 2\r\nscope = flat\r\n";
+    const PayloadInfo p = contentPayload();
+    Options flatOpt = testOptions();
+    flatOpt.scope = "flat";
+
+    {   // (a) The folder after an Uninstall that left the both descriptor and the OpenXR files: a flat install is not blocked.
+        const Plan plan = planInstall(leftoverSurvey(dir, p, false, shaOfText(kTestLoaderBytes)), flatOpt, p);
+        check(!plan.blocked, "a flat install over a both descriptor with no record and the game's original runtime is not blocked",
+              unifiedProblems(plan));
+        check(hasStep(plan, Action::Delete, L"openxr_loader.dll", nullptr) &&
+              hasStep(plan, Action::Delete, L"OPENXR-LOADER-LICENSE.txt", nullptr) &&
+              hasStep(plan, Action::Delete, L"edvr_openxr.ini", nullptr),
+              "and removes the loader, licence and startup config, proved by their content");
+        check(hasStep(plan, Action::Backup, L"openxr_loader.dll", nullptr) &&
+              hasStep(plan, Action::Backup, L"edvr_openxr.ini", nullptr),
+              "each of those is backed up before it is removed");
+        check(!hasStep(plan, Action::Delete, L"openvr_api.dll", nullptr) &&
+              !hasStep(plan, Action::Rename, nullptr, L"openvr_api.dll") &&
+              !hasStep(plan, Action::Backup, L"openvr_api.dll", nullptr) &&
+              !hasStep(plan, Action::WritePayload, nullptr, L"openvr_api.dll"),
+              "and leaves the game's openvr_api.dll alone");
+        check(!hasStep(plan, Action::Delete, L"libxess.dll", nullptr) &&
+              !hasStep(plan, Action::Delete, L"INTEL-XESS-LICENSE.txt", nullptr),
+              "the XeSS files stay: a flat install uses them");
+        check(plan.nextState.scope == "flat" && plannedText(plan, L"edvr_profile.ini") == flat2,
+              "and writes scope = flat");
+    }
+    {   // (b) The state before an Uninstall: EDVR's runtime, a both descriptor, a stale flat record. The uninstall removes what EDVR
+        // placed, and the runtime follows the rules it always has.
+        Survey s = leftoverSurvey(dir, p, true, shaOfText(kTestLoaderBytes));
+        keepOriginalRuntime(s);
+        s.state.present = true; s.state.profile = "flat"; s.state.scope = "flat";
+        s.state.descriptorSha = descriptorShaFor("flat");
+        const Plan plan = planUninstall(s, testOptions(), p);
+        check(!plan.blocked, "an uninstall of that state is not blocked", unifiedProblems(plan));
+        check(hasStep(plan, Action::Delete, L"edvr_profile.ini", nullptr),
+              "removes the both descriptor, though the record says flat");
+        check(hasStep(plan, Action::Delete, L"openxr_loader.dll", nullptr) &&
+              hasStep(plan, Action::Delete, L"OPENXR-LOADER-LICENSE.txt", nullptr) &&
+              hasStep(plan, Action::Delete, L"edvr_openxr.ini", nullptr),
+              "removes the loader, licence and startup config without a record");
+        check(hasStep(plan, Action::Delete, L"libxess.dll", nullptr) &&
+              hasStep(plan, Action::Delete, L"INTEL-XESS-LICENSE.txt", nullptr) &&
+              hasStep(plan, Action::Delete, L"INTEL-XESS-THIRD-PARTY.txt", nullptr),
+              "removes the XeSS trio by its payload hashes");
+        check(hasStep(plan, Action::Delete, L"openvr_api.dll", nullptr) &&
+              hasStep(plan, Action::Rename, L"openvr_api_orig.dll", L"openvr_api.dll"),
+              "and puts the game's own openvr_api.dll back, as before");
+    }
+    {   // (c) A loader with one byte changed matches neither proof: nothing removes it, install or uninstall, and it is said so.
+        const std::string changed = shaOfText(kTestLoaderChanged);
+        Survey s = leftoverSurvey(dir, p, true, changed);
+        keepOriginalRuntime(s);
+        const Plan removal = planUninstall(s, testOptions(), p);
+        check(!hasStep(removal, Action::Delete, L"openxr_loader.dll", nullptr) &&
+              notesMention(removal, "Keeping a changed OpenXR file"),
+              "uninstall keeps a loader that matches neither the record nor the payload, with a note");
+        check(hasStep(removal, Action::Delete, L"OPENXR-LOADER-LICENSE.txt", nullptr),
+              "the licence beside it is still removed");
+        const Plan flatPlan = planInstall(leftoverSurvey(dir, p, false, changed), flatOpt, p);
+        check(!flatPlan.blocked && !hasStep(flatPlan, Action::Delete, L"openxr_loader.dll", nullptr) &&
+              notesMention(flatPlan, "Keeping a changed OpenXR file"),
+              "a flat install keeps it too, with a note");
+    }
+    {   // (d) A startup config naming another folder's loader is not this folder's EDVR config; a descriptor edited by hand is not EDVR's.
+        Survey s = leftoverSurvey(dir, p, true, shaOfText(kTestLoaderBytes));
+        keepOriginalRuntime(s);
+        s.nativeConfigText = "[openxr]\r\nversion=1\r\nloader=D:\\Other\\openxr_loader.dll\r\ngraphics=" +
+                             toUtf8(joinPath(dir, L"d3d11.dll")) + "\r\nruntime=system\r\nseparate_device=1\r\n";
+        s.nativeConfig.sha256 = shaOfText(s.nativeConfigText);
+        s.descriptorSha = shaOfText("[install]\r\nschema = 2\r\nscope = both\r\n# edited by hand\r\n");
+        const Plan plan = planUninstall(s, testOptions(), p);
+        check(!hasStep(plan, Action::Delete, L"edvr_openxr.ini", nullptr) &&
+              notesMention(plan, "Keeping a changed OpenXR file"),
+              "a startup config naming another loader is kept, with a note");
+        check(!hasStep(plan, Action::Delete, L"edvr_profile.ini", nullptr) &&
+              notesMention(plan, "Keeping an unverified edvr_profile.ini"),
+              "a descriptor that is not one of EDVR's texts is kept, with a note");
+    }
+    {   // Planning writes nothing: the cases above are planned over real files, and the folder is listed before and after.
+        const std::wstring cdir = joinPath(scratch, L"content-ownership");
+        removeTree(cdir);
+        makeTree(joinPath(cdir, L"Openvr\\win64"));
+        writeAll(joinPath(cdir, L"Openvr\\win64\\openxr_loader.dll"), kTestLoaderBytes);
+        writeAll(joinPath(cdir, L"Openvr\\win64\\OPENXR-LOADER-LICENSE.txt"), kTestLicenseBytes);
+        writeAll(joinPath(cdir, L"Openvr\\win64\\edvr_openxr.ini"), startupConfigFor(cdir));
+        writeAll(joinPath(cdir, L"Openvr\\win64\\openvr_api.dll"), "game-vr");
+        writeAll(joinPath(cdir, L"edvr_profile.ini"), "[install]\r\nschema = 2\r\nscope = both\r\n");
+        writeAll(joinPath(cdir, L"libxess.dll"), kTestXessBytes);
+        const std::string before = listing(cdir) + listing(joinPath(cdir, L"Openvr\\win64"));
+        planInstall(leftoverSurvey(cdir, p, false, shaOfText(kTestLoaderBytes)), flatOpt, p);
+        planUninstall(leftoverSurvey(cdir, p, true, shaOfText(kTestLoaderBytes)), testOptions(), p);
+        planUninstall(leftoverSurvey(cdir, p, false, shaOfText(kTestLoaderChanged)), testOptions(), p);
+        check((listing(cdir) + listing(joinPath(cdir, L"Openvr\\win64"))) == before,
+              "and planning the three cases over real files changed nothing in the folder");
+    }
+}
+
 static void testFlatSettingsPlanner() {
     printf("\nthe flat edition's settings file: planning\n");
     const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
@@ -5832,6 +5996,7 @@ int wmain(int argc, wchar_t** argv) {
     testFlatPlanner();
     testUnifiedDescriptor();
     testXessPlanner();
+    testContentOwnership(scratch);
     testFlatSettingsPlanner();
     testApply(scratch);
     testMirror(scratch);

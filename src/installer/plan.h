@@ -74,6 +74,8 @@ struct Survey {
     DllInfo              d3d11;       // <game>\d3d11.dll
     DllInfo              openxrLoader; // <game>\Openvr\win64\openxr_loader.dll
     DllInfo              nativeConfig; // edvr_openxr.ini
+    // edvr_openxr.ini's text, read only when the file is present: a file is EDVR's by what it says as well as by its hash (planner).
+    std::string          nativeConfigText;
     DllInfo              openxrLicense; // Khronos notice
     std::vector<DllInfo> otherD3d11;  // d3d11_*.dll beside it: chain targets, ours or theirs
     bool                 iniPresent = false;
@@ -210,7 +212,9 @@ struct Plan {
 };
 
 Plan planInstall(const Survey& survey, const Options& options, const PayloadInfo& payload);
-Plan planUninstall(const Survey& survey, const Options& options);
+// The payload says which OpenXR and XeSS files are EDVR's by their bytes. Without one (an empty PayloadInfo) only the record proves a
+// file, which can only keep more files than the full proof would: callers that remove files pass the payload the installer carries.
+Plan planUninstall(const Survey& survey, const Options& options, const PayloadInfo& payload = PayloadInfo());
 
 // The one-paragraph summary shown before anything is done.
 std::string planSummary(const Plan& plan);

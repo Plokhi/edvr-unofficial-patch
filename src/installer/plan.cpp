@@ -150,6 +150,99 @@ std::wstring relativeOpenvr(const std::wstring& gameDir, const std::wstring& ope
     return openvrDir;
 }
 
+bool isCanonicalDescriptor(const std::string& sha) {
+    edvr::InstallScope scope = edvr::InstallScope::Invalid;
+    return ownDescriptorScope(sha, &scope);
+}
+
+// A file is EDVR's by its hash when its bytes are the ones the record kept, or the ones this installer carries. Either is proof; a
+// file that is absent or unreadable is not EDVR's by anything, and a changed one matches neither and is someone's to keep.
+bool ownedByHash(const DllInfo& info, const std::string& recorded, const std::string& carried) {
+    if (info.kind == DllKind::Absent || info.kind == DllKind::Unreadable || info.sha256.empty()) return false;
+    return info.sha256 == recorded || info.sha256 == carried;
+}
+
+std::string trimmedSpaces(const std::string& text) {
+    const size_t first = text.find_first_not_of(" \t");
+    if (first == std::string::npos) return std::string();
+    return text.substr(first, text.find_last_not_of(" \t") - first + 1);
+}
+
+// Whether `text` is an EDVR startup config that names the loader and graphics paths given. The grammar is the runtime's own
+// (src\openxr\native_local_config.h): one [openxr] section, version=1, and loader, graphics, runtime and separate_device=1 each
+// once; frame_thread_priority and frame_end_overlap are optional. LF and CRLF both parse.
+bool isEdvrStartupConfig(const std::string& text, const std::wstring& loaderPath, const std::wstring& graphicsPath) {
+    bool section = false;
+    std::vector<std::string> keys;
+    std::wstring loader, graphics;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(pos, end - pos);
+        pos = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        line = trimmedSpaces(line);
+        if (line.empty()) continue;
+        if (line == "[openxr]") {
+            if (section) return false;
+            section = true;
+            continue;
+        }
+        const size_t equal = line.find('=');
+        if (!section || equal == std::string::npos) return false;
+        const std::string key = trimmedSpaces(line.substr(0, equal));
+        const std::string value = trimmedSpaces(line.substr(equal + 1));
+        if (std::find(keys.begin(), keys.end(), key) != keys.end()) return false;
+        keys.push_back(key);
+        if (key == "version") {
+            if (value != "1") return false;
+        } else if (key == "loader") {
+            loader = fromUtf8(value);
+        } else if (key == "graphics") {
+            graphics = fromUtf8(value);
+        } else if (key == "runtime") {
+            if (value.empty()) return false;
+        } else if (key == "separate_device") {
+            if (value != "1") return false;
+        } else if (key == "frame_thread_priority") {
+            if (value != "high" && value != "normal") return false;
+        } else if (key == "frame_end_overlap") {
+            if (value != "on" && value != "off") return false;
+        } else {
+            return false;
+        }
+    }
+    for (const char* required : {"version", "loader", "graphics", "runtime", "separate_device"}) {
+        if (std::find(keys.begin(), keys.end(), std::string(required)) == keys.end()) return false;
+    }
+    return section && _wcsicmp(loader.c_str(), loaderPath.c_str()) == 0 &&
+           _wcsicmp(graphics.c_str(), graphicsPath.c_str()) == 0;
+}
+
+// The Openvr folder the OpenXR files are written into: the surveyed one, else the default beside the game.
+std::wstring nativeDirOf(const Survey& s) {
+    return s.game.openvrDir.empty() ? joinPath(s.game.dir, L"Openvr\\win64") : s.game.openvrDir;
+}
+
+// The OpenXR files EDVR places beside the game's VR runtime, each EDVR's by one of its proofs: the record's hash, or the bytes this
+// installer carries (loader, licence), or for the startup config, its text naming this folder's loader and graphics (the same
+// paths the planner writes into it).
+bool loaderOwned(const Survey& s, const std::string& carriedSha) {
+    return ownedByHash(s.openxrLoader, s.state.openxrLoaderSha, carriedSha);
+}
+
+bool licenseOwned(const Survey& s, const std::string& carriedSha) {
+    return ownedByHash(s.openxrLicense, s.state.openxrLicenseSha, carriedSha);
+}
+
+bool startupConfigOwned(const Survey& s) {
+    if (ownedByHash(s.nativeConfig, s.state.nativeConfigSha, std::string())) return true;
+    if (s.nativeConfig.kind == DllKind::Absent || s.nativeConfig.kind == DllKind::Unreadable) return false;
+    return isEdvrStartupConfig(s.nativeConfigText, joinPath(nativeDirOf(s), L"openxr_loader.dll"),
+                               joinPath(s.game.dir, kD3d11));
+}
+
 }  // namespace
 
 // The descriptor on disk is what the DLL reads, so a canonical one names the scope and the record is only the fallback. A record
@@ -257,6 +350,8 @@ Survey surveyTarget(const GameInstall& game) {
             return info;
         };
         s.nativeConfig=surveyText(L"edvr_openxr.ini");
+        if(s.nativeConfig.kind!=DllKind::Absent && s.nativeConfig.kind!=DllKind::Unreadable)
+            s.nativeConfigText=readTextFile(s.nativeConfig.path);
         s.openxrLicense=surveyText(L"OPENXR-LOADER-LICENSE.txt");
         s.openvrCurrent = probeDll(joinPath(s.game.openvrDir, kOpenvr));
 
@@ -339,7 +434,10 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     const std::string descriptor = descriptorTextFor(scope);
     const std::string descriptorSha = sha256Bytes(descriptor.data(), descriptor.size());
     const std::string existingProfile = installedProfile(s);
-    const bool conversion = flat && !installed.empty() && installed != "flat";
+    // Flat retires the VR runtime only when the file in Openvr\win64 is EDVR's own build. The descriptor and the record say what the last
+    // run wrote; what is on disk decides whether anything needs retiring. A folder whose runtime is the game's original (a leftover
+    // descriptor, a stale record) has nothing to prove, and its openvr_api.dll is left alone.
+    const bool retireRuntime = flat && s.openvrCurrent.kind == DllKind::Edvr;
     // The file on disk is the one the record names, or the planner's own text for the scope, or any of EDVR's texts for the edition
     // this folder already has (schema 1 or 2, whichever an earlier install or the tool wrote). That last clause upgrades such a file in
     // place; a modified or unknown file matches none of them and is refused.
@@ -349,24 +447,19 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     if (s.descriptorPresent && (s.descriptorSha.empty() || (!recordAgrees && !ownEdition))) {
         plan.blocked = true; plan.problems.push_back("edvr_profile.ini differs from the recorded file; it was left untouched."); return plan;
     }
-    if (flat && (conversion || (!s.state.present && s.openvrCurrent.nativeRuntimeExports))) {
-        const bool stockRestored = s.openvrCurrent.kind == DllKind::OpenVrRuntime &&
-            !s.state.openvrOrigSha.empty() && s.openvrCurrent.sha256 == s.state.openvrOrigSha;
-        const bool ownedVr = s.openvrCurrent.kind == DllKind::Edvr &&
-            !s.state.openvrSha.empty() && s.openvrCurrent.sha256 == s.state.openvrSha &&
+    if (retireRuntime) {
+        const bool ownedVr = !s.state.openvrSha.empty() && s.openvrCurrent.sha256 == s.state.openvrSha &&
             (s.openvrOrig.kind == DllKind::OpenVrRuntime || !s.openvrOrigInBackups.empty()) &&
             (s.openvrOrig.kind != DllKind::OpenVrRuntime || s.state.openvrOrigSha.empty() ||
              s.openvrOrig.sha256 == s.state.openvrOrigSha);
-        if (!s.state.present || (!stockRestored && !ownedVr)) {
+        if (!s.state.present || !ownedVr) {
             plan.blocked = true; plan.problems.push_back("Cannot prove EDVR's VR runtime and the game's original; flat conversion left the VR files intact."); return plan;
         }
-        for (const auto& asset : {std::make_pair(&s.openxrLoader, &s.state.openxrLoaderSha),
-                                  std::make_pair(&s.openxrLicense, &s.state.openxrLicenseSha),
-                                  std::make_pair(&s.nativeConfig, &s.state.nativeConfigSha)}) {
-            if (asset.first->kind != DllKind::Absent &&
-                (asset.second->empty() || asset.first->sha256 != *asset.second)) {
-                plan.blocked = true; plan.problems.push_back("An OpenXR asset differs from EDVR's record; conversion cannot retire it safely."); return plan;
-            }
+        // The OpenXR files beside the runtime are retired with it, so each must be EDVR's by a proof; a changed one refuses the conversion.
+        if ((s.openxrLoader.kind != DllKind::Absent && !loaderOwned(s, p.openxrLoaderSha)) ||
+            (s.openxrLicense.kind != DllKind::Absent && !licenseOwned(s, p.openxrLicenseSha)) ||
+            (s.nativeConfig.kind != DllKind::Absent && !startupConfigOwned(s))) {
+            plan.blocked = true; plan.problems.push_back("An OpenXR asset differs from EDVR's record; conversion cannot retire it safely."); return plan;
         }
     }
     switch (s.eliteKind) {
@@ -395,7 +488,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         }
     }
     for (const DllInfo* item : {&s.d3d11,&s.openvrCurrent,&s.openxrLoader,&s.nativeConfig,&s.openxrLicense}) {
-        if (flat && item != &s.d3d11 && !conversion) continue;
+        if (flat && item != &s.d3d11 && !retireRuntime) continue;
         if(item->kind==DllKind::Unreadable) {
             plan.blocked=true;plan.problems.push_back("A native OpenXR destination cannot be read. Nothing will be installed.");return plan;
         }
@@ -774,10 +867,11 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         }
         writeText(config,destination,"selects the Windows OpenXR runtime");changed=true;
     }
-    } else if (conversion) {
-        // Only the files proved to belong to the recorded VR edition are retired.
+    } else {
+        // Flat owns no VR runtime. What a VR install left in Openvr\win64 is retired only by its proofs: the runtime when it is EDVR's
+        // build (proved above), and each OpenXR file by its hash or its content, whether or not this folder's record lists it.
         const std::wstring runtime = joinPath(nativeDir, kOpenvr);
-        if (s.openvrCurrent.kind == DllKind::Edvr) {
+        if (retireRuntime) {
             backup(runtime, "the EDVR VR runtime being retired");
             body.back().required = true; body.back().expectSha = s.openvrCurrent.sha256;
             Step removeRuntime; removeRuntime.action = Action::Delete; removeRuntime.from = runtime;
@@ -793,20 +887,34 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
             restoreOriginal.why = "restores the game's original VR library";
             body.push_back(restoreOriginal);
         }
-        for (const DllInfo* asset : {&s.openxrLoader, &s.openxrLicense, &s.nativeConfig}) {
-            if (asset->kind == DllKind::Absent) continue;
-            backup(asset->path, "the EDVR OpenXR asset being retired");
-            body.back().required = true; body.back().expectSha = asset->sha256;
-            Step retire; retire.action = Action::Delete; retire.from = asset->path;
-            retire.expectSha = asset->sha256; retire.why = "retires EDVR's OpenXR asset";
+        const struct NativeFile { const DllInfo* info; bool owned; } nativeFiles[] = {
+            {&s.openxrLoader, loaderOwned(s, p.openxrLoaderSha)},
+            {&s.openxrLicense, licenseOwned(s, p.openxrLicenseSha)},
+            {&s.nativeConfig, startupConfigOwned(s)},
+        };
+        for (const NativeFile& file : nativeFiles) {
+            if (file.info->kind == DllKind::Absent) continue;
+            if (!file.owned) {
+                plan.notes.push_back("Keeping a changed OpenXR file: " + say(leafOf(file.info->path)));
+                continue;
+            }
+            backup(file.info->path, "the EDVR OpenXR asset being retired");
+            body.back().required = true; body.back().expectSha = file.info->sha256;
+            Step retire; retire.action = Action::Delete; retire.from = file.info->path;
+            retire.expectSha = file.info->sha256; retire.why = "retires EDVR's OpenXR asset";
             body.push_back(retire);
+            changed = true;
         }
         next.openvrInstalled = false; next.openvrSha.clear();
         next.openvrOrigName.clear(); next.openvrOrigSha.clear();
         next.nativeRuntimeSha.clear(); next.openxrLoaderSha.clear();
         next.openxrLicenseSha.clear(); next.nativeConfigSha.clear();
         next.nativeOriginalName.clear(); next.nativeOriginalSha.clear();
-        plan.notes.push_back("Converting VR to flat: the game's original VR library is in place and verified EDVR OpenXR assets are retired.");
+        if (retireRuntime) {
+            plan.notes.push_back("Converting VR to flat: the game's original VR library is in place and verified EDVR OpenXR assets are retired.");
+        } else if (!installed.empty() && installed != "flat") {
+            plan.notes.push_back("Converting to flat: the VR library here is not EDVR's, so it is left where it is.");
+        }
     }
     if (flat) next.nativeGraphicsSha = p.d3d11Sha;
 
@@ -981,7 +1089,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     return plan;
 }
 
-Plan planUninstall(const Survey& s, const Options& o) {
+Plan planUninstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     Plan plan;
     if((s.state.nativeInstalled || s.openvrCurrent.nativeRuntimeExports) && s.openvrCurrent.kind==DllKind::Edvr &&
        s.openvrOrig.kind!=DllKind::OpenVrRuntime && s.openvrOrigInBackups.empty()) {
@@ -1146,18 +1254,20 @@ Plan planUninstall(const Survey& s, const Options& o) {
         }
     }
 
-    if(s.state.nativeInstalled) {
-        auto retire=[&](const DllInfo& info,const std::string& owned) {
+    // The OpenXR files EDVR placed beside the VR runtime are removed by their proofs, whether or not this folder's record lists them
+    // (a record from an older flat install lists none); a changed one is kept.
+    {
+        auto retire=[&](const DllInfo& info,bool owned) {
             if(info.kind==DllKind::Absent)return;
-            if(owned.empty() || info.sha256!=owned) {
+            if(!owned) {
                 plan.notes.push_back("Keeping a changed OpenXR file: "+say(leafOf(info.path)));return;
             }
             backup(info.path,"the native OpenXR file being removed");
             remove(info.path,"removes EDVR's OpenXR dependency",info.sha256);
         };
-        retire(s.openxrLoader,s.state.openxrLoaderSha);
-        retire(s.openxrLicense,s.state.openxrLicenseSha);
-        retire(s.nativeConfig,s.state.nativeConfigSha);
+        retire(s.openxrLoader,loaderOwned(s,p.openxrLoaderSha));
+        retire(s.openxrLicense,licenseOwned(s,p.openxrLicenseSha));
+        retire(s.nativeConfig,startupConfigOwned(s));
     }
 
     // ---- NVIDIA's DLSS runtime ----------------------------------------
@@ -1177,10 +1287,12 @@ Plan planUninstall(const Survey& s, const Options& o) {
     const DllInfo* xessFiles[] = {&s.xess, &s.xessLicense, &s.xessThirdParty};
     const std::string* xessOwned[] = {&s.state.xessSha, &s.state.xessLicenseSha,
                                      &s.state.xessThirdPartySha};
+    const std::string* xessCarried[] = {&p.xessSha, &p.xessLicenseSha, &p.xessThirdPartySha};
     for (unsigned i=0; i<3; ++i) {
         const DllInfo& cur = *xessFiles[i];
         if (cur.kind == DllKind::Absent) continue;
-        if (xessOwned[i]->empty() || cur.sha256 != *xessOwned[i]) {
+        // EDVR's by the record's hash, or by the bytes the payload carries; a changed file is someone's to keep.
+        if (!ownedByHash(cur, *xessOwned[i], *xessCarried[i])) {
             plan.notes.push_back("Keeping a changed XeSS file: " + say(leafOf(cur.path)));
             continue;
         }
@@ -1221,8 +1333,10 @@ Plan planUninstall(const Survey& s, const Options& o) {
     }
     if (fileExists(statePath(s.game.dir))) remove(statePath(s.game.dir), "removes the install record");
     const std::wstring descriptorPath = joinPath(s.game.dir, kProfile);
-    if (s.descriptorPresent && !s.state.descriptorSha.empty() &&
-        s.descriptorSha == s.state.descriptorSha) {
+    // Its bytes are one of EDVR's descriptor texts, or its hash is the one the record kept: a leftover from an install whose record is gone
+    // says `scope = both` in exactly EDVR's bytes, and is EDVR's whatever the record says.
+    if (s.descriptorPresent && ((!s.state.descriptorSha.empty() && s.descriptorSha == s.state.descriptorSha) ||
+                                isCanonicalDescriptor(s.descriptorSha))) {
         remove(descriptorPath, "removes EDVR's profile descriptor", s.descriptorSha);
     } else if (s.descriptorPresent) {
         plan.notes.push_back("Keeping an unverified edvr_profile.ini; its ownership could not be proved.");

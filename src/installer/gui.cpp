@@ -907,7 +907,7 @@ void runAction(AppArgs::Act action) {
     // there is no conversion prompt, and the planner's own proofs gate it.
     const Options options = optionsFor(args, action == AppArgs::Act::Repair);
     const Plan plan = action == AppArgs::Act::Uninstall
-                          ? planUninstall(g.survey, options)
+                          ? planUninstall(g.survey, options, payloadInfo())
                           : planInstall(g.survey, options, payloadInfo());
 
     setReport(planReport(plan));

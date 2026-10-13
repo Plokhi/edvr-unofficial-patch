@@ -393,7 +393,7 @@ int runConsole(const AppArgs& args) {
     }
 
     const Options options = optionsFor(args, args.action == AppArgs::Act::Repair);
-    const Plan plan = args.action == AppArgs::Act::Uninstall ? planUninstall(survey, options)
+    const Plan plan = args.action == AppArgs::Act::Uninstall ? planUninstall(survey, options, payload)
                                                              : planInstall(survey, options, payload);
     writeOut(planReport(plan));
 
