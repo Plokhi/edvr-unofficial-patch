@@ -76,6 +76,74 @@ inline uint32_t flatUiMapToneSlotOf(uint64_t vs, uint64_t ps) {
     return vs == kFlatUiMapToneVs && ps == kFlatUiMapTonePs ? 0u : ~0u;  // the scene is SRV slot 0
 }
 
+// The 11:40 XeSS cockpit capture physically verified both exact E894 variants reading the HDR HUD at PS t1 and writing
+// a full-size LDR target. This flat UI-only table stays separate from the mono HDR selector and shared/VR tone registry.
+constexpr uint64_t kFlatUiSourceToneVsSteady = 0xF9CFC798F21E9AEAull;
+constexpr uint64_t kFlatUiSourceToneVsTransition = 0x43CA9F1C0AD2ACFEull;
+constexpr uint64_t kFlatUiSourceTonePs = 0xE8948389387DA083ull;
+inline bool flatUiSourceTonePair(uint64_t vs, uint64_t ps) {
+    return ps == kFlatUiSourceTonePs && (vs == kFlatUiSourceToneVsSteady || vs == kFlatUiSourceToneVsTransition);
+}
+// Process-lifetime diagnostic budget for physically qualifying unknown pairs.
+// No frame, route or resize resets it; exhausted is reported once.
+struct FlatUiUnknownSourceToneLog {
+    static constexpr uint32_t kCapacity = 16;
+    struct Pair { uint64_t vs = 0, ps = 0; };
+    Pair pairs[kCapacity]{};
+    Pair rejectedPairs[kCapacity]{};
+    uint32_t count = 0;
+    uint32_t rejectedCount = 0;
+    bool exhausted = false;
+    enum class Result { NewPair, Duplicate, CapacityReached, Full };
+    bool shouldInspect(uint64_t vs, uint64_t ps) const {
+        if (exhausted || rejectedCount == kCapacity) return false;
+        for (uint32_t i = 0; i < count; ++i)
+            if (pairs[i].vs == vs && pairs[i].ps == ps) return false;
+        for (uint32_t i = 0; i < rejectedCount; ++i)
+            if (rejectedPairs[i].vs == vs && rejectedPairs[i].ps == ps) return false;
+        return true;
+    }
+    // Negative observations suppress diagnostics only, never qualify a shader.
+    // At capacity stop inspecting ALL unknown pairs, rather than evicting and
+    // repeatedly querying descriptors. The true return reports exhaustion once.
+    bool reject(uint64_t vs, uint64_t ps) {
+        if (!shouldInspect(vs, ps)) return false;
+        rejectedPairs[rejectedCount++] = {vs, ps};
+        return rejectedCount == kCapacity;
+    }
+    Result record(uint64_t vs, uint64_t ps) {
+        if (exhausted || rejectedCount == kCapacity) return Result::Full;
+        for (uint32_t i = 0; i < count; ++i)
+            if (pairs[i].vs == vs && pairs[i].ps == ps) return Result::Duplicate;
+        for (uint32_t i = 0; i < rejectedCount; ++i)
+            if (rejectedPairs[i].vs == vs && rejectedPairs[i].ps == ps) return Result::Duplicate;
+        if (count == kCapacity) { exhausted = true; return Result::CapacityReached; }
+        pairs[count++] = {vs, ps};
+        return Result::NewPair;
+    }
+};
+inline bool flatUiSourceToneShape(uint32_t renderW, uint32_t renderH, uint32_t cachedOutW, uint32_t cachedOutH,
+                                  uint32_t physicalOutW, uint32_t physicalOutH, uint32_t physicalOutViewFmt,
+                                  uint32_t hdrW, uint32_t hdrH, uint32_t hdrViewFmt,
+                                  bool lut3D, bool hdr2D, bool fullViewport) {
+    return renderW && renderH && cachedOutW == renderW && cachedOutH == renderH &&
+           physicalOutW == renderW && physicalOutH == renderH && physicalOutViewFmt == 28 &&
+           hdrW == renderW && hdrH == renderH && hdrViewFmt == 26 && lut3D && hdr2D && fullViewport;
+}
+// Diagnostics can report an unverified 8-bit LDR view format; admission above
+// keeps the exact format 28 that the two E894 pairs physically used.
+inline bool flatUiUnknownSourceToneShape(uint32_t renderW, uint32_t renderH, uint32_t cachedOutW, uint32_t cachedOutH,
+                                         uint32_t physicalOutW, uint32_t physicalOutH, uint32_t physicalOutViewFmt,
+                                         uint32_t hdrW, uint32_t hdrH, uint32_t hdrViewFmt,
+                                         bool lut3D, bool hdr2D, bool fullViewport) {
+    return renderW && renderH && cachedOutW == renderW && cachedOutH == renderH &&
+           physicalOutW == renderW && physicalOutH == renderH && flatUiIs8bit(physicalOutViewFmt) &&
+           hdrW == renderW && hdrH == renderH && hdrViewFmt == 26 && lut3D && hdr2D && fullViewport;
+}
+inline bool flatUiSourceToneDirectHud(const void* cachedHud, const void* physicalHud, const void* physicalInput) {
+    return cachedHud && cachedHud == physicalHud && physicalHud == physicalInput;
+}
+
 // TEMPORAL AA OFF WHILE A MAP IS OPEN (maintainer's decisions, 2026-10-10: the Galaxy Map and the Orrery first, then the System
 // Map). The map scenes' grid, line and star draws are not taken by the UI layer, and their temporal history smears (the
 // System Map's stars pan with the plane in one capture and sit near still in another, so no motion rule fits both: the

@@ -6,6 +6,8 @@
 #include "flat_camera_phase.h"     // flatCameraMeasureRowShift: the jitter a draw's camera rows carry
 #include "flat_compute_readback.h" // FlatComputeInternalScope
 #include "flat_ui_layer_math.h"
+#include "exposure_fix.h"         // lookupShaderHash: compare the physical shaders with the draw's cached pair
+#include "tonemap_admit.h"        // read-only structural description of the actual game's tone-shaped draw
 #include "ui_layer.h"
 
 #include "../common/log.h"
@@ -63,6 +65,63 @@ bool g_mapFirstToneNoted = false;                         // the once-only first
 FlatUiMapAaTally g_mapAa;                                 // temporal AA off on the Galaxy Map and the Orrery: the map line's counts
 uint64_t g_mapAskFrame = 0, g_mapAsksFrame = 0;           // the frame of the last map ask, and how many map asks it has had
 FlatUiToneProof g_proof;
+bool g_sourceToneFirstNoted = false;
+FlatUiUnknownSourceToneLog g_unknownSourceToneLog;
+// First physical RTV for each distinct, HDR-qualified HUD target in the current frame. The E894 UI-only tone guard
+// requires this independent binding check before it may establish proof; references release at Present/device/resize.
+struct HudPhysical {
+    const void* shadow = nullptr;
+    Ptr<ID3D11Resource> actual;
+};
+HudPhysical g_hudPhysical[4];
+uint64_t g_hudPhysicalFrame = 0;
+unsigned g_hudPhysicalCount = 0;
+void clearHudPhysical(uint64_t frame) {
+    for (auto& h : g_hudPhysical) h = HudPhysical{};
+    g_hudPhysicalFrame = frame;
+    g_hudPhysicalCount = 0;
+}
+void observeHudPhysical(ID3D11DeviceContext* ctx, const FlatUiLayerDraw& d) {
+    if (g_hudPhysicalFrame != d.frame) clearHudPhysical(d.frame);
+    for (unsigned i = 0; i < g_hudPhysicalCount; ++i)
+        if (g_hudPhysical[i].shadow == d.color) return;
+    if (g_hudPhysicalCount == 4) return;
+    HudPhysical& h = g_hudPhysical[g_hudPhysicalCount++];
+    h.shadow = d.color;
+    FlatComputeInternalScope internal;
+    ID3D11RenderTargetView* rawRtv = nullptr;
+    ctx->OMGetRenderTargets(1, &rawRtv, nullptr);
+    Ptr<ID3D11RenderTargetView> rtv; rtv.Attach(rawRtv);
+    if (rtv) rtv->GetResource(&h.actual);
+}
+// Shared physical test for the two admitted E894 pairs and diagnostic-only
+// unknown pairs. The caller must hold FlatComputeInternalScope.
+bool sourceTonePhysicalShape(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t renderW, uint32_t renderH,
+                             uint64_t vs, uint64_t ps, const void* cachedOutput,
+                             uint32_t outW, uint32_t outH, bool unknownDiagnostic, ToneAdmit& shape) {
+    if (!ctx || g_hudPhysicalFrame != frame || !g_hudPhysicalCount) return false;
+    Ptr<ID3D11VertexShader> actualVs;
+    Ptr<ID3D11PixelShader> actualPs;
+    ctx->VSGetShader(&actualVs, nullptr, nullptr);
+    ctx->PSGetShader(&actualPs, nullptr, nullptr);
+    if (lookupShaderHash(actualVs.Get()) != vs || lookupShaderHash(actualPs.Get()) != ps) return false;
+    if (!tonemapAdmitStructure(ctx, ps, shape) || shape.hdrSlotRead != 1 || shape.rtvRes != cachedOutput) return false;
+    D3D11_VIEWPORT viewport[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT viewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ctx->RSGetViewports(&viewportCount, viewport);
+    const bool fullViewport = viewportCount == 1 && viewport[0].TopLeftX == 0.0f && viewport[0].TopLeftY == 0.0f &&
+        viewport[0].Width == static_cast<float>(renderW) && viewport[0].Height == static_cast<float>(renderH) &&
+        viewport[0].MinDepth == 0.0f && viewport[0].MaxDepth == 1.0f;
+    const auto shapeMatches = unknownDiagnostic ? flatUiUnknownSourceToneShape : flatUiSourceToneShape;
+    if (!shapeMatches(renderW, renderH, outW, outH, shape.rtvW, shape.rtvH,
+                               static_cast<uint32_t>(shape.rtvFmt), shape.hdrW, shape.hdrH,
+                               static_cast<uint32_t>(shape.hdrFmt), shape.psT0Is3D && shape.psT0Res != nullptr,
+                               shape.hdr2D, fullViewport)) return false;
+    for (unsigned i = 0; i < g_hudPhysicalCount; ++i)
+        if (flatUiSourceToneDirectHud(g_hudPhysical[i].shadow, g_hudPhysical[i].actual.Get(), shape.hdrRes))
+            return true;
+    return false;
+}
 uint32_t g_candidateLines = 0;  // eight tone candidates logged, re-armed after a route, render-size or swap-chain change
 char g_candidateRoute[48] = "";
 uint32_t g_candidateW = 0, g_candidateH = 0;
@@ -161,6 +220,7 @@ FlatUiLayerAsk flatUiLayerDecide(ID3D11DeviceContext* ctx, const FlatUiLayerDraw
     if (!d.hdrTarget || !d.width || !d.height) return refuse(FlatUiRefuse::kNotHdrTarget);
     // The proof's subject: the target this frame's HUD families draw into, from the first ask, taken or not.
     flatUiToneProofHud(g_proof, d.frame, d.color);
+    observeHudPhysical(ctx, d);  // read-only OM binding before any UI take or target substitution
     if (flatUiToneConsumed(g_proof, d.frame, d.color)) return refuse(FlatUiRefuse::kAfterTone);
     if (!flatUiToneProven(g_proof, d.frame, d.color)) return refuse(FlatUiRefuse::kToneUnproven);
     if (!d.upstream) return refuse(FlatUiRefuse::kNotUpstream);
@@ -270,8 +330,63 @@ bool flatUiLayerToneAdmit(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t ren
 }
 
 void flatUiLayerNoteCopy(uint64_t frame, const void* source, const void* output) {
-    if (!flatUiLayerOn()) return;
-    flatUiToneProofCopy(g_proof, frame, source, output);
+    if (flatUiLayerOn()) flatUiToneProofCopy(g_proof, frame, source, output);
+}
+
+bool flatUiLayerSourceToneCandidate(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t renderW, uint32_t renderH,
+                                    uint64_t vs, uint64_t ps, const void* cachedOutput,
+                                    uint32_t outW, uint32_t outH, const char* route) {
+    if (!ctx || !flatUiLayerOn() || !flatUiSourceTonePair(vs, ps) || g_hudPhysicalFrame != frame) return false;
+    FlatComputeInternalScope internal;
+    ToneAdmit shape{};
+    if (!sourceTonePhysicalShape(ctx, frame, renderW, renderH, vs, ps, cachedOutput, outW, outH, false, shape))
+        return false;  // no proof from a cached shadow or an unverified alias
+    if (!g_sourceToneFirstNoted) {
+        g_sourceToneFirstNoted = true;
+        Log::get().note("flat ui layer: first E894 source tone qualified -- frame %llu VS %016llX PS %016llX, "
+                        "physical HUD t1=%p, LDR RTV=%p R=%ux%u, full viewport; flat UI proof only.",
+                        static_cast<unsigned long long>(frame), static_cast<unsigned long long>(vs),
+                        static_cast<unsigned long long>(ps), shape.hdrRes, shape.rtvRes, renderW, renderH);
+    }
+    return flatUiLayerToneCandidate(ctx, frame, renderW, renderH, 1, vs, ps, shape.hdrRes, outW, outH, route);
+}
+
+void flatUiLayerProbeUnknownSourceTone(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t renderW, uint32_t renderH,
+                                       uint64_t vs, uint64_t ps, const void* cachedOutput,
+                                       uint32_t outW, uint32_t outH, char kind, uint32_t count,
+                                       uint32_t instances, uint32_t startInstance) {
+    if (!ctx || !flatUiLayerOn() || !g_hudPhysicalCount || flatUiSourceTonePair(vs, ps) ||
+        (kind != 'D' && kind != 'N') || count != 3 || instances != 1 || startInstance != 0 ||
+        !g_unknownSourceToneLog.shouldInspect(vs, ps)) return;
+    FlatComputeInternalScope internal;
+    ToneAdmit shape{};
+    const auto reject = [&]() {
+        if (g_unknownSourceToneLog.reject(vs, ps))
+            Log::get().note("flat ui layer: unknown source-tone rejection capacity=%u exhausted; later unknown pairs are not inspected",
+                            FlatUiUnknownSourceToneLog::kCapacity);
+    };
+    if (!sourceTonePhysicalShape(ctx, frame, renderW, renderH, vs, ps, cachedOutput, outW, outH, true, shape)) { reject(); return; }
+    // The unknown draw must also bind the measured bloom input at PS t2.
+    // A 2D resource proves the binding shape, not what an unknown shader does with it.
+    Ptr<ID3D11ShaderResourceView> bloom;
+    ctx->PSGetShaderResources(2, 1, &bloom);
+    if (!bloom) { reject(); return; }
+    D3D11_SHADER_RESOURCE_VIEW_DESC bloomView{};
+    bloom->GetDesc(&bloomView);
+    if (bloomView.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) { reject(); return; }
+    Ptr<ID3D11Resource> bloomResource;
+    bloom->GetResource(&bloomResource);
+    if (!bloomResource) { reject(); return; }
+    const auto result = g_unknownSourceToneLog.record(vs, ps);
+    if (result == FlatUiUnknownSourceToneLog::Result::NewPair)
+        Log::get().note("flat ui layer: unknown source-tone probe -- frame %llu VS %016llX PS %016llX, physical HUD t1=%p, LDR RTV=%p fmt=%u, bound 2D t2=%p R=%ux%u; candidate shape only, no source-tone proof or admission",
+                        static_cast<unsigned long long>(frame), static_cast<unsigned long long>(vs),
+                        static_cast<unsigned long long>(ps), shape.hdrRes, shape.rtvRes,
+                        static_cast<unsigned>(shape.rtvFmt),
+                        bloomResource.Get(), renderW, renderH);
+    else if (result == FlatUiUnknownSourceToneLog::Result::CapacityReached)
+        Log::get().note("flat ui layer: unknown source-tone probe capacity=%u exhausted; later unknown pairs are unreported",
+                        FlatUiUnknownSourceToneLog::kCapacity);
 }
 
 bool flatUiLayerToneCandidate(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t renderW, uint32_t renderH, int hdrSlot,
@@ -447,6 +562,8 @@ void flatUiLayerNoteDevice(ID3D11Device* device) {
     if (!device || device == g_device.Get()) return;
     if (g_device) {
         g_proof = FlatUiToneProof{};
+        clearHudPhysical(0);
+        g_sourceToneFirstNoted = false;
         g_view.Reset();
         g_viewTex = nullptr;
         g_viewFmt = DXGI_FORMAT_UNKNOWN;
@@ -463,6 +580,8 @@ void flatUiLayerNoteDevice(ID3D11Device* device) {
 
 void flatUiLayerRelease() {
     g_proof = FlatUiToneProof{};  // a fresh chain proves itself again
+    clearHudPhysical(0);
+    g_sourceToneFirstNoted = false;
     g_candidateLines = 0;         // and its first tone candidates are logged
     g_takenFrame = 0;
     g_takenTarget = nullptr;
@@ -481,8 +600,9 @@ void flatUiLayerMapAaFrame(bool engaged, bool jitterWanted) {
 }
 void flatUiLayerMapAaCopy(bool ok, bool easu, bool smaa) { g_mapAa.copy(ok, easu, smaa); }
 
-void flatUiLayerFrame(bool mapOpen) {
+void flatUiLayerFrame(bool mapOpen, uint64_t nextFrame) {
     if (!runtimeFlatProfile()) return;
+    clearHudPhysical(nextFrame);  // release the previous frame's physical RTV resources at Present
     if (mapOpen) ++g_w.mapOpenFrames;
     static uint64_t windowStartMs = 0;
     const uint64_t now = GetTickCount64();

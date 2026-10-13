@@ -2850,10 +2850,10 @@ void uiLayerConfigure(Config& cfg) {
                         "ui_quality = %s -- the old one is read for this release only.",
                         text.c_str(), newSpelling, uiQualityLabel(target), newSpelling);
     }
-    const bool temporalVr = temporalModeEnabled(cfg.getString("fix.temporal_aa", "off"));
+    const bool temporalVr = temporalModeEnabledFor(cfg.getString("fix.temporal_aa", "off"), false);
     // The flat profile reads its mode around the gate (fix.temporal_aa reads off there): its half of the layer -- the cockpit
     // HUD families through the mono adapter, flat_ui_layer.cpp -- and its panel factor arm with the flat anti-aliasing.
-    const bool flatAa = runtimeFlatProfile() && temporalModeEnabled(cfg.requestedTemporalMode());
+    const bool flatAa = runtimeFlatProfile() && temporalModeEnabledFor(cfg.requestedTemporalMode(), true);
     const bool temporal = runtimeFlatProfile() ? flatAa : temporalVr;
     // The cancel follows the shipped jitter convention (as_is, no lag), always. The flat profile's jitter is the
     // flat phase machine's, read per draw from the camera rows (flat_ui_layer.cpp): as shipped by construction.
@@ -4772,6 +4772,16 @@ bool uiLayerFlatRelease() {
     g_crispPending = CrispTonePending{};
     detail::g_uiLayerCrispPending = false;
     return any;
+}
+
+// Called at a profile switch, render thread, frame boundary. The layers and the door go exactly as on a swap-chain resize
+// (uiLayerFlatRelease: it is releaseLayers plus the door, the target cache and the per-draw facts), so the next armed eye builds
+// its layers afresh for the profile now active. The flat profile's panel factor (ui_panel_scale.cpp) is also cleared here:
+// its only setter runs under the flat profile and nothing else ever cleared it. Safe when the layer never started: every
+// release tests for nothing to release.
+void uiLayerProfileSwitch() {
+    uiLayerFlatRelease();
+    uiPanelScaleSetFlatTemporal(false);
 }
 
 namespace {

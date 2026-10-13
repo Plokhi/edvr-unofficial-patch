@@ -2,8 +2,8 @@
 
 ## Status
 
-- State: device workaround verified; remediation closed. Compiler and earlier
-  exit causes remain unresolved.
+- State: desktop startup and Game Mode workarounds verified; remediation
+  closed. Compiler and earlier exit causes remain unresolved.
 - Device: ONEXPLAYER 3, Intel Arc B390 PTL 8086:b080, xe driver, CachyOS,
   kernel 7.2.9-1-cachyos-deckify, Mesa 26.2.4-arch3.1.
 - Game: Steam 359320, installed build 25433925, Proton Experimental
@@ -42,6 +42,22 @@
   changes. Steam Launch Options uses the verified persistent wrapper below;
   clear it to revert.
 - Evidence directory: /home/deck/.cache/elite-startup-diagnostics/2026-10-11.
+- Launcher follow-up: user reports the EDLaunch window stays open after
+  closing. The Mesa wrapper uses execvpe and retains no Python parent. No live
+  hung launcher was captured; driver involvement in its shutdown is not ruled
+  out.
+- Alternative: verified native MinEdLauncher v0.13.0 installed outside the
+  game. Steam launch options verified; user confirms the game launches and its
+  terminal closes on game exit. Command and rollback are recorded below.
+- Game Mode: Elite build 91576e7e fails every Present with 0x80004005 before
+  XeSS processes a scene; BG3 rejects B390 because no present queue is found.
+- Confirmed omission: private Mesa 37bf953a58 was built with platforms=x11; its
+  extension list lacks VK_KHR_wayland_surface. Gamescope uses Wayland.
+- Matched headless XCB tests: stock Mesa + Gamescope WSI passes 60 frames;
+  private Mesa + WSI crashes; private Mesa + WSI disabled passes 60 frames.
+- Corrected build: same commit with X11 and Wayland installed; host/runtime
+  loading and 60-frame WSI presentation pass. User confirms both Elite and BG3
+  work in Game Mode with existing launch options. No global driver changes.
 
 ## October 11 evidence
 
@@ -267,3 +283,118 @@ compiler/exit causes remain unresolved. No EDVR changes were needed.
 - [Fossilize capture
   source](https://github.com/ValveSoftware/Fossilize/blob/master/layer/dispatch.cpp#L893)
   records ordinary compute pipelines after successful driver compilation.
+
+### Launcher shutdown follow-up and MinEdLauncher installation
+
+The user reports that the visible EDLaunch window stays open after closing and
+has to be killed. Read-only inspection of the persistent Mesa wrapper shows it
+sets VK_DRIVER_FILES/VK_ICD_FILENAMES and calls os.execvpe: it leaves no Python
+waiting parent, spawns no background process and has no wait loop. This rules
+out wrapper-parent retention, not a Mesa/Proton shutdown problem inside the
+launcher. Inspection after the user closed the session found no EDLaunch, game,
+Proton or wineserver process; Steam recorded removal of app 359320 from its
+running list at 12:21:03. No live shutdown hang was captured and no causal
+launcher fix is claimed.
+
+At the user's request, installed the official [MinEdLauncher v0.13.0 Linux
+release](https://github.com/rfvgyhn/min-ed-launcher/releases/tag/v0.13.0) in
+`/home/deck/.local/share/min-ed-launcher-v0.13.0`, outside the game. Its
+archive SHA-256
+c50a2c8bd3ffad8876e30f05c9e80c1ee55c43c79455e7521ef2cdd2f88367a8 matches the
+release shasum and GitHub asset digest; GitHub attestation verification exits
+0. Dry-run creates nothing, installation verifies all five copied release files
+and preserves executable mode. This is a self-contained Linux application; no
+system .NET installation is needed. Native startup displays v0.13.0+6e50d0e0
+and correctly rejects missing game-location arguments in a sandbox smoke test.
+The initial smoke test needed a temporary DOTNET_BUNDLE_EXTRACT_BASE_DIR
+because the sandbox cannot write the normal home cache. No such override is
+installed for Steam.
+
+The [exact-release
+README](https://github.com/rfvgyhn/min-ed-launcher/tree/v0.13.0) documents the
+alacritty Steam command, /edo, /novr and /autoquit waitForExit. The
+exact-release Settings.fs discovers Elite from EDLaunch.exe in %command% and
+preserves the preceding Steam/Proton command, allowing the standalone
+installation. Activated Steam command preserves the Mesa wrapper and Proton
+Experimental:
+
+```text
+/usr/bin/python3 /home/deck/.local/share/elite-mesa-37bf953a58/launch.py /usr/bin/alacritty -e /home/deck/.local/share/min-ed-launcher-v0.13.0/MinEdLauncher %command% /autorun /autoquit waitForExit /edo /novr
+```
+
+Steam's saved Elite launch options match this command. The user confirms the
+game launches and the terminal closes after quitting Elite. No live Steam VDF
+was edited by the agent. Previous launch option, also the rollback command:
+
+```text
+/usr/bin/python3 /home/deck/.local/share/elite-mesa-37bf953a58/launch.py %command%
+```
+
+The installed Mesa driver, wrapper and flown 4b7bfec4 EDVR files/settings
+remain unchanged. Main stays 99476a02; XeSS/UI diagnostic cleanup 02f50bd7 is
+pushed on codex/xess-flat with native Windows full validation pending.
+
+## October 11 Game Mode presentation follow-up
+
+Desktop tests succeeded, but Game Mode gives Elite a white screen with audio
+and BG3 reports `graphics queue does not support presenting and present queue
+not found`. Elite's 15:03:19 flight log matches the installed clean 91576e7e
+build and fails its first and subsequent Present calls with 0x80004005. It
+records zero treated scenes. Ruled out: XeSS scene processing causes this white
+screen, because presentation fails before any scene reaches XeSS.
+
+The private Mesa build's `intro-buildoptions.json` sets platforms to `x11`
+only. Its host Vulkan extension list includes XCB/Xlib surfaces but omits
+VK_KHR_wayland_surface. The working desktop path therefore did not validate the
+Wayland path required by Gamescope's WSI layer. Hypothesis: the missing Wayland
+platform prevents private-driver presentation in Game Mode. Confirm or refute
+by building the same commit with both platforms and repeating the matched
+headless Gamescope XCB test with its WSI layer enabled.
+
+Three explicit client-return-code tests isolate a driver/layer interaction:
+stock Mesa 26.2.4 with WSI enabled presents 60 frames and exits 0; private
+37bf953a58 with WSI enabled exits -11 after surface creation; private Mesa with
+DISABLE_GAMESCOPE_WSI=1 presents 60 frames and exits 0. Evidence is in
+`/tmp/edvr_gamescope_headless_{stock_xcb,private}_status_*.log`. The headless
+tests have no DRM output. Ruled out: DRM AddFB2 failures explain this client
+test crash, because it reproduces without the DRM path. Those compositor errors
+predate both games, so a Game Mode flight is still required even if the
+corrected driver passes the headless test. No wrappers or settings have been
+changed during diagnosis.
+
+The isolated corrected build completed successfully. Its source remains clean
+at 37bf953a58; Meson options differ only in platforms (`x11,wayland`), staging
+prefix and the pkg-config path for the data-only Wayland protocols dependency.
+Protocols 1.41 are pinned to official GitLab commit
+71da8bd7f9fd3ea7c5d87ad19ca087eeca137673 and installed under `/tmp`; no system
+packages changed. The new library SHA256 is
+470baad14a458382b3d9ae08440be1901a1f2ae6ecc73cf67892b7b8b8838daa.
+
+Host and Steam Runtime4 Vulkan summaries both identify B390 and the same Mesa
+revision, expose VK_KHR_wayland_surface and exit 0. Matched headless XCB
+clients now create a swapchain and present 60 frames with Gamescope WSI
+enabled, exit 0; WSI disabled also exits 0. This confirms that adding the
+missing platform corrects the reproduced presentation failure, without
+disabling the layer. Logs are
+`/tmp/edvr_mesa_wayland_{host,runtime4}_summary.log` and
+`/tmp/edvr_gamescope_headless_wayland_xcb_status_{enabled,disabled}.log`. The
+user subsequently confirmed that both Elite and BG3 work in Game Mode.
+
+Guarded installation replaced only the private library and its version.json
+library hash, retaining the old files as rollback backups. Independent SHA
+checks confirm both wrappers, rear-button helpers, ICD, system Mesa and both
+live/mirrored flat INIs unchanged. The existing generic wrapper then loads the
+installed driver inside Steam Runtime4, reports the correct B390/Mesa revision
+and Wayland extension, exit 0. Evidence:
+`/tmp/edvr_mesa_wayland_installed_runtime4_summary.log`. The user confirms that
+both Elite and BG3 work in Game Mode with their existing Steam launch options.
+This closes the presentation follow-up. The new cockpit/scene AA disengagement
+reported during that flight belongs to the XeSS/flat arc.
+
+Retained backups beside the original files:
+`lib/libvulkan_intel.so.edvr-rollback` and `version.json.edvr-rollback`. The
+guarded helper `python3 -I -B /tmp/edvr_private_mesa_library.py --rollback
+--new-sha256 470baad14a458382b3d9ae08440be1901a1f2ae6ecc73cf67892b7b8b8838daa`
+restores only those two files after validating their exact identity and
+checking that neither game is running. The helper is temporary; the backups are
+in the persistent private-driver directory.

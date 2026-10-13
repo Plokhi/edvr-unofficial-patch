@@ -29,4 +29,17 @@ inline std::wstring eliteGraphicsFolderUnder(const std::wstring& localAppData) {
     return out;
 }
 
+// Where Elite's own crash reporter leaves minidumps, one folder per crash id:
+//   <a Temp folder>\Frontier Developments\EliteDangerous\CrashDumps\<id>\<stamp>_MiniDump.dmp
+// (the same publisher folder, but "EliteDangerous" with no space, and under Temp
+// rather than the profile root). The installer's log bundler offers the dump
+// from a session that ended in a crash. Empty in, empty out.
+inline std::wstring eliteCrashDumpsFolderUnder(const std::wstring& tempDir) {
+    if (tempDir.empty()) return std::wstring();
+    std::wstring out = tempDir;
+    if (out.back() != L'\\' && out.back() != L'/') out += L'\\';
+    out += L"Frontier Developments\\EliteDangerous\\CrashDumps";
+    return out;
+}
+
 }  // namespace edvr

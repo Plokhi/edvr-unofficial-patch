@@ -1223,6 +1223,75 @@ void testFlatLayerRules() {
               flatUiMapToneSlotOf(0xF9CFC798F21E9AEAull, 0xFEE777E92850B390ull) == ~0u,
           "map tone: a neighbouring PS on CFA918, the same PS on another VS, and the registry's own pair are not this table's "
           "(the bloom composite FA01CD writes the scene and is named by neither: its exact hash is not in the repo)");
+    check(flatUiSourceTonePair(0xF9CFC798F21E9AEAull, 0xE8948389387DA083ull) &&
+              flatUiSourceTonePair(0x43CA9F1C0AD2ACFEull, 0xE8948389387DA083ull) &&
+              !flatUiSourceTonePair(0xF9CFC798F21E9AEAull, 0xE8948389387DA082ull) &&
+              !flatUiSourceTonePair(0xCFA91824129ECBBCull, 0xE8948389387DA083ull),
+          "E894 UI source tone: both observed exact pairs qualify, neighbouring PS and unrelated VS do not");
+    {
+        FlatUiUnknownSourceToneLog log;
+        check(log.shouldInspect(1, 2) &&
+              log.record(1, 2) == FlatUiUnknownSourceToneLog::Result::NewPair &&
+              !log.shouldInspect(1, 2) &&
+              log.record(1, 2) == FlatUiUnknownSourceToneLog::Result::Duplicate,
+              "unknown UI tone diagnostic records each shader pair only once");
+        for (uint32_t i = 1; i < FlatUiUnknownSourceToneLog::kCapacity; ++i)
+            check(log.record(i + 1, 2) == FlatUiUnknownSourceToneLog::Result::NewPair,
+                  "unknown UI tone diagnostic accepts a pair within its fixed cap");
+        check(log.count == FlatUiUnknownSourceToneLog::kCapacity &&
+              log.record(99, 2) == FlatUiUnknownSourceToneLog::Result::CapacityReached &&
+              log.record(100, 2) == FlatUiUnknownSourceToneLog::Result::Full &&
+              !log.shouldInspect(101, 2),
+              "unknown UI tone diagnostic reports capacity once and stops probing");
+    }
+    {
+        FlatUiUnknownSourceToneLog log;
+        unsigned inspections = 0, reports = 0, overflowReports = 0;
+        auto inspect = [&](uint64_t vs, uint64_t ps, bool physicalShape, bool bloom2D) {
+            if (!log.shouldInspect(vs, ps)) return;
+            ++inspections;
+            if (!physicalShape || !bloom2D) { overflowReports += log.reject(vs, ps) ? 1 : 0; return; }
+            reports += log.record(vs, ps) == FlatUiUnknownSourceToneLog::Result::NewPair ? 1 : 0;
+        };
+        inspect(1, 2, false, true);
+        inspect(1, 2, true, true);
+        inspect(2, 2, true, false);
+        inspect(2, 2, true, true);
+        check(inspections == 2 && reports == 0 && log.count == 0 && log.rejectedCount == 2 &&
+                  log.record(1, 2) == FlatUiUnknownSourceToneLog::Result::Duplicate,
+              "unknown tone physical and bloom rejection is remembered without positive reports or admission");
+        inspect(3, 2, true, true);inspect(3, 2, true, true);
+        check(inspections == 3 && reports == 1 && log.count == 1 && !flatUiSourceTonePair(3, 2),
+              "uncached positive diagnostic reports once but never changes exact source-tone admission");
+        for (uint32_t i = 2; i < FlatUiUnknownSourceToneLog::kCapacity; ++i)
+            inspect(i + 100, 2, false, false);
+        const unsigned bounded = inspections;
+        for (uint32_t i = 0; i < 1000; ++i) inspect(i + 1000, 2, true, true);
+        check(log.rejectedCount == FlatUiUnknownSourceToneLog::kCapacity && overflowReports == 1 &&
+                  inspections == bounded && reports == 1 && !log.reject(9999, 2),
+              "negative capacity reports once and stops all further unknown descriptor inspections without eviction");
+        check(flatUiSourceTonePair(kFlatUiSourceToneVsSteady, kFlatUiSourceTonePs) &&
+                  flatUiSourceTonePair(kFlatUiSourceToneVsTransition, kFlatUiSourceTonePs),
+              "exhausted unknown diagnostic cache does not affect known exact pair admission");
+    }
+    check(flatUiMapToneSlotOf(0xF9CFC798F21E9AEAull, 0xE8948389387DA083ull) == ~0u,
+          "E894 UI source tone: the map table remains unchanged");
+    check(flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 28, 1720, 720, 26, true, true, true) &&
+              !flatUiSourceToneShape(1720, 720, 3440, 1440, 1720, 720, 28, 1720, 720, 26, true, true, true) &&
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 28, 1720, 720, 26, true, true, false) &&
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 27, 1720, 720, 26, true, true, true) &&
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 28, 1720, 720, 26, false, true, true),
+          "E894 UI source tone: full-size LDR RTV, R11 HUD source, LUT and viewport are required");
+    check(flatUiUnknownSourceToneShape(1720, 720, 1720, 720, 1720, 720, 29, 1720, 720, 26, true, true, true) &&
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 29, 1720, 720, 26, true, true, true) &&
+              !flatUiUnknownSourceToneShape(1720, 720, 1720, 720, 1720, 720, 10, 1720, 720, 26, true, true, true),
+          "unknown UI source tone: diagnostics can name an LDR view variant without widening admission");
+    static int kE894Hud = 0, kE894Other = 0;
+    check(flatUiSourceToneDirectHud(&kE894Hud, &kE894Hud, &kE894Hud) &&
+              !flatUiSourceToneDirectHud(&kE894Hud, &kE894Other, &kE894Hud) &&
+              !flatUiSourceToneDirectHud(&kE894Hud, &kE894Hud, &kE894Other) &&
+              !flatUiSourceToneDirectHud(nullptr, nullptr, nullptr),
+          "E894 UI source tone: proof bootstraps only from the direct, physically verified HUD target");
     // The first map-tone candidate's log reason (flatUiToneMatchWhy): what a tone read proves, and the three ways it does not.
     {
         static int kTargetA = 0, kTargetB = 0;
@@ -1405,14 +1474,75 @@ void testFlatLayerRules() {
     check(uiLayerLiveFor(1.0f, true, true, false) && !uiLayerNotLiveReasonFor(1.0f, true, true, false),
           "flat layer: ui_quality 100 + flat AA with the jitter as shipped -> live, no reason");
     {
-        std::ifstream layerSrc("src/d3d11/ui_layer.cpp", std::ios::binary), adapterSrc("src/d3d11/flat_ui_layer.cpp", std::ios::binary);
+        std::ifstream layerSrc("src/d3d11/ui_layer.cpp", std::ios::binary), adapterSrc("src/d3d11/flat_ui_layer.cpp", std::ios::binary),
+            runtimeSrc("src/d3d11/flat_runtime.cpp", std::ios::binary);
         const std::string layer((std::istreambuf_iterator<char>(layerSrc)), std::istreambuf_iterator<char>());
         const std::string adapter((std::istreambuf_iterator<char>(adapterSrc)), std::istreambuf_iterator<char>());
+        const std::string runtime((std::istreambuf_iterator<char>(runtimeSrc)), std::istreambuf_iterator<char>());
+        std::ifstream monoSrc("src/d3d11/flat_mono_frame.h", std::ios::binary),
+            sharedToneSrc("src/d3d11/tonemap_admit.h", std::ios::binary);
+        const std::string mono((std::istreambuf_iterator<char>(monoSrc)), std::istreambuf_iterator<char>());
+        const std::string sharedTone((std::istreambuf_iterator<char>(sharedToneSrc)), std::istreambuf_iterator<char>());
         check(!layer.empty() && layer.find("constexpr bool g_jitterAsShipped = true;") != std::string::npos,
               "wiring: the layer's jitter is always as shipped");
         check(!adapter.empty() && adapter.find("const char* why = uiLayerNotLiveReason();") != std::string::npos &&
                   adapter.find("strstr") == std::string::npos,
               "wiring: the flat layer's state names the shared not-live reason verbatim (no relabelling)");
+        const size_t hudProof = adapter.find("flatUiToneProofHud(g_proof, d.frame, d.color);");
+        const size_t hudDecision = adapter.find("flatUiToneConsumed(g_proof, d.frame, d.color)", hudProof);
+        check(hudProof != std::string::npos && hudDecision != std::string::npos &&
+                  adapter.substr(hudProof, hudDecision - hudProof).find("observeHudPhysical(ctx, d)") != std::string::npos &&
+                  runtime.find("flatUiLayerFrame(flatRuntimeMapOpenFrame(), s.prefix.frame)") != std::string::npos,
+              "wiring: the HUD physical RTV is read after its qualified ask and released at the next Present");
+        check(adapter.find("void flatUiLayerNoteCopy(uint64_t frame, const void* source, const void* output)") != std::string::npos &&
+                  adapter.find("flatUiToneProofCopy(g_proof, frame, source, output)") != std::string::npos &&
+                  runtime.find("flatUiLayerNoteCopy(s.prefix.frame, copySource.Get(), k.color)") != std::string::npos,
+              "wiring: the original plain-copy tone proof remains after diagnostic cleanup");
+        const size_t physicalShape = adapter.find("bool sourceTonePhysicalShape(");
+        const size_t afterPhysicalShape = adapter.find("uint32_t g_candidateLines", physicalShape);
+        const size_t sourceTone = adapter.find("bool flatUiLayerSourceToneCandidate(");
+        const size_t afterSourceTone = adapter.find("void flatUiLayerProbeUnknownSourceTone(", sourceTone);
+        const std::string physical = physicalShape != std::string::npos && afterPhysicalShape != std::string::npos
+            ? adapter.substr(physicalShape, afterPhysicalShape - physicalShape) : "";
+        const std::string source = sourceTone != std::string::npos && afterSourceTone != std::string::npos
+            ? adapter.substr(sourceTone, afterSourceTone - sourceTone) : "";
+        const size_t structure = physical.find("tonemapAdmitStructure(ctx, ps, shape)");
+        const size_t directHud = physical.find("flatUiSourceToneDirectHud(");
+        const size_t pairGate = source.find("flatUiSourceTonePair(vs, ps)");
+        const size_t physicalCall = source.find("sourceTonePhysicalShape(ctx, frame, renderW, renderH, vs, ps, cachedOutput, outW, outH, false, shape)");
+        const size_t proofCall = source.find("return flatUiLayerToneCandidate(");
+        check(!physical.empty() && !source.empty() && structure != std::string::npos &&
+                  directHud != std::string::npos && structure < directHud &&
+                  physical.find("flatUiSourceToneShape") != std::string::npos &&
+                  pairGate != std::string::npos && physicalCall != std::string::npos &&
+                  proofCall != std::string::npos && pairGate < physicalCall && physicalCall < proofCall &&
+                  runtime.find("flatUiLayerSourceToneCandidate(ctx, s.prefix.frame") != std::string::npos,
+              "wiring: physical E894 shape and direct-HUD identity qualify before the ordinary flat UI tone proof");
+        const size_t afterProbe = adapter.find("bool flatUiLayerToneCandidate(", afterSourceTone);
+        const std::string probe = afterSourceTone != std::string::npos && afterProbe != std::string::npos
+            ? adapter.substr(afterSourceTone, afterProbe - afterSourceTone) : "";
+        const size_t probeShape = probe.find("sourceTonePhysicalShape(ctx, frame, renderW, renderH, vs, ps, cachedOutput, outW, outH, true, shape)");
+        const size_t bloom = probe.find("ctx->PSGetShaderResources(2, 1, &bloom)");
+        const size_t record = probe.find("g_unknownSourceToneLog.record(vs, ps)");
+        check(probe.find("g_unknownSourceToneLog.shouldInspect(vs, ps)") < probeShape &&
+                  probe.find("g_unknownSourceToneLog.reject(vs, ps)") != std::string::npos &&
+                  probe.find("true, shape)) { reject(); return; }") != std::string::npos &&
+                  probe.find("if (!bloom) { reject(); return; }") != std::string::npos &&
+                  probe.find("if (bloomView.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) { reject(); return; }") != std::string::npos &&
+                  probe.find("if (!bloomResource) { reject(); return; }") != std::string::npos,
+              "wiring: cache precedes expensive queries and every physical/bloom rejection is negatively cached");
+        check(!probe.empty() && probeShape != std::string::npos && bloom != std::string::npos &&
+                  record != std::string::npos && probeShape < bloom && bloom < record &&
+                  probe.find("flatUiLayerToneCandidate(") == std::string::npos &&
+                  runtime.find("flatUiLayerProbeUnknownSourceTone(ctx, s.prefix.frame") != std::string::npos,
+              "wiring: unknown source-tone pairs are logged only after physical shape and t2 checks, without granting proof");
+        check(adapter.find("flat ui tone probe") == std::string::npos &&
+                  runtime.find("flatUiLayerProbeTone(") == std::string::npos &&
+                  adapter.find("FlatUiToneProbeBudget") == std::string::npos,
+              "wiring: temporary E894 sampling is gone while the physical HUD admission guard remains");
+        check(!mono.empty() && !sharedTone.empty() && mono.find("E8948389387DA083") == std::string::npos &&
+                  sharedTone.find("E8948389387DA083") == std::string::npos,
+              "wiring: E894 remains absent from the mono HDR selector and shared tonemap registry");
     }
 }
 
@@ -3165,6 +3295,11 @@ int main(int argc, char** argv) {
         std::puts("ui_quality_test: dry-run (no device, no files)");
         return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--flat-cpu") == 0) {
+        testFlatLayerRules();
+        std::printf("ui_quality_test --flat-cpu: %u checks, %u failures\n", g_checks, g_fails);
+        return g_fails ? 1 : 0;
+    }
     // --wiring: the source scans of src\d3d11 alone, with their controls (no device). tools\vr_world_route_test\mutants.py runs this on edited
     // copies of vscreen.cpp in a temp tree (the rig reads its sources from the working directory), so every pin is seen to fail on the real file.
     if (argc == 2 && std::strcmp(argv[1], "--wiring") == 0) {
@@ -3178,7 +3313,7 @@ int main(int argc, char** argv) {
     // WARP, by hand (the gate runs --self-test; a build machine may have no GPU).
     const bool hardware = argc == 2 && std::strcmp(argv[1], "--hardware") == 0;
     if (argc != 2 || (std::strcmp(argv[1], "--self-test") != 0 && !hardware)) {
-        std::puts("usage: ui_quality_test --self-test | --hardware | --wiring | --dry-run");
+        std::puts("usage: ui_quality_test --self-test | --hardware | --wiring | --flat-cpu | --dry-run");
         return 2;
     }
     testRenderState();

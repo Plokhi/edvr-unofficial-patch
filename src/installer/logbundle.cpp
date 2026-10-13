@@ -6,11 +6,15 @@
 #include <new>
 
 #include <algorithm>
+#include <string>
 #include <vector>
+#include <wchar.h>
 
 #include "detect.h"
+#include "plan.h"
 #include "../common/elite_graphics_folder.h"
 #include "../common/iniedit.h"
+#include "../common/install_scope.h"
 #include "state.h"
 
 namespace edvr::installer {
@@ -21,14 +25,37 @@ namespace {
 // session.
 const long long kSessionWindowSeconds = 180;
 
-// The edition installed in this folder, as far as it can be told without a
-// survey: the record when there is one, else the descriptor the flat edition
-// always writes. Everything else is VR.
-std::string editionOf(const std::wstring& gameDir) {
-    const InstallState state = readState(gameDir);
-    if (state.present) return state.profile;
+// The scope installed in this folder, as far as it can be told without a survey, in the planner's order (plan.cpp installedScope):
+// a canonical descriptor first, so a record an older install left cannot outvote the files; then the record; then the descriptor's own
+// text (schema 1 `profile = flat`). Everything else is VR.
+std::string scopeOf(const std::wstring& gameDir) {
     const std::string descriptor = readTextFile(joinPath(gameDir, L"edvr_profile.ini"));
-    return iniValue(descriptor, "install.profile") == "flat" ? "flat" : "vr";
+    const std::string canonical = canonicalDescriptorScope(descriptor);
+    if (!canonical.empty()) return canonical;
+    const InstallState state = readState(gameDir);
+    if (state.present && !recordedScope(state).empty()) return recordedScope(state);
+    const edvr::InstallScope parsed = edvr::parseInstallDescriptor(descriptor).scope;
+    return parsed == edvr::InstallScope::Invalid ? std::string("vr") : std::string(edvr::scopeName(parsed));
+}
+
+// The log folder one settings file names: its log.dir, or edvr_logs beside the game when the file is absent or names none. The runtime
+// resolves it the same way.
+std::wstring logDirOf(const std::wstring& gameDir, const std::wstring& iniPath) {
+    const std::string configured = iniValue(readTextFile(iniPath), "log.dir");
+    return configured.empty() ? joinPath(gameDir, L"edvr_logs") : fromUtf8(configured);
+}
+
+// The zip prefix for a file from log folder `folder` (0-based) whose plain name the zip already holds: two folders can each hold a file
+// of one name (a shader dumped by both runs, say), and the zip cannot hold two entries of one name.
+std::wstring zipPrefixFor(size_t folder) { return L"log-folder-" + std::to_wstring(folder + 1) + L"/"; }
+
+// The index of the log folder a path sits in, 0 when none of them is.
+size_t folderIndexOf(const std::wstring& path, const std::vector<std::wstring>& dirs) {
+    for (size_t i = 0; i < dirs.size(); ++i) {
+        const size_t n = dirs[i].size();
+        if (path.size() > n && path[n] == L'\\' && _wcsnicmp(path.c_str(), dirs[i].c_str(), n) == 0) return i;
+    }
+    return 0;
 }
 
 unsigned long crc32Of(const unsigned char* data, size_t size, unsigned long running) {
@@ -374,30 +401,161 @@ bool writeZip(const std::wstring& zipPath, const std::vector<std::wstring>& file
     return true;
 }
 
-LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) try {
+std::vector<CrashDump> findCrashDumps(const std::wstring& localAppData, const std::wstring& tempDir,
+                                      const FILETIME& around, long long windowSeconds,
+                                      unsigned long long maxBytes,
+                                      std::vector<std::string>* skippedOut) {
+    CrashDump ownBest, werBest;
+    bool haveOwn = false, haveWer = false;
+
+    // The newest .dmp in `dir` that was written inside the window, into `best`.
+    auto scan = [&](const std::wstring& dir, const wchar_t* pattern, bool own, CrashDump& best, bool& have) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW(joinPath(dir, pattern).c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+            if (secondsBetween(fd.ftLastWriteTime, around) > windowSeconds) continue;
+            if (have && CompareFileTime(&fd.ftLastWriteTime, &best.written) <= 0) continue;
+            best.path = joinPath(dir, fd.cFileName);
+            best.zipName = fd.cFileName;
+            best.size = (static_cast<unsigned long long>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+            best.written = fd.ftLastWriteTime;
+            best.eliteOwn = own;
+            have = true;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    };
+
+    // Elite's reporter keeps one folder per crash id under CrashDumps\. The
+    // temp folder is asked for twice -- the process's, and LocalAppData\Temp --
+    // since an elevated or redirected TEMP is not where the game ran from.
+    std::vector<std::wstring> roots;
+    if (!tempDir.empty()) roots.push_back(edvr::eliteCrashDumpsFolderUnder(tempDir));
+    if (!localAppData.empty()) {
+        const std::wstring second = edvr::eliteCrashDumpsFolderUnder(joinPath(localAppData, L"Temp"));
+        if (roots.empty() || _wcsicmp(roots.front().c_str(), second.c_str()) != 0) roots.push_back(second);
+    }
+    for (const std::wstring& root : roots) {
+        scan(root, L"*.dmp", true, ownBest, haveOwn);
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW(joinPath(root, L"*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            scan(joinPath(root, fd.cFileName), L"*.dmp", true, ownBest, haveOwn);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    // Windows Error Reporting's LocalDumps, where the machine has it turned on.
+    if (!localAppData.empty())
+        scan(joinPath(localAppData, L"CrashDumps"), L"EliteDangerous64.exe.*.dmp", false, werBest, haveWer);
+
+    std::vector<CrashDump> found;
+    for (const CrashDump* dump : {haveOwn ? &ownBest : nullptr, haveWer ? &werBest : nullptr}) {
+        if (!dump) continue;
+        if (dump->size > maxBytes) {
+            if (skippedOut) {
+                char line[192];
+                sprintf_s(line, "Crash dump left out (%.0f MB is over the %.0f MB limit): ",
+                          static_cast<double>(dump->size) / 1048576.0, static_cast<double>(maxBytes) / 1048576.0);
+                skippedOut->push_back(line + toUtf8(dump->path));
+            }
+            continue;
+        }
+        found.push_back(*dump);
+    }
+    return found;
+}
+
+namespace {
+
+// Deflates through Windows' own tar.exe (bsdtar: `-a` picks zip from the file
+// name). Every entry is named by its file's own name, so the caller's names must
+// be those. False, with nothing left at zipPath, for any reason it did not work.
+bool deflateWithTar(const std::wstring& zipPath, const std::vector<std::wstring>& files,
+                    const std::vector<std::wstring>& names) {
+    if (files.empty() || files.size() != names.size()) return false;
+    wchar_t system[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(system, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return false;
+    const std::wstring exe = joinPath(system, L"tar.exe");
+    if (!fileExists(exe)) return false;
+
+    std::wstring command = L"\"" + exe + L"\" -a -c -f \"" + zipPath + L"\"";
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::wstring leaf = leafOf(files[i]);
+        if (leaf.empty() || leaf != names[i] || files[i].size() <= leaf.size() + 1) return false;
+        command += L" -C \"" + files[i].substr(0, files[i].size() - leaf.size() - 1) + L"\" \"" + leaf + L"\"";
+    }
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(0);
+    if (!CreateProcessW(exe.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &startup, &process)) {
+        return false;
+    }
+    CloseHandle(process.hThread);
+    DWORD exitCode = 1;
+    if (WaitForSingleObject(process.hProcess, 5 * 60 * 1000) != WAIT_OBJECT_0) {
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, 5000);
+    } else {
+        GetExitCodeProcess(process.hProcess, &exitCode);
+    }
+    CloseHandle(process.hProcess);
+    if (exitCode == 0 && fileExists(zipPath)) return true;
+    DeleteFileW(zipPath.c_str());
+    return false;
+}
+
+}  // namespace
+
+bool writeDumpZip(const std::wstring& zipPath, const std::vector<std::wstring>& files,
+                  const std::vector<std::wstring>& names, std::string* error, bool* deflatedOut) {
+    if (deflatedOut) *deflatedOut = false;
+    if (deflateWithTar(zipPath, files, names)) {
+        if (deflatedOut) *deflatedOut = true;
+        return true;
+    }
+    return writeZip(zipPath, files, names, error);
+}
+
+LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir,
+                      const DumpSearch* dumpSearch) try {
     LogBundle bundle;
     if (gameDir.empty()) {
         bundle.error = "No game folder chosen.";
         return bundle;
     }
 
-    // Where the logs are is a setting, so ask the file rather than assume -- the
-    // file the installed edition's runtime reads: the flat edition's edvr-flat.ini
-    // (edvr.ini only while it has none), the VR edition's edvr.ini.
-    const bool flatEdition = editionOf(gameDir) == "flat";
-    const std::wstring flatIniPath = joinPath(gameDir, L"edvr-flat.ini");
+    // Where the logs are is a setting, and each settings file names its own: edvr.ini
+    // and edvr-flat.ini may point at different folders, so both are read and each
+    // distinct folder is swept (the same folder twice is swept once).
     const std::wstring sharedIniPath = joinPath(gameDir, L"edvr.ini");
-    const std::string iniText =
-        readTextFile(flatEdition && fileExists(flatIniPath) ? flatIniPath : sharedIniPath);
-    const std::string configured = iniValue(iniText, "log.dir");
-    const std::wstring logDir =
-        configured.empty() ? joinPath(gameDir, L"edvr_logs") : fromUtf8(configured);
+    const std::wstring flatIniPath = joinPath(gameDir, L"edvr-flat.ini");
+    std::vector<std::wstring> logDirs;
+    for (const std::wstring& dir : {logDirOf(gameDir, sharedIniPath), logDirOf(gameDir, flatIniPath)}) {
+        const bool seen = std::any_of(logDirs.begin(), logDirs.end(),
+                                      [&](const std::wstring& d) { return _wcsicmp(d.c_str(), dir.c_str()) == 0; });
+        if (!seen) logDirs.push_back(dir);
+    }
+
+    // The scope is the one thing the summary of a bundle states: which settings file is this install's own.
+    const std::string scope = scopeOf(gameDir);
+    bundle.notes.push_back("Install scope: " + scope);
 
     std::vector<Found> take;
 
     // ---- the newest session's logs ------------------------------------
     struct LogFile {
         std::wstring name;
+        std::wstring path;
         FILETIME     written{};
         FILETIME     actualWritten{};
     };
@@ -405,13 +563,15 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
     FILETIME sessionStart{}, sessionEnd{};
     bool haveNewestLog = false;
     std::vector<LogFile> logs;
-    WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW(joinPath(logDir, L"edvr_*.log").c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
+    for (size_t folder = 0; folder < logDirs.size(); ++folder) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW(joinPath(logDirs[folder], L"edvr_*.log").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             LogFile log;
             log.name = fd.cFileName;
+            log.path = joinPath(logDirs[folder], log.name);
             log.actualWritten = fd.ftLastWriteTime;
             // The name first, the write time only when the name does not carry
             // a stamp -- a log from a custom log.dir, or one somebody renamed.
@@ -422,8 +582,9 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
     }
 
     if (logs.empty()) {
-        bundle.notes.push_back("No logs in " + toUtf8(logDir) +
-                               " -- has the game been started since EDVR was installed?");
+        std::string where;
+        for (const std::wstring& dir : logDirs) where += (where.empty() ? "" : " or ") + toUtf8(dir);
+        bundle.notes.push_back("No logs in " + where + " -- has the game been started since EDVR was installed?");
     } else {
         const LogFile* newest = &logs.front();
         for (const LogFile& log : logs) {
@@ -438,7 +599,7 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
             if (secondsBetween(log.written, newest->written) > kSessionWindowSeconds) continue;
             if(CompareFileTime(&log.written,&sessionStart)<0) sessionStart=log.written;
             if(CompareFileTime(&log.actualWritten,&sessionEnd)>0) sessionEnd=log.actualWritten;
-            take.push_back({joinPath(logDir, log.name), log.name});
+            take.push_back({log.path, log.name});
             ++sessionCount;
         }
         char line[160];
@@ -453,16 +614,32 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
         std::wstring name;
         const char*  missing;  // note when it is not there, or nullptr to stay quiet
     };
+    // The native OpenXR runtime's startup file, beside its openvr_api.dll: the
+    // folder the installer itself resolves (detect.cpp). It carries keys that
+    // change what the runtime does -- frame_end_overlap, pose_cache, the runtime
+    // manifest -- and none of them are in edvr.ini, so a log can only say what
+    // the runtime did with the file, never what the file said. A flat install has
+    // no such runtime, so it contributes nothing. A VR install without the file
+    // is a valid one (the runtime then starts from its packaged defaults and its
+    // log says source=packaged-default), so a missing file is not noted.
+    std::wstring nativeIniPath;
+    if (scope != "flat") {  // the runtime is installed for both and vr scopes
+        const std::wstring openvrDir = findOpenvrDir(gameDir);
+        nativeIniPath = joinPath(openvrDir.empty() ? joinPath(gameDir, L"Openvr\\win64") : openvrDir,
+                                 L"edvr_openxr.ini");
+    }
     const Extra extras[] = {
         {joinPath(gameDir, L"edvr_breadcrumbs.txt"), L"edvr_breadcrumbs.txt", nullptr},
         {joinPath(gameDir, L"edvr_FATAL.txt"), L"edvr_FATAL.txt", nullptr},
-        // Each edition's settings file is the one to miss when it is that
-        // edition's: a flat install that reads only edvr-flat.ini is not short of
-        // an edvr.ini, and a VR one has no use for a flat file.
-        {sharedIniPath, L"edvr.ini", flatEdition ? nullptr : "edvr.ini is not there"},
+        // Each settings file is the one to miss when the scope installs it. A flat
+        // scope's runtime falls back to edvr.ini while it has no edvr-flat.ini, so
+        // there a missing edvr-flat.ini is only missed without an edvr.ini either.
+        {sharedIniPath, L"edvr.ini", scopeHasVrIni(scope) ? "edvr.ini is not there" : nullptr},
         {flatIniPath, L"edvr-flat.ini",
-         flatEdition && !fileExists(sharedIniPath) ? "edvr-flat.ini is not there" : nullptr},
+         scopeHasFlatIni(scope) && (scope != "flat" || !fileExists(sharedIniPath)) ? "edvr-flat.ini is not there"
+                                                                                    : nullptr},
         {statePath(gameDir), L"edvr_install_state.ini", nullptr},
+        {nativeIniPath, L"edvr_openxr.ini", nullptr},
     };
     for (const Extra& extra : extras) {
         if (fileExists(extra.path)) {
@@ -496,10 +673,19 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
             unsigned long long size = 0;
             bool unsafe = false;
         };
+        // Every capture root of every log folder.
+        struct CaptureRoot {
+            std::wstring dir;
+            const wchar_t* name;
+        };
+        std::vector<CaptureRoot> roots;
+        for (const std::wstring& dir : logDirs)
+            for (const wchar_t* name : captureRoots) roots.push_back({dir, name});
         std::vector<CapFile> caps;
-        for (const wchar_t* root : captureRoots) {
+        for (const CaptureRoot& captureRoot : roots) {
+            const wchar_t* root = captureRoot.name;
             const bool packetRoot=wcscmp(root,L"flat_draw_packets")==0;
-            const std::wstring rootPath = joinPath(logDir, root);
+            const std::wstring rootPath = joinPath(captureRoot.dir, root);
             WIN32_FIND_DATAW cfd{};
             HANDLE ch = FindFirstFileW(joinPath(rootPath, L"*").c_str(), &cfd);
             if (ch == INVALID_HANDLE_VALUE) continue;
@@ -700,12 +886,17 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
     if (where.empty()) where = desktopFolder();
     if (where.empty() || !dirExists(where)) where = gameDir;
 
-    bundle.zipPath = joinPath(where, L"edvr-logs-" + timestampName() + L".zip");
+    const std::wstring stamp = timestampName();
+    bundle.zipPath = joinPath(where, L"edvr-logs-" + stamp + L".zip");
 
+    // Names are the files' own, except where the zip already holds one of that name: the later copy then carries its folder's prefix.
     std::vector<std::wstring> files, names;
     for (const Found& found : take) {
+        std::wstring name = found.name;
+        if (std::find(names.begin(), names.end(), name) != names.end())
+            name = zipPrefixFor(folderIndexOf(found.path, logDirs)) + found.name;
         files.push_back(found.path);
-        names.push_back(found.name);
+        names.push_back(name);
     }
     std::string error;
     std::vector<std::wstring> skipped;
@@ -719,6 +910,76 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
         bundle.notes.push_back(toUtf8(name) +
                                " could not be read consistently (unreadable or changed during collection) and is not in the zip -- it is probably still "
                                "being written to.");
+    }
+
+    // ---- the game's crash dump -----------------------------------------
+    //
+    // When the session ended in a crash, Elite's own reporter (or Windows
+    // Error Reporting, where LocalDumps is on) has written a minidump of the
+    // game seconds after EDVR's last line. It holds what the logs cannot: the
+    // memory at the fault, the threads, the modules that were unloaded. It goes
+    // in a zip of its own, not the log zip: it is tens of MB and holds a copy
+    // of the game's memory, so the log zip stays the one that is safe to
+    // attach to a public issue. The end of the session is the later of the
+    // last log write and the breadcrumbs' last write: the gfx log can hit its
+    // size cap long before a crash, and the breadcrumb heartbeat runs to it.
+    if (haveNewestLog) {
+        FILETIME end = sessionEnd;
+        WIN32_FILE_ATTRIBUTE_DATA crumbs{};
+        if (GetFileAttributesExW(joinPath(gameDir, L"edvr_breadcrumbs.txt").c_str(),
+                                 GetFileExInfoStandard, &crumbs) &&
+            CompareFileTime(&crumbs.ftLastWriteTime, &end) > 0) {
+            end = crumbs.ftLastWriteTime;
+        }
+        std::wstring localAppData, tempDir;
+        if (dumpSearch) {
+            localAppData = dumpSearch->localAppData;
+            tempDir = dumpSearch->tempDir;
+        } else {
+            PWSTR known = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &known)) && known) {
+                localAppData = known;
+                CoTaskMemFree(known);
+            }
+            wchar_t tempBuffer[MAX_PATH]{};
+            const DWORD tempLength = GetTempPathW(MAX_PATH, tempBuffer);
+            if (tempLength > 0 && tempLength < MAX_PATH) tempDir = tempBuffer;
+            while (!tempDir.empty() && (tempDir.back() == L'\\' || tempDir.back() == L'/')) tempDir.pop_back();
+        }
+
+        const unsigned long long kDumpFileBytes = 512ull << 20;
+        std::vector<std::string> leftOut;
+        const std::vector<CrashDump> dumps =
+            findCrashDumps(localAppData, tempDir, end, kSessionWindowSeconds, kDumpFileBytes, &leftOut);
+        for (const std::string& note : leftOut) bundle.notes.push_back(note);
+        if (!dumps.empty()) {
+            std::vector<std::wstring> dumpFiles, dumpNames;
+            unsigned long long total = 0;
+            for (const CrashDump& dump : dumps) {
+                dumpFiles.push_back(dump.path);
+                dumpNames.push_back(dump.zipName);
+                total += dump.size;
+            }
+            const std::wstring dumpZip = joinPath(where, L"edvr-crash-dump-" + stamp + L".zip");
+            std::string dumpError;
+            bool deflated = false;
+            if (writeDumpZip(dumpZip, dumpFiles, dumpNames, &dumpError, &deflated)) {
+                bundle.dumpZipPath = dumpZip;
+                bundle.dumpEntries = dumpNames;
+                char line[256];
+                sprintf_s(line,
+                          "%d crash dump%s of the game from this session (%.0f MB%s) saved separately as %s; "
+                          "it holds a copy of the game's memory, so send it privately and not on a public issue",
+                          static_cast<int>(dumps.size()), dumps.size() == 1 ? "" : "s",
+                          static_cast<double>(total) / 1048576.0, deflated ? ", compressed" : ", not compressed",
+                          toUtf8(leafOf(dumpZip)).c_str());
+                bundle.notes.push_back(line);
+            } else {
+                bundle.notes.push_back("A crash dump from this session was found but could not be zipped (" +
+                                       dumpError + "); it is still where the game wrote it: " +
+                                       toUtf8(dumps.front().path));
+            }
+        }
     }
     bundle.ok = true;
     return bundle;

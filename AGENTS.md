@@ -79,6 +79,8 @@ named without the maintainer's consent.
 ```bash
 python tools\install_edvr.py --target steam --dry-run
 python tools\install_edvr.py --target steam
+python tools\install_edvr.py --target steam --scope flat --xess
+python tools\install_edvr.py --target steam --scope flat --verify-only
 python tools\edvr_log.py --target steam --expect-build HEAD --version
 ```
 
@@ -137,7 +139,8 @@ minutes after a flight finally reproduced the effect being chased.
   receipt check fails, run the full build again. The receipt fingerprints
   tracked files, untracked files git does not ignore, and the ignored
   dependency folders (`third_party\ngx`, `third_party\ffx-dx11`,
-  `third_party\openxr\loader`); `docs\`, `reviews\` and other ignored paths
+  `third_party\openxr\loader`, `third_party\xess`); `docs\`, `reviews\` and
+  other ignored paths
   are not inputs, so writing a review or a doc does not stale it
   (`tools\build_receipt.py` states the rule and its self-test pins it).
 - After editing, re-read the changed region for the things that have bitten
@@ -157,11 +160,12 @@ minutes after a flight finally reproduced the effect being chased.
 - `edvr.ini` in a game directory carries the settings of whoever flew
   last. A reinstall does not undo an edit to it. `install_edvr.py` does not
   touch it unless `--ini` says so, and backs it up when it does.
-- `edvr-flat.ini` is the flat profile's own settings file: the flat build
-  reads it first and falls back to `edvr.ini`, `--profile flat --ini`
-  writes it (never `edvr.ini`), and a flat install seeds it from
-  `edvr.ini` when the game directory has none yet. Everything above about
-  a live `edvr.ini` applies to it verbatim.
+- `edvr-flat.ini` is the flat profile's own settings file: while the flat
+  profile is active, EDVR reads it first and falls back to `edvr.ini`.
+  `--scope flat --ini` writes it (never `edvr.ini`), `--scope both --ini`
+  writes both, and a scope that includes flat seeds it from `edvr.ini` when
+  the game directory has none yet. Everything above about a live `edvr.ini`
+  applies to it verbatim.
 - Settings mirror to `%LOCALAPPDATA%\EDVR\<leaf>-<store>\` and are restored
   from there, because a game update once wiped the whole install directory
   including the ini.

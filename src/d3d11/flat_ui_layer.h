@@ -74,6 +74,17 @@ void flatUiLayerWriteBackEnd(ID3D11DeviceContext* ctx);
 // `route` names the frame's route so far ("hdr" once the HDR route treated, else the resolve plan's route name).
 bool flatUiLayerToneCandidate(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t renderW, uint32_t renderH, int hdrSlot,
                               uint64_t vs, uint64_t ps, const void* input, uint32_t outW, uint32_t outH, const char* route);
+// The two flight-verified E894 source writers: physically qualify their full-size LDR draw and direct HUD read at t1
+// before using the usual flat-only tone candidate/proof path. Unknown pairs do not bootstrap proof.
+bool flatUiLayerSourceToneCandidate(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t renderW, uint32_t renderH,
+                                    uint64_t vs, uint64_t ps, const void* cachedOutput,
+                                    uint32_t outW, uint32_t outH, const char* route);
+// Diagnostic only: log each unknown pair once (up to a process-lifetime cap)
+// if the physical HUD/tone shape, bloom binding and exact fullscreen draw match.
+void flatUiLayerProbeUnknownSourceTone(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t renderW, uint32_t renderH,
+                                       uint64_t vs, uint64_t ps, const void* cachedOutput,
+                                       uint32_t outW, uint32_t outH, char kind, uint32_t count,
+                                       uint32_t instances, uint32_t startInstance);
 // A plain copy (the game's copy pixel shader) from `source` into `output` this frame: when the source is the HUD's HDR
 // target, the output is the copy the tone may read instead (the HDR route's post chain does).
 void flatUiLayerNoteCopy(uint64_t frame, const void* source, const void* output);
@@ -109,7 +120,7 @@ void flatUiLayerMapAaCopy(bool ok, bool easu = false, bool smaa = false);
 // Once a frame from the flat runtime's frame boundary (mapOpen: this frame's map answer, counted as an open-map frame):
 // every 30 s the "flat ui layer" lines (flatUiLayerReport), zeros included, every window of the flat profile -- a log
 // without them is a build that never ran the adapter.
-void flatUiLayerFrame(bool mapOpen);
+void flatUiLayerFrame(bool mapOpen, uint64_t nextFrame);
 void flatUiLayerReport(uint64_t windowSeconds);
 // The layer's state for the 30 s line: "live", or the shared not-live reason verbatim.
 const char* flatUiLayerState();
