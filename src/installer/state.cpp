@@ -19,8 +19,18 @@ std::wstring statePath(const std::wstring& gameDir) {
 std::wstring baseIniPath(const std::wstring& gameDir) {
     return joinPath(stateDirPath(gameDir), L"edvr.ini.base");
 }
+std::wstring flatBaseIniPath(const std::wstring& gameDir) {
+    return joinPath(stateDirPath(gameDir), L"edvr-flat.ini.base");
+}
 std::wstring backupRootPath(const std::wstring& gameDir) {
     return joinPath(gameDir, L"edvr_backup");
+}
+
+std::string recordedScope(const InstallState& state) {
+    if (!state.scope.empty()) return state.scope;
+    if (state.profile == "flat") return "flat";
+    if (state.profile == "vr") return "both";
+    return std::string();
 }
 
 const wchar_t* settingsLeafFor(const std::string& profile) {
@@ -62,6 +72,8 @@ InstallState parseState(const std::string& text) {
     s.installedUtc = get("edvr", "installed_utc");
     s.profile = get("edvr", "profile");
     if (s.profile.empty()) s.profile = "vr";
+    s.scope = get("edvr", "scope");
+    if (s.scope.empty()) s.scope = recordedScope(s);   // a record from before scopes: its profile says which
     s.descriptorSha = get("edvr", "descriptor_sha256");
     s.components = get("edvr", "components");
     s.openvrDir = fromUtf8(get("edvr", "openvr_dir"));
@@ -114,6 +126,7 @@ std::string serializeState(const InstallState& state) {
     out += "version = " + state.edvrVersion + "\r\n";
     out += "installed_utc = " + state.installedUtc + "\r\n";
     out += "profile = " + state.profile + "\r\n";
+    out += "scope = " + recordedScope(state) + "\r\n";
     out += "descriptor_sha256 = " + state.descriptorSha + "\r\n";
     out += "components = " + state.components + "\r\n";
     out += "openvr_dir = " + toUtf8(state.openvrDir) + "\r\n";

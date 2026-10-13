@@ -47,7 +47,8 @@ struct PayloadInfo {
     bool        haveOpenxrLicense = false;
     std::string openxrLicenseSha;
     // The shipped default settings, one text per settings file (state.h: settingsLeafFor
-    // names each). The VR edition carries edvr.ini; both editions carry edvr-flat.ini.
+    // names each). The VR edition carries edvr.ini; both editions carry edvr-flat.ini. The
+    // scope the install was asked for decides which of these it writes.
     bool        haveIni = false;      // edvr.ini
     std::string iniText;
     bool        haveFlatIni = false;  // edvr-flat.ini
@@ -86,9 +87,11 @@ struct Survey {
     // operation and a VR one never touch each other's tuning.
     bool        flatIniPresent = false;
     std::string flatIniText;
-    // The shipped settings of the installed edition's version, if kept. One file
-    // for both editions: it belongs to whichever the record says is installed.
+    // The shipped defaults each settings file was last merged against: edvr.ini.base
+    // and edvr-flat.ini.base (state.h). Each is only as good as the install that
+    // wrote it; the planner decides whether it describes the file (planInstall).
     std::string baseIniText;
+    std::string flatBaseIniText;
 
     // NVIDIA's DLSS runtime beside the game, and whether this machine has a
     // card for it: an NVIDIA adapter by DXGI's vendor id. A machine with an
@@ -126,6 +129,10 @@ Survey surveyTarget(const GameInstall& game);
 // installer record. Its scope names the edition: both and vr are "vr", flat is "flat".
 std::string installedProfile(const Survey& survey);
 
+// The scope the folder's install covers: both, vr or flat, from the record (recordedScope) or, without a record, from a canonical
+// descriptor. Empty when the folder has neither.
+std::string installedScope(const Survey& survey);
+
 // Whether the folder holds a settings file `profile` would read: its own, or, for
 // flat, the shared edvr.ini that the flat runtime falls back to until it has one
 // of its own. What "this folder has lost its settings" is asked in terms of.
@@ -137,9 +144,13 @@ struct Options {
     // install with only one of them is a support thread waiting to happen --
     // the log says a fix stood down, and the person reading it has no idea they
     // opted out of it. What this installer carries is what it installs.
-    bool keepSettings = true;   // merge the edition's settings file rather than replace it
+    // What the install covers: "both" (VR runtime and both settings files), "vr" (runtime and edvr.ini) or "flat" (edvr-flat.ini,
+    // no runtime). Empty means the scope the folder already has, else both (or flat when the payload carries no runtime).
+    std::string scope;
+    bool keepSettings = true;   // merge each settings file the scope installs rather than replace it
     bool repair = false;        // rewrite our files even when they look right
-    bool convertProfile = false; // explicit edition conversion
+    // No longer read by the planner: a scope change needs no confirmation. The GUI and CLI still set it until P3-3 removes them.
+    bool convertProfile = false;
     bool removeSettings = false;  // uninstall: delete the installed edition's settings file too
     std::wstring backupStamp;   // folder name under edvr_backup\; caller supplies the clock
     std::string  nowUtc;        // stamped into the install record
