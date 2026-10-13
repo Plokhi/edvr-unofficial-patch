@@ -12,14 +12,14 @@
 
 #include "../common/code_hook.h"
 #include "../common/log.h"
+#include "explorer_cam_core.h"
 #include "optimized_station.h"
+#include "optimized_station_core.h"
 
 namespace edvr {
 namespace {
 
 constexpr uintptr_t kStoreRva = 0x4312040u;
-constexpr uint8_t kStorePin[16] = {0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x56, 0x41,
-                                   0x57, 0x48, 0x8D, 0xAC, 0x24, 0x68, 0xFE, 0xFF};
 constexpr size_t kRelayBytes = 44, kOriginalLiteral = 36;
 
 using StoreFn = uintptr_t(__fastcall*)(uintptr_t bucket, uintptr_t mask, uintptr_t out, uintptr_t lod, uintptr_t record);
@@ -35,14 +35,11 @@ struct Detour {
     CodeHook hook;
     uint8_t* relay = nullptr;
     std::atomic<bool> ready{false};
+    std::atomic<bool> refused{false};   // built v14.18: a refusal is final (the build does not change), so it is logged once
     std::atomic<const char*> status{"not wanted yet"};
 };
 
 Detour g_store;
-
-bool bytesMatch(const uint8_t* got, const uint8_t* want, size_t n) noexcept {
-    return got && want && std::memcmp(got, want, n) == 0;
-}
 
 uint8_t* allocateRelay(uintptr_t target) noexcept {
     SYSTEM_INFO info{};
@@ -110,15 +107,34 @@ __declspec(noinline) uintptr_t __fastcall storeObserved(uintptr_t bucket, uintpt
     return result;
 }
 
-// Installs the detour once: the prologue must match the pin, and the CodeHook must accept it.
+// The PE identity the other build-keyed hooks read (kinematic_eval_hook.cpp targetValid): base+0x3C -> e_lfanew, then the TimeDateStamp at +8
+// and the SizeOfImage at +0x50. Under __try: an unreadable header is a refusal, not a crash.
+bool readIdentity(uintptr_t base, uint32_t* stamp, uint32_t* size) noexcept {
+    __try {
+        uint32_t peOff = 0;
+        std::memcpy(&peOff, reinterpret_cast<const void*>(base + 0x3C), 4);
+        if (peOff > 0x1000) return false;
+        std::memcpy(stamp, reinterpret_cast<const void*>(base + peOff + 8), 4);
+        std::memcpy(size, reinterpret_cast<const void*>(base + peOff + 0x50), 4);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Installs the detour once: the PE identity must be build 332841's, the prologue must match the pin, and the CodeHook must accept it.
+// A refusal is final and logged once; with the detour refused nothing is written to the game (the observer that writes is never reached).
 void installOnce() noexcept {
-    if (g_store.ready.load(std::memory_order_acquire)) return;
+    if (g_store.ready.load(std::memory_order_acquire) || g_store.refused.load(std::memory_order_acquire)) return;
     const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     if (!base) {
         g_store.status.store("the module base is unknown", std::memory_order_release);
         return;
     }
-    uint8_t got[sizeof(kStorePin)] = {};
+    uint32_t stamp = 0;
+    uint32_t size = 0;
+    const bool identityRead = readIdentity(base, &stamp, &size);
+    uint8_t got[sizeof(sealed::kStorePrologue)] = {};
     bool readOk = false;
     __try {
         std::memcpy(got, reinterpret_cast<const void*>(base + kStoreRva), sizeof(got));
@@ -126,10 +142,23 @@ void installOnce() noexcept {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         readOk = false;
     }
-    if (!readOk || !bytesMatch(got, kStorePin, sizeof(kStorePin))) {
-        g_store.status.store("the store's prologue does not match build 332841", std::memory_order_release);
-        Log::get().note("store hook: refused: the admission store's sixteen prologue bytes are not build 332841's; "
-                        "the optimized station stands down.");
+    const sealed::StoreInstall verdict = sealed::storeInstallDecision(identityRead, stamp, size, ecm::kExpectedTimestamp, ecm::kExpectedImageSize,
+                                                                     readOk ? got : nullptr, sealed::kStorePrologue, sizeof(got));
+    if (verdict != sealed::StoreInstall::kInstall) {
+        g_store.refused.store(true, std::memory_order_release);
+        if (verdict == sealed::StoreInstall::kWrongIdentity) {
+            g_store.status.store("not build 332841 (PE timestamp or image size)", std::memory_order_release);
+            Log::get().note("store hook: refused: not build 332841 (PE timestamp %u, image size %u); the optimized station stands down.",
+                            static_cast<unsigned>(stamp), static_cast<unsigned>(size));
+        } else if (verdict == sealed::StoreInstall::kUnreadable) {
+            g_store.status.store("the executable's PE header or the store's prologue is unreadable", std::memory_order_release);
+            Log::get().note("store hook: refused: the PE header or the admission store's prologue is unreadable; "
+                            "the optimized station stands down.");
+        } else {
+            g_store.status.store("the store's prologue does not match build 332841", std::memory_order_release);
+            Log::get().note("store hook: refused: the admission store's sixteen prologue bytes are not build 332841's; "
+                            "the optimized station stands down.");
+        }
         return;
     }
     g_store.relay = allocateRelay(base + kStoreRva);

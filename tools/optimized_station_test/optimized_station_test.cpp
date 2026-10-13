@@ -3,6 +3,7 @@
 // shell, a hangar change, launch), the pad-local frame's round trip and the release's threshold, the parse of the per-size floors, the own-ship
 // prefix and sphere, the bay's volume, and the unreadable rule. No DLL and no game.
 #include "../../src/d3d11/optimized_station_core.h"
+#include "../../src/d3d11/explorer_cam_core.h"   // the build-332841 PE identity constants (store hook gate)
 
 #include <cmath>
 #include <cstdio>
@@ -1281,6 +1282,197 @@ int main(int argc, char** argv) {
                   !se::padMovedAway(relE, se::shellRelative(padUp5, shellE, up)),
               "the pad rising 3 m against the shell releases the cell (the limit is 2 m); 1.5 m and exactly 2 m do not");
         check(!se::padMovedAway(NAN, 0.0f), "an unreadable reference never releases");
+    }
+
+    // ---- Built v14.17 (2026-10-13): the dock's arrival, the pad's turn and the shell's change, the arrival's sun hold, the shell frame ------------
+    {
+        // The dock watch: a session that starts docked is not an arrival; a docked reading after an undocked one is.
+        se::DockWatch startsDocked;
+        startsDocked.step(true, true);
+        check(!startsDocked.arrived, "v14.17 dock: a session whose first reading is docked is not an arrival (the load-in rule stays)");
+        se::DockWatch unknownFirst;
+        unknownFirst.step(false, true);
+        unknownFirst.step(true, false);
+        unknownFirst.step(true, true);
+        check(unknownFirst.arrived, "v14.17 dock: an unknown reading is no reading; an undock then a dock is an arrival");
+        se::DockWatch arr;
+        arr.step(true, false);
+        arr.step(true, true);
+        check(arr.arrived, "v14.17 dock: a docked reading after an undocked one is an arrival in flight");
+        arr.sealedThisDock = true;
+        arr.step(true, true);
+        check(arr.sealedThisDock, "v14.17 dock: a repeated docked reading is no new dock (its seal state stands)");
+        arr.step(true, false);
+        arr.step(true, true);
+        check(arr.arrived && !arr.sealedThisDock, "v14.17 dock: each new dock resets its seal state and is an arrival again");
+
+        // An arrived dock: the pad first seen lowered does not seal at load-in; it seals 2 s after it lowers (the bay settles).
+        se::SealState st;
+        se::SealInputs arrivedIn = quiet(0);
+        arrivedIn.arrived = true;
+        const uint64_t tArr = firstEngage(&st, arrivedIn, 100, 10000);
+        check(tArr == 100 + se::kBayStillMs && !st.immediate,
+              "v14.17 arrival: a pad first seen lowered after an in-flight arrival does not seal at load-in: it seals 2 s after it lowers");
+
+        // A pad identity change during an arrived dock keeps moved: no load-in seal for the new pad.
+        se::SealState stPad;
+        se::ReleaseWhy wPad = se::ReleaseWhy::kNone;
+        se::SealInputs padA = quiet(0);
+        padA.arrived = true;
+        padA.pad = 0x1000;
+        se::sealStep(padA, &stPad, &wPad);
+        se::SealInputs padB = padA;
+        padB.pad = 0x2000;
+        padB.nowMs = 100;
+        se::sealStep(padB, &stPad, &wPad);
+        check(stPad.moved, "v14.17 arrival: a pad identity change during an arrived dock keeps moved");
+        check(firstEngage(&stPad, padB, 200, 1900) == 0 && !stPad.immediate,
+              "v14.17 arrival: the new pad does not seal at load-in; its bay clock runs (no seal before 2 s)");
+
+        // A turn in place: the pad's centre fixed at -45 m, its forward axis turned 2 deg at 1 s. The still clock restarts: the seal comes 2 s after
+        // the turn (3 s), where a pad that never turns seals at 2 s.
+        const float kDeg = 3.14159265f / 180.0f;
+        const float fwd0[3] = {1.0f, 0.0f, 0.0f};
+        const float fwd2[3] = {std::cos(2.0f * kDeg), std::sin(2.0f * kDeg), 0.0f};
+        {
+            se::PadStillWatch pw;
+            se::SealState stT;
+            uint64_t sealedT = 0;
+            for (uint64_t t = 0; t <= 5000; t += 100) {
+                const float* axis = t >= 1000 ? fwd2 : fwd0;
+                pw.step(0x1000, axis, 1, 0x5000, t);
+                se::SealInputs in = quiet(t);
+                in.arrived = true;
+                in.pad = 0x1000;
+                in.padLastMotionMs = pw.motionMs();
+                se::ReleaseWhy w = se::ReleaseWhy::kNone;
+                if (se::sealStep(in, &stT, &w) == se::SealAction::kRequestEngage && sealedT == 0) sealedT = t;
+            }
+            check(sealedT == 3000, "v14.17 turn: a pad turning 2 deg in place at 1 s restarts the still clock: the seal comes at 3 s, not 2 s");
+        }
+        {
+            se::PadStillWatch pw;
+            se::SealState stT;
+            uint64_t sealedT = 0;
+            for (uint64_t t = 0; t <= 5000; t += 100) {
+                pw.step(0x1000, fwd0, 1, 0x5000, t);
+                se::SealInputs in = quiet(t);
+                in.arrived = true;
+                in.pad = 0x1000;
+                in.padLastMotionMs = pw.motionMs();
+                se::ReleaseWhy w = se::ReleaseWhy::kNone;
+                if (se::sealStep(in, &stT, &w) == se::SealAction::kRequestEngage && sealedT == 0) sealedT = t;
+            }
+            check(sealedT == 2000, "v14.17 turn: control: a pad that never turns seals 2 s after it lowers (2 s)");
+        }
+        {
+            // A slow turn: 0.4 deg a reading (under the latch's 0.5 deg per-frame limit) adds up; the anchor sees 1.2 deg at the third reading.
+            se::PadStillWatch pw;
+            bool m1 = pw.step(0x1000, fwd0, 1, 0x5000, 0);
+            const float a4[3] = {std::cos(0.4f * kDeg), std::sin(0.4f * kDeg), 0.0f};
+            const float a8[3] = {std::cos(0.8f * kDeg), std::sin(0.8f * kDeg), 0.0f};
+            const float a12[3] = {std::cos(1.2f * kDeg), std::sin(1.2f * kDeg), 0.0f};
+            const bool m2 = pw.step(0x1000, a4, 1, 0x5000, 100);
+            const bool m3 = pw.step(0x1000, a8, 1, 0x5000, 200);
+            const bool m4 = pw.step(0x1000, a12, 1, 0x5000, 300);
+            check(!m1 && !m2 && !m3 && m4 && pw.turnMs == 300,
+                  "v14.17 turn: slow turns add up against the anchor: 0.4 deg steps restart the clock only at 1.2 deg (the third step)");
+        }
+
+        // A shell change: the pad still and not turned, the record its height is measured against changes at 1 s: the clock restarts (3 s).
+        {
+            se::PadStillWatch pw;
+            se::SealState stS;
+            uint64_t sealedS = 0;
+            for (uint64_t t = 0; t <= 5000; t += 100) {
+                pw.step(0x1000, fwd0, 1, t >= 1000 ? 0x6000 : 0x5000, t);
+                se::SealInputs in = quiet(t);
+                in.arrived = true;
+                in.pad = 0x1000;
+                in.padLastMotionMs = pw.motionMs();
+                se::ReleaseWhy w = se::ReleaseWhy::kNone;
+                if (se::sealStep(in, &stS, &w) == se::SealAction::kRequestEngage && sealedS == 0) sealedS = t;
+            }
+            check(sealedS == 3000, "v14.17 shell: a change of the shell record restarts the still clock: the seal comes at 3 s");
+        }
+
+        // A session that starts docked keeps the load-in rule: the pad first seen lowered seals at the first eligible frame (100 ms).
+        se::DockWatch sessionDocked;
+        sessionDocked.step(true, true);
+        se::SealState stDocked;
+        se::SealInputs dockedIn = quiet(0);
+        dockedIn.arrived = sessionDocked.arrived;
+        check(firstEngage(&stDocked, dockedIn, 100, 10000) == 100 && stDocked.immediate,
+              "v14.17: a session that starts docked still seals at load-in on the first eligible frame (100 ms)");
+
+        // The sun after an arrival: the pad lowered turns the sun off; a pad raised (launch) before any seal keeps it off; undock turns it on.
+        {
+            se::SunState sun;
+            se::SunInputs si;
+            si.setting = true;
+            si.docked = true;
+            si.hangar = true;
+            si.relOk = true;
+            si.rel = -45.0f;
+            si.holdForSeal = true;
+            const char* why = "";
+            check(se::sunStep(si, &sun, &why) && sun.off, "v14.17 sun: the pad lowered in an arrived dock turns the sun off");
+            si.rel = 5.0f;
+            check(!se::sunStep(si, &sun, &why) && sun.off,
+                  "v14.17 sun: after an arrival, a pad raised (launch) before any seal keeps the sun off");
+            si.docked = false;
+            check(se::sunStep(si, &sun, &why) && !sun.off && std::strcmp(why, "undocked") == 0,
+                  "v14.17 sun: undocking turns the sun back on");
+        }
+        {
+            se::SunState sun;
+            se::SunInputs si;
+            si.setting = true;
+            si.docked = true;
+            si.hangar = true;
+            si.relOk = true;
+            si.rel = -45.0f;
+            const char* why = "";
+            se::sunStep(si, &sun, &why);
+            si.rel = 5.0f;
+            check(se::sunStep(si, &sun, &why) && !sun.off && std::strcmp(why, "pad raised (launch)") == 0,
+                  "v14.17 sun: without the arrival hold (a session that started docked, or after a seal) the pad raised turns the sun on");
+        }
+
+        // The shell frame: the pad 3 m along x and 4 m along y from the shell, 45 m below it; its forward axis along +y: yaw +90 deg about up.
+        const float shellO[3] = {0.0f, 0.0f, 0.0f};
+        const float upZ[3] = {0.0f, 0.0f, 1.0f};
+        const float shFwdX[3] = {1.0f, 0.0f, 0.0f};
+        const float padP[3] = {3.0f, 4.0f, -45.0f};
+        const float padFwdY[3] = {0.0f, 1.0f, 0.0f};
+        const se::ShellFrame sf = se::shellFrameOf(padP, shellO, upZ, shFwdX, padFwdY);
+        check(sf.ok && std::fabs(sf.z + 45.0f) < 1e-4f && std::fabs(sf.x - 3.0f) < 1e-4f && std::fabs(sf.y - 4.0f) < 1e-4f &&
+                  std::fabs(sf.lateral - 5.0f) < 1e-4f,
+              "v14.17 shell frame: z is the rel reading (-45), x and y across the shaft (3, 4), lateral is the distance from the shaft (5)");
+        check(sf.yawOk && std::fabs(sf.yawDeg - 90.0f) < 1e-3f, "v14.17 shell frame: a forward axis of +y against the shell's +x is yaw +90 deg about up");
+        const float padFwdUp[3] = {0.0f, 0.0f, 1.0f};
+        check(se::shellFrameOf(padP, shellO, upZ, shFwdX, padFwdUp).ok && !se::shellFrameOf(padP, shellO, upZ, shFwdX, padFwdUp).yawOk,
+              "v14.17 shell frame: yaw is n/a when the pad's forward axis lies along the shaft; the position is still read");
+        const float shellUp[3] = {0.0f, 0.0f, 1.0f};
+        check(!se::shellFrameOf(padP, shellO, upZ, shellUp, padFwdY).ok,
+              "v14.17 shell frame: no horizontal frame when the shell's forward axis lies along the shaft");
+
+        // The store hook's install decision: the identity first, then the prologue pin.
+        const uint8_t* pin = se::kStorePrologue;
+        uint8_t wrongPrologue[16] = {};
+        std::memcpy(wrongPrologue, pin, sizeof(wrongPrologue));
+        wrongPrologue[0] ^= 0xFFu;
+        const uint32_t wantStamp = edvr::ecm::kExpectedTimestamp, wantSize = edvr::ecm::kExpectedImageSize;
+        check(se::storeInstallDecision(true, wantStamp, wantSize, wantStamp, wantSize, pin, pin, 16) == se::StoreInstall::kInstall,
+              "v14.17 store hook: build 332841's identity and pin install the detour");
+        check(se::storeInstallDecision(true, wantStamp + 1, wantSize, wantStamp, wantSize, pin, pin, 16) == se::StoreInstall::kWrongIdentity,
+              "v14.17 store hook: the pin matches but the PE timestamp is another build's: refused");
+        check(se::storeInstallDecision(true, wantStamp, wantSize + 4096, wantStamp, wantSize, pin, pin, 16) == se::StoreInstall::kWrongIdentity,
+              "v14.17 store hook: the pin matches but the image size is another build's: refused");
+        check(se::storeInstallDecision(true, wantStamp, wantSize, wantStamp, wantSize, wrongPrologue, pin, 16) == se::StoreInstall::kWrongPrologue,
+              "v14.17 store hook: the right identity with the wrong prologue bytes is refused");
+        check(se::storeInstallDecision(false, 0, 0, wantStamp, wantSize, pin, pin, 16) == se::StoreInstall::kUnreadable,
+              "v14.17 store hook: an unreadable PE header is refused");
     }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);

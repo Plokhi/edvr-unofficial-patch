@@ -887,6 +887,11 @@ float g_namesPadC[3] = {};
 uintptr_t g_hangarPad = 0;
 // Built v14.12: the bay's mechanism, latched once per descent (core LatchSet). Candidates are gathered only while a latch is pending.
 sealed::LatchSet g_latch;
+// Built v14.17: the dock's arrival and this dock's seal (the lock: g_sealedMutex); the pad's turn and the shell's change as still motion; the pad
+// in the shell's frame this frame (the temporary track line and the sealed line).
+sealed::DockWatch g_dock;
+sealed::PadStillWatch g_padStill;
+sealed::ShellFrame g_frameShell;
 sealed::LatchCand g_latchCands[sealed::kLatchCandCap];
 size_t g_latchCandN = 0;
 bool g_latchPending = false;         // docked, unsealed, after a descent, not yet latched
@@ -1058,7 +1063,8 @@ void captureEngageInfo(uint64_t now) noexcept {
 }
 
 // The own pad's still time for the seal: the pad's last motion (its latch record).
-uint64_t padLastMotion() noexcept { return g_latch.padLastMotionMs(); }
+// Built v14.17: the pad's turn and the shell's change restart it too (PadStillWatch).
+uint64_t padLastMotion() noexcept { return std::max(g_latch.padLastMotionMs(), g_padStill.motionMs()); }
 
 // The seal's account for the status line (built v14.10).
 const char* engageHow() noexcept {
@@ -1107,15 +1113,64 @@ void hangarNote() noexcept {
     Log::get().note("optimized station: no sized hangar shell near the pad; the hangar-like and pad records near it: %s", text);
 }
 
+// Built v14.17: a log value with two decimals, or "n/a" when it is unreadable.
+void numOrNa(char* out, size_t cap, bool ok, float v) noexcept {
+    if (ok) std::snprintf(out, cap, "%.2f", static_cast<double>(v));
+    else std::snprintf(out, cap, "n/a");
+}
+
+// Built v14.17: a whole-millisecond log value, or "n/a" when it is unreadable.
+void msOrNa(char* out, size_t cap, bool ok, uint64_t ms) noexcept {
+    if (ok) std::snprintf(out, cap, "%llu", static_cast<unsigned long long>(ms));
+    else std::snprintf(out, cap, "n/a");
+}
+
 // The seal's status line, once per seal (called from the engage, after the cell is held and localized).
 void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
     ++g_sealCount;
+    char lat[24] = {};
+    char yaw[24] = {};
+    numOrNa(lat, sizeof(lat), g_frameShell.ok, g_frameShell.lateral);   // the last frame's shell frame (built v14.17)
+    numOrNa(yaw, sizeof(yaw), g_frameShell.yawOk, g_frameShell.yawDeg);
     Log::get().note("optimized station: sealed in %s hangar (%s, frame %u, seal %u): pad %s, box %.0f x %.0f x %.0f m (length, width, height), "
-                    "floor %.0f m under the pad, shell %s.", sizeWord(cell.size), engageHow(),
+                    "floor %.0f m under the pad, shell %s, lateral %s m, yaw %s deg.", sizeWord(cell.size), engageHow(),
                     frame, g_sealCount, cell.padName,
                     static_cast<double>(cell.boxHalf[0] * 2.0f), static_cast<double>(cell.boxHalf[1] * 2.0f),
                     static_cast<double>(cell.boxHalf[2] * 2.0f), static_cast<double>(belowFor(cell.size)),
-                    g_shellValid ? g_shellName : "none (the pad's motion is not checked)");
+                    g_shellValid ? g_shellName : "none (the pad's motion is not checked)", lat, yaw);
+}
+
+// Built v14.17 (TEMPORARY instrument: remove when the outpost flight confirms the rule). While docked, unsealed, after an arrival, at 4 Hz, at most
+// 240 lines per dock: the pad's track in the shell's frame and its still times. The position and turn still times run from the later of their last
+// motion and the dock's first line (so a pad that never moved reads as still for the time observed); the bay quiet time is the seal's own clock.
+void padTrackLine(uint64_t now) noexcept {
+    sealed::DockWatch& d = g_dock;
+    if (d.trackLines >= 240) return;
+    if (d.trackLastMs != 0 && now - d.trackLastMs < 250) return;
+    if (d.trackStartMs == 0) d.trackStartMs = now;
+    d.trackLastMs = now;
+    ++d.trackLines;
+    const uint64_t floorMs = d.trackStartMs;
+    char rel[24] = {}, x[24] = {}, y[24] = {}, z[24] = {}, lat[24] = {}, yaw[24] = {};
+    char stillS[24] = {}, stillT[24] = {}, quiet[24] = {}, shell[96] = {};
+    numOrNa(rel, sizeof(rel), g_relOk, g_relM);
+    if (g_preShellValid) {
+        std::snprintf(shell, sizeof(shell), "%s@%06llx", g_preShellName, static_cast<unsigned long long>(g_preShellAddr & 0xFFFFFFu));
+    } else {
+        std::snprintf(shell, sizeof(shell), "n/a");
+    }
+    numOrNa(x, sizeof(x), g_frameShell.ok, g_frameShell.x);
+    numOrNa(y, sizeof(y), g_frameShell.ok, g_frameShell.y);
+    numOrNa(z, sizeof(z), g_frameShell.ok, g_frameShell.z);
+    numOrNa(lat, sizeof(lat), g_frameShell.ok, g_frameShell.lateral);
+    numOrNa(yaw, sizeof(yaw), g_frameShell.yawOk, g_frameShell.yawDeg);
+    msOrNa(stillS, sizeof(stillS), g_pickCell.has, now - std::max(g_latch.padLastMotionMs(), floorMs));
+    msOrNa(stillT, sizeof(stillT), g_pickCell.has, now - std::max(g_padStill.turnMs, floorMs));
+    const uint64_t quietSince = std::max(std::max(g_sealState.lowerSinceMs, g_latch.lastMotionMs), padLastMotion());
+    msOrNa(quiet, sizeof(quiet), g_sealState.lowerSet && now >= quietSince, now - quietSince);
+    Log::get().note("optimized station: pad track: rel %s m, shell %s, pad in shell frame (x %s, y %s along the shaft, z %s) m, "
+                    "lateral %s m from the shell axis, yaw %s deg against the shell, still %s ms (position), %s ms (turn), bay quiet %s ms",
+                    rel, shell, x, y, z, lat, yaw, stillS, stillT, quiet);
 }
 
 // The 30 s summary: what the station did in the window. A user's log shows the station's work here.
@@ -1301,6 +1356,7 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
             pickOwnRecord(frame);
             g_heldCell = next;
             g_heldValid = true;
+            g_dock.sealedThisDock = true;   // built v14.17: this dock has sealed (the sun's arrival hold ends)
             setHeldFrame(g_heldCell, frame);
             g_engagePending = false;
             g_sealedFlag.store(true, std::memory_order_release);
@@ -1531,6 +1587,11 @@ void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept {
 
 // The render thread's frame tick: the setting, the held cell in the pad's frame, the seal and release rules, the rig verdicts, the summary.
 void optimizedStationFrame(uint32_t frame) {
+    {
+        // Built v14.17: the dock's arrival is read before the setting gate, so a toggle while undocked never misses the undock (DockWatch).
+        std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
+        g_dock.step(journalDockedKnown(), journalDocked());
+    }
     if (++g_settingPoll >= kSettingPollFrames) {
         g_settingPoll = 0;
         const std::string text = Config::get().getString("fix.optimized_station", "on");
@@ -1592,6 +1653,7 @@ void optimizedStationFrame(uint32_t frame) {
             g_ownRecAddr = 0;
             g_ownLiveValid = false;
             g_latch.reset();   // a new ship: the mechanism is latched again
+            g_padStill = sealed::PadStillWatch{};
         }
     }
     // Built v14.5: the height above the shell along the pad's own up axis, read live, with the shell picked once per pad (the same pick as the
@@ -1603,6 +1665,7 @@ void optimizedStationFrame(uint32_t frame) {
         g_shellNowValid = false;
     }
     g_heightChanged = false;
+    g_frameShell = sealed::ShellFrame{};   // built v14.17: the pad in the shell's frame, read when the height is
     if (g_pickCell.has) {
         g_relOk = false;
         if (!g_hangarWatch.giveUp && (!g_preShellValid || g_preShellPad != g_pickCell.pad)) {
@@ -1635,6 +1698,15 @@ void optimizedStationFrame(uint32_t frame) {
                     g_shellNowSrc = sw.source;
                     g_shellNowValid = true;
                     g_heightChanged = g_heightSrc.note(pw.source, sw.source);
+                    // Built v14.17: the pad's turn and the shell's change (the still clock), and the pad in the shell's frame (the instrument).
+                    g_padStill.step(g_pickCell.pad, axes[0], pw.source, g_preShellAddr, now);
+                    float shAxes[3][3] = {};
+                    float shExt[3] = {};
+                    bool shExtOk = false;
+                    uint8_t shSrc = 4;
+                    if (poseOrientOf(g_preShellAddr, shAxes, shExt, &shExtOk, &shSrc)) {
+                        g_frameShell = sealed::shellFrameOf(pw.world, sw.world, up, shAxes[0], axes[0]);
+                    }
                 }
             }
         }
@@ -1688,6 +1760,7 @@ void optimizedStationFrame(uint32_t frame) {
         su.relOk = g_relOk;
         su.rel = g_relM;
         su.hangarChanged = g_flagHangarChanged;
+        su.holdForSeal = g_dock.arrived && !g_dock.sealedThisDock;   // built v14.17: an arrival's sun waits for its first seal
         const char* why = "";
         if (sealed::sunStep(su, &g_sun, &why)) {
             g_sunOff.store(g_sun.off, std::memory_order_release);
@@ -1698,6 +1771,7 @@ void optimizedStationFrame(uint32_t frame) {
     sealed::SealInputs in;
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
+    in.arrived = g_dock.arrived;   // built v14.17: an arrived dock expects its descent (no load-in rule)
     in.pickOk = g_pickCell.has && g_preShellValid;   // no sized shell: the trigger stays idle (built v14.13)
     in.padHeld = padHeld;
     in.mechanismMoved = g_mechanismMoved;
@@ -1717,6 +1791,7 @@ void optimizedStationFrame(uint32_t frame) {
         g_heightSrc = sealed::ShellHeightSources{};
         g_preShellValid = false;
         g_latch.reset();
+        g_padStill = sealed::PadStillWatch{};
     }
     in.hangarChanged = g_flagHangarChanged;
     in.launched = false;   // the pad state object's reader is not in this build (optimized-station doc, "Not yet")
@@ -1740,6 +1815,8 @@ void optimizedStationFrame(uint32_t frame) {
             captureEngageInfo(now);
         }
     }
+    // Built v14.17 (temporary instrument): the pad's track while an arrived dock waits for its first seal.
+    if (g_dockedNow.load(std::memory_order_acquire) && g_dock.arrived && !g_dock.sealedThisDock && !g_heldValid) padTrackLine(now);
     // Built v14.1: while docked and unsealed, one line when the seal's inputs change, and at most every 10 s while docked: the unmet condition.
     if (!g_heldValid) {
         sealed::WaitView w;

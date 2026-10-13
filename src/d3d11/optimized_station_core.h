@@ -1018,6 +1018,7 @@ enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kCameraLeft
 struct SealInputs {
     bool setting = false;        // fix.optimized_station is on
     bool docked = false;         // Status.json Flags bit 0
+    bool arrived = false;        // built v14.17: this dock was reached in flight (DockWatch): the descent is expected, so no load-in rule
     bool pickOk = false;         // the own pad is found this frame, with a pose
     bool padHeld = false;        // built v14.9: the own pad is absent this frame, held for fewer than kHeldLostFrames: the trigger keeps its state
     bool mechanismMoved = false;  // built v14.14: a latched bay mechanism record moved on two frames in a row (sealed: the launch)
@@ -1060,6 +1061,136 @@ inline void clearTrigger(SealState* st) noexcept {
     st->fallback = false;
     st->lowerSet = false;
     st->lowerSinceMs = 0;
+}
+
+// Built v14.17 (2026-10-13): the dock's arrival. The glue steps this on every tick, before the setting gate, so a toggle never misses an undock.
+// A dock is "arrived" when a docked reading follows an undocked one since the process started: the pad is then expected to descend, so the
+// load-in rule does not apply to it. A session that starts docked (its first reading is docked) is not arrived and keeps the load-in rule.
+// Not cleared by a setting toggle or by clearTrigger.
+struct DockWatch {
+    bool haveFlag = false;        // a Status docked reading has been seen
+    bool prevDocked = false;      // the last reading's docked flag
+    bool sawUndocked = false;     // an undocked reading has been seen since the process started
+    bool arrived = false;         // this dock was reached in flight
+    bool sealedThisDock = false;  // a seal engaged during this dock (the sun holds for an arrival until one does)
+    uint32_t trackLines = 0;      // pad track lines written this dock (the temporary instrument)
+    uint64_t trackStartMs = 0;    // when the first pad track line of this dock was written (0: none yet)
+    uint64_t trackLastMs = 0;     // when the last pad track line was written (the 4 Hz gate)
+    // One Status reading. known: the reading exists. A change of the docked flag starts a dock afresh: the seal and track state reset.
+    void step(bool known, bool docked) noexcept {
+        if (!known) return;
+        if (!docked) sawUndocked = true;
+        if (haveFlag && docked == prevDocked) return;
+        if (haveFlag) {
+            sealedThisDock = false;
+            trackLines = 0;
+            trackStartMs = 0;
+            trackLastMs = 0;
+            if (docked) arrived = sawUndocked;   // a rising edge: arrived in flight when an undocked reading came before it
+        }
+        haveFlag = true;
+        prevDocked = docked;
+    }
+};
+
+// Built v14.17: the pad's turn and its shell's change count as motion for the bay's still clock. The flight at -45.7 m sat still in height while
+// turning, and the nearest shell changed under it, yet neither restarted the clock. The turn is measured against an anchor (the pad's forward axis
+// at the last turn or re-anchor), so a slow turn adds up. The latch's own check compares each frame with the last at kBayRotDeg (0.5 deg) and
+// misses a turn slower than that per frame.
+constexpr float kPadTurnDeg = 1.0f;
+inline float axisAngleDeg(const float a[3], const float b[3]) noexcept;   // defined with the bay watch below
+
+struct PadStillWatch {
+    bool have = false;
+    uintptr_t pad = 0;            // the pad the anchor belongs to
+    uint8_t posSrc = 4;           // the centre source of the pad's position at the anchor (a change re-anchors without counting)
+    uintptr_t shell = 0;          // the shell record the pad's height is measured against
+    float fwd[3] = {};            // the orientation anchor: the pad's forward axis
+    uint64_t turnMs = 0;          // the last turn beyond kPadTurnDeg (0: none)
+    uint64_t shellMs = 0;         // the last change of the shell record (0: none)
+    // One reading (the pad's forward axis from the same pose as its position). Returns true when this reading restarted the still clock.
+    bool step(uintptr_t padAddr, const float axis[3], uint8_t src, uintptr_t shellAddr, uint64_t nowMs) noexcept {
+        bool moved = false;
+        if (have && shellAddr != shell) {   // the shell the height is read against changed: a new reference is motion
+            shellMs = nowMs;
+            moved = true;
+        }
+        shell = shellAddr;
+        const bool same = have && padAddr == pad && src == posSrc;
+        if (!same || axisAngleDeg(fwd, axis) > kPadTurnDeg) {
+            if (same) {   // a turn beyond the limit, not a new pad
+                turnMs = nowMs;
+                moved = true;
+            }
+            fwd[0] = axis[0];
+            fwd[1] = axis[1];
+            fwd[2] = axis[2];
+        }
+        have = true;
+        pad = padAddr;
+        posSrc = src;
+        return moved;
+    }
+    uint64_t motionMs() const noexcept { return std::max(turnMs, shellMs); }
+};
+
+// Built v14.17 (instrument): the pad in the hangar shell's frame. The shaft is the pad's up axis, the one shellRelative measures along, so z is the
+// rel reading. x and y lie across the shaft: x along the shell's forward axis (its pose axes[0] with the shaft removed), y across both. lateral is the
+// distance from the shell's shaft line. yaw is the pad's forward axis against the shell's, about the shaft, in degrees.
+struct ShellFrame {
+    bool ok = false;      // position fields valid
+    bool yawOk = false;   // yawDeg valid (the pad's forward axis is not along the shaft)
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float lateral = 0.0f;
+    float yawDeg = 0.0f;
+};
+
+inline ShellFrame shellFrameOf(const float pad[3], const float shell[3], const float up[3], const float shellFwd[3], const float padFwd[3]) noexcept {
+    ShellFrame f;
+    const float z = shellRelative(pad, shell, up);
+    const float d[3] = {pad[0] - shell[0], pad[1] - shell[1], pad[2] - shell[2]};
+    const float h[3] = {d[0] - z * up[0], d[1] - z * up[1], d[2] - z * up[2]};   // across the shaft
+    const float sd = shellFwd[0] * up[0] + shellFwd[1] * up[1] + shellFwd[2] * up[2];
+    float xa[3] = {shellFwd[0] - sd * up[0], shellFwd[1] - sd * up[1], shellFwd[2] - sd * up[2]};
+    const float xl = std::sqrt(xa[0] * xa[0] + xa[1] * xa[1] + xa[2] * xa[2]);
+    if (!(xl > 1e-4f)) return f;   // the shell's forward axis lies along the shaft: no horizontal frame
+    for (int k = 0; k < 3; ++k) xa[k] /= xl;
+    const float ya[3] = {up[1] * xa[2] - up[2] * xa[1], up[2] * xa[0] - up[0] * xa[2], up[0] * xa[1] - up[1] * xa[0]};   // up x xa
+    f.ok = true;
+    f.z = z;
+    f.x = h[0] * xa[0] + h[1] * xa[1] + h[2] * xa[2];
+    f.y = h[0] * ya[0] + h[1] * ya[1] + h[2] * ya[2];
+    f.lateral = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+    const float pd = padFwd[0] * up[0] + padFwd[1] * up[1] + padFwd[2] * up[2];
+    float pa[3] = {padFwd[0] - pd * up[0], padFwd[1] - pd * up[1], padFwd[2] - pd * up[2]};
+    const float pl = std::sqrt(pa[0] * pa[0] + pa[1] * pa[1] + pa[2] * pa[2]);
+    if (pl > 1e-4f) {
+        for (int k = 0; k < 3; ++k) pa[k] /= pl;
+        const float c = xa[0] * pa[0] + xa[1] * pa[1] + xa[2] * pa[2];
+        const float cr[3] = {xa[1] * pa[2] - xa[2] * pa[1], xa[2] * pa[0] - xa[0] * pa[2], xa[0] * pa[1] - xa[1] * pa[0]};   // xa x pa
+        const float s = cr[0] * up[0] + cr[1] * up[1] + cr[2] * up[2];
+        f.yawDeg = std::atan2(s, c) * 57.29577951f;
+        f.yawOk = true;
+    }
+    return f;
+}
+
+// Built v14.18 (2026-10-13, the store hook's identity gate): the admission store's sixteen prologue bytes in build 332841. store_hook.cpp detours
+// FUN_144312040 by them, and the identity check comes first.
+inline constexpr uint8_t kStorePrologue[16] = {0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x68, 0xFE, 0xFF};
+
+// The store hook's install decision (store_hook.cpp installOnce). The identity (the PE TimeDateStamp and SizeOfImage the other build-keyed hooks
+// check) is read first; a mismatch refuses whatever the prologue is. identityRead false: the PE header was unreadable. got null: the prologue was
+// unreadable. The caller passes the expected pair from the build's constants (explorer_cam_core.h's ecm::kExpectedTimestamp and ecm::kExpectedImageSize).
+enum class StoreInstall : uint8_t { kInstall = 0, kUnreadable, kWrongIdentity, kWrongPrologue };
+inline StoreInstall storeInstallDecision(bool identityRead, uint32_t stamp, uint32_t size, uint32_t wantStamp, uint32_t wantSize,
+                                         const uint8_t* got, const uint8_t* pin, size_t n) noexcept {
+    if (!identityRead || got == nullptr || pin == nullptr) return StoreInstall::kUnreadable;
+    if (stamp != wantStamp || size != wantSize) return StoreInstall::kWrongIdentity;
+    if (std::memcmp(got, pin, n) != 0) return StoreInstall::kWrongPrologue;
+    return StoreInstall::kInstall;
 }
 
 // Built v14.5: the centre sources a height was read from. A change is a different reading: the still test restarts.
@@ -1368,6 +1499,7 @@ struct SunInputs {
     bool relOk = false;          // the pad's height above the shell is readable this frame
     float rel = 0.0f;
     bool hangarChanged = false;
+    bool holdForSeal = false;    // built v14.17: an arrived dock that has not sealed yet: a pad raised (launch) does not turn the sun back on
 };
 
 struct SunState {
@@ -1407,6 +1539,7 @@ inline bool sunStep(const SunInputs& in, SunState* st, const char** why) noexcep
     }
     if (!in.relOk) return false;   // unreadable this frame: hold
     if (in.rel >= kLoweredM) {
+        if (in.holdForSeal) return false;   // built v14.17: the arrival's sun stays off until the station has sealed in this dock
         st->off = false;
         *why = "pad raised (launch)";
         return true;
@@ -1506,8 +1639,9 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         st->seen = true;
         st->padAddr = in.pad;
         st->firstRel = in.rel;
-        st->moved = false;
+        if (!in.arrived) st->moved = false;   // built v14.17: an arrived dock keeps moved across a pad change
     }
+    if (in.arrived) st->moved = true;         // built v14.17: an arrived dock always expects its descent: never the load-in rule
     if (in.sourceChanged) st->firstRel = in.rel;   // a different centre source is a different reading: the motion reference follows it
     if (std::fabs(in.rel - st->firstRel) > kSealStillM) st->moved = true;
     const bool lowered = in.rel < kLoweredM;
