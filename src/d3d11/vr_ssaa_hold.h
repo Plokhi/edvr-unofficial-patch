@@ -62,4 +62,12 @@ unsigned long long vrSsaaHoldLoaderObject();
 // The Settings.xml mode read at startup (*known false when unread or unparsed).
 int vrSsaaHoldLastMode(bool* known);
 
+// The render context the hold holds (0 until a setter, a getter or a settings copy has named it). Lock-free. Read by the stereo table
+// probe (mode_watch.cpp); nothing here decides from it.
+uintptr_t vrSsaaHoldRenderContext();
+
+// The stereo table probe's read: the 7 signed dwords at render context +0x3678 (Elite's per-3D-mode table, build 332841), through the
+// same SEH read as every game read in this file. False when ctx is 0 or the read faults.
+bool vrSsaaHoldReadStereoTable(uintptr_t ctx, int32_t* out);
+
 }  // namespace edvr

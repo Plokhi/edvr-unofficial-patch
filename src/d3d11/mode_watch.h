@@ -17,9 +17,9 @@ void modeWatchStart();
 // Any thread; cheap. Safe before modeWatchStart: the bit is kept and the worker reads it at its first wake.
 void modeWatchHint(ModeHint h);
 
-// The render thread, at the top of presentFrameBoundary after the frame counter moves. Commits a posted mode and samples the runtime's
-// live flag once a frame.
-void modeWatchFrameBoundary();
+// The render thread, at the top of presentFrameBoundary after the frame counter moves. Commits a posted mode, samples the runtime's
+// live flag once a frame, and logs Elite's stereo table while the render context is known (log only). frame is the frame counter.
+void modeWatchFrameBoundary(uint32_t frame);
 
 // The menu's toast poll: true once per commit, with the notice text copied to out.
 bool modeWatchNoticeDue(char* out, size_t size);

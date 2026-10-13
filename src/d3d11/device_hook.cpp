@@ -1517,7 +1517,7 @@ void presentFrameBoundary() {
     // number could answer it. One counter, published here, printed by both.
     ++g_state->frameCounter;
     // The 3D mode watch's commit (mode_watch.h): a posted mode is applied here, at the one point no draw of the next frame has started.
-    tkModeWatch.run([] { modeWatchFrameBoundary(); });
+    tkModeWatch.run([] { modeWatchFrameBoundary(static_cast<uint32_t>(g_state->frameCounter)); });
     // The kinematic probe's clock: exactly once per owned Present. Here,
     // not beside vScreenFrameBoundary below -- that site sits behind the
     // graphicsRuntimeDisabled early return and would skip those presents.

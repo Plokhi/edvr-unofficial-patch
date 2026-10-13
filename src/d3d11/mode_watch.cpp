@@ -432,6 +432,85 @@ void commitPosted(uint64_t packed) {
     }
 }
 
+// The stereo table probe (log only; nothing reads it for a decision). Elite's 7-dword table at render context +0x3678 is read once a frame
+// while the context is known. A launch whose context is never known says `no render context yet` once, at its first frame boundary,
+// so "never read" and "never changed" differ in the log. Render thread only.
+constexpr size_t kStereoSlots = 7;
+constexpr unsigned kStereoLinesPerSecond = 20;  // change lines; the ones over the limit are counted into the next line logged
+constexpr size_t kStereoTextBytes = 96;         // seven signed 32-bit values with brackets and commas: at most 85 characters
+struct StereoProbe {
+    bool sawBoundary = false;     // the first frame boundary has passed
+    uintptr_t ctx = 0;            // the context the table was last read at (0: none yet)
+    bool haveValues = false;      // a read at ctx has succeeded: last holds the table
+    bool stopped = false;         // a read at ctx failed: no reads until the context pointer changes
+    int32_t last[kStereoSlots] = {};
+    uint64_t windowStartMs = 0;   // the one-second window the change lines are counted in
+    unsigned linesInWindow = 0;
+    unsigned dropped = 0;         // change lines over the limit since the last one logged
+};
+StereoProbe g_stereo;
+
+// "[a,b,c,d,e,f,g]" into out.
+void formatStereo(char* out, size_t n, const int32_t* v) {
+    std::snprintf(out, n, "[%d,%d,%d,%d,%d,%d,%d]", v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+}
+
+void stereoTableFrameBoundary(uint32_t frame) {
+    const uint64_t now = nowMs();
+    const uintptr_t ctx = vrSsaaHoldRenderContext();
+    if (!g_stereo.sawBoundary) {
+        g_stereo.sawBoundary = true;
+        if (!ctx) Log::get().note("mode watch: stereo table: no render context yet");
+    }
+    if (!ctx) return;
+    if (ctx != g_stereo.ctx) {
+        if (g_stereo.ctx)
+            Log::get().note("mode watch: stereo table render context now 0x%llX (was 0x%llX) t=%llu frame=%u",
+                            static_cast<unsigned long long>(ctx), static_cast<unsigned long long>(g_stereo.ctx),
+                            static_cast<unsigned long long>(now), frame);
+        g_stereo.ctx = ctx;
+        g_stereo.haveValues = false;
+        g_stereo.stopped = false;
+    }
+    if (g_stereo.stopped) return;
+    int32_t v[kStereoSlots] = {};
+    if (!vrSsaaHoldReadStereoTable(ctx, v)) {
+        g_stereo.stopped = true;
+        Log::get().note("mode watch: stereo table read failed at ctx=0x%llX", static_cast<unsigned long long>(ctx));
+        return;
+    }
+    char text[kStereoTextBytes];
+    if (!g_stereo.haveValues) {
+        g_stereo.haveValues = true;
+        std::memcpy(g_stereo.last, v, sizeof(v));
+        formatStereo(text, sizeof(text), v);
+        Log::get().note("mode watch: stereo table first t=%llu frame=%u ctx=0x%llX %s", static_cast<unsigned long long>(now), frame,
+                        static_cast<unsigned long long>(ctx), text);
+        return;
+    }
+    if (std::memcmp(v, g_stereo.last, sizeof(v)) == 0) return;
+    char was[kStereoTextBytes];
+    formatStereo(was, sizeof(was), g_stereo.last);
+    std::memcpy(g_stereo.last, v, sizeof(v));
+    if (now >= g_stereo.windowStartMs + 1000) {
+        g_stereo.windowStartMs = now;
+        g_stereo.linesInWindow = 0;
+    }
+    if (g_stereo.linesInWindow >= kStereoLinesPerSecond) {
+        ++g_stereo.dropped;
+        return;
+    }
+    ++g_stereo.linesInWindow;
+    formatStereo(text, sizeof(text), v);
+    const unsigned dropped = g_stereo.dropped;
+    g_stereo.dropped = 0;
+    if (dropped)
+        Log::get().note("mode watch: stereo table t=%llu frame=%u %s (was %s) (%u change lines over the limit before this one)",
+                        static_cast<unsigned long long>(now), frame, text, was, dropped);
+    else
+        Log::get().note("mode watch: stereo table t=%llu frame=%u %s (was %s)", static_cast<unsigned long long>(now), frame, text, was);
+}
+
 }  // namespace
 
 void modeWatchStart() {
@@ -477,7 +556,7 @@ void modeWatchHint(ModeHint h) {
     if (e) SetEvent(e);
 }
 
-void modeWatchFrameBoundary() {
+void modeWatchFrameBoundary(uint32_t frame) {
     if (!g_started.load(std::memory_order_acquire)) return;
     const uint64_t posted = g_posted.exchange(0, std::memory_order_acq_rel);
     if (posted) commitPosted(posted);
@@ -488,6 +567,8 @@ void modeWatchFrameBoundary() {
     const bool live = edvrQueryNativeRenderSizing(EDVR_NATIVE_RENDER_SIZING_VERSION_1, sizeof(sizing), &sizing) && sizing.valid == 1;
     if (live && !lastLive) modeWatchHint(ModeHint::LiveRise);
     lastLive = live;
+
+    stereoTableFrameBoundary(frame);
 }
 
 bool modeWatchNoticeDue(char* out, size_t size) {
