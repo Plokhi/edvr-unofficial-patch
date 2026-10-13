@@ -500,4 +500,8 @@ launches. The phase-1 build switches to Passthrough rather than live.
   (`vr_window_trampolines.cpp:111`); fixed in 7b0358b4.
 - ruled out: the file alone as the switch signal after a launch the file did not decide, because it stays stale until the
   game's first write (B missed a real 3D off).
-- ruled out: an unrelated apply writing the stale value, because D's Supersampling apply wrote the live mode 3.
+- ruled out: an unrelated apply writing the stale value, because D's Supersampling apply wrote the live mode 3.- E, 18:15 (`/steam /vr`, file 4, build 28a28a4a): 3D off posted flat at 18:16:06 (file before submits this time: the write at
+  18:16:06.1, submits stopped 18:16:07.1), Passthrough. 3D on kept the window at 3840x2160 borderless (7b0358b4 works). After 3D
+  on the UI was not sharp: Passthrough is a PARTIAL stand-down. Per-call gates stop the upscaler, but the UI layer still built a
+  composite output at 2016x2017 (render size, not the 4032x4034 output) at 18:16:21. Phase 2's teardown must release the VR UI
+  layers at a switch (3.3's table, `releaseLayers`), and a stand-down must not leave half a pipeline running.
