@@ -60,7 +60,7 @@ const UINT kMsgFirstScan = WM_APP + 1;
 
 const wchar_t* kTipUrl = L"https://ko-fi.com/seancharacterecho";
 const wchar_t* kDiscordUrl = L"https://discord.gg/ynkdf6Gdua";
-const wchar_t* kTipText = L"EDVR is free. If it saved you an evening, you can";
+const wchar_t* kTipText = L"EDVR is free. If it makes your flight more enjoyable, you can";
 
 // The client area and every control position below are in 96-dpi units, scaled
 // once at layout time.
@@ -314,7 +314,7 @@ void applyLayout() {
         const int frameTop = dp(250);
         const int frameH = dp(282) - frameTop;
         const int y = frameTop + (frameH > textH ? (frameH - textH) / 2 : 0);
-        MoveWindow(g.search, dp(kMargin + kCardPad), y, dp(320), textH, TRUE);
+        MoveWindow(g.search, dp(kMargin + kCardPad), y, dp(318), textH, TRUE);
     }
 
     // Shown or hidden by the scope, not by the screen alone, so it runs after the loop above.
@@ -862,15 +862,13 @@ void runAction(AppArgs::Act action) {
     // are wanted, and old settings reappearing anyway would be worse than not
     // finding the mirror at all.
     //
-    // Asked in the scope's terms: a flat install's file is edvr-flat.ini (or the
-    // shared edvr.ini it falls back to), and a mirror that holds only edvr-flat.ini
-    // is one worth offering.
-    const std::string edition = args.scope == "flat" ? "flat" : "vr";
+    // Asked in the chosen scope's terms: each file the scope installs that the
+    // folder lacks, if the mirror holds it. A file the folder has is never restored over.
     if (canMirror && args.keepSettings) {
         const MirrorInfo mirror = readMirror(mirrorDir);
-        if (offerRestore(hasSettingsFor(g.survey, edition), mirror, edition)) {
-            const std::wstring wanted = edition == "flat" ? L"edvr-flat.ini or edvr.ini"
-                                                          : L"edvr.ini";
+        const std::vector<std::string> missing = settingsToRestore(g.survey.game.dir, mirror, args.scope);
+        if (!missing.empty()) {
+            const std::wstring wanted = fromUtf8(settingsNamesOf(missing));
             const std::wstring text =
                 L"This folder has no " + wanted + L", but settings from an earlier install of it "
                 L"were found outside the game folder, last saved " +
@@ -881,7 +879,7 @@ void runAction(AppArgs::Act action) {
                                            MB_YESNO | MB_ICONQUESTION);
             if (answer == IDYES) {
                 std::vector<std::string> notes;
-                const bool restored = restoreFromMirror(g.survey.game.dir, mirror, &notes);
+                const bool restored = restoreFromMirror(g.survey.game.dir, mirror, args.scope, &notes);
                 if (!restored) {
                     // Said, not swallowed: some of the saved settings did not come
                     // back, and carrying on quietly would install over the gap.
@@ -1109,7 +1107,8 @@ void createControls(HWND window) {
                                nullptr);
     SendMessageW(g.search, WM_SETFONT, reinterpret_cast<WPARAM>(f.body), TRUE);
     SendMessageW(g.search, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search settings"));
-    place(g.search, kMargin + kCardPad, 252, 320, 28, Screen::Settings);
+    // 318 wide, so the box ends 8 units short of the VR button at x=370.
+    place(g.search, kMargin + kCardPad, 252, 318, 28, Screen::Settings);
 
     g.settingsList = createSettingsList(window, kIdSettingsList, g.dpi);
     place(g.settingsList, kMargin + 2, 292, kClientWidth - 2 * kMargin - 4, 350, Screen::Settings);

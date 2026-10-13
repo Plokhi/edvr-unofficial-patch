@@ -47,10 +47,6 @@ bool isOwnDescriptor(const std::string& sha, const std::string& edition) {
 // The scopes the installer installs, by the names the descriptor and the record use.
 bool knownScope(const std::string& scope) { return scope == "both" || scope == "vr" || scope == "flat"; }
 
-// The settings files a scope installs: edvr.ini for both and vr, edvr-flat.ini for both and flat.
-bool scopeHasVrIni(const std::string& scope) { return scope != "flat"; }
-bool scopeHasFlatIni(const std::string& scope) { return scope != "vr"; }
-
 // The descriptor a scope writes: the canonical schema-2 text, byte for byte (kDescriptorTexts holds the same bytes).
 std::string descriptorTextFor(const std::string& scope) {
     return "[install]\r\nschema = 2\r\nscope = " + scope + "\r\n";
@@ -162,6 +158,12 @@ std::string descriptorScopeOf(const Survey& s) {
     if (!s.descriptorPresent || s.descriptorSha.empty()) return std::string();
     edvr::InstallScope scope = edvr::InstallScope::Invalid;
     if (!ownDescriptorScope(s.descriptorSha, &scope)) return std::string();
+    return edvr::scopeName(scope);
+}
+
+std::string canonicalDescriptorScope(const std::string& text) {
+    edvr::InstallScope scope = edvr::InstallScope::Invalid;
+    if (!ownDescriptorScope(sha256Bytes(text.data(), text.size()), &scope)) return std::string();
     return edvr::scopeName(scope);
 }
 

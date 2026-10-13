@@ -360,14 +360,14 @@ int runConsole(const AppArgs& args) {
     // week's settings appear anyway. --dry-run promises to touch nothing, and
     // a restore is a write, so it is only ever described there, never done.
     //
-    // "A settings file" and "a mirror of one" are asked in the edition's terms:
-    // the flat edition's is edvr-flat.ini (or the shared edvr.ini it falls back
-    // to), and a mirror holding only edvr-flat.ini is one worth offering.
+    // "A settings file" and "a mirror of one" are asked in the chosen scope's
+    // terms: each file the scope installs that the folder lacks, if the mirror
+    // holds it. A file the folder has is never restored over.
     if (canMirror && args.keepSettings) {
         const MirrorInfo mirror = readMirror(mirrorDir);
-        const std::string edition = scope == "flat" ? "flat" : "vr";
-        if (offerRestore(hasSettingsFor(survey, edition), mirror, edition)) {
-            const std::string wanted = edition == "flat" ? "edvr-flat.ini or edvr.ini" : "edvr.ini";
+        const std::vector<std::string> missing = settingsToRestore(survey.game.dir, mirror, scope);
+        if (!missing.empty()) {
+            const std::string wanted = settingsNamesOf(missing);
             writeOut("This folder has no " + wanted + ", but settings from an earlier install of it "
                      "were found outside the game folder (" + toUtf8(mirror.dir) + "), last saved " +
                      mirror.savedUtc + ".\r\n");
@@ -377,7 +377,7 @@ int runConsole(const AppArgs& args) {
                          ".\r\n\r\n");
             } else {
                 std::vector<std::string> notes;
-                const bool restored = restoreFromMirror(survey.game.dir, mirror, &notes);
+                const bool restored = restoreFromMirror(survey.game.dir, mirror, scope, &notes);
                 for (const std::string& n : notes) writeOut("  " + n + "\r\n");
                 if (!restored) {
                     writeOut("  Could not restore all of it -- carrying on with what is in the "

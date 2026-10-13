@@ -33,6 +33,10 @@ std::string recordedScope(const InstallState& state) {
     return std::string();
 }
 
+// The settings files a scope installs: edvr.ini for vr and both, edvr-flat.ini for flat and both.
+bool scopeHasVrIni(const std::string& scope) { return scope != "flat"; }
+bool scopeHasFlatIni(const std::string& scope) { return scope != "vr"; }
+
 const wchar_t* settingsLeafFor(const std::string& profile) {
     return profile == "flat" ? L"edvr-flat.ini" : L"edvr.ini";
 }

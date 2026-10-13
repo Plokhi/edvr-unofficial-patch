@@ -132,6 +132,10 @@ std::string installedProfile(const Survey& survey);
 // descriptor. Empty when the folder has neither.
 std::string installedScope(const Survey& survey);
 
+// The scope a descriptor text declares when it is one of EDVR's own canonical texts (both, vr or flat), else empty. installedScope
+// reads the same texts from the file on disk; the log bundler reads the file's text.
+std::string canonicalDescriptorScope(const std::string& text);
+
 // The scope an install runs when none was asked for: the folder's own, else both.
 std::string defaultScope(const Survey& survey);
 

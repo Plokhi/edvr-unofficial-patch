@@ -73,6 +73,10 @@ std::wstring backupRootPath(const std::wstring& gameDir);
 // Empty when neither says anything a scope can be read from.
 std::string recordedScope(const InstallState& state);
 
+// The settings files a scope ("both", "vr" or "flat") installs: edvr.ini for vr and both, edvr-flat.ini for flat and both.
+bool scopeHasVrIni(const std::string& scope);
+bool scopeHasFlatIni(const std::string& scope);
+
 // The settings file an edition owns: edvr.ini for "vr", edvr-flat.ini for "flat".
 // The flat runtime reads edvr-flat.ini first and falls back to edvr.ini only
 // while there is none (config.cpp), so a flat operation that touched edvr.ini
