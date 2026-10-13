@@ -1418,9 +1418,12 @@ void optimizedStationFrame(uint32_t frame) {
     }
     // Built v14.5: the height above the shell along the pad's own up axis, read live, with the shell picked once per pad (the same pick as the
     // freeze, from the gathered parts). The camera in the candidate box is the seal's other condition.
-    g_relOk = false;
+    // Built v14.9: a pad absent for fewer than kHeldLostFrames frames keeps its last reading (no still-clock reset).
+    const bool padHeld = !g_pickCell.has && g_ownSticky.pad != 0 && g_ownSticky.unseen > 0 && g_ownSticky.unseen < sealed::kHeldLostFrames;
+    if (!padHeld) g_relOk = false;
     g_heightChanged = false;
     if (g_pickCell.has) {
+        g_relOk = false;
         if (!g_preShellValid || g_preShellPad != g_pickCell.pad) {
             const size_t pick = sealed::pickShell(g_explicits, g_explicitCount, g_pickCell.centre, g_pickCell.size, 150.0f);
             g_preShellValid = pick < g_explicitCount;
@@ -1464,6 +1467,7 @@ void optimizedStationFrame(uint32_t frame) {
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
     in.pickOk = g_pickCell.has;
+    in.padHeld = padHeld;
     in.rel = g_relM;
     in.relOk = g_relOk;
     in.sourceChanged = g_heightChanged;

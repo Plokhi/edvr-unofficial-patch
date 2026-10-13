@@ -480,6 +480,35 @@ int main(int argc, char** argv) {
         check(req == 100 + se::kSealDelayMs, "v14.8: a source change re-bases the reading; the seal still comes 6 s after the pad settled (6100 ms)");
     }
 
+    // ---- Built v14.9: a pad absent for a frame or two keeps the still clock (the flight's 97 s re-seal) --------------------------------------
+    {
+        // The pad is missing from the store one frame in every five while the still clock runs: it still seals at 6.1 s (the clock is not reset).
+        se::SealState st = descended();   // moved, the still clock from 100 ms
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        uint64_t req = 0;
+        for (uint64_t tt = 200; tt <= 10000; tt += 100) {
+            se::SealInputs in = quiet(tt);
+            if ((tt / 100) % 5 == 4) {
+                in.pickOk = false;
+                in.padHeld = true;
+            }
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
+        }
+        check(req == 100 + se::kSealDelayMs, "v14.9: a pad missing one frame in five keeps the still clock: sealed at 6100 ms, not never");
+    }
+    {
+        // The same absence without the hold resets the clock every time (the flight): no seal.
+        se::SealState st = descended();
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        uint64_t req = 0;
+        for (uint64_t tt = 200; tt <= 10000; tt += 100) {
+            se::SealInputs in = quiet(tt);
+            if ((tt / 100) % 5 == 4) in.pickOk = false;
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
+        }
+        check(req == 0, "v14.9: without the hold the same absence resets the clock and never seals (the flight's fault)");
+    }
+
     // ---- Built v14.6: a ship change (the own ship\'s type prefix) resets the trigger; a flicker is not a change -----------------------------
     {
         se::ShipWatch w;

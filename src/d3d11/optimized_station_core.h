@@ -1012,6 +1012,7 @@ struct SealInputs {
     bool setting = false;        // fix.optimized_station is on
     bool docked = false;         // Status.json Flags bit 0
     bool pickOk = false;         // the own pad is found this frame, with a pose
+    bool padHeld = false;        // built v14.9: the own pad is absent this frame, held for fewer than kHeldLostFrames: the trigger keeps its state
     float rel = 0.0f;            // the pad's height above the hangar shell along its up axis now (metres; frame-independent)
     bool relOk = false;          // rel is readable this frame (an unreadable frame holds the trigger's state)
     bool sourceChanged = false;  // a centre source changed since the last reading: the still test restarts, the motion reference follows
@@ -1144,7 +1145,12 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         }
         return SealAction::kNone;
     }
-    if (!in.docked || !in.pickOk) {
+    if (!in.docked) {
+        clearTrigger(st);
+        return SealAction::kNone;
+    }
+    if (!in.pickOk) {   // built v14.9: a short absence keeps the last reading and the still clock (the hangar-change rule is unchanged)
+        if (in.padHeld) return SealAction::kNone;
         clearTrigger(st);
         return SealAction::kNone;
     }
