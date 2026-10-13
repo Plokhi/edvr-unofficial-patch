@@ -1018,6 +1018,14 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     auto frame=boundary.frame();
     if(!applyFrameSequence(frame)){boundary.clear();return XR_ERROR_LIMIT_REACHED;}
     if(!flatPanelAvailable()||!frame.shouldRender)return boundary.clear();
+    // The clock starts at the stretch's first panel frame. The text shows for ten seconds, the eye images are black for one more,
+    // then the frames carry no layers: the compositor holds the last projection frame, so the black settles before it stops.
+    const auto panel=flatClear.panelFrame(GetTickCount64());
+    if(panel.wentDark)nativeTracePrintf("flat_clear,panel=dark,after_ms=%llu\n",(unsigned long long)panel.afterMs);
+    if(!panel.draw){
+      if(panel.wentEmpty)nativeTracePrintf("flat_clear,panel=empty,after_ms=%llu\n",(unsigned long long)panel.afterMs);
+      return boundary.clear();
+    }
     // The views, located as loadingStep locates its skybox frame.
     uint64_t applied=0;
     if(!changes.advance(frame.predictedDisplayTime,applied)){boundary.clear();return XR_ERROR_TIME_INVALID;}
@@ -1033,9 +1041,6 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     boundary.setGeometryReady(valid);
     if(!valid)return boundary.clear();
     XrCompositionLayerProjection layer{};
-    // The clock starts at the stretch's first panel frame; after two minutes the same frames carry no text.
-    const auto panel=flatClear.panelFrame(GetTickCount64());
-    if(panel.wentDark)nativeTracePrintf("flat_clear,panel=dark,after_ms=%llu\n",(unsigned long long)panel.afterMs);
     r=stereo.renderNotice(frameViews,frameSpace,layer,panel.text);
     if(r!=XR_SUCCESS){boundary.clear();return r;}
     if(stereo.noticeGeneration()!=flatNoticeGeneration){

@@ -199,7 +199,7 @@ void noticeSelfTest(){
   check(rasterizeFlatNotice(205,512,heading)&&!heading.face.empty()&&heading.fallbackFace==f.renderer.noticeFontFallback(),
         "notice: the font face is chosen and the renderer reports the same fallback");
   std::printf("notice font: %ls (fallback=%d)\n",heading.face.c_str(),int(heading.fallbackFace));
-  // Past two minutes the same panel frame carries no text: the eye images are black on both eyes, still a layer that renders.
+  // Past ten seconds the same panel frame carries no text: the eye images are black on both eyes, still a layer that renders.
   XrCompositionLayerProjection dark{};
   check(f.renderer.renderNotice(f.views,space,dark,false)==XR_SUCCESS&&dark.viewCount==2,"notice: the text-hidden frame renders");
   for(unsigned eye=0;eye<2;++eye){
