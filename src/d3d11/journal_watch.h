@@ -121,6 +121,11 @@ uint32_t journalDisembarks();
 // ...and boarded.
 uint32_t journalEmbarks();
 
+// Built v14.19 (optimized station): how many LoadGame events and Undocked events this process has read. A change is a load or an undock; the
+// station's dock arrival rule (DockWatch) counts them, so a load is never an arrival.
+uint32_t journalLoadGames();
+uint32_t journalUndocks();
+
 // The live on-foot state from Status.json, updated by the game about once a
 // second. 6bb measured the flags HOLDING through the entire external-camera
 // window (Flags2 0x8011, frozen, across eight view changes); boarding drops

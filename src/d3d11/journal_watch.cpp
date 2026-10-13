@@ -85,6 +85,8 @@ struct Published {
     bool     gameplay = false;
     uint32_t disembarks = 0;
     uint32_t embarks = 0;
+    uint32_t loadGames = 0;   // built v14.19: every LoadGame (a load is never a dock arrival)
+    uint32_t undocks = 0;     // built v14.19: every Undocked event
     // When a jump tunnel MAY be on screen: armed at StartJump, cleared by
     // the event that resolves it (FSDJump for hyperspace, SupercruiseEntry
     // for the other branch -- StartJump fires for both, and telling them
@@ -132,6 +134,8 @@ struct Visible {
     std::atomic<bool>     gameplay{false};
     std::atomic<uint32_t> disembarks{0};
     std::atomic<uint32_t> embarks{0};
+    std::atomic<uint32_t> loadGames{0};
+    std::atomic<uint32_t> undocks{0};
     std::atomic<uint64_t> jumpArmedMs{0};
     std::atomic<bool>     fsdJumpKnown{false};
     std::atomic<bool>     fsdJumpLive{false};
@@ -160,6 +164,8 @@ void applyPublished(const Published& p) {
     g_v.gameplay.store(p.gameplay, kRelaxed);
     g_v.disembarks.store(p.disembarks, kRelaxed);
     g_v.embarks.store(p.embarks, kRelaxed);
+    g_v.loadGames.store(p.loadGames, kRelaxed);
+    g_v.undocks.store(p.undocks, kRelaxed);
     g_v.jumpArmedMs.store(p.jumpArmedMs, kRelaxed);
     g_v.fsdJumpKnown.store(p.fsdJumpKnown, kRelaxed);
     g_v.fsdJumpLive.store(p.fsdJumpLive, kRelaxed);
@@ -336,6 +342,7 @@ void onEvent(Session& s, const char* name, uint32_t len) {
     // business, and not keeping it is the privacy posture: names only, and
     // only these names do anything.
     if (len == 8 && memcmp(name, "LoadGame", 8) == 0) {
+        ++s.pub.loadGames;   // built v14.19: the station's arrival rule counts loads
         if (!s.pub.gameplay) {
             s.pub.gameplay = true;
             Log::get().note("journal: LoadGame -- gameplay has started, so the "
@@ -351,6 +358,8 @@ void onEvent(Session& s, const char* name, uint32_t len) {
         // journal and a fresh LoadGame.
         s.pub.gameplay = false;
         s.pub.jumpArmedMs = 0;
+    } else if (len == 8 && memcmp(name, "Undocked", 8) == 0) {
+        ++s.pub.undocks;   // built v14.19: the station's arrival rule counts undocks
     } else if (len == 9 && memcmp(name, "StartJump", 9) == 0) {
         s.pub.jumpArmedMs = stampMs();
     } else if (len == 7 && memcmp(name, "FSDJump", 7) == 0) {
@@ -987,6 +996,8 @@ bool journalSupercruise() { return journalWatchActive() && peek(g_v.supercruise)
 bool journalGameplay() { return !runtimeFlatProfile() && peek(g_v.gameplay); }
 uint32_t journalDisembarks() { return runtimeFlatProfile() ? 0u : peek(g_v.disembarks); }
 uint32_t journalEmbarks() { return runtimeFlatProfile() ? 0u : peek(g_v.embarks); }
+uint32_t journalLoadGames() { return runtimeFlatProfile() ? 0u : peek(g_v.loadGames); }
+uint32_t journalUndocks() { return runtimeFlatProfile() ? 0u : peek(g_v.undocks); }
 
 bool journalInJumpTunnel() {
     if (runtimeFlatProfile()) return false;

@@ -1168,7 +1168,7 @@ void padTrackLine(uint64_t now) noexcept {
     msOrNa(stillT, sizeof(stillT), g_pickCell.has, now - std::max(g_padStill.turnMs, floorMs));
     const uint64_t quietSince = std::max(std::max(g_sealState.lowerSinceMs, g_latch.lastMotionMs), padLastMotion());
     msOrNa(quiet, sizeof(quiet), g_sealState.lowerSet && now >= quietSince, now - quietSince);
-    Log::get().note("optimized station: pad track: rel %s m, shell %s, pad in shell frame (x %s, y %s along the shaft, z %s) m, "
+    Log::get().note("optimized station: pad track: rel %s m, shell %s, pad in shell frame (x %s, y %s, z %s along the shaft) m, "
                     "lateral %s m from the shell axis, yaw %s deg against the shell, still %s ms (position), %s ms (turn), bay quiet %s ms",
                     rel, shell, x, y, z, lat, yaw, stillS, stillT, quiet);
 }
@@ -1590,7 +1590,7 @@ void optimizedStationFrame(uint32_t frame) {
     {
         // Built v14.17: the dock's arrival is read before the setting gate, so a toggle while undocked never misses the undock (DockWatch).
         std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
-        g_dock.step(journalDockedKnown(), journalDocked());
+        g_dock.step(journalDockedKnown(), journalDocked(), journalLoadGames(), journalUndocks());
     }
     if (++g_settingPoll >= kSettingPollFrames) {
         g_settingPoll = 0;
@@ -1761,6 +1761,7 @@ void optimizedStationFrame(uint32_t frame) {
         su.rel = g_relM;
         su.hangarChanged = g_flagHangarChanged;
         su.holdForSeal = g_dock.arrived && !g_dock.sealedThisDock;   // built v14.17: an arrival's sun waits for its first seal
+        su.descentPending = g_dock.arrived && !g_sealState.dockDescended;   // built v14.19: and the arrival's skip waits for its descent
         const char* why = "";
         if (sealed::sunStep(su, &g_sun, &why)) {
             g_sunOff.store(g_sun.off, std::memory_order_release);
@@ -1772,6 +1773,9 @@ void optimizedStationFrame(uint32_t frame) {
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
     in.arrived = g_dock.arrived;   // built v14.17: an arrived dock expects its descent (no load-in rule)
+    in.shellAddr = g_preShellValid ? g_preShellAddr : 0;   // built v14.19: the dock reference is per shell record
+    in.lateral = g_frameShell.lateral;                     // built v14.19: the pad's lateral from the shell's shaft (the reference's second measure)
+    in.latOk = g_frameShell.ok;
     in.pickOk = g_pickCell.has && g_preShellValid;   // no sized shell: the trigger stays idle (built v14.13)
     in.padHeld = padHeld;
     in.mechanismMoved = g_mechanismMoved;

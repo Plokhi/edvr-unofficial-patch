@@ -1306,13 +1306,12 @@ int main(int argc, char** argv) {
         arr.step(true, true);
         check(arr.arrived && !arr.sealedThisDock, "v14.17 dock: each new dock resets its seal state and is an arrival again");
 
-        // An arrived dock: the pad first seen lowered does not seal at load-in; it seals 2 s after it lowers (the bay settles).
+        // An arrived dock: the pad first seen lowered with no descent observed never seals (v14.19: the descent is required).
         se::SealState st;
         se::SealInputs arrivedIn = quiet(0);
         arrivedIn.arrived = true;
         const uint64_t tArr = firstEngage(&st, arrivedIn, 100, 10000);
-        check(tArr == 100 + se::kBayStillMs && !st.immediate,
-              "v14.17 arrival: a pad first seen lowered after an in-flight arrival does not seal at load-in: it seals 2 s after it lowers");
+        check(tArr == 0 && !st.immediate, "v14.19 arrival: a pad first seen lowered after an in-flight arrival, with no descent, never seals");
 
         // A pad identity change during an arrived dock keeps moved: no load-in seal for the new pad.
         se::SealState stPad;
@@ -1325,9 +1324,9 @@ int main(int argc, char** argv) {
         padB.pad = 0x2000;
         padB.nowMs = 100;
         se::sealStep(padB, &stPad, &wPad);
-        check(stPad.moved, "v14.17 arrival: a pad identity change during an arrived dock keeps moved");
-        check(firstEngage(&stPad, padB, 200, 1900) == 0 && !stPad.immediate,
-              "v14.17 arrival: the new pad does not seal at load-in; its bay clock runs (no seal before 2 s)");
+        check(!stPad.moved && !stPad.dockDescended, "v14.19 arrival: with no descent observed, moved stays false across a pad change");
+        check(firstEngage(&stPad, padB, 200, 10000) == 0 && !stPad.immediate,
+              "v14.19 arrival: a new pad on a still surface never seals (no load-in, no settled path)");
 
         // A turn in place: the pad's centre fixed at -45 m, its forward axis turned 2 deg at 1 s. The still clock restarts: the seal comes 2 s after
         // the turn (3 s), where a pad that never turns seals at 2 s.
@@ -1342,7 +1341,7 @@ int main(int argc, char** argv) {
                 const float* axis = t >= 1000 ? fwd2 : fwd0;
                 pw.step(0x1000, axis, 1, 0x5000, t);
                 se::SealInputs in = quiet(t);
-                in.arrived = true;
+                in.rel = t == 0 ? 14.0f : -45.0f;   // v14.19: a descent from raised to lowered at 100 ms, then still (the load-in rule is not in play)
                 in.pad = 0x1000;
                 in.padLastMotionMs = pw.motionMs();
                 se::ReleaseWhy w = se::ReleaseWhy::kNone;
@@ -1357,13 +1356,13 @@ int main(int argc, char** argv) {
             for (uint64_t t = 0; t <= 5000; t += 100) {
                 pw.step(0x1000, fwd0, 1, 0x5000, t);
                 se::SealInputs in = quiet(t);
-                in.arrived = true;
+                in.rel = t == 0 ? 14.0f : -45.0f;   // v14.19: the descent as above
                 in.pad = 0x1000;
                 in.padLastMotionMs = pw.motionMs();
                 se::ReleaseWhy w = se::ReleaseWhy::kNone;
                 if (se::sealStep(in, &stT, &w) == se::SealAction::kRequestEngage && sealedT == 0) sealedT = t;
             }
-            check(sealedT == 2000, "v14.17 turn: control: a pad that never turns seals 2 s after it lowers (2 s)");
+            check(sealedT == 2100, "v14.17 turn: control: a pad that never turns seals 2 s after it lowers (100 ms to 2.1 s)");
         }
         {
             // A slow turn: 0.4 deg a reading (under the latch's 0.5 deg per-frame limit) adds up; the anchor sees 1.2 deg at the third reading.
@@ -1387,7 +1386,7 @@ int main(int argc, char** argv) {
             for (uint64_t t = 0; t <= 5000; t += 100) {
                 pw.step(0x1000, fwd0, 1, t >= 1000 ? 0x6000 : 0x5000, t);
                 se::SealInputs in = quiet(t);
-                in.arrived = true;
+                in.rel = t == 0 ? 14.0f : -45.0f;   // v14.19: the descent as above
                 in.pad = 0x1000;
                 in.padLastMotionMs = pw.motionMs();
                 se::ReleaseWhy w = se::ReleaseWhy::kNone;
@@ -1437,6 +1436,135 @@ int main(int argc, char** argv) {
             si.rel = 5.0f;
             check(se::sunStep(si, &sun, &why) && !sun.off && std::strcmp(why, "pad raised (launch)") == 0,
                   "v14.17 sun: without the arrival hold (a session that started docked, or after a seal) the pad raised turns the sun on");
+        }
+
+        // ---- Built v14.19 (2026-10-13): a load is never an arrival; an arrived dock seals only after a descent observed against its reference ----
+        {
+            // A menu undocked reading, then a LoadGame, then a docked reading: no arrival; the load-in seals at once.
+            se::DockWatch load;
+            load.step(true, false, 0, 0);
+            load.step(false, false, 1, 0);   // the LoadGame tick: no Status reading that tick
+            load.step(true, true, 1, 0);
+            se::SealState stL;
+            se::SealInputs loadIn = quiet(0);
+            loadIn.arrived = load.arrived;
+            check(!load.arrived && firstEngage(&stL, loadIn, 100, 10000) == 100 && stL.immediate,
+                  "v14.19 load: a menu undocked reading before a LoadGame is no arrival: the load-in seals at once (100 ms)");
+            // An undock event after the load is an arrival when the dock follows.
+            se::DockWatch undo;
+            undo.step(true, true, 1, 0);
+            undo.step(true, true, 1, 1);
+            undo.step(true, false, 1, 1);
+            undo.step(true, true, 1, 1);
+            check(undo.arrived, "v14.19 load: a journal Undocked after the load, then a dock, is an arrival");
+
+            // A dock reference: the pad at the outpost surface, lowered against the shell (rel -53.5, lateral 68.9), still. The reference is its first
+            // reading; no descent is observed while it stays, so the dock never seals (no load-in path, no settled path, no 30 s fallback).
+            auto dockIn = [](uint64_t now, float rel, float lat, uintptr_t shell, uintptr_t pad) {
+                se::SealInputs in = quiet(now);
+                in.arrived = true;
+                in.rel = rel;
+                in.lateral = lat;
+                in.latOk = true;
+                in.shellAddr = shell;
+                in.pad = pad;
+                return in;
+            };
+            se::SealState stS;
+            se::ReleaseWhy wS = se::ReleaseWhy::kNone;
+            uint64_t sealedS = 0;
+            for (uint64_t t = 0; t <= 60000; t += 100) {
+                if (se::sealStep(dockIn(t, -53.5f, 68.9f, 0x5000, 0x1000), &stS, &wS) == se::SealAction::kRequestEngage && sealedS == 0) sealedS = t;
+            }
+            check(sealedS == 0 && stS.refOk && !stS.dockDescended,
+                  "v14.19 surface: an arrived dock whose pad sits still below the shell at the surface never seals: no fallback after 60 s");
+            se::SunState sunS;
+            se::SunInputs ss;
+            ss.setting = true;
+            ss.docked = true;
+            ss.hangar = true;
+            ss.relOk = true;
+            ss.rel = -53.5f;
+            ss.descentPending = true;
+            const char* whyS = "";
+            check(!se::sunStep(ss, &sunS, &whyS) && !sunS.off,
+                  "v14.19 sun: at the surface the arrival's skip does not turn on before the descent is observed");
+
+            // The descent: the pad at the surface until 2 s, then 30 m down and still from 2 s (its last motion at 2 s). It seals 2 s after it rests.
+            se::SealState stD;
+            se::ReleaseWhy wD = se::ReleaseWhy::kNone;
+            uint64_t sealedD = 0;
+            for (uint64_t t = 0; t <= 10000; t += 100) {
+                const bool down = t >= 2000;
+                se::SealInputs in = dockIn(t, down ? -83.5f : -53.5f, down ? 9.6f : 68.9f, 0x5000, 0x1000);
+                in.padLastMotionMs = t >= 2000 ? 2000 : 0;
+                if (se::sealStep(in, &stD, &wD) == se::SealAction::kRequestEngage && sealedD == 0) sealedD = t;
+            }
+            check(sealedD == 4000 && stD.dockDescended,
+                  "v14.19 descent: an arrived dock whose pad descends 30 m seals 2 s after the pad comes to rest (4 s)");
+            se::SunState sunD;
+            se::SunInputs sd = ss;
+            sd.rel = -83.5f;
+            sd.descentPending = false;
+            check(se::sunStep(sd, &sunD, &whyS) && sunD.off, "v14.19 sun: once the descent is observed, a lowered pad turns the skip on");
+
+            // A pad record change during an arrived dock keeps the reference: the same surface reading, a new pad record, then the descent by that pad.
+            se::SealState stP;
+            se::ReleaseWhy wP = se::ReleaseWhy::kNone;
+            se::sealStep(dockIn(0, -53.5f, 68.9f, 0x5000, 0x1000), &stP, &wP);
+            se::sealStep(dockIn(100, -53.5f, 68.9f, 0x5000, 0x2000), &stP, &wP);
+            check(stP.refOk && std::fabs(stP.refRel + 53.5f) < 1e-3f && !stP.dockDescended,
+                  "v14.19 reference: a pad record change during an arrived dock keeps the dock's reference (no descent counted)");
+            se::sealStep(dockIn(200, -83.5f, 9.6f, 0x5000, 0x2000), &stP, &wP);
+            check(stP.dockDescended, "v14.19 reference: a descent by the new pad record is still observed against the kept reference");
+
+            // A shell change re-takes the reference without counting as a descent: the shell record changes and the rel reads 6.5 m higher against it.
+            se::SealState stSh;
+            se::ReleaseWhy wSh = se::ReleaseWhy::kNone;
+            se::sealStep(dockIn(0, -53.5f, 68.9f, 0x5000, 0x1000), &stSh, &wSh);
+            se::sealStep(dockIn(100, -60.0f, 60.0f, 0x6000, 0x1000), &stSh, &wSh);
+            check(!stSh.dockDescended && stSh.refOk && std::fabs(stSh.refRel + 60.0f) < 1e-3f && stSh.refShell == 0x6000,
+                  "v14.19 reference: a shell change re-takes the reference without counting as a descent");
+            se::sealStep(dockIn(200, -80.0f, 60.0f, 0x6000, 0x1000), &stSh, &wSh);
+            check(stSh.dockDescended, "v14.19 reference: after a shell change, a 20 m descent against the new reference is observed");
+
+            // A mechanism release (the launch) holds the seal: 2 s of quiet at rest does not re-seal; raised and lowered again, it re-seals 2 s later.
+            se::SealState stM;
+            se::ReleaseWhy wM = se::ReleaseWhy::kNone;
+            check(se::sealStep(quiet(0), &stM, &wM) == se::SealAction::kRequestEngage, "v14.19 mechanism: the load-in seals at once (the setup)");
+            se::SealInputs mRel = quiet(100);
+            mRel.held = true;
+            mRel.mechanismMoved = true;
+            check(se::sealStep(mRel, &stM, &wM) == se::SealAction::kRelease && wM == se::ReleaseWhy::kMechanism,
+                  "v14.19 mechanism: the bay mechanism moving releases the seal");
+            uint64_t reseal = 0;
+            for (uint64_t t = 200; t <= 2500; t += 100) {
+                if (se::sealStep(quiet(t), &stM, &wM) == se::SealAction::kRequestEngage && reseal == 0) reseal = t;
+            }
+            check(reseal == 0, "v14.19 mechanism: after the launch release, 2 s of quiet at rest does not re-seal");
+            se::SealInputs raised = quiet(2600);
+            raised.rel = 5.0f;
+            se::sealStep(raised, &stM, &wM);
+            uint64_t reseal2 = 0;
+            for (uint64_t t = 2700; t <= 10000; t += 100) {
+                if (se::sealStep(quiet(t), &stM, &wM) == se::SealAction::kRequestEngage && reseal2 == 0) reseal2 = t;
+            }
+            check(reseal2 == 4700, "v14.19 mechanism: once the pad is raised and lowered again, it re-seals 2 s after it rests (4.7 s)");
+
+            // A 'pad started moving' release is not a mechanism release: the re-seal follows the settled rule at once.
+            se::SealState stPm;
+            se::ReleaseWhy wPm = se::ReleaseWhy::kNone;
+            se::sealStep(quiet(0), &stPm, &wPm);
+            se::SealInputs pmRel = quiet(100);
+            pmRel.held = true;
+            pmRel.padMoved = true;
+            const bool pmReleased = se::sealStep(pmRel, &stPm, &wPm) == se::SealAction::kRelease && wPm == se::ReleaseWhy::kPadMoved;
+            uint64_t pmSeal = 0;
+            for (uint64_t t = 200; t <= 10000; t += 100) {
+                if (se::sealStep(quiet(t), &stPm, &wPm) == se::SealAction::kRequestEngage && pmSeal == 0) pmSeal = t;
+            }
+            check(pmReleased && pmSeal == 2200,
+                  "v14.19 mechanism: a 'pad started moving' release still allows the re-seal (2 s after the pad lowers, 2.2 s)");
         }
 
         // The shell frame: the pad 3 m along x and 4 m along y from the shell, 45 m below it; its forward axis along +y: yaw +90 deg about up.

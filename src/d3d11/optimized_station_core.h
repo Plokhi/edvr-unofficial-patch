@@ -1019,6 +1019,9 @@ struct SealInputs {
     bool setting = false;        // fix.optimized_station is on
     bool docked = false;         // Status.json Flags bit 0
     bool arrived = false;        // built v14.17: this dock was reached in flight (DockWatch): the descent is expected, so no load-in rule
+    uintptr_t shellAddr = 0;     // built v14.19: the shell record rel is measured against (0: none); a change re-takes the dock's reference
+    float lateral = 0.0f;        // built v14.19: the pad's distance from the shell's shaft line this frame (the dock reference's second measure)
+    bool latOk = false;          // lateral is readable this frame
     bool pickOk = false;         // the own pad is found this frame, with a pose
     bool padHeld = false;        // built v14.9: the own pad is absent this frame, held for fewer than kHeldLostFrames: the trigger keeps its state
     bool mechanismMoved = false;  // built v14.14: a latched bay mechanism record moved on two frames in a row (sealed: the launch)
@@ -1052,6 +1055,15 @@ struct SealState {
     // Built v14.10: the pad lowered (the bay clock starts here; cleared when it is not lowered).
     bool lowerSet = false;
     uint64_t lowerSinceMs = 0;
+    // Built v14.19: an arrived dock's descent reference, kept per DOCK (not per pad record): the pad's rel and lateral at the dock's first reading,
+    // the shell it was read against, and whether the pad has since moved more than kDockDescentM from it (dockDescended: the descent is observed).
+    bool refOk = false;
+    float refRel = 0.0f;
+    float refLat = 0.0f;
+    uintptr_t refShell = 0;
+    bool dockDescended = false;
+    // Built v14.19: a release by the bay mechanism moving (the launch) holds the seal off until the pad is raised or the ship undocks.
+    bool noReseal = false;
 };
 
 // A release, or the trigger lapsing: the trigger starts again, the pad's motion memory stays (a pad that has descended still waits its delay).
@@ -1076,8 +1088,21 @@ struct DockWatch {
     uint32_t trackLines = 0;      // pad track lines written this dock (the temporary instrument)
     uint64_t trackStartMs = 0;    // when the first pad track line of this dock was written (0: none yet)
     uint64_t trackLastMs = 0;     // when the last pad track line was written (the 4 Hz gate)
-    // One Status reading. known: the reading exists. A change of the docked flag starts a dock afresh: the seal and track state reset.
-    void step(bool known, bool docked) noexcept {
+    uint32_t lastLoads = 0;       // the journal's LoadGame count at the last step (built v14.19)
+    uint32_t lastUndocks = 0;     // the journal's Undocked count at the last step
+    // One tick. known: the Status reading exists. loads and undocks: the journal's LoadGame and Undocked counts (journalLoadGames, journalUndocks).
+    // Built v14.19: a load is never an arrival. A LoadGame clears sawUndocked (the menu's undocked reading is no undock of this session) and the
+    // arrival; an undocked Status reading or a journal Undocked after it sets sawUndocked again. The arrival stays the docked rising edge.
+    void step(bool known, bool docked, uint32_t loads = 0, uint32_t undocks = 0) noexcept {
+        if (loads != lastLoads) {
+            lastLoads = loads;
+            sawUndocked = false;
+            arrived = false;
+        }
+        if (undocks != lastUndocks) {
+            lastUndocks = undocks;
+            sawUndocked = true;
+        }
         if (!known) return;
         if (!docked) sawUndocked = true;
         if (haveFlag && docked == prevDocked) return;
@@ -1500,6 +1525,7 @@ struct SunInputs {
     float rel = 0.0f;
     bool hangarChanged = false;
     bool holdForSeal = false;    // built v14.17: an arrived dock that has not sealed yet: a pad raised (launch) does not turn the sun back on
+    bool descentPending = false; // built v14.19: an arrived dock whose descent is not observed yet: the skip does not turn on at all
 };
 
 struct SunState {
@@ -1510,7 +1536,7 @@ struct SunState {
 inline bool sunStep(const SunInputs& in, SunState* st, const char** why) noexcept {
     *why = "";
     if (!st->off) {
-        if (in.setting && in.docked && in.hangar && in.relOk && in.rel < kLoweredM) {
+        if (in.setting && in.docked && in.hangar && in.relOk && in.rel < kLoweredM && !in.descentPending) {
             st->off = true;
             *why = "pad lowered";
             return true;
@@ -1586,6 +1612,28 @@ inline bool hangarLikeName(const char* name) noexcept {
            containsNoCase(name, "BlastShield") || containsNoCase(name, "Bay") || containsNoCase(name, "Elevator");
 }
 
+// Built v14.19: an arrived dock's descent reference, kept per dock. The reference is the pad's rel and lateral (its shell-frame reading) at the dock's
+// first reading. A change of the shell record or of the centre source re-takes it without counting as a descent. A move of more than kDockDescentM
+// in rel or in lateral from the reference is the observed descent (dockDescended); moved then follows it and the settled rule applies unchanged.
+// The reference is not reset by a pad record change: a pad flicker must not restart the dock.
+constexpr float kDockDescentM = 3.0f;
+inline void updateDockReference(const SealInputs& in, SealState* st) noexcept {
+    if (!in.latOk) {   // the shell frame is unreadable this frame: no reference, no count
+        st->moved = st->dockDescended;
+        return;
+    }
+    if (st->refOk && (in.shellAddr != st->refShell || in.sourceChanged)) st->refOk = false;   // a different reading: re-taken, not counted
+    if (!st->refOk) {
+        st->refOk = true;
+        st->refShell = in.shellAddr;
+        st->refRel = in.rel;
+        st->refLat = in.lateral;
+    } else if (!st->dockDescended && (std::fabs(in.rel - st->refRel) > kDockDescentM || std::fabs(in.lateral - st->refLat) > kDockDescentM)) {
+        st->dockDescended = true;
+    }
+    st->moved = st->dockDescended;
+}
+
 // Advances the state and returns the action. With kRelease, *why says which rule released (the order of the brief: setting off, undocked,
 // Explorer Cam, camera left, pad moved, hangar changed, launch). A pad first seen lowered with no descent observed seals on the first eligible
 // frame (the load-in rule, v14.3); after an observed descent the still delay applies. A raised pad never seals. The camera must be in the bay.
@@ -1617,6 +1665,7 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         else if (in.launched) w = ReleaseWhy::kLaunch;
         if (w != ReleaseWhy::kNone) {
             if (in.padMoved || in.launched || in.mechanismMoved) st->moved = true;   // a release by motion is a descent (built v14.16)
+            if (w == ReleaseWhy::kMechanism) st->noReseal = true;   // built v14.19: no re-seal mid-launch until the pad is raised or the ship undocks
             clearTrigger(st);
             st->camOutRun = 0;
             if (w == ReleaseWhy::kCameraLeft) st->camInRun = 0;   // the re-seal waits kCameraFrames inside the bay
@@ -1627,6 +1676,9 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
     }
     if (!in.docked) {
         clearTrigger(st);
+        st->refOk = false;          // built v14.19: the dock's reference and its hold end with the dock
+        st->dockDescended = false;
+        st->noReseal = false;
         return SealAction::kNone;
     }
     if (!in.pickOk) {   // built v14.9: a short absence keeps the last reading and the bay clock
@@ -1639,13 +1691,21 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         st->seen = true;
         st->padAddr = in.pad;
         st->firstRel = in.rel;
-        if (!in.arrived) st->moved = false;   // built v14.17: an arrived dock keeps moved across a pad change
+        if (!in.arrived) st->moved = false;   // an arrived dock's moved is its dock reference's (updateDockReference), across a pad change too
     }
-    if (in.arrived) st->moved = true;         // built v14.17: an arrived dock always expects its descent: never the load-in rule
-    if (in.sourceChanged) st->firstRel = in.rel;   // a different centre source is a different reading: the motion reference follows it
-    if (std::fabs(in.rel - st->firstRel) > kSealStillM) st->moved = true;
+    if (in.arrived) {
+        updateDockReference(in, st);          // built v14.19: the arrival expects a descent, observed against the dock's reference
+    } else {
+        if (in.sourceChanged) st->firstRel = in.rel;   // a different centre source is a different reading: the motion reference follows it
+        if (std::fabs(in.rel - st->firstRel) > kSealStillM) st->moved = true;
+    }
     const bool lowered = in.rel < kLoweredM;
+    if (!lowered) st->noReseal = false;       // built v14.19: the pad raised: the mid-launch hold ends
     if (!lowered || st->camInRun < kCameraFrames) {
+        clearTrigger(st);
+        return SealAction::kNone;
+    }
+    if (st->noReseal) {                       // built v14.19: after a mechanism release, no re-seal until the pad is raised or the ship undocks
         clearTrigger(st);
         return SealAction::kNone;
     }
@@ -1654,6 +1714,8 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         st->lowerSinceMs = in.nowMs;
     }
     if (st->requested) return SealAction::kNone;
+    // Built v14.19: an arrived dock seals only after its descent is observed: no load-in path, no settled path, and no 30 s fallback before it.
+    if (in.arrived && !st->dockDescended) return SealAction::kNone;
     if (!st->moved) {   // load-in: no descent observed, the pad rests lowered: seal at the first eligible frame
         st->requested = true;
         st->immediate = true;
