@@ -19,6 +19,7 @@
 #include "journal_watch.h"
 #include "kinematic_eval_hook.h"
 #include "optimized_station_core.h"
+#include "pad_state_probe.h"
 #include "store_hook.h"
 #include "view_source.h"
 
@@ -1036,6 +1037,7 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
     // Built v14.20 (review 3): the release is a state change: it runs under the state lock, serialized with the store callbacks.
     std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
     if (!g_heldValid) return;
+    padStateEvent("release");   // built v14.22: the pad-state probe writes its line at the next tick
     Log::get().note("optimized station: released (frame %u): %s. Everything is drawn as without the station until the seal conditions hold again.",
                     frame, why);
     g_heldValid = false;
@@ -1207,6 +1209,7 @@ void msOrNa(char* out, size_t cap, bool ok, uint64_t ms) noexcept {
 // The seal's status line, once per seal (called from the engage, after the cell is held and localized).
 void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
     ++g_sealCount;
+    padStateEvent("seal");   // built v14.22: the pad-state probe writes its line at the next tick
     char lat[24] = {};
     char yaw[24] = {};
     numOrNa(lat, sizeof(lat), g_frameShell.ok, g_frameShell.lateral);   // the last frame's shell frame (built v14.17)
@@ -1337,6 +1340,7 @@ void applySetting(bool on, uint32_t frame) noexcept {
     } else {
         Log::get().note("optimized station: off (frame %u).", frame);
     }
+    padStateSetOn(on);   // built v14.22: the pad-state probe (temporary, log only) installs with the setting
     g_vetoesAttached = on;
 }
 
@@ -1734,6 +1738,7 @@ void optimizedStationFrame(uint32_t frame) {
     if (g_dockedWasNow && !g_dockedNow.load(std::memory_order_acquire)) bumpRigEpoch();
     g_dockedWasNow = g_dockedNow.load(std::memory_order_acquire);
     storeHookGate();   // built v14.20 (review 7b): the store observer gathers only while docked (an atomic gate: no hook is installed here)
+    padStateTick(now);   // built v14.22: the pad-state probe's lines (temporary, log only)
     refreshHeldWorld();
     // The camera against the held box: outside it by more than kCameraLeaveM releases the seal.
     bool cameraOutside = false;
