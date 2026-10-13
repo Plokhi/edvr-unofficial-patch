@@ -1250,6 +1250,13 @@ void latchCandNote(GatherWriter& w, uintptr_t record, const float* centre, const
     w.push(gatherEntry(GKind::kLatch, record, centre, 0.0f, 0, nm));
 }
 
+// Built v14.28: the latch backstop's last samples (latchRead).
+float g_latchLastWorld[sealed::kLatchCap][3] = {};
+float g_latchLastShell[3] = {};
+uint32_t g_latchLastFrame = 0;
+size_t g_latchLastN = 0;
+uint64_t g_winOriginShifts = 0;   // the rebases the backstop saw this window
+
 // Built v14.12: latch the bay's mechanism once: the own pad's shaft (its up axis), the pads of its size and the mechanism records near the shaft.
 void latchNow(uint64_t now) noexcept {
     float axes[3][3] = {};
@@ -1275,6 +1282,7 @@ void latchNow(uint64_t now) noexcept {
     const size_t k = sealed::selectMechanism(cands, n, g_pickCell.pad, g_pickCell.padName, g_pickCell.size, g_pickCell.centre, up, alongMin, alongMax,
                                              g_latch.recs, rej, 10, &rejN);
     g_latch.n = k;
+    g_latchLastN = 0;   // built v14.28: the backstop's last world positions belong to the old set
     g_latch.latched = true;
     g_latchId.bind(g_pickCell.pad, g_preShellValid ? g_preShellAddr : 0);   // built v14.20 (review 2)
     g_latch.lastMotionMs = 0;
@@ -1291,19 +1299,73 @@ void latchNow(uint64_t now) noexcept {
 
 // Built v14.12: each latched record is read by address in the tick (its world centre and orientation), against the shell read this frame. A record
 // unreadable this frame is skipped and re-based on the next reading.
+// Built v14.28: every record is measured in the hangar SHELL's frame (its centre and its two axes along the shell's own axes), with the shell read in this
+// same call. The game's origin shifts (on foot to cockpit) moved every record by one vector (50.85 m) and the latch, which compared world positions and
+// read the shell from an earlier part of the tick, released the seal as a launch (flight 2d4ba6db). The shell unreadable: no sample, the references hold.
+// Backstop: when the shell and every latched record moved by the same vector since the last sample, it is a rebase: the references are re-based.
 void latchRead(uint64_t now) noexcept {
     const uint32_t frame = g_frameStamp.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < g_latch.n; ++i) {
-        sealed::LatchRec& r = g_latch.recs[i];
-        const WorldRead pw = worldOfRecord(r.addr);
-        if (pw.source == 4) continue;
+    const uintptr_t shellAddr = g_shellValid ? g_shellAddr : (g_preShellValid ? g_preShellAddr : 0);
+    if (shellAddr == 0) return;
+    const WorldRead sw = worldOfRecord(shellAddr);
+    float sAx[3][3] = {};
+    float sExt[3] = {};
+    bool sExtOk = false;
+    uint8_t sSrc = 4;
+    if (sw.source == 4 || !poseOrientOf(shellAddr, sAx, sExt, &sExtOk, &sSrc)) return;   // the shell is unreadable in this pass: no sample
+    struct Samp {
+        bool ok = false;
+        float world[3] = {};
+        float rel[3] = {};
+        float l0[3] = {};
+        float l2[3] = {};
+        uint8_t src = 4;
+    };
+    Samp samp[sealed::kLatchCap];
+    bool allOk = true;
+    for (size_t i = 0; i < g_latch.n && i < sealed::kLatchCap; ++i) {
+        const WorldRead pw = worldOfRecord(g_latch.recs[i].addr);
         float axes[3][3] = {};
         float ext[3] = {};
         bool extOk = false;
         uint8_t src = 4;
-        if (!poseOrientOf(r.addr, axes, ext, &extOk, &src)) continue;
-        const float rel[3] = {pw.world[0] - g_shellNow[0], pw.world[1] - g_shellNow[1], pw.world[2] - g_shellNow[2]};
-        r.step(frame, rel, axes[0], axes[2], pw.source, g_shellNowSrc, now);
+        if (pw.source == 4 || !poseOrientOf(g_latch.recs[i].addr, axes, ext, &extOk, &src)) {
+            allOk = false;
+            continue;
+        }
+        Samp& s = samp[i];
+        s.ok = true;
+        s.src = pw.source;
+        std::memcpy(s.world, pw.world, sizeof(s.world));
+        sealed::shellLocalSample(pw.world, axes[0], axes[2], sw.world, sAx, s.rel, s.l0, s.l2);
+    }
+    bool shifted = false;
+    if (allOk && g_latchLastFrame + 1 == frame && g_latchLastN == g_latch.n && g_latch.n > 0) {
+        float deltas[sealed::kLatchCap][3];
+        const float sd[3] = {sw.world[0] - g_latchLastShell[0], sw.world[1] - g_latchLastShell[1], sw.world[2] - g_latchLastShell[2]};
+        for (size_t i = 0; i < g_latch.n; ++i) {
+            for (int k = 0; k < 3; ++k) deltas[i][k] = samp[i].world[k] - g_latchLastWorld[i][k];
+        }
+        shifted = sealed::commonFrameShift(deltas, g_latch.n, sd, 1.0f, 0.1f);
+        if (shifted) {
+            ++g_winOriginShifts;
+            Log::get().note("optimized station: the coordinate origin shifted by %.2f m (the shell and all %u latched records moved together); the bay's "
+                            "motion references are re-based and this is not motion.",
+                            static_cast<double>(std::sqrt(sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2])), static_cast<unsigned>(g_latch.n));
+        }
+    }
+    g_latchLastN = allOk ? g_latch.n : 0;
+    g_latchLastFrame = frame;
+    for (size_t i = 0; i < g_latch.n && i < sealed::kLatchCap; ++i) std::memcpy(g_latchLastWorld[i], samp[i].world, sizeof(g_latchLastWorld[i]));
+    std::memcpy(g_latchLastShell, sw.world, sizeof(g_latchLastShell));
+    for (size_t i = 0; i < g_latch.n && i < sealed::kLatchCap; ++i) {
+        sealed::LatchRec& r = g_latch.recs[i];
+        if (!samp[i].ok) continue;
+        if (shifted) {
+            r.stamp = 0;   // the next step re-bases without counting
+            r.movedRun = 0;
+        }
+        r.step(frame, samp[i].rel, samp[i].l0, samp[i].l2, samp[i].src, sw.source, now);
     }
     g_latch.recomputeMotion();
 }
@@ -1390,7 +1452,7 @@ void summaryLine(uint64_t now) noexcept {
         Log::get().note("optimized station: last %llu s passes: %llu informative, %llu empty, %llu unfinished (a writer was still inside), %llu thin (under "
                         "half the usual calls); callbacks per informative pass min/avg/max %llu/%.0f/%llu; the own pad's record in %llu informative passes, "
                         "missing from %llu, missing from the whole window %llu; camera held through %llu failed resolutions, %llu jumps over %.0f m, %llu "
-                        "context changes; rig publications %llu (%.0f rigs each); rig requests sent %llu.",
+                        "context changes; rig publications %llu (%.0f rigs each); rig requests sent %llu; origin shifts re-based by the latch %llu.",
                         static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(g.informative),
                         static_cast<unsigned long long>(g.empty), static_cast<unsigned long long>(g.deferred), static_cast<unsigned long long>(g.thin),
                         static_cast<unsigned long long>(g.informative > 0 ? g.callsMin : 0), avg, static_cast<unsigned long long>(g.callsMax),
@@ -1399,7 +1461,8 @@ void summaryLine(uint64_t now) noexcept {
                         static_cast<unsigned long long>(g_winCamJump), static_cast<double>(kCamJumpM), static_cast<unsigned long long>(g_winCtxChange),
                         static_cast<unsigned long long>(g_winRigPublications),
                         g_winRigPublications > 0 ? static_cast<double>(g_winRigPublished) / static_cast<double>(g_winRigPublications) : 0.0,
-                        static_cast<unsigned long long>(g_rigTally.asked.load()));
+                        static_cast<unsigned long long>(g_rigTally.asked.load()), static_cast<unsigned long long>(g_winOriginShifts));
+        g_winOriginShifts = 0;
         g_passGate.clearWindow();
         g_winPadSeen = g_winPadMissed = g_winPadAbsentWindow = g_winCamHold = g_winCamJump = g_winCtxChange = 0;
         g_winRigPublications = g_winRigPublished = 0;

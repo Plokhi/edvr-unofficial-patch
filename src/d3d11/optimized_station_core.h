@@ -1372,6 +1372,35 @@ inline bool poseMoved(const float prevRel[3], const float rel[3], const float pr
     return axisAngleDeg(prevA0, a0) > kBayRotDeg || axisAngleDeg(prevA2, a2) > kBayRotDeg;
 }
 
+// Built v14.28: a latched record in the hangar SHELL's frame. The game's coordinate origin shifts (on foot to cockpit, a rebase), moving every record by
+// one vector and, if the frame turns, rotating every axis; the v14.14 latch compared world positions and read that as the mechanism moving (flight
+// 2d4ba6db: 50.85 m on every record, a false launch release). The record's centre is written along the shell's unit axes from the shell's centre, and its
+// two axes in those axes, so a shift or a turn that the shell shares changes nothing. sAx[k] is the k-th unit axis of the shell in world coordinates.
+inline void shellLocalSample(const float p[3], const float a0[3], const float a2[3], const float shellPos[3], const float sAx[3][3], float rel[3], float l0[3],
+                             float l2[3]) noexcept {
+    const float d[3] = {p[0] - shellPos[0], p[1] - shellPos[1], p[2] - shellPos[2]};
+    for (int k = 0; k < 3; ++k) {
+        rel[k] = sAx[k][0] * d[0] + sAx[k][1] * d[1] + sAx[k][2] * d[2];
+        l0[k] = sAx[k][0] * a0[0] + sAx[k][1] * a0[1] + sAx[k][2] * a0[2];
+        l2[k] = sAx[k][0] * a2[0] + sAx[k][1] * a2[1] + sAx[k][2] * a2[2];
+    }
+}
+
+// Built v14.28 (the backstop): between two samples the shell moved by shellDelta (at least minShellM) and every one of the n latched records moved by
+// that vector within tolM: the whole frame shifted (an origin rebase), nothing in the bay moved. The caller re-bases its references and counts no motion.
+inline bool commonFrameShift(const float (*recDelta)[3], size_t n, const float shellDelta[3], float minShellM, float tolM) noexcept {
+    if (n == 0) return false;
+    const float sl = std::sqrt(shellDelta[0] * shellDelta[0] + shellDelta[1] * shellDelta[1] + shellDelta[2] * shellDelta[2]);
+    if (!(sl >= minShellM)) return false;
+    for (size_t i = 0; i < n; ++i) {
+        const float dx = recDelta[i][0] - shellDelta[0];
+        const float dy = recDelta[i][1] - shellDelta[1];
+        const float dz = recDelta[i][2] - shellDelta[2];
+        if (std::sqrt(dx * dx + dy * dy + dz * dz) > tolM) return false;
+    }
+    return true;
+}
+
 // Built v14.12: the bay's mechanism, latched once per descent. The own pad; the other pads of its size within kLatchLateralM of the shaft; and the
 // mechanism records (Lift*, TurboLift*, BlastShield*, HangarGate*) within kLatchLateralM of the shaft and along it within the box's span. The own pad
 // is first; at most kLatchCap records. Each is read by address each frame (LatchRec::step); nothing else is watched.

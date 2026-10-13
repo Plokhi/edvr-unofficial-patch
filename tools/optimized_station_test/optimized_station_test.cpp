@@ -1778,6 +1778,145 @@ int main(int argc, char** argv) {
         check(totalRigGaps == 0, "v14.27 random interleavings: the rig publication stays across empty and unfinished passes");
         check(totalSeal > 0, "v14.27 random interleavings: the seal's pass condition is met");
     }
+    // ---- Built v14.28: the latch measures in the hangar shell's frame; an origin rebase is not motion (flight 2d4ba6db: 50.85 m on every record) --------
+    {
+        struct Frame {   // the game's world frame: a rotation about z and a translation, applied to everything in it
+            float c = 1.0f, s = 0.0f, t[3] = {0, 0, 0};
+            void pos(const float p[3], float o[3]) const { o[0] = c * p[0] - s * p[1] + t[0]; o[1] = s * p[0] + c * p[1] + t[1]; o[2] = p[2] + t[2]; }
+            void dir(const float d[3], float o[3]) const { o[0] = c * d[0] - s * d[1]; o[1] = s * d[0] + c * d[1]; o[2] = d[2]; }
+        };
+        struct Rec {
+            float p[3];
+            float a0[3];
+            float a2[3];
+        };
+        // the shell with identity axes; a pad (index 0), a Lift, a gate ramp, in the shell's own frame
+        const float shellP[3] = {100, 200, 0};
+        const float sAx0[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        const Rec base[3] = {{{110, 200, -48}, {1, 0, 0}, {0, 0, 1}}, {{112, 203, -20}, {1, 0, 0}, {0, 0, 1}}, {{95, 210, -10}, {0, 1, 0}, {0, 0, 1}}};
+        // Reads the three records and the shell in a world frame, as latchRead does (the shell read in the same call), into three LatchRecs.
+        auto sample = [&](const Frame& fr, const Rec in[3], uint32_t frame, se::LatchRec out[3]) {
+            float sp[3];
+            fr.pos(shellP, sp);
+            float sAx[3][3];
+            for (int k = 0; k < 3; ++k) fr.dir(sAx0[k], sAx[k]);
+            for (int i = 0; i < 3; ++i) {
+                float p[3], a0[3], a2[3], rel[3], l0[3], l2[3];
+                fr.pos(in[i].p, p);
+                fr.dir(in[i].a0, a0);
+                fr.dir(in[i].a2, a2);
+                se::shellLocalSample(p, a0, a2, sp, sAx, rel, l0, l2);
+                out[i].step(frame, rel, l0, l2, 1, 1, 1000);
+            }
+        };
+        auto movedAny = [](const se::LatchRec r[3]) { return r[0].movedRun >= 2 || r[1].movedRun >= 2 || r[2].movedRun >= 2; };
+        {
+            se::LatchRec lr[3];
+            Frame fr;
+            Rec cur[3] = {base[0], base[1], base[2]};
+            bool moved = false;
+            for (uint32_t f = 1; f <= 60; ++f) {
+                if (f == 20) fr.t[0] = 50.85f;   // the origin rebase of the flight: one vector for everything
+                if (f == 35) {                   // and a turn of the whole frame
+                    fr.c = 0.0f;
+                    fr.s = 1.0f;
+                    fr.t[1] = -300.0f;
+                }
+                sample(fr, cur, f, lr);
+                moved = moved || movedAny(lr);
+            }
+            check(!moved, "v14.28 latch: a common 50.85 m translation and a common 90 degree turn of the whole frame give no motion");
+        }
+        {
+            // the v14.27 reading: the shell taken from before the shift (stale), the records live: the same rebase reads as motion
+            se::LatchRec lr[3];
+            Frame after;
+            after.t[0] = 50.85f;
+            bool moved = false;
+            for (uint32_t f = 1; f <= 30; ++f) {
+                const Frame before;
+                const Frame& live = f >= 10 ? after : before;
+                for (int i = 0; i < 3; ++i) {
+                    float p[3], a0[3], a2[3];
+                    live.pos(base[i].p, p);
+                    live.dir(base[i].a0, a0);
+                    live.dir(base[i].a2, a2);
+                    const float rel[3] = {p[0] - shellP[0], p[1] - shellP[1], p[2] - shellP[2]};
+                    lr[i].step(f, rel, a0, a2, 1, 1, 1000);
+                }
+                moved = moved || movedAny(lr);
+            }
+            check(moved || lr[0].haveMotion, "v14.28 latch: the world-space reading with a stale shell does read the rebase as motion (the bug is reproduced)");
+        }
+        {
+            se::LatchRec lr[3];
+            Frame fr;
+            Rec cur[3] = {base[0], base[1], base[2]};
+            bool moved = false;
+            for (uint32_t f = 1; f <= 40; ++f) {
+                if (f == 20) fr.t[0] = 50.85f;
+                if (f >= 25 && f <= 30) cur[1].p[2] += 0.5f;   // the Lift travels 0.5 m a frame for six frames: 3 m against the shell
+                sample(fr, cur, f, lr);
+                if (lr[1].movedRun >= 2) moved = true;
+            }
+            check(moved, "v14.28 latch: a Lift that moves 3 m against the shell releases, with a rebase in the same window");
+        }
+        {
+            se::LatchRec lr[3];
+            Frame fr;
+            Rec cur[3] = {base[0], base[1], base[2]};
+            bool moved = false;
+            for (uint32_t f = 1; f <= 40; ++f) {
+                if (f >= 20) {   // the ramp turns 89 degrees in place and shifts 0.65 m over seven frames
+                    const float u = f < 27 ? static_cast<float>(f - 19) / 7.0f : 1.0f;
+                    const float ang = u * 89.0f * 0.0174532925f;
+                    cur[2].a0[0] = std::sin(ang);
+                    cur[2].a0[1] = std::cos(ang);
+                    cur[2].a0[2] = 0.0f;
+                    cur[2].p[0] = base[2].p[0] + 0.65f * u;
+                }
+                sample(fr, cur, f, lr);
+                if (lr[2].movedRun >= 2) moved = true;
+            }
+            check(moved, "v14.28 latch: a gate ramp that turns 89 degrees in place (0.65 m) still releases");
+        }
+        {
+            // The pose-back rule across a rebase: the poses at the seal, the Lift moves away, the origin shifts and turns, the Lift comes back.
+            se::LatchRec seal[3];
+            Frame f0;
+            Rec cur[3] = {base[0], base[1], base[2]};
+            sample(f0, cur, 1, seal);
+            Frame fr;
+            cur[1].p[2] += 3.0f;   // away
+            se::LatchRec lr[3];
+            sample(fr, cur, 2, lr);
+            float dM = 0.0f, dDeg = 0.0f;
+            se::latchPoseDelta(lr[1].rel, seal[1].rel, lr[1].ax0, seal[1].ax0, lr[1].ax2, seal[1].ax2, &dM, &dDeg);
+            check(!se::latchPoseWithin(dM, dDeg), "v14.28 pose-back: a Lift 3 m from its sealed pose is away");
+            fr.t[0] = 50.85f;   // the rebase while it is away
+            fr.c = std::cos(0.5f);
+            fr.s = std::sin(0.5f);
+            cur[1].p[2] = base[1].p[2];   // and it returns
+            sample(fr, cur, 3, lr);
+            bool allBack = true;
+            for (int i = 0; i < 3; ++i) {
+                se::latchPoseDelta(lr[i].rel, seal[i].rel, lr[i].ax0, seal[i].ax0, lr[i].ax2, seal[i].ax2, &dM, &dDeg);
+                allBack = allBack && se::latchPoseWithin(dM, dDeg);
+            }
+            check(allBack, "v14.28 pose-back: a Lift that moved and returned is back at its sealed pose though the origin shifted and turned between");
+        }
+        {
+            const float sd[3] = {50.85f, 0, 0};
+            const float same[3][3] = {{50.85f, 0, 0}, {50.9f, 0.05f, 0}, {50.8f, 0, 0.04f}};
+            check(se::commonFrameShift(same, 3, sd, 1.0f, 0.1f), "v14.28 backstop: the shell and every record moving by one vector is a rebase");
+            const float lift[3][3] = {{50.85f, 0, 0}, {50.85f, 0, 2.0f}, {50.85f, 0, 0}};
+            check(!se::commonFrameShift(lift, 3, sd, 1.0f, 0.1f), "v14.28 backstop: one record moving differently is not a rebase");
+            const float still[3] = {0.02f, 0, 0};
+            const float tiny[3][3] = {{0.02f, 0, 0}, {0.02f, 0, 0}, {0.02f, 0, 0}};
+            check(!se::commonFrameShift(tiny, 3, still, 1.0f, 0.1f) && !se::commonFrameShift(tiny, 0, sd, 1.0f, 0.1f),
+                  "v14.28 backstop: a small common move, or no records, is not a rebase");
+        }
+    }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
