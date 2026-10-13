@@ -677,7 +677,7 @@ void STDMETHODCALLTYPE hookedDispatchIndirect(ID3D11DeviceContext* self,
         return;
     }
     if (g_vrWorldInternal) { g_state->realDispatchIndirect(self, args, off); return; }   // the world route's own (vr_world_route.h)
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     State* s = g_state;
     if (drawCensusArmed()) {
         drawCensusDispatch(self, 0, 0, 0, foreignContext(self), args, off);
@@ -706,7 +706,7 @@ void STDMETHODCALLTYPE hookedDispatch(ID3D11DeviceContext* self, UINT x, UINT y,
         return;
     }
     if (g_vrWorldInternal) { g_state->realDispatch(self, x, y, z); return; }   // the world route's own: not the game's exposure pass
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     State* s = g_state;
     ++s->thunkHits[kHitDispatch];
     if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteDispatch();   // a UAV write into H after the resolve is the latch's

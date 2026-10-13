@@ -32,9 +32,10 @@ changes.*
   its overcount fixed 2026-09-25, has since flown (the 09-29 entries). The
   overlap is unflown on the Quest runtimes; the depth layer is set aside
   (Sean, 2026-09-24); a controlled OpenVR comparison needs a v0.16.2 build.
-- **Closed:** sections 5 and 6 below (the private and producer copies): the
-  producer copy measured 0.039 ms p50 per eye at 4100x3962, under the
-  0.1 ms bar.
+- **AA-off cuts** (2026-10-13; BUILT, NOT FLOWN): per-draw fast path, Map timer
+  sampled 1 in 16, app_gpu_timing default off, VR panels follow AA. See
+  `docs/ui-layer-2026-09-23.md`, entry "2026-10-13".
+- **Closed:** sections 5 and 6 below (the private and producer copies; 0.039 ms p50 per eye, under the 0.1 ms bar).
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
   stalls' cause; engine motion's CPU as the carrier's limit; the six wrapped

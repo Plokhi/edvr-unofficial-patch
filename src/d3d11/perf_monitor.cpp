@@ -4,9 +4,11 @@
 #include "engine_motion_cpu.h"
 #include "frame_ticks.h"
 #include "gpu_frame_timing.h"
+#include "vscreen.h"   // vScreenAaOffForDraws, vScreenEyeDrawsThisFrame: the draw hook CPU line
 
 #include <windows.h>
 #include <algorithm>
+#include <vector>
 
 #include <d3d11.h>
 #include <dxgi1_4.h>
@@ -1022,6 +1024,34 @@ void perfMonitorCrossProfileFrame() {
     for (int i = 0; i < lines.count; ++i) Log::get().note("%s", lines.text[i]);
 }
 
+// The Present hook's tick sum, p50 and p95 over each 30 s (2026-10-13). One float per frame at the edge, the frames whose
+// chain was measured (marks > 0); sorted once a window, on the render thread. The LONG FRAME lines report single frames only.
+struct HookTickWindow {
+    std::vector<float> samples;
+    uint64_t startMs = 0;
+};
+HookTickWindow g_hookTickWindow;
+
+void hookTickNote(const FrameTickSummary& t, uint64_t nowMs) {
+    if (g_hookTickWindow.startMs == 0) g_hookTickWindow.startMs = nowMs;
+    if (t.marks > 0 && std::isfinite(t.hookMs)) g_hookTickWindow.samples.push_back(t.hookMs);
+    if (nowMs - g_hookTickWindow.startMs < 30000) return;
+    std::vector<float>& v = g_hookTickWindow.samples;
+    if (v.empty()) {
+        Log::get().note("Present hook ticks: 30 s with no frame whose chain was measured.");
+    } else {
+        std::sort(v.begin(), v.end());
+        const size_t n = v.size();
+        const size_t i95 = std::min(n - 1, n * 95 / 100);
+        Log::get().note("Present hook ticks: 30 s, %u frame(s) with a measured chain; EDVR's tick sum per frame p50 %.3f ms, "
+                        "p95 %.3f ms, max %.3f ms (the real Present excluded; the draw hooks are the separate line).",
+                        static_cast<unsigned>(n), static_cast<double>(v[n / 2]), static_cast<double>(v[i95]),
+                        static_cast<double>(v.back()));
+    }
+    v.clear();
+    g_hookTickWindow.startMs = nowMs;
+}
+
 void perfMonitorFrame(ID3D11Device* dev) {
     State& s = g_s;
     ++s.frameNo;
@@ -1042,6 +1072,7 @@ void perfMonitorFrame(ID3D11Device* dev) {
     // the rest add up (frame_ticks.h). The stretch since the last mark is the
     // menu tick's own head; the remainder of this function is marked at its end.
     f.ticks = g_frameTicks.cut("menu_tick", q, qpcFrequency());
+    hookTickNote(f.ticks, nowMs());
     // Engine motion's hooks, cut at the same edge (engine_motion_cpu.h): this
     // thread is the render thread, the one that calls Present. The figures are
     // this frame's own, every call clocked -- what the LONG FRAME line reads.
@@ -1161,10 +1192,13 @@ void perfMonitorFrame(ID3D11Device* dev) {
     // explain a settlement's many thousands of hook invocations. Average
     // only measured frames, never the held value copied into the ring.
     if (s.frameNo % 1800 == 0) {
-        Log::get().note("draw hook CPU: 1800-frame window ending %u; %.3f ms/sampled frame mean, %.3f ms max, %u sampled frames (one in %u); excludes forwarded game draw time, includes EDVR reissues; zero samples means unavailable. Each sampled frame's figure is estimated from every %uth draw, scaled by %u.",
+        // The AA mode (2026-10-13: the AA-off fast path's switch) and the eye draws counted at this edge. The eye count is
+        // taken after the subscriber gate (beginPanelOverride), so it is exact while a subscriber is on and reads 0 on the fast path.
+        Log::get().note("draw hook CPU: 1800-frame window ending %u; %.3f ms/sampled frame mean, %.3f ms max, %u sampled frames (one in %u); excludes forwarded game draw time, includes EDVR reissues; zero samples means unavailable. Each sampled frame's figure is estimated from every %uth draw, scaled by %u. Temporal AA %s; eye draws counted this frame %u (counted only while a draw subscriber is on).",
             s.frameNo, s.drawWindowSamples ? s.drawWindowMs / s.drawWindowSamples : 0.0,
             double(s.drawWindowMaxMs), s.drawWindowSamples, unsigned(kDrawSampleEvery),
-            unsigned(kPerfMonitorDrawTimeStride), unsigned(kPerfMonitorDrawTimeStride));
+            unsigned(kPerfMonitorDrawTimeStride), unsigned(kPerfMonitorDrawTimeStride),
+            vScreenAaOffForDraws() ? "off" : "on", vScreenEyeDrawsThisFrame());
         s.drawWindowMs = 0.0; s.drawWindowMaxMs = 0.0f; s.drawWindowSamples = 0;
         // Written every window, quiet or not, so a window with no refresh in it (all zeros) can be told from a build that does not have this line.
         const uint32_t reloads = s.cfgReloads.exchange(0, std::memory_order_relaxed);
@@ -1386,7 +1420,7 @@ int perfMonitorTiles(PerfTile* out, int max) {
         snprintf(v, sizeof(v), "%.1f", nativeApplicationGpu.meanMs);
         tile("GPU TIME", v, "ms application render; elapsed");
     } else if (native) {
-        tile("GPU TIME", "--", noTiming);
+        tile("GPU TIME", "--", gpuFrameSnapshot().enabled ? noTiming : "disabled: advanced.app_gpu_timing");
     }
     if (native && nativeApplicationCpu.count) {
         // The caller work per cycle: the game's thread from one pose wait's

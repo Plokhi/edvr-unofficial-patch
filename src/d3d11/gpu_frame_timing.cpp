@@ -254,6 +254,8 @@ void gpuFrameConfigure(bool enabled) noexcept {
         c->ring.shutdown(now, c->driver.currentOwner());
         c->ring.~GpuSpanState();
         new (&c->ring) GpuSpanState(c->driver, c->owner);
+        // Completions that finished before the disable are not delivered to the census or the benchmark cursors later (2026-10-13).
+        g_completionFloor = g_nextCompletion;
     }
     c->seenToken = g_token.load(std::memory_order_acquire); // Wait for a new boundary.
     AcquireSRWLockExclusive(&g_snapshotLock);

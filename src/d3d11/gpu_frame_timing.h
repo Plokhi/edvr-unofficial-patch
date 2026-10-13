@@ -40,6 +40,12 @@ inline bool gpuFrameCommandMightAct() noexcept {
            detail::g_gpuFrameCommandLive.load(std::memory_order_relaxed);
 }
 
+// The draw thunks' call (2026-10-13): with advanced.app_gpu_timing off, gpuFrameCommand returns on its first test, and
+// this keeps that call from being made at all -- one relaxed load per draw instead of an out-of-line call.
+inline void gpuFrameCommandIfLive(ID3D11DeviceContext* ctx) noexcept {
+    if (gpuFrameCommandMightAct()) gpuFrameCommand(ctx);
+}
+
 struct GpuFrameSnapshot {
     bool enabled = false, haveResult = false;
     GpuSpanResult result{};

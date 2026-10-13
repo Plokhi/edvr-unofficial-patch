@@ -35,6 +35,8 @@
 #include "device_hook.h"  // contextHookModeFor
 #include "draw_census.h"
 #include "draw_gate.h"    // the sampled subscriber gate the draw path reads
+#include "draw_fast_path.h"   // the AA-off draw path's decisions (2026-10-13)
+#include "../common/temporal_mode.h"  // temporalModeEnabledFor: the AA-off fast path's switch
 #include "object_probe.h"     // tier 2 stage 1: the instanced-mesh pool, read on two frames
 #include "pixel_probe.h"      // advanced.pixel_probe: who drew this pixel, during an eye dump
 #include "fss_panel.h"
@@ -96,6 +98,12 @@ namespace edvr {
 namespace detail {
 std::atomic<bool> g_drawGateWanted{true};
 }  // namespace detail
+
+// The AA-off draw path (draw_fast_path.h, 2026-10-13). g_aaOffDraw: VR's temporal AA reads off, set with the config
+// (vScreenRefreshConfigBody). g_shadowsSkipped: a bind skipped the VsSrv33 and Blend records while that was so; the
+// frame boundary invalidates both once engine velocity needs them again.
+std::atomic<bool> g_aaOffDraw{false};
+std::atomic<bool> g_shadowsSkipped{false};
 
 namespace {
 
@@ -1790,6 +1798,13 @@ void pixelProbeAfterEye(State* s, ID3D11DeviceContext* self, uint32_t count,
 // rather than stashed because a stash read the wrong draw's numbers once
 // (hookedDraw says); every other consumer of this function is indifferent
 // to them.
+// The AA-off fast path's decision for one draw (draw_fast_path.h, 2026-10-13): the verdict the draw got, the three loads
+// the decision reads (relaxed), and the VR world route's flag. Every draw thunk asks this after beginPanelOverride.
+inline bool drawPathFast(DrawVerdict v) {
+    return drawFastPathTaken(DrawPathInputs{g_aaOffDraw.load(std::memory_order_relaxed), drawGateWanted(),
+                                            engineVelocityLiveNow(), g_vrWorldWants, v != DrawVerdict::kNone});
+}
+
 DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                                UINT instances, const DrawArgs& args) {
     State* s = g_state;
@@ -2772,7 +2787,7 @@ __declspec(noinline) void noteStaleForwardOnce(State* s, size_t slot, const void
 void STDMETHODCALLTYPE hookedClearRtv(ID3D11DeviceContext* self,
                                       ID3D11RenderTargetView* rtv, const FLOAT c[4]) {
     if (g_flatComputeInternal) { g_state->realClearRtv(self, rtv, c); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     noteStaleForward(kSlotClearRenderTargetView, reinterpret_cast<const void*>(g_state->realClearRtv),
                      "ClearRenderTargetView");
     State* s = g_state;
@@ -2827,7 +2842,7 @@ void STDMETHODCALLTYPE hookedClearUavUint(ID3D11DeviceContext* self,
                                           ID3D11UnorderedAccessView* uav,
                                           const UINT c[4]) {
     if (g_flatComputeInternal) { g_state->realClearUavUint(self, uav, c); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     if (!foreignContext(self) && flatRuntimeActive()) {
         flatRuntimeSubstitution(self, FlatSubstEvent::kClear);
@@ -2841,7 +2856,7 @@ void STDMETHODCALLTYPE hookedClearUavFloat(ID3D11DeviceContext* self,
                                            ID3D11UnorderedAccessView* uav,
                                            const FLOAT c[4]) {
     if (g_flatComputeInternal) { g_state->realClearUavFloat(self, uav, c); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     if (!foreignContext(self) && flatRuntimeActive()) {
         flatRuntimeSubstitution(self, FlatSubstEvent::kClear);
@@ -2854,7 +2869,7 @@ void STDMETHODCALLTYPE hookedClearUavFloat(ID3D11DeviceContext* self,
 void STDMETHODCALLTYPE hookedGenerateMips(ID3D11DeviceContext* self,
                                           ID3D11ShaderResourceView* srv) {
     if (g_flatComputeInternal) { g_state->realGenerateMips(self, srv); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     if (!foreignContext(self) && flatRuntimeActive()) {
         flatRuntimeSubstitution(self, FlatSubstEvent::kCopy);
@@ -2999,8 +3014,13 @@ void STDMETHODCALLTYPE hookedPSSetConstantBuffers(ID3D11DeviceContext* self, UIN
 void STDMETHODCALLTYPE hookedVSSetShaderResources(ID3D11DeviceContext* self, UINT start, UINT n,
                                                   ID3D11ShaderResourceView* const* srvs) {
     if (g_flatComputeInternal) { g_state->realVSSetShaderResources(self, start, n, srvs); return; }
-    if (!foreignContext(self) && start <= kEngineVelocityPoolSlot && kEngineVelocityPoolSlot - start < n)
-        bindingSet(BindSlot::VsSrv33, srvs ? srvs[kEngineVelocityPoolSlot - start] : nullptr);
+    if (!foreignContext(self) && start <= kEngineVelocityPoolSlot && kEngineVelocityPoolSlot - start < n) {
+        // Only engine velocity reads VsSrv33 (draw_fast_path.h): not recorded while the AA is off.
+        if (bindShadowsSkipped(g_aaOffDraw.load(std::memory_order_relaxed), engineVelocityLiveNow()))
+            g_shadowsSkipped.store(true, std::memory_order_relaxed);
+        else
+            bindingSet(BindSlot::VsSrv33, srvs ? srvs[kEngineVelocityPoolSlot - start] : nullptr);
+    }
     g_state->realVSSetShaderResources(self, start, n, srvs);
 }
 
@@ -3009,7 +3029,13 @@ void STDMETHODCALLTYPE hookedVSSetShaderResources(ID3D11DeviceContext* self, UIN
 void STDMETHODCALLTYPE hookedOMSetBlendState(ID3D11DeviceContext* self, ID3D11BlendState* state,
                                              const FLOAT factor[4], UINT sampleMask) {
     if (g_flatComputeInternal) { g_state->realOMSetBlendState(self, state, factor, sampleMask); return; }
-    if (!foreignContext(self)) bindingSet(BindSlot::Blend, state);
+    if (!foreignContext(self)) {
+        // Only engine velocity reads Blend (draw_fast_path.h): not recorded while the AA is off.
+        if (bindShadowsSkipped(g_aaOffDraw.load(std::memory_order_relaxed), engineVelocityLiveNow()))
+            g_shadowsSkipped.store(true, std::memory_order_relaxed);
+        else
+            bindingSet(BindSlot::Blend, state);
+    }
     g_state->realOMSetBlendState(self, state, factor, sampleMask);
 }
 
@@ -3086,7 +3112,7 @@ void forgetBindings(State*) { bindingForgetAll(); }
 // count looks right" into evidence, on whatever machine the log came from.
 void STDMETHODCALLTYPE hookedClearState(ID3D11DeviceContext* self) {
     if (g_flatComputeInternal) { g_state->realClearState(self); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     State* s = g_state;
     if (foreignContext(self)) {
         s->realClearState(self);
@@ -3112,7 +3138,7 @@ void STDMETHODCALLTYPE hookedClearState(ID3D11DeviceContext* self) {
 void STDMETHODCALLTYPE hookedExecuteCommandList(ID3D11DeviceContext* self,
                                                 ID3D11CommandList* list,
                                                 BOOL restoreContextState) {
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     State* s = g_state;
     if (foreignContext(self)) {
         if (flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
@@ -3202,12 +3228,20 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
     // forwards the Map with one relaxed load instead of two clock reads and
     // three atomics -- about 1100 times a frame over terrain. Both branches
     // call the same real Map with the same arguments.
+    //
+    // While armed, every Map is counted (exact), and one Map in kMapWaitSampleRate is also timed (2026-10-13):
+    // the ticks are scaled back up when the line takes them (map_wait.h).
     HRESULT hr;
     if (mapWaitArmed()) {
-        LARGE_INTEGER mapT0{}; QueryPerformanceCounter(&mapT0);
-        hr = s->realMap(self, res, sub, type, flags, mapped);
-        LARGE_INTEGER mapT1{}; QueryPerformanceCounter(&mapT1);
-        edvr::mapWaitNote(type, mapT1.QuadPart > mapT0.QuadPart ? static_cast<uint64_t>(mapT1.QuadPart - mapT0.QuadPart) : 0u);
+        if (edvr::mapWaitSampleNext(edvr::mapWaitSampleSeq())) {
+            LARGE_INTEGER mapT0{}; QueryPerformanceCounter(&mapT0);
+            hr = s->realMap(self, res, sub, type, flags, mapped);
+            LARGE_INTEGER mapT1{}; QueryPerformanceCounter(&mapT1);
+            edvr::mapWaitNote(type, mapT1.QuadPart > mapT0.QuadPart ? static_cast<uint64_t>(mapT1.QuadPart - mapT0.QuadPart) : 0u);
+        } else {
+            hr = s->realMap(self, res, sub, type, flags, mapped);
+        }
+        edvr::mapWaitCall(type);
     } else {
         hr = s->realMap(self, res, sub, type, flags, mapped);
     }
@@ -4259,7 +4293,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
 void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
                                           ID3D11Resource* dst, ID3D11Resource* src) {
     if (g_flatComputeInternal) { g_state->realCopyResource(self, dst, src); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     noteStaleForward(kSlotCopyResource, reinterpret_cast<const void*>(g_state->realCopyResource),
                      "CopyResource");
@@ -4288,7 +4322,7 @@ void STDMETHODCALLTYPE hookedClearDsv(ID3D11DeviceContext* self,
                                       ID3D11DepthStencilView* dsv, UINT flags,
                                       FLOAT depth, UINT8 stencil) {
     if (g_flatComputeInternal) { g_state->realClearDsv(self, dsv, flags, depth, stencil); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     noteStaleForward(kSlotClearDepthStencilView, reinterpret_cast<const void*>(g_state->realClearDsv),
                      "ClearDepthStencilView");
@@ -4318,7 +4352,7 @@ void STDMETHODCALLTYPE hookedBegin(ID3D11DeviceContext* self,
                                    ID3D11Asynchronous* async) {
     if (g_flatComputeInternal) { g_state->realBegin(self, async); return; }
     if(runtimeFlatProfile())flatRuntimeReplayQueryBegin(self, async);
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (gpuFrameInternal()) { g_state->realBegin(self, async); return; }
     if (drawCensusArmed()) {
         drawCensusQuery('B', async, foreignContext(self));
@@ -4329,7 +4363,7 @@ void STDMETHODCALLTYPE hookedBegin(ID3D11DeviceContext* self,
 void STDMETHODCALLTYPE hookedEnd(ID3D11DeviceContext* self,
                                  ID3D11Asynchronous* async) {
     if (g_flatComputeInternal) { g_state->realEnd(self, async); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (gpuFrameInternal()) {
         g_state->realEnd(self, async);
         if(runtimeFlatProfile())flatRuntimeReplayQueryEnd(self, async);
@@ -4357,7 +4391,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
     }
     if (g_vrWorldInternal) { g_state->realDrawIndexedInstancedIndirect(self, args, off); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     noteStaleForward(kSlotDrawIndexedInstancedIndirect, reinterpret_cast<const void*>(g_state->realDrawIndexedInstancedIndirect),
                      "DrawIndexedInstancedIndirect");
     if (drawCensusArmed()) {
@@ -4388,7 +4422,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
     }
     if (g_vrWorldInternal) { g_state->realDrawInstancedIndirect(self, args, off); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     noteStaleForward(kSlotDrawInstancedIndirect, reinterpret_cast<const void*>(g_state->realDrawInstancedIndirect),
                      "DrawInstancedIndirect");
     if (drawCensusArmed()) {
@@ -4407,7 +4441,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
 void STDMETHODCALLTYPE hookedCopyStructureCount(ID3D11DeviceContext* self,
                                                 ID3D11Buffer* dst, UINT off,
                                                 ID3D11UnorderedAccessView* src) {
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     if (!foreignContext(self) && flatRuntimeActive()) {
         flatRuntimeSubstitution(self, FlatSubstEvent::kCopy);
@@ -4428,7 +4462,7 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
     ID3D11DeviceContext* self, ID3D11Resource* dst, UINT dstSub, UINT dstX, UINT dstY,
     UINT dstZ, ID3D11Resource* src, UINT srcSub, const D3D11_BOX* box) {
     if (g_flatComputeInternal) { g_state->realCopySubresourceRegion(self,dst,dstSub,dstX,dstY,dstZ,src,srcSub,box); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     noteStaleForward(kSlotCopySubresourceRegion, reinterpret_cast<const void*>(g_state->realCopySubresourceRegion),
                      "CopySubresourceRegion");
@@ -4473,7 +4507,7 @@ void STDMETHODCALLTYPE hookedUpdateSubresource(ID3D11DeviceContext* self,
                                                const D3D11_BOX* box, const void* data,
                                                UINT rowPitch, UINT depthPitch) {
     if (g_flatComputeInternal) { g_state->realUpdateSubresource(self, dst, dstSub, box, data, rowPitch, depthPitch); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     noteStaleForward(kSlotUpdateSubresource, reinterpret_cast<const void*>(g_state->realUpdateSubresource),
                      "UpdateSubresource");
@@ -4526,7 +4560,7 @@ void STDMETHODCALLTYPE hookedResolveSubresource(ID3D11DeviceContext* self,
                                                 ID3D11Resource* src, UINT srcSub,
                                                 DXGI_FORMAT fmt) {
     if (g_flatComputeInternal) { g_state->realResolveSubresource(self, dst, dstSub, src, srcSub, fmt); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     if (foreignContext(self) && flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
     noteStaleForward(kSlotResolveSubresource, reinterpret_cast<const void*>(g_state->realResolveSubresource),
                      "ResolveSubresource");
@@ -4697,7 +4731,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         return;
     }
     if (g_vrWorldInternal) { g_state->realDraw(self, count, start); return; }   // the world route's own draw (vr_world_route.h)
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     DrawClock clock;
     ++g_state->thunkHits[kHitDraw];
     noteStaleForward(kSlotDraw, reinterpret_cast<const void*>(g_state->realDraw),
@@ -4706,10 +4740,18 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     DrawArgs args;
     args.base = static_cast<int32_t>(start);
     const DrawVerdict v = beginPanelOverride(self, 'D', count, 1, args);
-    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
+    const bool fast = drawPathFast(v);   // AA off, unclaimed, no subscriber: no verdict scope, no engine velocity (draw_fast_path.h)
+    if (!fast && v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
     if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);   // the VR world route's detector; at the tone, its resolve
-    forwardWithVerdict(self, v, 'D', count, 1, args, [&](AlteredDraw altered) {
+    if (fast) {
+        // forwardWithVerdict's own return for the owner's blocked UI layer is kept; the game's draw otherwise as it is issued there.
+        if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
+            const int64_t r0 = clock.on ? qpcNow() : 0;
+            g_state->realDraw(self, count, start);
+            if (clock.on) clock.realCall(r0);
+        }
+    } else forwardWithVerdict(self, v, 'D', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
@@ -4733,8 +4775,9 @@ void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
     }
     if (g_vrWorldInternal) { g_state->realDrawAuto(self); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
-    gpuFrameCommand(self);
-    if(self==g_state->ownerCtx)engineVelocityBeforeDraw(self,g_state->rtv0Eye);
+    gpuFrameCommandIfLive(self);
+    // No verdict on this path: the fast path's decision is the gate and the AA alone (draw_fast_path.h).
+    if (self == g_state->ownerCtx && !drawPathFast(DrawVerdict::kNone)) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     g_state->realDrawAuto(self);
 }
@@ -4757,7 +4800,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         return;
     }
     if (g_vrWorldInternal) { g_state->realDrawIndexed(self, count, startIndex, baseVertex); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     DrawClock clock;
     ++g_state->thunkHits[kHitDrawIndexed];
     noteStaleForward(kSlotDrawIndexed,
@@ -4767,10 +4810,17 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     args.start = startIndex;
     args.base = baseVertex;
     const DrawVerdict v = beginPanelOverride(self, 'I', count, 1, args);
-    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
+    const bool fast = drawPathFast(v);   // draw_fast_path.h
+    if (!fast && v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
     if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
-    forwardWithVerdict(self, v, 'I', count, 1, args, [&](AlteredDraw altered) {
+    if (fast) {
+        if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
+            const int64_t r0 = clock.on ? qpcNow() : 0;
+            g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            if (clock.on) clock.realCall(r0);
+        }
+    } else forwardWithVerdict(self, v, 'I', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
@@ -4803,7 +4853,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         return;
     }
     if (g_vrWorldInternal) { g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     noteStaleForward(kSlotDrawInstanced, reinterpret_cast<const void*>(g_state->realDrawInstanced),
                      "DrawInstanced");
     DrawClock clock;
@@ -4813,7 +4863,8 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     args.base = static_cast<int32_t>(startVertex);
     args.startInstance = startInstance;
     const DrawVerdict v = beginPanelOverride(self, 'N', perInstance, instances, args);
-    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) {
+    const bool fast = drawPathFast(v);   // draw_fast_path.h
+    if (!fast && v == DrawVerdict::kNone && self == g_state->ownerCtx) {
         engineVelocityBeforeDraw(self, g_state->rtv0Eye);
         engineVelocityNoteSkinDraw(self, startInstance, instances);   // F2: a skinned family's draw lists the instance entries it reads
     }
@@ -4825,7 +4876,13 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     const UINT drawn = g_state->glareClamp && g_state->glareClamp < instances
                            ? g_state->glareClamp
                            : instances;
-    forwardWithVerdict(self, v, 'N', perInstance, drawn, args, [&](AlteredDraw altered) {
+    if (fast) {
+        if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
+            const int64_t r0 = clock.on ? qpcNow() : 0;
+            g_state->realDrawInstanced(self, perInstance, drawn, startVertex, startInstance);
+            if (clock.on) clock.realCall(r0);
+        }
+    } else forwardWithVerdict(self, v, 'N', perInstance, drawn, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
@@ -4862,7 +4919,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
         return;
     }
     if (g_vrWorldInternal) { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); return; }
-    gpuFrameCommand(self);
+    gpuFrameCommandIfLive(self);
     noteStaleForward(kSlotDrawIndexedInstanced, reinterpret_cast<const void*>(g_state->realDrawIndexedInstanced),
                      "DrawIndexedInstanced");
     DrawClock clock;
@@ -5531,6 +5588,8 @@ uint32_t vScreenEyeDrawsThisFrame() {
     return s ? s->eyeDrawsThisFrame : 0;
 }
 
+bool vScreenAaOffForDraws() { return g_aaOffDraw.load(std::memory_order_relaxed); }
+
 // The one refresh. vScreenRefreshConfig runs it behind the reload's gate; vScreenForceRefreshConfig runs it with the gate taken away.
 // The configure calls stay in this one body: the reload gate is the only difference between the two.
 static void vScreenRefreshConfigBody(bool forced) {
@@ -5547,7 +5606,7 @@ static void vScreenRefreshConfigBody(bool forced) {
         // The quiet-pass counters go back to zero with the sweep: the vouch list is rebuilt from silence the new profile earns.
         for (uint8_t& q : s->quietPasses) q = 0;
     }
-    const bool gpuTimingEnabled = cfg.getBool("advanced.app_gpu_timing", true);
+    const bool gpuTimingEnabled = cfg.getBool("advanced.app_gpu_timing", false);
     gpuFrameConfigure(gpuTimingEnabled);
     // A reload -- the parse of a 124 KB ini and every module's reconfigure,
     // on the render thread -- is an EDVR event with a duration, for the
@@ -5639,6 +5698,8 @@ static void vScreenRefreshConfigBody(bool forced) {
     // newly enabled fix its first frame of draws. A refresh runs this only on a change -- the reloadIfChanged early return in
     // vScreenRefreshConfig sees to that. A forced refresh (a profile switch) runs it with no change to wait for.
     drawGateSet(drawGateSubscribed(s));
+    // The AA-off fast path's switch (draw_fast_path.h): the same reading as uiLayerConfigure's VR gate.
+    g_aaOffDraw.store(!temporalModeEnabledFor(cfg.getString("fix.temporal_aa", "off"), false), std::memory_order_relaxed);
 }
 
 void vScreenRefreshConfig() {
@@ -5807,6 +5868,14 @@ void introCurveNoteRetired() {
 }  // namespace
 
 void vScreenFrameBoundary() {
+    // The AA-off path's skipped shadows (2026-10-13): once engine velocity is read again, VsSrv33 and Blend hold
+    // no binding EDVR knows, so both are invalidated before any draw of this frame can compare against them.
+    if (g_shadowsSkipped.load(std::memory_order_relaxed) &&
+        !bindShadowsSkipped(g_aaOffDraw.load(std::memory_order_relaxed), engineVelocityLiveNow())) {
+        bindingInvalidate(BindSlot::VsSrv33);
+        bindingInvalidate(BindSlot::Blend);
+        g_shadowsSkipped.store(false, std::memory_order_relaxed);
+    }
     // The quad probe's readback: a capture taken a few frames ago is decoded
     // here, where the copy has certainly executed and mapping cannot stall
     // the render thread mid-frame.
@@ -6765,7 +6834,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     // them: armed in the log, then nothing, and not even the give-up notice,
     // because the frame counter it waits on also lives in here.
     if (!wantVoid && scale == 1.0f && !glitchFrameNeedsEyeDraws() &&
-        !cfg.getBool("advanced.app_gpu_timing", true) &&
+        !cfg.getBool("advanced.app_gpu_timing", false) &&
         !cfg.getBool("advanced.panel_hooks_always", true)) {
         // The optional fixes are deliberately dormant, but native discovery
         // still needs the exact immediate-context transport. It has its own
@@ -6789,7 +6858,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     // The measured owner path supplies the canonical context and actual OS
     // thread. Timing failure never prevents installing the rendering fixes.
     gpuTimingBind(device, ctx);
-    gpuFrameBind(device, ctx, cfg.getBool("advanced.app_gpu_timing", true));
+    gpuFrameBind(device, ctx, cfg.getBool("advanced.app_gpu_timing", false));
 
     g_state = new State();
     g_state->installMs = stampMs();

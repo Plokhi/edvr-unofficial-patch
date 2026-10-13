@@ -1,0 +1,224 @@
+// aa_off_test -- the AA-off draw path and the cheap instruments it rides on (2026-10-13).
+//
+//   Cut B: draw_fast_path.h's decisions, the same functions vscreen.cpp's draw thunks and bind hooks call. A model
+//          of a run of draws (a claimed draw, a gate-open draw, an unclaimed one) counts the verdict scopes, the
+//          engine velocity calls and the shadow records the thunks would make. The model is a transcription of the
+//          thunk's branches; the real thunks cannot run without a device, so the rig pins the decisions they take.
+//   Cut C: map_wait.h's call counts (exact) and sampled ticks (scaled at take), and map_wait_sample.h's sampler.
+//   Cut D: gpu_frame_timing.h's gpuFrameCommandIfLive, with a counting stub for the out-of-line gpuFrameCommand:
+//          with the instrument off, no call is made; on, every call is made.
+//
+// Exit codes: 0 pass, 1 a check failed, 2 usage. --dry-run touches nothing.
+#include "../../src/d3d11/draw_fast_path.h"
+#include "../../src/d3d11/gpu_frame_timing.h"
+#include "../../src/d3d11/map_wait.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+
+namespace edvr {
+
+// The stub of gpu_frame_timing.cpp's out-of-line call, counting what the thunks would have made.
+static unsigned g_gpuCommandCalls = 0;
+void gpuFrameCommand(ID3D11DeviceContext*) noexcept { ++g_gpuCommandCalls; }
+
+namespace detail {
+thread_local bool g_gpuFrameInternal = false;
+std::atomic<bool> g_gpuFrameCommandLive{false};
+}  // namespace detail
+
+}  // namespace edvr
+
+namespace {
+
+int g_failed = 0, g_checks = 0;
+
+void check(bool ok, const char* what) {
+    ++g_checks;
+    if (!ok) {
+        ++g_failed;
+        std::printf("FAIL: %s\n", what);
+    }
+}
+
+// Cut B: the fast-path decision over all 32 input combinations.
+void testFastPathTable() {
+    unsigned taken = 0, mismatch = 0;
+    for (unsigned bits = 0; bits < 32; ++bits) {
+        const edvr::DrawPathInputs in{(bits & 1) != 0, (bits & 2) != 0, (bits & 4) != 0, (bits & 8) != 0, (bits & 16) != 0};
+        const bool expect = !in.claimed && in.aaOff && !in.gateWanted && !in.engineVelocityLive && !in.vrWorld;
+        const bool got = edvr::drawFastPathTaken(in);
+        taken += got;
+        mismatch += got != expect;
+    }
+    check(mismatch == 0, "fast path: the decision matches its rule for all 32 input combinations");
+    check(taken == 1, "fast path: exactly one combination takes it (AA off, no claim, no gate, no engine velocity, no world route)");
+    // Each non-AA-off or claimed or gate-open or EV-live or world-route draw is kept on the full path.
+    const edvr::DrawPathInputs base{true, false, false, false, false};
+    check(edvr::drawFastPathTaken(base), "fast path: the unclaimed AA-off draw is taken");
+    edvr::DrawPathInputs c = base; c.claimed = true;
+    check(!edvr::drawFastPathTaken(c), "fast path: a fix-claimed draw keeps the full path");
+    c = base; c.gateWanted = true;
+    check(!edvr::drawFastPathTaken(c), "fast path: an open subscriber gate keeps the full path");
+    c = base; c.engineVelocityLive = true;
+    check(!edvr::drawFastPathTaken(c), "fast path: live engine velocity (a diagnostic) keeps the full path");
+    c = base; c.vrWorld = true;
+    check(!edvr::drawFastPathTaken(c), "fast path: the VR world route keeps the full path");
+    c = base; c.aaOff = false;
+    check(!edvr::drawFastPathTaken(c), "fast path: AA on never takes it (behaviour with AA on is unchanged)");
+}
+
+// Cut B: the bind records. Only AA off with engine velocity closed skips VsSrv33 and Blend.
+void testBindShadows() {
+    check(edvr::bindShadowsSkipped(true, false), "bind shadows: skipped with AA off and engine velocity closed");
+    check(!edvr::bindShadowsSkipped(true, true), "bind shadows: recorded while engine velocity is live");
+    check(!edvr::bindShadowsSkipped(false, false), "bind shadows: recorded with AA on");
+    check(!edvr::bindShadowsSkipped(false, true), "bind shadows: recorded with AA on and engine velocity live");
+}
+
+// Cut B: a model of the thunks over a run of draws. The model is the branch structure of hookedDraw / hookedDrawIndexed
+// / hookedDrawInstanced: the verdict decides the scope; the fast path decides the scope and engine velocity; an
+// unclaimed owner draw calls engine velocity on the full path only.
+struct DrawTally {
+    unsigned scopes = 0;          // forwardWithVerdict scopes entered
+    unsigned engineVelocity = 0;  // engineVelocityBeforeDraw calls
+    unsigned fastDraws = 0;       // draws issued directly (fast path)
+    unsigned realDraws = 0;       // game draws issued, either way
+};
+
+DrawTally runDraws(bool aaOff, bool gateWanted, unsigned draws, unsigned claimEvery) {
+    DrawTally t;
+    for (unsigned i = 0; i < draws; ++i) {
+        const bool claimed = claimEvery && (i % claimEvery) == 0;
+        const edvr::DrawPathInputs in{aaOff, gateWanted, false, false, claimed};
+        const bool fast = edvr::drawFastPathTaken(in);
+        if (!fast && !claimed) ++t.engineVelocity;   // the full path's engineVelocityBeforeDraw on an unclaimed owner draw
+        if (fast) {
+            ++t.fastDraws;
+        } else {
+            ++t.scopes;
+        }
+        ++t.realDraws;
+    }
+    return t;
+}
+
+void testThunkModel() {
+    // AA off, gate closed, no claims: every draw is fast, no scope, no engine velocity call.
+    DrawTally a = runDraws(true, false, 1000, 0);
+    check(a.fastDraws == 1000 && a.scopes == 0 && a.engineVelocity == 0 && a.realDraws == 1000,
+          "thunk model: AA off, no subscriber, no claims: all 1000 draws skip the scope and engine velocity");
+    // AA off, every 10th draw claimed: the claimed draws keep the full path, the rest are fast.
+    DrawTally b = runDraws(true, false, 1000, 10);
+    check(b.scopes == 100 && b.fastDraws == 900, "thunk model: every claimed draw (100 of 1000) keeps the full path");
+    check(b.engineVelocity == 0, "thunk model: no unclaimed draw calls engine velocity while AA is off");
+    // AA off with an open gate (a subscriber on): nothing is fast, every draw keeps the full path.
+    DrawTally c = runDraws(true, true, 1000, 0);
+    check(c.fastDraws == 0 && c.scopes == 1000, "thunk model: an open subscriber gate keeps every draw on the full path");
+    // AA on: nothing is fast, whatever the gate and the claims.
+    DrawTally d = runDraws(false, false, 1000, 10);
+    check(d.fastDraws == 0 && d.scopes == 1000 && d.engineVelocity == 900,
+          "thunk model: AA on keeps the full path (unclaimed draws still call engine velocity, as before)");
+}
+
+// Cut B: the bind-side model across an AA toggle (on, then off, then on). Recorded binds only when the records are
+// wanted; the frame boundary invalidates skipped slots once they are wanted again.
+void testBindToggle() {
+    unsigned recorded = 0, skipped = 0;
+    bool skippedFlag = false;
+    // The sequence is AA on, on, off, off, off, on, on: aaOff is the negation.
+    const bool aaOffSequence[] = {false, false, true, true, true, false, false};
+    for (bool aaOff : aaOffSequence) {
+        for (unsigned bind = 0; bind < 10; ++bind) {
+            if (edvr::bindShadowsSkipped(aaOff, false)) {
+                ++skipped;
+                skippedFlag = true;
+            } else {
+                ++recorded;
+            }
+        }
+        // The frame boundary: skipped slots are invalidated once the records are wanted again.
+        if (skippedFlag && !edvr::bindShadowsSkipped(aaOff, false)) skippedFlag = false;
+    }
+    check(recorded == 40 && skipped == 30, "bind toggle: 40 binds recorded, 30 skipped across on-on-off-off-off-on-on");
+    check(!skippedFlag, "bind toggle: back on, the skipped flag is cleared by the frame boundary");
+}
+
+// Cut C: the sampler and the scaling.
+void testSampler() {
+    uint32_t seq = 0;
+    unsigned sampled = 0;
+    unsigned firstAt = 0;
+    for (unsigned i = 1; i <= 1600; ++i) {
+        if (edvr::mapWaitSampleNext(seq)) {
+            if (!sampled) firstAt = i;
+            ++sampled;
+        }
+    }
+    check(sampled == 100, "sampler: 1 in 16 -- 100 of 1600 calls are sampled");
+    check(firstAt == 16, "sampler: the first sampled call is the 16th");
+    check(edvr::mapWaitScaleSampled(3) == 48, "sampler: a sampled total scales by 16");
+    check(edvr::mapWaitScaleSampled(0) == 0, "sampler: an empty total scales to zero");
+}
+
+// Cut C: the Map totals through the real map_wait.cpp: calls exact, ticks scaled by the rate at take.
+void testMapTotals() {
+    edvr::mapWaitTake();   // zero the totals
+    for (int i = 0; i < 1600; ++i) edvr::mapWaitCall(D3D11_MAP_WRITE_DISCARD);
+    for (int i = 0; i < 100; ++i) edvr::mapWaitCall(D3D11_MAP_READ);
+    edvr::mapWaitNote(D3D11_MAP_READ, 1000);     // one sampled read of 1000 ticks
+    edvr::mapWaitNote(D3D11_MAP_WRITE, 500);     // one sampled write of 500 ticks
+    const edvr::MapWaitTotals t = edvr::mapWaitTake();
+    check(t.writeCalls == 1600 && t.readCalls == 100, "map totals: call counts are exact (1600 writes, 100 reads)");
+    check(t.readTicks == 16000 && t.writeTicks == 8000, "map totals: the sampled ticks are scaled by 16 at take");
+    check(t.longestTicks == 1000, "map totals: the longest call is a measured one, not scaled");
+    const edvr::MapWaitTotals again = edvr::mapWaitTake();
+    check(again.readCalls == 0 && again.writeCalls == 0 && again.readTicks == 0,
+          "map totals: taking zeroes the window");
+}
+
+// Cut D: the inline guard. With the instrument off, the thunks make no call; on, every call is made.
+void testGpuGuard() {
+    using namespace edvr;
+    detail::g_gpuFrameCommandLive.store(false, std::memory_order_relaxed);
+    g_gpuCommandCalls = 0;
+    for (int i = 0; i < 1000; ++i) gpuFrameCommandIfLive(nullptr);
+    check(g_gpuCommandCalls == 0, "gpu guard: with app_gpu_timing off, 1000 thunk calls make no gpuFrameCommand call");
+    detail::g_gpuFrameCommandLive.store(true, std::memory_order_relaxed);
+    g_gpuCommandCalls = 0;
+    for (int i = 0; i < 1000; ++i) gpuFrameCommandIfLive(nullptr);
+    check(g_gpuCommandCalls == 1000, "gpu guard: with app_gpu_timing on, every thunk call is made");
+    detail::g_gpuFrameInternal = true;   // inside EDVR's own GPU timing call: never re-entered
+    g_gpuCommandCalls = 0;
+    gpuFrameCommandIfLive(nullptr);
+    check(g_gpuCommandCalls == 0, "gpu guard: the reentrancy flag suppresses the call");
+    detail::g_gpuFrameInternal = false;
+    detail::g_gpuFrameCommandLive.store(false, std::memory_order_relaxed);
+}
+
+void usage() {
+    std::puts("usage: aa_off_test --self-test | --dry-run");
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--dry-run") == 0) {
+        std::puts("aa_off_test: dry run, nothing written");
+        return 0;
+    }
+    if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
+        usage();
+        return 2;
+    }
+    testFastPathTable();
+    testBindShadows();
+    testThunkModel();
+    testBindToggle();
+    testSampler();
+    testMapTotals();
+    testGpuGuard();
+    std::printf("aa_off_test: %d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
