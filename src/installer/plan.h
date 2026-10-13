@@ -29,7 +29,6 @@ namespace edvr::installer {
 // build" without reading the payload itself.
 struct PayloadInfo {
     std::string version;
-    std::string profile = "vr"; // fixed by the artifact, never inferred from edvr.ini
     std::string descriptorText;
     std::string descriptorSha;
     bool        haveD3d11 = false;
@@ -133,6 +132,12 @@ std::string installedProfile(const Survey& survey);
 // descriptor. Empty when the folder has neither.
 std::string installedScope(const Survey& survey);
 
+// The scope an install runs when none was asked for: the folder's own, else both.
+std::string defaultScope(const Survey& survey);
+
+// The installer record names a different scope than the descriptor on disk: an install older than the files here.
+bool installRecordStale(const Survey& survey);
+
 // Whether the folder holds a settings file `profile` would read: its own, or, for
 // flat, the shared edvr.ini that the flat runtime falls back to until it has one
 // of its own. What "this folder has lost its settings" is asked in terms of.
@@ -145,12 +150,10 @@ struct Options {
     // the log says a fix stood down, and the person reading it has no idea they
     // opted out of it. What this installer carries is what it installs.
     // What the install covers: "both" (VR runtime and both settings files), "vr" (runtime and edvr.ini) or "flat" (edvr-flat.ini,
-    // no runtime). Empty means the scope the folder already has, else both (or flat when the payload carries no runtime).
+    // no runtime). Empty means defaultScope: the scope the folder already has, else both.
     std::string scope;
     bool keepSettings = true;   // merge each settings file the scope installs rather than replace it
     bool repair = false;        // rewrite our files even when they look right
-    // No longer read by the planner: a scope change needs no confirmation. The GUI and CLI still set it until P3-3 removes them.
-    bool convertProfile = false;
     bool removeSettings = false;  // uninstall: delete the installed edition's settings file too
     std::wstring backupStamp;   // folder name under edvr_backup\; caller supplies the clock
     std::string  nowUtc;        // stamped into the install record

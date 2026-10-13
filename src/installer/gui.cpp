@@ -51,6 +51,9 @@ enum : int {
     kIdTabSettings = 1051,
     kIdSearch = 1060,
     kIdSettingsList = 1061,
+    kIdSettingsVr = 1062,
+    kIdSettingsFlat = 1063,
+    kIdScope = 1070,
 };
 
 const UINT kMsgFirstScan = WM_APP + 1;
@@ -65,6 +68,10 @@ const int kClientWidth = 720;
 const int kClientHeight = 688;
 const int kMargin = 24;
 const int kCardPad = 20;
+
+// The scope prompt's three choices, in the order the combo lists them. The
+// default is the folder's own scope, else both.
+const wchar_t* kScopeChoices[] = {L"VR and flat (recommended)", L"VR only", L"Flat only"};
 
 enum class Screen { Install, Settings };
 
@@ -86,6 +93,7 @@ struct Place {
 struct Gui {
     HWND window = nullptr;
     HWND combo = nullptr;
+    HWND scopeCombo = nullptr;
     HWND report = nullptr;
     HWND chkKeep = nullptr;
     HWND install = nullptr;
@@ -94,16 +102,22 @@ struct Gui {
     HWND collectLogs = nullptr;
     HWND tabInstall = nullptr;
     HWND tabSettings = nullptr;
+    HWND settingsVr = nullptr;
+    HWND settingsFlat = nullptr;
     HWND tip = nullptr;
     HWND discord = nullptr;
     HWND search = nullptr;
     HWND settingsList = nullptr;
     SettingsModel settings;
+    std::string   settingsEdition = "vr";   // the file the settings screen edits: "vr" (edvr.ini) or "flat" (edvr-flat.ini)
+    edvr::ModeRead mode = edvr::readGameMode(nullptr);  // Elite's 3D mode, read when the folder is surveyed
     UINT dpi = 96;
 
     std::vector<Place>      places;
     std::vector<StatusRow>  status;
     std::wstring            statusPath;   // the full folder, under the picker
+    std::wstring            modeLine;     // "Elite's 3D mode is ..." under the status rows
+    std::wstring            scopeLine;    // "This install does not include ..." when the scope leaves the mode out
 
     std::vector<GameInstall> installs;
     Survey                   survey;
@@ -126,7 +140,7 @@ void setText(HWND control, const std::string& utf8) {
 // stock chrome the drawn look could not restyle); the parent paints the
 // same slim thumb the settings list uses, in the report card's right
 // gutter, and drives the EDIT by lines when it is dragged.
-const RECT kReportCard{kMargin, 482, kClientWidth - kMargin, 648};
+const RECT kReportCard{kMargin, 524, kClientWidth - kMargin, 650};
 
 RECT reportCardRect() {
     return RECT{dp(kReportCard.left), dp(kReportCard.top), dp(kReportCard.right),
@@ -215,6 +229,40 @@ void place(HWND hwnd, int x, int y, int w, int h, Screen screen, bool bothScreen
     g.places.push_back(p);
 }
 
+// The scope the prompt names: both, vr or flat. The combo is the only record of it.
+std::string scopeChoice() {
+    if (!g.scopeCombo) return "both";
+    switch (SendMessageW(g.scopeCombo, CB_GETCURSEL, 0, 0)) {
+        case 1: return "vr";
+        case 2: return "flat";
+        default: return "both";
+    }
+}
+
+int scopeIndex(const std::string& scope) {
+    return scope == "vr" ? 1 : scope == "flat" ? 2 : 0;
+}
+
+// The settings file the screen edits for a scope: the one scope that installs only one of
+// them, else the file the game's 3D mode runs on (flat for modes 0 and 1, VR otherwise and when
+// the mode is unknown).
+std::string editionFor(const std::string& scope) {
+    if (scope == "vr") return "vr";
+    if (scope == "flat") return "flat";
+    return g.mode.mode == edvr::GameMode::Flat ? "flat" : "vr";
+}
+
+// The VR/Flat selector offers only the files the scope installs, and shows the one in use.
+void syncSettingsSelector() {
+    if (!g.settingsVr || !g.settingsFlat) return;
+    const std::string scope = scopeChoice();
+    ui::setButtonStyle(g.settingsVr, g.settingsEdition == "vr" ? ui::ButtonStyle::TabActive : ui::ButtonStyle::Tab);
+    ui::setButtonStyle(g.settingsFlat, g.settingsEdition == "flat" ? ui::ButtonStyle::TabActive : ui::ButtonStyle::Tab);
+    const bool settingsShown = g.screen == Screen::Settings;
+    ShowWindow(g.settingsVr, settingsShown && scope != "flat" ? SW_SHOW : SW_HIDE);
+    ShowWindow(g.settingsFlat, settingsShown && scope != "vr" ? SW_SHOW : SW_HIDE);
+}
+
 // Everything moved and shown or hidden for the current screen and scale.
 //
 // The first version of this took the window's size from GetDpiForSystem and the
@@ -242,15 +290,17 @@ void applyLayout() {
     // what MoveWindow asked for. The frame is measured and the item height
     // set to land the field at exactly the 30 units the Browse button
     // beside it gets; the text centres itself within the item.
-    if (g.combo) {
-        SendMessageW(g.combo, CB_SETITEMHEIGHT, 0, dp(24));  // dropdown rows
-        SendMessageW(g.combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), dp(22));
+    // The scope prompt's combo is sized the same way.
+    for (HWND combo : {g.combo, g.scopeCombo}) {
+        if (!combo) continue;
+        SendMessageW(combo, CB_SETITEMHEIGHT, 0, dp(24));  // dropdown rows
+        SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), dp(22));
         RECT rc{};
-        GetWindowRect(g.combo, &rc);
+        GetWindowRect(combo, &rc);
         const int frame = (rc.bottom - rc.top) - dp(22);
         const int fieldItem = dp(30) - frame;
         if (fieldItem > 0) {
-            SendMessageW(g.combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), fieldItem);
+            SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), fieldItem);
         }
     }
 
@@ -267,6 +317,8 @@ void applyLayout() {
         MoveWindow(g.search, dp(kMargin + kCardPad), y, dp(320), textH, TRUE);
     }
 
+    // Shown or hidden by the scope, not by the screen alone, so it runs after the loop above.
+    syncSettingsSelector();
     InvalidateRect(g.window, nullptr, TRUE);
 }
 
@@ -293,6 +345,8 @@ Tone toneForOurs(DllKind kind) {
 
 void rebuildStatus() {
     g.status.clear();
+    g.modeLine.clear();
+    g.scopeLine.clear();
     if (!g.haveSurvey) {
         g.statusPath.clear();
         return;
@@ -303,9 +357,11 @@ void rebuildStatus() {
     StatusRow fixes;
     fixes.label = L"The fixes";
     fixes.tone = toneForOurs(s.d3d11.kind);
+    // A record older than the files says nothing about what is installed, its version included.
+    const bool stale = installRecordStale(s);
     if (s.d3d11.kind == DllKind::Edvr) {
         fixes.value = L"EDVR installed as d3d11.dll";
-        if (!s.state.edvrVersion.empty()) fixes.value += L" \x00b7 " + fromUtf8(s.state.edvrVersion);
+        if (!s.state.edvrVersion.empty() && !stale) fixes.value += L" \x00b7 " + fromUtf8(s.state.edvrVersion);
     } else if (s.d3d11.kind == DllKind::Absent) {
         fixes.value = L"not installed";
     } else {
@@ -330,40 +386,71 @@ void rebuildStatus() {
     }
     g.status.push_back(vr);
 
+    if (stale) {
+        StatusRow record;
+        record.label = L"Install record";
+        record.tone = Tone::Warn;
+        record.value = L"older than the files here; Update refreshes it";
+        g.status.push_back(record);
+    }
+
+    // The game's runtime depends on the scope: flat expects the game's own openvr_api.dll, and both and vr
+    // run EDVR's own runtime as openvr_api.dll.
+    const std::string scope = scopeChoice();
     if (s.haveOpenvrDir) {
         StatusRow orig;
         orig.label = L"The game's runtime";
-        if (s.openvrOrig.kind == DllKind::OpenVrRuntime) {
-            orig.tone = Tone::Good;
-            orig.value = L"safe, renamed openvr_api_orig.dll";
-        } else if (s.openvrCurrent.kind == DllKind::OpenVrRuntime) {
-            orig.tone = Tone::Good;
-            orig.value = L"in place, nothing renamed yet";
-        } else if (s.openvrCurrent.kind == DllKind::Edvr) {
-            orig.tone = Tone::Bad;
-            orig.value = L"missing \x2014 VR cannot start; use Repair";
+        if (scope == "flat") {
+            if (s.openvrCurrent.kind == DllKind::OpenVrRuntime) {
+                orig.tone = Tone::Good;
+                orig.value = L"the game's own runtime is in place";
+            } else if (s.openvrOrig.kind == DllKind::OpenVrRuntime) {
+                orig.tone = Tone::Good;
+                orig.value = L"safe, renamed openvr_api_orig.dll";
+            } else if (s.openvrCurrent.kind == DllKind::Edvr) {
+                orig.tone = Tone::Warn;
+                orig.value = L"EDVR's runtime is in place; flat restores the game's own";
+            } else {
+                orig.tone = Tone::Muted;
+                orig.value = L"not found";
+            }
         } else {
-            orig.tone = Tone::Muted;
-            orig.value = L"not found";
+            if (s.openvrCurrent.kind == DllKind::Edvr) {
+                orig.tone = Tone::Good;
+                orig.value = L"EDVR's own runtime is in place";
+            } else if (s.openvrCurrent.kind == DllKind::OpenVrRuntime) {
+                orig.tone = Tone::Muted;
+                orig.value = L"the game's own runtime; the install replaces it";
+            } else if (s.openvrOrig.kind == DllKind::OpenVrRuntime) {
+                orig.tone = Tone::Good;
+                orig.value = L"safe, renamed openvr_api_orig.dll";
+            } else {
+                orig.tone = Tone::Muted;
+                orig.value = L"not found";
+            }
         }
         g.status.push_back(orig);
     }
 
-    // The settings of the edition this window installs. The flat edition keeps
-    // its own edvr-flat.ini and only reads the shared edvr.ini until it has one,
-    // so a folder with just that is a flat install with settings still to carry over.
+    // One row for the scope's settings files, each with whether it is here and kept. The flat file is read
+    // from edvr-flat.ini and falls back to the shared edvr.ini until it has its own.
     StatusRow settings;
     settings.label = L"Your settings";
-    if (payloadInfo().profile == "flat") {
-        settings.tone = hasSettingsFor(s, "flat") ? Tone::Good : Tone::Muted;
-        settings.value = s.flatIniPresent
-                             ? L"edvr-flat.ini is here and will be kept"
-                             : (s.iniPresent ? L"no edvr-flat.ini yet; your edvr.ini will be copied into it"
-                                             : L"no edvr-flat.ini yet");
-    } else {
-        settings.tone = s.iniPresent ? Tone::Good : Tone::Muted;
-        settings.value = s.iniPresent ? L"edvr.ini is here and will be kept" : L"no edvr.ini yet";
+    std::wstring parts;
+    bool allHere = true;
+    if (scope != "flat") {
+        parts += s.iniPresent ? L"edvr.ini kept" : L"edvr.ini not yet";
+        allHere = allHere && s.iniPresent;
     }
+    if (scope == "both") parts += L"; ";
+    if (scope != "vr") {
+        parts += s.flatIniPresent ? L"edvr-flat.ini kept"
+                                  : (s.iniPresent ? L"edvr-flat.ini not yet (edvr.ini is copied into it)"
+                                                  : L"edvr-flat.ini not yet");
+        allHere = allHere && s.flatIniPresent;
+    }
+    settings.value = parts;
+    settings.tone = allHere ? Tone::Good : Tone::Muted;
     g.status.push_back(settings);
 
     if (!s.state.chainTarget.empty()) {
@@ -401,6 +488,22 @@ void rebuildStatus() {
         running.value = L"could not check whether it is running \x2014 nothing will be installed";
         g.status.push_back(running);
     }
+
+    // Elite's 3D mode decides which half of EDVR runs. Said in a sentence under the rows, and
+    // when the scope leaves that half out, said again: somebody who installed VR only and
+    // then turned 3D off is owed the reason the flat fixes are not there.
+    if (!g.mode.known) {
+        g.modeLine = L"Elite's 3D mode is unknown: EDVR starts in VR.";
+    } else if (g.mode.mode == edvr::GameMode::Flat) {
+        g.modeLine = L"Elite's 3D mode is off: EDVR runs its flat fixes.";
+    } else {
+        g.modeLine = L"Elite's 3D mode is on: EDVR runs its VR fixes.";
+    }
+    if (g.mode.mode == edvr::GameMode::Flat && scope == "vr") {
+        g.scopeLine = L"This install does not include flat: EDVR stays out of the way.";
+    } else if (g.mode.mode == edvr::GameMode::Vr && scope == "flat") {
+        g.scopeLine = L"This install does not include VR: EDVR stays out of the way.";
+    }
 }
 
 COLORREF colourFor(Tone tone) {
@@ -434,7 +537,9 @@ void paintInstallScreen(HDC dc) {
     const ui::Theme& t = ui::theme();
     const ui::Fonts& f = ui::fonts();
 
-    RECT card{dp(kMargin), dp(186), dp(kClientWidth - kMargin), dp(336)};
+    // The window is not taller than it was, so the status card, the actions card
+    // and the report card are fitted into the space the one-install layout left.
+    RECT card{dp(kMargin), dp(186), dp(kClientWidth - kMargin), dp(384)};
     ui::paintCard(dc, card, g.dpi);
 
     int y = 202;
@@ -450,13 +555,29 @@ void paintInstallScreen(HDC dc) {
                    dp(y + 20)};
         ui::drawText(dc, row.value, value, f.body, t.text,
                      DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-        y += 22;
+        // 20 apart, not 22: seven rows and the two lines under them fit the card at the window's fixed height.
+        y += 20;
     }
 
-    RECT actions{dp(kMargin), dp(348), dp(kClientWidth - kMargin), dp(470)};
+    if (!g.modeLine.empty()) {
+        RECT mode{dp(kMargin + kCardPad), dp(y + 2), dp(kClientWidth - kMargin - kCardPad), dp(y + 20)};
+        ui::drawText(dc, g.modeLine, mode, f.caption, t.text, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (!g.scopeLine.empty()) {
+            RECT scope{dp(kMargin + kCardPad), dp(y + 20), dp(kClientWidth - kMargin - kCardPad),
+                       dp(y + 38)};
+            ui::drawText(dc, g.scopeLine, scope, f.caption, colourFor(Tone::Warn),
+                         DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+    }
+
+    // The scope prompt sits on the tab row, to the right of the tabs.
+    RECT scopeLabel{dp(372), dp(146), dp(484), dp(176)};
+    ui::drawText(dc, L"Install EDVR for:", scopeLabel, f.body, t.subtext, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT actions{dp(kMargin), dp(394), dp(kClientWidth - kMargin), dp(512)};
     ui::paintCard(dc, actions, g.dpi);
 
-    RECT reassure{dp(kMargin + kCardPad), dp(440), dp(kClientWidth - kMargin - kCardPad), dp(460)};
+    RECT reassure{dp(kMargin + kCardPad), dp(478), dp(kClientWidth - kMargin - kCardPad), dp(498)};
     ui::drawText(dc,
                  L"Nothing is changed until you confirm it, and every file replaced is copied "
                  L"into edvr_backup\\ first.",
@@ -484,7 +605,7 @@ void paintSettingsScreen(HDC dc) {
     RECT note{dp(kMargin + kCardPad), dp(202), dp(kClientWidth - kMargin - kCardPad), dp(222)};
     const std::wstring where =
         g.settings.loaded()
-            ? L"Written into the " + std::wstring(settingsLeafFor(payloadInfo().profile)) +
+            ? L"Written into the " + std::wstring(settingsLeafFor(g.settingsEdition)) +
                   L" of the install above, and live within a second. The few that need a game "
                   L"restart are marked."
             : L"Pick an install above first.";
@@ -519,9 +640,7 @@ void paintWindow(HWND window) {
     ui::drawText(dc, L"EDVR", title, f.title, t.text, DT_LEFT | DT_SINGLELINE);
 
     const std::wstring subtitle = fromUtf8(payloadInfo().version) +
-        (payloadInfo().profile == "flat"
-             ? L"  \x00b7  experimental flat temporal build; zero-jitter testing"
-             : L"  \x00b7  unofficial patch for Elite Dangerous in VR");
+        L"  \x00b7  unofficial patch for Elite Dangerous in VR and flat";
     RECT sub{dp(kMargin), dp(52), dp(kClientWidth - kMargin), dp(70)};
     ui::drawText(dc, subtitle, sub, f.caption, t.subtext, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -546,6 +665,8 @@ void paintWindow(HWND window) {
 // ---------------------------------------------------------------------------
 
 void showSurvey() {
+    // Read again on every change: the game's 3D switch is flipped outside this window.
+    g.mode = eliteGameMode();
     rebuildStatus();
     if (!g.haveSurvey) {
         EnableWindow(g.install, FALSE);
@@ -573,6 +694,15 @@ void showSurvey() {
     InvalidateRect(g.window, nullptr, TRUE);
 }
 
+// Loads one settings file into the settings screen. Before a folder is chosen there
+// is nothing to load; the choice is kept for when there is.
+void loadSettings(const std::string& edition) {
+    g.settingsEdition = edition;
+    if (!g.haveSurvey) return;
+    g.settings.load(g.survey.game.dir, edition);
+    settingsListSetModel(g.settingsList, &g.settings, mirrorDirFor(g.survey.game));
+}
+
 void selectInstall(size_t index) {
     if (index >= g.installs.size()) {
         g.haveSurvey = false;
@@ -581,9 +711,27 @@ void selectInstall(size_t index) {
     }
     g.survey = surveyTarget(g.installs[index]);
     g.haveSurvey = true;
-    g.settings.load(g.survey.game.dir, payloadInfo().profile);
-    settingsListSetModel(g.settingsList, &g.settings, mirrorDirFor(g.survey.game));
+    // The scope this folder gets: the one the run was started with, else the folder's own, else both.
+    SendMessageW(g.scopeCombo, CB_SETCURSEL, scopeIndex(g.args.scope.empty() ? defaultScope(g.survey) : g.args.scope), 0);
+    g.mode = eliteGameMode();
+    loadSettings(editionFor(scopeChoice()));
     showSurvey();
+}
+
+// The scope prompt changed. A settings screen on a file the new scope does not install moves to
+// the one it does; the status and the selector follow.
+void scopeChanged() {
+    const std::string scope = scopeChoice();
+    if (scope != "both" && scope != g.settingsEdition) loadSettings(scope);
+    showSurvey();
+    syncSettingsSelector();
+}
+
+void settingsEditionPicked(const std::string& edition) {
+    if (edition == g.settingsEdition) return;
+    loadSettings(edition);
+    syncSettingsSelector();
+    InvalidateRect(g.window, nullptr, TRUE);
 }
 
 void addInstall(const GameInstall& game) {
@@ -702,11 +850,10 @@ void runAction(AppArgs::Act action) {
     args.dir = g.survey.game.dir;
     args.keepSettings = ui::checkboxChecked(g.chkKeep);
     args.removeSettings = false;
+    args.scope = scopeChoice();
 
     const std::wstring mirrorDir = mirrorDirFor(g.survey.game);
     const bool canMirror = action != AppArgs::Act::Uninstall;
-
-    const PayloadInfo& payload = payloadInfo();
 
     // A folder with no settings file at all but a mirror outside it is exactly
     // the folder a game update just wiped. Asked about, not assumed -- unlike the
@@ -715,14 +862,15 @@ void runAction(AppArgs::Act action) {
     // are wanted, and old settings reappearing anyway would be worse than not
     // finding the mirror at all.
     //
-    // Asked in the edition's terms: the flat edition's file is edvr-flat.ini (or
-    // the shared edvr.ini it falls back to), and a mirror that holds only
-    // edvr-flat.ini is one worth offering.
+    // Asked in the scope's terms: a flat install's file is edvr-flat.ini (or the
+    // shared edvr.ini it falls back to), and a mirror that holds only edvr-flat.ini
+    // is one worth offering.
+    const std::string edition = args.scope == "flat" ? "flat" : "vr";
     if (canMirror && args.keepSettings) {
         const MirrorInfo mirror = readMirror(mirrorDir);
-        if (offerRestore(hasSettingsFor(g.survey, payload.profile), mirror, payload.profile)) {
-            const std::wstring wanted = payload.profile == "flat" ? L"edvr-flat.ini or edvr.ini"
-                                                                  : L"edvr.ini";
+        if (offerRestore(hasSettingsFor(g.survey, edition), mirror, edition)) {
+            const std::wstring wanted = edition == "flat" ? L"edvr-flat.ini or edvr.ini"
+                                                          : L"edvr.ini";
             const std::wstring text =
                 L"This folder has no " + wanted + L", but settings from an earlier install of it "
                 L"were found outside the game folder, last saved " +
@@ -747,19 +895,12 @@ void runAction(AppArgs::Act action) {
             }
         }
     }
-    const std::string existingProfile = installedProfile(g.survey);
-    if (canMirror && !existingProfile.empty() && existingProfile != payload.profile) {
-        const std::wstring prompt = L"This folder has the " + fromUtf8(existingProfile) +
-            L" edition. Convert explicitly to " + fromUtf8(payload.profile) +
-            L"? The plan will show the files being changed, and conversion stops if the original VR library cannot be proved.";
-        if (MessageBoxW(g.window, prompt.c_str(), L"EDVR edition conversion",
-                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
-        args.convertProfile = true;
-    }
+    // A scope change is planned and shown in the report like any other install:
+    // there is no conversion prompt, and the planner's own proofs gate it.
     const Options options = optionsFor(args, action == AppArgs::Act::Repair);
     const Plan plan = action == AppArgs::Act::Uninstall
                           ? planUninstall(g.survey, options)
-                          : planInstall(g.survey, options, payload);
+                          : planInstall(g.survey, options, payloadInfo());
 
     setReport(planReport(plan));
 
@@ -900,6 +1041,28 @@ void createControls(HWND window) {
     place(g.tabInstall, kMargin, 146, 84, 30, Screen::Install, true);
     place(g.tabSettings, kMargin + 92, 146, 92, 30, Screen::Install, true);
 
+    // The scope prompt, on the same row as the tabs and drawn beside it as
+    // "Install EDVR for:". Owner-drawn like the install combo, sized the same way.
+    g.scopeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST |
+                                       CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+                                   0, 0, 10, 10, window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdScope)), nullptr,
+                                   nullptr);
+    SendMessageW(g.scopeCombo, WM_SETFONT, reinterpret_cast<WPARAM>(f.body), TRUE);
+    for (const wchar_t* choice : kScopeChoices) {
+        SendMessageW(g.scopeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(choice));
+    }
+    SendMessageW(g.scopeCombo, CB_SETCURSEL, 0, 0);
+    place(g.scopeCombo, 490, 146, 206, 30, Screen::Install);
+
+    // The settings screen's file selector, two tab-like buttons. Which of them shows is
+    // the scope's call (syncSettingsSelector), not the screen's alone.
+    g.settingsVr = ui::makeButton(window, L"VR", kIdSettingsVr, ui::ButtonStyle::TabActive, f.body);
+    g.settingsFlat = ui::makeButton(window, L"Flat", kIdSettingsFlat, ui::ButtonStyle::Tab, f.body);
+    place(g.settingsVr, 370, 250, 150, 32, Screen::Settings);
+    place(g.settingsFlat, 526, 250, 150, 32, Screen::Settings);
+
     // Still a real combo -- keyboard selection and the wheel are the two
     // things a hand-rolled dropdown gets subtly wrong -- but owner-drawn,
     // so the field and the list are painted in the house font and colours,
@@ -924,7 +1087,7 @@ void createControls(HWND window) {
      // it to checked threw that flag away without a word.
     g.chkKeep = ui::makeCheckbox(window, L"Keep the settings I have changed", kIdChkKeep,
                                  g.args.keepSettings, f.body);
-    place(g.chkKeep, kMargin + kCardPad, 366, 420, 24, Screen::Install);
+    place(g.chkKeep, kMargin + kCardPad, 404, 420, 24, Screen::Install);
 
     g.install = ui::makeButton(window, L"Install", kIdInstall, ui::ButtonStyle::Primary, f.body);
     g.repair = ui::makeButton(window, L"Repair", kIdRepair, ui::ButtonStyle::Secondary, f.body);
@@ -932,10 +1095,10 @@ void createControls(HWND window) {
                                  f.body);
     g.collectLogs = ui::makeButton(window, L"Save logs", kIdCollectLogs,
                                    ui::ButtonStyle::Secondary, f.body);
-    place(g.install, kMargin + kCardPad, 398, 124, 34, Screen::Install);
-    place(g.repair, 172, 398, 104, 34, Screen::Install);
-    place(g.uninstall, 284, 398, 104, 34, Screen::Install);
-    place(g.collectLogs, 396, 398, 116, 34, Screen::Install);
+    place(g.install, kMargin + kCardPad, 436, 124, 34, Screen::Install);
+    place(g.repair, 172, 436, 104, 34, Screen::Install);
+    place(g.uninstall, 284, 436, 104, 34, Screen::Install);
+    place(g.collectLogs, 396, 436, 116, 34, Screen::Install);
     // No Close button: it was the one control at list height marked
     // both-screens, so it painted through the settings page -- and the
     // window's own close box already does the job.
@@ -958,7 +1121,7 @@ void createControls(HWND window) {
                                nullptr);
     SendMessageW(g.report, WM_SETFONT, reinterpret_cast<WPARAM>(f.body), TRUE);
     SetWindowSubclass(g.report, reportProc, 1, 0);
-    place(g.report, kMargin + kCardPad - 4, 496, 636, 140, Screen::Install);
+    place(g.report, kMargin + kCardPad - 4, 536, 636, 102, Screen::Install);
 
     g.tip = ui::makeButton(window, L"leave a tip", kIdKofi, ui::ButtonStyle::Link, f.caption);
     place(g.tip, kMargin, 657, 76, 20, Screen::Install, true);  // x fixed up in applyLayout
@@ -972,6 +1135,7 @@ void createControls(HWND window) {
     // (or an older Windows) they simply do nothing.
     if (ui::theme().dark) {
         SetWindowTheme(g.combo, L"DarkMode_CFD", nullptr);
+        SetWindowTheme(g.scopeCombo, L"DarkMode_CFD", nullptr);
         SetWindowTheme(g.report, L"DarkMode_Explorer", nullptr);
         SetWindowTheme(g.search, L"DarkMode_CFD", nullptr);
         SetWindowTheme(g.settingsList, L"DarkMode_Explorer", nullptr);
@@ -1024,7 +1188,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 
         case WM_DRAWITEM: {
             const DRAWITEMSTRUCT* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
-            if (item->CtlID == kIdCombo) {
+            if (item->CtlID == kIdCombo || item->CtlID == kIdScope) {
                 ui::drawComboItem(item, g.dpi);
                 return TRUE;
             }
@@ -1034,7 +1198,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 
         case WM_MEASUREITEM: {
             MEASUREITEMSTRUCT* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
-            if (measure->CtlID == kIdCombo) {
+            if (measure->CtlID == kIdCombo || measure->CtlID == kIdScope) {
                 measure->itemHeight = static_cast<UINT>(dp(24));
                 return TRUE;
             }
@@ -1055,9 +1219,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
                 if (index != CB_ERR) selectInstall(static_cast<size_t>(index));
                 return 0;
             }
+            if (id == kIdScope && code == CBN_SELCHANGE) {
+                scopeChanged();
+                return 0;
+            }
             if (code != BN_CLICKED) return 0;
             switch (id) {
                 case kIdBrowse: browseForFolder(); return 0;
+                case kIdSettingsVr: settingsEditionPicked("vr"); return 0;
+                case kIdSettingsFlat: settingsEditionPicked("flat"); return 0;
                 case kIdInstall: runAction(AppArgs::Act::Install); return 0;
                 case kIdRepair: runAction(AppArgs::Act::Repair); return 0;
                 case kIdUninstall: runAction(AppArgs::Act::Uninstall); return 0;

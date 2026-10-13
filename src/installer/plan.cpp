@@ -156,12 +156,31 @@ std::wstring relativeOpenvr(const std::wstring& gameDir, const std::wstring& ope
 
 }  // namespace
 
-std::string installedScope(const Survey& s) {
-    if (s.state.present) return recordedScope(s.state);
+// The descriptor on disk is what the DLL reads, so a canonical one names the scope and the record is only the fallback. A record
+// left by an earlier install (a flat GUI install, say) must not outvote the files: that made a both install look flat.
+std::string descriptorScopeOf(const Survey& s) {
     if (!s.descriptorPresent || s.descriptorSha.empty()) return std::string();
     edvr::InstallScope scope = edvr::InstallScope::Invalid;
     if (!ownDescriptorScope(s.descriptorSha, &scope)) return std::string();
     return edvr::scopeName(scope);
+}
+
+std::string installedScope(const Survey& s) {
+    const std::string fromDescriptor = descriptorScopeOf(s);
+    if (!fromDescriptor.empty()) return fromDescriptor;
+    if (s.state.present) return recordedScope(s.state);
+    return std::string();
+}
+
+// The record names a different scope than the descriptor on disk: the install is older than the files here, and Update refreshes it.
+bool installRecordStale(const Survey& s) {
+    const std::string fromDescriptor = descriptorScopeOf(s);
+    return s.state.present && !fromDescriptor.empty() && recordedScope(s.state) != fromDescriptor;
+}
+
+std::string defaultScope(const Survey& s) {
+    const std::string installed = installedScope(s);
+    return installed.empty() ? std::string("both") : installed;
 }
 
 std::string installedProfile(const Survey& s) {
@@ -288,16 +307,14 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         plan.problems.push_back(kRunStateUnknown);
         return plan;
     }
-    // The scope this run installs: the one asked for, else the one the folder already has, else the payload's own edition (both for the
-    // VR installer, flat for the flat edition). A VR build missing its runtime still defaults to both, and is refused below rather than
-    // quietly installing flat.
+    // The scope this run installs: the one asked for, else the one the folder already has, else both. A payload with no VR runtime
+    // is refused below for a scope that needs one, rather than quietly installing flat.
     const std::string installed = installedScope(s);
     if (s.state.present && !knownScope(installed)) {
         plan.blocked = true; plan.problems.push_back("The existing install record has an unknown profile. Repair it before changing editions."); return plan;
     }
     const bool payloadHasRuntime = p.haveOpenvr && p.haveOpenxrLoader && p.haveOpenxrLicense && p.nativePairValid;
-    std::string scope = o.scope;
-    if (scope.empty()) scope = !installed.empty() ? installed : (p.profile == "flat" ? std::string("flat") : std::string("both"));
+    const std::string scope = o.scope.empty() ? defaultScope(s) : o.scope;
     if (!knownScope(scope)) {
         plan.blocked = true; plan.problems.push_back("Unknown scope \"" + scope + "\": use both, vr or flat."); return plan;
     }

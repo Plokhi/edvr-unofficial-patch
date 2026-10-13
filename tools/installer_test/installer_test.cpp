@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "../../src/common/iniedit.h"
+#include "../../src/installer/app.h"
 #include "../../src/installer/apply.h"
 #include "../../src/installer/plan.h"
 #include "../../src/installer/probe.h"
@@ -173,7 +174,6 @@ static const char* kTestFlatIni = "[fix]\r\ntemporal_aa = off\r\n[advanced]\r\nr
 static PayloadInfo testPayload(const std::string& iniText) {
     PayloadInfo p;
     p.version = "v9.9.9-test";
-    p.profile = "vr";
     p.descriptorText = "[install]\r\nschema = 2\r\nscope = both\r\n";
     p.descriptorSha = sha256Bytes(p.descriptorText.data(), p.descriptorText.size());
     p.haveD3d11 = true;
@@ -195,10 +195,9 @@ static PayloadInfo testPayload(const std::string& iniText) {
 
 static const char kFlatGraphicsBytes[] = "TEST-FLAT-D3D11-PAYLOAD";
 
-// The flat edition's payload: graphics, edvr-flat.ini and no VR runtime. Its settings are the flat file alone.
+// A payload with no VR runtime: graphics and edvr-flat.ini only. It can install scope flat and nothing that needs the runtime.
 static PayloadInfo flatPayloadFor(const std::string& flatIniText) {
     PayloadInfo p = testPayload(std::string());
-    p.profile = "flat";
     p.haveOpenvr = false; p.haveOpenxrLoader = false; p.haveOpenxrLicense = false; p.nativePairValid = false;
     p.haveIni = false;
     p.haveFlatIni = true;
@@ -1842,9 +1841,14 @@ static void testFlatPlanner() {
     Survey s = baseSurvey(dir);
     s.haveOpenvrDir = false;
     Options o = testOptions();
-    Plan fresh = planInstall(s, o, flat);
+    // The default scope is both, and a payload with no VR runtime refuses it rather than
+    // quietly installing flat. Asking for scope flat is the way to install this payload.
+    check(planInstall(s, o, flat).blocked, "a payload with no VR runtime refuses the default scope both");
+    Options flatOptions = o;
+    flatOptions.scope = "flat";
+    Plan fresh = planInstall(s, flatOptions, flat);
     check(!fresh.blocked, "flat accepts graphics without the native runtime pair");
-    check(fresh.nextState.scope == "flat", "a flat payload with no runtime defaults to scope flat");
+    check(fresh.nextState.scope == "flat", "a payload with no runtime installs scope flat when asked");
     check(hasStep(fresh, Action::WritePayload, nullptr, L"d3d11.dll"), "flat installs graphics");
     check(hasStep(fresh, Action::WriteText, nullptr, L"edvr_profile.ini"), "flat installs its descriptor");
     check(!hasStep(fresh, Action::WritePayload, nullptr, L"openvr_api.dll"), "flat omits the VR runtime");
@@ -1872,7 +1876,7 @@ static void testFlatPlanner() {
           "unknown descriptor is never treated as permission to install VR");
 
     s.d3d11 = fakeDll(DllKind::D3d11Provider, joinPath(dir, L"d3d11.dll"), "edhm", L"3Dmigoto");
-    Plan chained = planInstall(s, o, flat);
+    Plan chained = planInstall(s, flatOptions, flat);
     check(!chained.blocked && hasStep(chained, Action::Rename, L"d3d11.dll", L"d3d11_edhm.dll"),
           "flat uses the existing EDHM chain planner");
 
@@ -2305,7 +2309,10 @@ static void testFlatSettingsPlanner() {
     const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
     const PayloadInfo flatOld = flatPayloadFor(kFlatTemplate);
     const PayloadInfo flatNew = flatPayloadFor(kFlatTemplateNewer);
-    const Options options = testOptions();
+    // Every case here plans a payload with no VR runtime, which the default scope (both) refuses:
+    // these ask for scope flat, and the VR cases below ask for their own scope.
+    Options options = testOptions();
+    options.scope = "flat";
 
     {   // The legacy shared-INI install: a flat install from before edvr-flat.ini
         // existed has only edvr.ini. The flat runtime has been reading it, so its
@@ -4404,7 +4411,9 @@ static void testFlatSettingsFiles(const std::wstring& scratch) {
     printf("\nthe flat edition's settings file, on real files\n");
     const PayloadInfo flatOld = flatPayloadFor(kFlatTemplate);
     const PayloadInfo flatNew = flatPayloadFor(kFlatTemplateNewer);
-    const Options options = testOptions();
+    // The flat payload has no VR runtime, so its cases ask for scope flat (the default, both, refuses it).
+    Options options = testOptions();
+    options.scope = "flat";
     auto gameAt = [](const std::wstring& dir) {
         GameInstall game;
         game.dir = dir;
@@ -4562,12 +4571,17 @@ static void testFlatSettingsWindow(const std::wstring& root, const std::wstring&
         fail("read the repository edvr.ini", "not found");
         return;
     }
+    // Rows by dotted key ("fix.ui_quality"), so a key in two sections is never mistaken for another.
     auto rowFor = [](const SettingsModel& model, const char* key) {
-        for (size_t i = 0; i < model.rows().size(); ++i)
-            if (std::string(model.rows()[i].def->key) == key) return i;
+        for (size_t i = 0; i < model.rows().size(); ++i) {
+            const SettingDef* def = model.rows()[i].def;
+            if (std::string(def->section) + "." + def->key == key) return i;
+        }
         return static_cast<size_t>(-1);
     };
-    const std::string flatOwn = "[fix]\r\nblack_void = 0\r\n";
+    // The flat view shows the keys the flat profile reads (flat_profile_keys.h): fix.ui_quality is one of them, and
+    // fix.black_void is a VR-only row it refuses. The shipped edvr.ini carries ui_quality = 100.
+    const std::string flatOwn = "[fix]\r\nui_quality = 0\r\n";
 
     {   // Two files: the flat model shows the flat file's value and writes only
         // there; the VR model beside it does the reverse.
@@ -4579,15 +4593,15 @@ static void testFlatSettingsWindow(const std::wstring& root, const std::wstring&
 
         SettingsModel flat;
         flat.load(dir, "flat");
-        const size_t toggle = rowFor(flat, "black_void");
+        const size_t toggle = rowFor(flat, "fix.ui_quality");
         if (toggle == static_cast<size_t>(-1)) {
-            fail("find the setting to exercise", "black_void is not exposed");
+            fail("find the setting to exercise", "fix.ui_quality is not exposed");
             return;
         }
         check(flat.iniPath() == joinPath(dir, L"edvr-flat.ini"), "the flat window's file is edvr-flat.ini");
         expectEq(flat.rows()[toggle].value, "0", "it shows the flat file's value, not edvr.ini's");
         check(flat.set(toggle, "1"), "a change in the flat window is written", flat.lastError());
-        expectEq(iniValue(readAll(joinPath(dir, L"edvr-flat.ini")), "fix.black_void"), "1",
+        expectEq(iniValue(readAll(joinPath(dir, L"edvr-flat.ini")), "fix.ui_quality"), "1",
                  "to edvr-flat.ini");
         expectEq(readAll(joinPath(dir, L"edvr.ini")), shipped, "and edvr.ini is byte for byte the same");
         const std::wstring backups = joinPath(dir, L"edvr_backup");
@@ -4599,7 +4613,7 @@ static void testFlatSettingsWindow(const std::wstring& root, const std::wstring&
         vr.load(dir);
         check(vr.iniPath() == joinPath(dir, L"edvr.ini"), "the VR window's file is edvr.ini");
         const std::string flatAfter = readAll(joinPath(dir, L"edvr-flat.ini"));
-        check(vr.set(rowFor(vr, "black_void"), "0"), "a change in the VR window is written", vr.lastError());
+        check(vr.set(rowFor(vr, "fix.black_void"), "0"), "a change in the VR window is written", vr.lastError());
         expectEq(iniValue(readAll(joinPath(dir, L"edvr.ini")), "fix.black_void"), "0", "to edvr.ini");
         expectEq(readAll(joinPath(dir, L"edvr-flat.ini")), flatAfter,
                  "and edvr-flat.ini is exactly what the flat window left");
@@ -4614,24 +4628,24 @@ static void testFlatSettingsWindow(const std::wstring& root, const std::wstring&
         writeAll(joinPath(dir, L"edvr.ini"), shipped);
         SettingsModel flat;
         flat.load(dir, "flat");
-        const size_t toggle = rowFor(flat, "black_void");
+        const size_t toggle = rowFor(flat, "fix.ui_quality");
         if (toggle == static_cast<size_t>(-1)) {
-            fail("find the setting to exercise", "black_void is not exposed");
+            fail("find the setting to exercise", "fix.ui_quality is not exposed");
             return;
         }
-        expectEq(flat.rows()[toggle].value, iniValue(shipped, "fix.black_void"),
+        expectEq(flat.rows()[toggle].value, iniValue(shipped, "fix.ui_quality"),
                  "with no edvr-flat.ini yet the window shows the shared file's value");
         check(flat.set(toggle, "0"), "the first change succeeds", flat.lastError());
         check(fileExists(joinPath(dir, L"edvr-flat.ini")), "and starts edvr-flat.ini");
         const std::string started = readAll(joinPath(dir, L"edvr-flat.ini"));
-        expectEq(iniValue(started, "fix.black_void"), "0", "with the change in it");
-        check(started.size() == shipped.size(),
-              "and every other setting carried over from the shared file: one character differs");
+        expectEq(iniValue(started, "fix.ui_quality"), "0", "with the change in it");
+        check(started.find("ui_quality = 0") != std::string::npos,
+              "and the shared file's line is changed in place, in the new file");
         expectEq(readAll(joinPath(dir, L"edvr.ini")), shipped, "while edvr.ini is exactly as it was");
         check(firstSubdirLike(joinPath(dir, L"edvr_backup"), L"settings-*").empty(),
               "a file that did not exist has nothing to back up");
         check(flat.set(toggle, "1"), "the next change succeeds too", flat.lastError());
-        expectEq(iniValue(readAll(joinPath(dir, L"edvr-flat.ini")), "fix.black_void"), "1",
+        expectEq(iniValue(readAll(joinPath(dir, L"edvr-flat.ini")), "fix.ui_quality"), "1",
                  "and lands in the flat file");
         expectEq(readAll(joinPath(dir, L"edvr.ini")), shipped, "with edvr.ini untouched again");
     }
@@ -4642,13 +4656,30 @@ static void testFlatSettingsWindow(const std::wstring& root, const std::wstring&
         makeTree(dir);
         SettingsModel flat;
         flat.load(dir, "flat");
-        const size_t toggle = rowFor(flat, "black_void");
+        const size_t toggle = rowFor(flat, "fix.ui_quality");
         if (toggle == static_cast<size_t>(-1)) return;
         check(!flat.set(toggle, "0"), "a change with no settings file anywhere fails");
         check(flat.lastError().find("edvr-flat.ini is not there yet") != std::string::npos,
               "and names edvr-flat.ini, the file that is missing", flat.lastError());
         check(!fileExists(joinPath(dir, L"edvr-flat.ini")) && !fileExists(joinPath(dir, L"edvr.ini")),
               "without creating either");
+    }
+
+    {   // Which rows each view shows: the flat view offers the keys the flat runtime reads and nothing that only the VR
+        // runtime reads; the VR view offers the VR-only row.
+        const std::wstring dir = joinPath(scratch, L"flatset-window-rows");
+        removeTree(dir);
+        makeTree(dir);
+        writeAll(joinPath(dir, L"edvr.ini"), shipped);
+        SettingsModel flat;
+        flat.load(dir, "flat");
+        SettingsModel vr;
+        vr.load(dir, "vr");
+        check(rowFor(flat, "fix.ui_quality") != static_cast<size_t>(-1), "the flat view shows fix.ui_quality");
+        check(rowFor(flat, "fix.temporal_aa") != static_cast<size_t>(-1), "the flat view shows fix.temporal_aa");
+        check(rowFor(flat, "fix.black_void") == static_cast<size_t>(-1), "a VR-only row is hidden under Flat");
+        check(rowFor(vr, "fix.black_void") != static_cast<size_t>(-1), "and shown under VR");
+        check(rowFor(vr, "fix.ui_quality") != static_cast<size_t>(-1), "and VR shows the rows flat shows");
     }
 }
 
@@ -4676,7 +4707,9 @@ static void testFlatMirror(const std::wstring& scratch) {
     const std::wstring dir = joinPath(scratch, L"flatmirror-game");
     layOutFlatGame(dir);
     const PayloadInfo flat = flatPayloadFor(kFlatTemplate);
-    const Plan plan = planInstall(diskSurvey(dir), testOptions(), flat);
+    Options flatOptions = testOptions();
+    flatOptions.scope = "flat";   // the flat payload has no VR runtime; the default scope, both, refuses it
+    const Plan plan = planInstall(diskSurvey(dir), flatOptions, flat);
     check(!plan.blocked && applyPlan(plan, flatProvider()).ok,
           "a fresh flat install, the one this test mirrors, applies");
     check(fileExists(joinPath(dir, L"edvr-flat.ini")) && !fileExists(joinPath(dir, L"edvr.ini")),
@@ -5421,7 +5454,9 @@ static void testScopes(const std::wstring& scratch) {
     {
         Survey s = baseSurvey(dir);
         s.haveOpenvrDir = false;
-        const Plan plan = planInstall(s, o, flat);
+        Options flatOpt = o;
+        flatOpt.scope = "flat";
+        const Plan plan = planInstall(s, flatOpt, flat);
         check(!plan.blocked && plan.nextState.scope == "flat" && plan.nextState.profile == "flat",
               "a fresh flat installer installs scope flat", unifiedProblems(plan));
         check(writesLeaf(plan, L"edvr-flat.ini") && writesLeaf(plan, L"edvr-flat.ini.base"),
@@ -5535,7 +5570,10 @@ static void testScopes(const std::wstring& scratch) {
         check(deletesLeaf(removedBoth, L"edvr.ini.base") && deletesLeaf(removedBoth, L"edvr-flat.ini.base"),
               "and both bases");
         Survey vrOnly = recordedBothSurvey(udir, vr);
+        // The descriptor on disk names the scope, so the scope vr install says so in both places.
         vrOnly.state.scope = "vr";
+        vrOnly.descriptorSha = descriptorShaFor("vr");
+        vrOnly.state.descriptorSha = descriptorShaFor("vr");
         const Plan removedVr = planUninstall(vrOnly, gone);
         check(deletesLeaf(removedVr, L"edvr.ini") && !deletesLeaf(removedVr, L"edvr-flat.ini"),
               "scope vr: --remove-settings removes edvr.ini and leaves edvr-flat.ini");
@@ -5598,6 +5636,75 @@ static void testState() {
           "a file that merely parses is not a record either");
 }
 
+// The command line's scope and the default one. --scope takes both, vr or flat and refuses anything else; --convert-profile is
+// accepted and changes nothing; with no --scope the run installs the folder's own scope, else both.
+static void testScopeArgs() {
+    printf("\nscope on the command line and the default scope\n");
+    auto parse = [](std::vector<const wchar_t*> words) {
+        std::vector<wchar_t*> argv{const_cast<wchar_t*>(L"edvr-installer.exe")};
+        for (const wchar_t* word : words) argv.push_back(const_cast<wchar_t*>(word));
+        return parseArgs(static_cast<int>(argv.size()), argv.data());
+    };
+    AppArgs a = parse({L"--install", L"--scope", L"vr"});
+    check(!a.badArg && a.scope == "vr", "--scope vr is read");
+    a = parse({L"--scope=flat"});
+    check(!a.badArg && a.scope == "flat", "--scope=flat is read");
+    a = parse({L"--scope", L"both"});
+    check(!a.badArg && a.scope == "both", "--scope both is read");
+    a = parse({L"--scope", L"bogus"});
+    check(a.badArg && a.scope.empty(), "--scope bogus is refused");
+    a = parse({L"--scope"});
+    check(a.badArg, "--scope with no value is refused");
+    a = parse({L"--install"});
+    check(!a.badArg && a.scope.empty(), "with no --scope the scope is left for the default");
+    a = parse({L"--install", L"--convert-profile"});
+    check(!a.badArg && a.convertProfile, "--convert-profile is accepted");
+    check(optionsFor(parse({L"--install", L"--scope", L"flat"}), false).scope == "flat",
+          "the scope from the command line reaches the planner's options");
+
+    // The default: the folder's own scope when it has one, else both.
+    const std::wstring dir = L"C:\\installer_test_no_such_folder";
+    Survey fresh = baseSurvey(dir);
+    check(defaultScope(fresh) == "both", "a folder with no install defaults to scope both");
+    Survey recorded = baseSurvey(dir);
+    recorded.state.present = true;
+    recorded.state.scope = "flat";
+    check(defaultScope(recorded) == "flat", "a folder recorded as scope flat defaults to flat");
+    Survey vrOnly = baseSurvey(dir);
+    vrOnly.state.present = true;
+    vrOnly.state.scope = "vr";
+    check(defaultScope(vrOnly) == "vr", "a folder recorded as scope vr defaults to vr");
+    Options defaults = testOptions();
+    check(defaults.scope.empty(), "the options carry no scope unless one was asked for");
+    check(!planInstall(baseSurvey(dir), defaults, testPayload("[fix]\r\n")).blocked &&
+              planInstall(baseSurvey(dir), defaults, testPayload("[fix]\r\n")).nextState.scope == "both",
+          "a fresh install with no scope asked for installs both");
+
+    // The descriptor on disk is the install's scope. A record left by an earlier flat GUI install is older than
+    // the files: it must neither name the scope nor trigger the flat conversion when the update is planned.
+    {
+        const std::wstring stale = L"C:\\installer_test_stale_record";
+        const PayloadInfo vr = testPayload("[fix]\r\n");
+        Survey s = toolBothSurvey(stale, vr);
+        check(installedScope(s) == "both" && !installRecordStale(s),
+              "a both descriptor with no record: scope both, and no record to be stale");
+        s.state.present = true;
+        s.state.profile = "flat";
+        s.state.scope = "flat";
+        s.state.descriptorSha = descriptorShaFor("flat");
+        s.state.edvrVersion = "v0.19.0";
+        check(installedScope(s) == "both", "a both descriptor outvotes a stale flat record");
+        check(installedProfile(s) == "vr", "and the edition is vr");
+        check(installRecordStale(s), "the flat record is older than the files: installRecordStale");
+        const Plan plan = planInstall(s, testOptions(), vr);
+        check(!plan.blocked, "an update over the stale record plans", unifiedProblems(plan));
+        check(plan.nextState.scope == "both" && plan.nextState.profile == "vr",
+              "the update records scope both");
+        check(!hasStep(plan, Action::Rename, L"openvr_api_orig.dll", L"openvr_api.dll"),
+              "and plans no flat conversion: the game's runtime is not restored");
+    }
+}
+
 int wmain(int argc, wchar_t** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
@@ -5638,6 +5745,7 @@ int wmain(int argc, wchar_t** argv) {
     testSettings(root, scratch);
     testLogBundle(scratch);
     testState();
+    testScopeArgs();
 
     printf("\n%s\n", g_fails == 0 ? "installer_test: all good" : "installer_test: FAILURES");
     return g_fails == 0 ? 0 : 1;

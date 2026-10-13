@@ -53,9 +53,6 @@ const PayloadInfo& payloadInfo() {
     static PayloadInfo info = [] {
         PayloadInfo p;
         p.version = EDVR_VERSION_STRING;
-#ifdef EDVR_INSTALLER_FLAT
-        p.profile = "flat";
-#endif
 
         const void* data = nullptr;
         size_t size = 0;
@@ -88,9 +85,9 @@ const PayloadInfo& payloadInfo() {
         const bool license = payloadItem("openxr_license", &data, &size);
         p.nativePairValid = graphics && runtime && loader && license;
         if (license) { p.haveOpenxrLicense = true; p.openxrLicenseSha = sha256Bytes(data, size); }
-        // Resource 103 is edvr.ini in the VR edition. The flat edition carries its own file
-        // there too (package_native checks it), but its settings are the flat file, read below.
-        if (p.profile != "flat" && payloadItem("ini", &data, &size)) {
+        // Resource 103 is edvr.ini; resource 111 is edvr-flat.ini. Both are carried, and the
+        // scope the install asks for decides which of them it writes.
+        if (payloadItem("ini", &data, &size)) {
             p.haveIni = true;
             p.iniText.assign(static_cast<const char*>(data), size);
         }

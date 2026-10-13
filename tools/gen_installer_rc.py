@@ -39,12 +39,12 @@ IDR_PROFILE = 107
 IDR_XESS = 108
 IDR_XESS_LICENSE = 109
 IDR_XESS_THIRD_PARTY = 110
-IDR_FLAT_INI = 111   # edvr-flat.ini, carried by both editions: the flat profile's own settings
+IDR_FLAT_INI = 111   # edvr-flat.ini: the flat profile's own settings, carried beside edvr.ini
 RT_MANIFEST = 24
 
 
 def flat_ini_bytes():
-    """The shipped edvr-flat.ini: the flat profile's own default settings. Both editions carry it."""
+    """The shipped edvr-flat.ini: the flat profile's own default settings."""
     return (b'# Experimental flat temporal profile: visual qualification in progress.\r\n'
             b'# F8 opens the AA menu: Off / TAA / DLSS / FSR3 / XeSS-SR and DLSS model presets.\r\n'
             b'# temporal_aa: off, on (TAA), dlaa (native SS), dlss, fsr, xess. Game SS controls render scale.\r\n'
@@ -56,12 +56,11 @@ def flat_ini_bytes():
             b'[advanced]\r\nreal_dll =\r\n')
 
 
-def descriptor_bytes(profile):
-    """The edvr_profile.ini a payload carries, schema 2: the VR edition declares
-    both scopes and the flat edition declares flat. package_native.py checks the
-    installer's embedded descriptor against these same bytes."""
-    scope = 'flat' if profile == 'flat' else 'both'
-    return ('[install]\r\nschema = 2\r\nscope = %s\r\n' % scope).encode('ascii')
+def descriptor_bytes():
+    """The edvr_profile.ini the installer carries, schema 2: scope both, the one the
+    installer's default names. package_native.py checks the installer's embedded
+    descriptor against these same bytes."""
+    return b'[install]\r\nschema = 2\r\nscope = both\r\n'
 
 
 def parse_version_tuple(describe):
@@ -289,8 +288,7 @@ def main(argv=None):
     ap.add_argument('--build')
     ap.add_argument('--out')
     ap.add_argument('--version', default='unknown')
-    ap.add_argument('--profile', choices=('vr', 'flat'), default='vr')
-    ap.add_argument('--ini', help='profile-specific shipped INI (default: root edvr.ini)')
+    ap.add_argument('--ini', help='the shipped edvr.ini (default: root edvr.ini)')
     ap.add_argument('--version-rc', choices=('graphics', 'runtime'),
                     help='write a standalone VERSIONINFO .rc for this DLL instead of '
                          'the installer payload')
@@ -310,26 +308,19 @@ def main(argv=None):
     runtime = os.path.join(args.build, 'edvr_openxr_runtime.dll')
     loader = os.path.join(args.build, 'openxr_loader.dll')
     notice = os.path.join(args.build, 'OPENXR-LOADER-LICENSE.txt')
-    ini = args.ini or (os.path.join(args.build, 'edvr-flat.ini') if args.profile == 'flat'
-                       else os.path.join(args.root, 'edvr.ini'))
-    # edvr-flat.ini is embedded by both editions (id 111). The flat edition's own
-    # build writes it; the VR edition carries the same generated text beside it.
-    flat_ini = args.ini if (args.profile == 'flat' and args.ini) else os.path.join(args.build, 'edvr-flat.ini')
-    write_flat_ini = flat_ini == os.path.join(args.build, 'edvr-flat.ini')
+    ini = args.ini or os.path.join(args.root, 'edvr.ini')
+    # edvr-flat.ini is generated here and embedded beside edvr.ini (id 111): one
+    # installer carries both settings files, and the scope decides which it writes.
+    flat_ini = os.path.join(args.build, 'edvr-flat.ini')
     ngx = os.path.join(args.build, 'nvngx_dlss.dll')
     xess = os.path.join(args.build, 'libxess.dll')
     xess_license = os.path.join(args.build, 'INTEL-XESS-LICENSE.txt')
     xess_third_party = os.path.join(args.build, 'INTEL-XESS-THIRD-PARTY.txt')
     manifest = os.path.join(args.root, 'src', 'installer', 'installer.manifest')
 
-    required = [("native graphics", d3d11)]
-    if args.profile != 'flat' or args.ini:
-        required.append(("INI", ini))
-    if not write_flat_ini:
-        required.append(("flat INI", flat_ini))
-    if args.profile == 'vr':
-        required += [("native runtime", runtime), ("OpenXR loader", loader),
-                     ("OpenXR loader notice", notice)]
+    required = [("native graphics", d3d11), ("INI", ini),
+                ("native runtime", runtime), ("OpenXR loader", loader),
+                ("OpenXR loader notice", notice)]
     missing = [(label, path) for label, path in required if not os.path.isfile(path)]
     if missing:
         for label, path in missing:
@@ -338,10 +329,9 @@ def main(argv=None):
     try:
         import openxr_pe
         openxr_pe.native_graphics_exports(d3d11)
-        if args.profile == 'vr':
-            openxr_pe.native_exports(runtime)
-            from fetch_openxr_loader import verify
-            verify(args.build)
+        openxr_pe.native_exports(runtime)
+        from fetch_openxr_loader import verify
+        verify(args.build)
     except (ImportError, OSError, ValueError) as exc:
         print('gen_installer_rc: ERROR: native payload validation failed: %s' % exc)
         return 1
@@ -366,33 +356,17 @@ def main(argv=None):
         return 1
 
     if args.dry_run:
-        print('gen_installer_rc: dry run; validated %s resources and wrote nothing' % args.profile)
+        print('gen_installer_rc: dry run; validated the installer resources and wrote nothing')
         return 0
     os.makedirs(args.out, exist_ok=True)
-    if write_flat_ini:
-        with open(flat_ini, 'wb') as f:
-            f.write(flat_ini_bytes())
-    if args.profile == 'flat':
-        with open(os.path.join(args.build, 'edvr-flat-README.txt'), 'wb') as f:
-            f.write(b'EDVR flat temporal AA qualification build\r\n\r\n'
-                    b'Run edvr-flat-installer.exe. This edition installs d3d11.dll, edvr-flat.ini,\r\n'
-                    b'and edvr_profile.ini beside EliteDangerous64.exe. No VR runtime is installed.\r\n'
-                    b'Its settings live in edvr-flat.ini, never in the VR profile\'s edvr.ini.\r\n'
-                    b'Experimental temporal AA; visual quality is not yet qualified.\r\n'
-                    b'Press F8 for the AA menu. Up/Down selects a row; Left/Right changes it.\r\n'
-                    b'Choose Off, TAA, DLSS, FSR3 or XeSS-SR and the DLSS model preset; settings save live.\r\n'
-                    b'Press F8 or Escape to close. Game keys are private while the menu is drawn.\r\n'
-                    b'[fix] temporal_aa also accepts off, on (TAA), dlaa, dlss, fsr or xess (default off).\r\n'
-                    b'XeSS-SR needs libxess.dll beside the game; the SDK-enabled flat installer includes it.\r\n'
-                    b'Game supersampling controls render scale; DLAA requires native SS.\r\n'
-                    b'Press NumLock while the issue is visible to collect a diagnostic capture.\r\n'
-                    b'Use --convert-profile for an explicit VR/flat edition switch.\r\n')
+    with open(flat_ini, 'wb') as f:
+        f.write(flat_ini_bytes())
     icon_path = os.path.join(args.out, 'edvr_installer.ico')
     with open(icon_path, 'wb') as f:
         f.write(ico_bytes())
-    descriptor_path = os.path.join(args.build, 'edvr_profile_%s.ini' % args.profile)
+    descriptor_path = os.path.join(args.build, 'edvr_profile_vr.ini')
     with open(descriptor_path, 'wb') as f:
-        f.write(descriptor_bytes(args.profile))
+        f.write(descriptor_bytes())
 
     lines = [
         '// Generated by tools/gen_installer_rc.py. Do not edit; do not commit.',
@@ -404,24 +378,19 @@ def main(argv=None):
         '%d RCDATA "%s"' % (IDR_INI, rc_path(ini)),
         '%d RCDATA "%s"' % (IDR_FLAT_INI, rc_path(flat_ini)),
         '%d RCDATA "%s"' % (IDR_PROFILE, rc_path(descriptor_path)),
+        '%d RCDATA "%s"' % (IDR_NATIVE_RUNTIME, rc_path(runtime)),
+        '%d RCDATA "%s"' % (IDR_LOADER, rc_path(loader)),
+        '%d RCDATA "%s"' % (IDR_LOADER_NOTICE, rc_path(notice)),
     ]
-    # The flat edition's settings are its own file (config.cpp reads edvr-flat.ini
-    # first), and this line is what a build log says the installer carries. The
-    # VR edition carries both files; the flat edition carries only its own.
-    ini_name = 'edvr-flat.ini' if args.profile == 'flat' else 'edvr.ini, edvr-flat.ini'
-    carried = 'graphics, %s and %s profile descriptor' % (ini_name, args.profile)
-    if args.profile == 'vr':
-        lines += ['%d RCDATA "%s"' % (IDR_NATIVE_RUNTIME, rc_path(runtime)),
-                  '%d RCDATA "%s"' % (IDR_LOADER, rc_path(loader)),
-                  '%d RCDATA "%s"' % (IDR_LOADER_NOTICE, rc_path(notice))]
-        carried += ', native OpenXR runtime, loader and notice'
+    # This line is what a build log says the installer carries.
+    carried = 'graphics, edvr.ini, edvr-flat.ini and vr profile descriptor, native OpenXR runtime, loader and notice'
     if os.path.exists(ngx):
         lines.append('%d RCDATA "%s"' % (IDR_NGX, rc_path(ngx)))
         carried += ", and NVIDIA's DLSS runtime (nvngx_dlss.dll)"
     else:
         lines.append('// no nvngx_dlss.dll in the build (no DLSS SDK): this installer ships without')
         lines.append("// NVIDIA's optional anti-aliasing runtime.")
-    # XeSS-SR ships with both editions: the VR profile's edvr.ini selects it too.
+    # XeSS-SR ships with the installer: both edvr.ini and edvr-flat.ini can select it.
     if os.path.exists(xess):
         lines += ['%d RCDATA "%s"' % (IDR_XESS, rc_path(xess)),
                   '%d RCDATA "%s"' % (IDR_XESS_LICENSE, rc_path(xess_license)),
@@ -431,9 +400,9 @@ def main(argv=None):
     version = args.version
     lines += [''] + versioninfo_lines(
         version,
-        file_description='EDVR flat temporal qualification installer' if args.profile == 'flat' else 'EDVR installer',
-        internal_name='edvr-flat-installer' if args.profile == 'flat' else 'edvr-installer',
-        original_filename='edvr-flat-installer.exe' if args.profile == 'flat' else 'edvr-installer.exe',
+        file_description='EDVR installer',
+        internal_name='edvr-installer',
+        original_filename='edvr-installer.exe',
         file_type='0x1L',
         comments='Carries %s' % carried) + ['']
 
@@ -476,63 +445,45 @@ def self_test():
             os.remove(os.path.join(build, 'edvr_openxr_runtime.dll'))
             assert main(['--root', root, '--build', build, '--out', out,
                          '--version', '1.2.3']) == 1 and not os.path.exists(out)
+            # The flat edition is retired: --profile is no longer an option at all.
+            with open(os.path.join(build, 'edvr_openxr_runtime.dll'), 'wb') as stream: stream.write(b'x')
             assert main(['--root', root, '--build', build, '--out', out,
-                         '--version', '1.2.3', '--profile', 'flat', '--dry-run']) == 0
+                         '--version', '1.2.3', '--dry-run']) == 0
             assert not os.path.exists(out) and not os.path.exists(os.path.join(build, 'edvr-flat.ini'))
-            assert main(['--root', root, '--build', build, '--out', out,
-                         '--version', '1.2.3', '--profile', 'flat']) == 0
-            with open(os.path.join(out, 'payload.rc'), encoding='utf-8') as stream:
-                rc_text = stream.read()
-            assert '%d RCDATA ' % IDR_NATIVE_RUNTIME not in rc_text
-            assert '%d RCDATA ' % IDR_LOADER not in rc_text
-            assert '%d RCDATA ' % IDR_LOADER_NOTICE not in rc_text
-            assert '%d RCDATA ' % IDR_PROFILE in rc_text
+            try:
+                main(['--root', root, '--build', build, '--out', out,
+                      '--version', '1.2.3', '--profile', 'flat'])
+            except SystemExit as exc:
+                assert exc.code == 2
+            else:
+                raise AssertionError('--profile flat was accepted')
             for name in ('libxess.dll', 'INTEL-XESS-LICENSE.txt', 'INTEL-XESS-THIRD-PARTY.txt'):
                 with open(os.path.join(build, name), 'wb') as stream: stream.write(name.encode('ascii'))
             assert main(['--root', root, '--build', build, '--out', out,
-                         '--version', '1.2.3', '--profile', 'flat']) == 0
+                         '--version', '1.2.3']) == 0
             with open(os.path.join(out, 'payload.rc'), encoding='utf-8') as stream:
                 rc_text = stream.read()
+            # One installer: both settings files, the descriptor, the runtime and the XeSS-SR files.
             assert all('%d RCDATA ' % resource_id in rc_text for resource_id in
-                       (IDR_XESS, IDR_XESS_LICENSE, IDR_XESS_THIRD_PARTY))
+                       (IDR_INI, IDR_FLAT_INI, IDR_PROFILE, IDR_NATIVE_RUNTIME, IDR_LOADER,
+                        IDR_LOADER_NOTICE, IDR_XESS, IDR_XESS_LICENSE, IDR_XESS_THIRD_PARTY))
+            assert 'Intel XeSS-SR runtime and notices' in rc_text
+            assert 'graphics, edvr.ini, edvr-flat.ini and vr profile descriptor' in rc_text
             with open(os.path.join(build, 'edvr-flat.ini'), 'rb') as stream:
                 flat_ini = stream.read()
+                assert flat_ini == flat_ini_bytes()
                 assert b'temporal_aa = off' in flat_ini
                 assert b'fsr, xess. Game SS controls render scale.' in flat_ini
                 assert b'FSR3 / XeSS-SR' in flat_ini
                 assert b'XeSS-SR needs libxess.dll' in flat_ini
                 assert b'temporal_aa_model = k' in flat_ini and b'menu = F8' in flat_ini
                 assert b'dump_draws = NUMLOCK' in flat_ini and b'dump_draws = F10' not in flat_ini
-            with open(os.path.join(build, 'edvr_profile_flat.ini'), 'rb') as stream:
-                assert stream.read() == b'[install]\r\nschema = 2\r\nscope = flat\r\n'
-            assert descriptor_bytes('vr') == b'[install]\r\nschema = 2\r\nscope = both\r\n'
-            # The flat edition's settings are edvr-flat.ini: what its README and the
-            # build's own summary say it carries must not send anybody to edvr.ini.
-            with open(os.path.join(build, 'edvr-flat-README.txt'), 'rb') as stream:
-                readme = stream.read()
-            assert b'installs d3d11.dll, edvr-flat.ini,' in readme, readme
-            assert b'installs d3d11.dll, edvr.ini' not in readme
-            assert b'FSR3 or XeSS-SR' in readme
-            assert b'XeSS-SR needs libxess.dll' in readme
-            with open(os.path.join(out, 'payload.rc'), encoding='utf-8') as stream:
-                flat_rc = stream.read()
-                assert 'graphics, edvr-flat.ini and flat profile descriptor' in flat_rc
-                assert '%d RCDATA ' % IDR_FLAT_INI in flat_rc
-            # The VR installer carries the same XeSS files: its edvr.ini selects XeSS-SR too.
-            with open(os.path.join(build, 'edvr_openxr_runtime.dll'), 'wb') as stream: stream.write(b'x')
-            assert main(['--root', root, '--build', build, '--out', out,
-                         '--version', '1.2.3']) == 0
-            with open(os.path.join(out, 'payload.rc'), encoding='utf-8') as stream:
-                rc_text = stream.read()
-            assert all('%d RCDATA ' % resource_id in rc_text for resource_id in
-                       (IDR_XESS, IDR_XESS_LICENSE, IDR_XESS_THIRD_PARTY))
-            assert 'Intel XeSS-SR runtime and notices' in rc_text
-            # The VR installer carries both settings files: its edvr.ini (103) and the
-            # generated edvr-flat.ini (111), so a scope other than vr has its file.
-            assert '%d RCDATA ' % IDR_FLAT_INI in rc_text
-            with open(os.path.join(build, 'edvr-flat.ini'), 'rb') as stream:
-                assert stream.read() == flat_ini_bytes()
-            assert 'graphics, edvr.ini, edvr-flat.ini and vr profile descriptor' in rc_text
+            with open(os.path.join(build, 'edvr_profile_vr.ini'), 'rb') as stream:
+                assert stream.read() == descriptor_bytes()
+            assert descriptor_bytes() == b'[install]\r\nschema = 2\r\nscope = both\r\n'
+            # The flat edition's README is folded into release\README.txt; the build
+            # writes no second README.
+            assert not os.path.exists(os.path.join(build, 'edvr-flat-README.txt'))
         finally:
             openxr_pe.native_graphics_exports, openxr_pe.native_exports = old_g, old_r
             fetch_openxr_loader.verify = old_v

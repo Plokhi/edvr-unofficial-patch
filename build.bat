@@ -2676,26 +2676,6 @@ REM sees. --help reads nothing and writes nothing.
 )
 exit /b 0
 
-:rig_flat_installer
-echo [edvr] === edvr-flat-installer.exe ===
-if not exist "%OBJ%\flatinstaller" mkdir "%OBJ%\flatinstaller"
-if not exist "%BUILD%\gen-flat" mkdir "%BUILD%\gen-flat"
-python "tools\gen_installer_rc.py" --root "%ROOT%" --build "%BUILD%" ^
-    --out "%BUILD%\gen-flat" --version "%EDVR_VER%" --profile flat
-if errorlevel 1 ( echo [edvr] ERROR: flat installer resource generation failed & exit /b 1 )
-rc.exe /nologo /fo "%OBJ%\flatinstaller\payload.res" "%BUILD%\gen-flat\payload.rc"
-if errorlevel 1 ( echo [edvr] ERROR: flat installer resources failed & exit /b 1 )
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
-    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I"%GEN%" ^
-    /DEDVR_INSTALLER_FLAT=1 /DEDVR_VERSION_STRING=\"%EDVR_VER%\" ^
-    /Fo"%OBJ%\flatinstaller"\ /Fe"%BUILD%\edvr-flat-installer.exe" ^
-    %INSTALLER_SRC% "%OBJ%\flatinstaller\payload.res" ^
-    /link /INCREMENTAL:NO /SUBSYSTEM:WINDOWS /MANIFEST:NO %INSTALLER_LIBS%
-if errorlevel 1 ( echo [edvr] ERROR: flat installer build failed & exit /b 1 )
-"%BUILD%\edvr-flat-installer.exe" --help >nul || exit /b 1
-python "tools\package_native.py" --check-installer --profile flat || exit /b 1
-exit /b 0
-
 :rig_installer_test
 echo [edvr] === installer_test.exe ===
 REM The planner over folders that are hard to arrange on a real machine: EDHM
@@ -2713,6 +2693,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMA
     "src\common\iniedit.cpp" "src\installer\state.cpp" ^
     "src\installer\mirror.cpp" ^
     "src\installer\settings.cpp" "src\installer\logbundle.cpp" ^
+    "src\installer\app.cpp" "src\installer\payload.cpp" ^
     /link /INCREMENTAL:NO %INSTALLER_LIBS%
 if errorlevel 1 ( echo [edvr] ERROR: installer_test build failed & exit /b 1 )
 "%BUILD%\installer_test.exe" "%ROOT%" "%BUILD%\insttest_scratch" || (

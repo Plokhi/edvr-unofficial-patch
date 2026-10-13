@@ -9,6 +9,7 @@
 #include <string>
 
 #include "elite_graphics_folder.h"
+#include "flat_profile_keys.h"
 #include "install_scope.h"
 
 namespace edvr {
@@ -159,28 +160,13 @@ inline bool runtimeScopeIncludesVr() {
 // row does nothing, with no line in the log. The panel's rows are the table in
 // menu_flat_rows.h, and tools\flat_sharpen_test fails the build for any of
 // them this function refuses.
+// The list itself is flat_profile_keys.h's, shared with the installer's Flat view. The log.* and advanced.real_dll keys are read by
+// every profile; the rest only by flat.
 inline bool runtimeProfileAllowsKey(const char* key) {
     if (runtimeVrProfile()) return true;
     if (!key) return false;
     if (std::strncmp(key, "log.", 4) == 0 || std::strcmp(key, "advanced.real_dll") == 0)
         return true;
-    return runtimeFlatProfile() && (std::strcmp(key, "advanced.d3d11_fixes") == 0 ||
-        std::strcmp(key, "advanced.input_gate") == 0 ||
-        std::strcmp(key, "advanced.flat_camera_producer_probe") == 0 ||
-        std::strcmp(key, "hotkey.menu") == 0 ||
-        std::strcmp(key, "fix.temporal_aa_model") == 0 ||
-        std::strcmp(key, "hotkey.dump_draws") == 0 ||
-        std::strcmp(key, "fix.render_sharpness") == 0 ||
-        // The interface quality (flat panel row; ui_panel_scale.cpp's flat factor and the flat UI layer). The VR layer reads it
-        // too, but stays inert in flat: it is live only with fix.temporal_aa on through this gate, which refuses that key.
-        std::strcmp(key, "fix.ui_quality") == 0 ||
-        // The flat jitter cycle's length (flat_runtime.cpp, FlatLivePhase::phaseCount; temporal_math.h). Developer tier, no flat panel
-        // row. Unlisted, getInt answers 0 here whatever the file says, which the reader takes for out of range and reads as 8.
-        std::strcmp(key, "advanced.temporal_aa_jitter_phases") == 0 ||
-        // The journal watcher, for the System Map's GuiFocus (journal_watch.h: journalFlatGuiFocus). Its other accessors answer
-        // flat with the no-journal values, so enabling the watcher here changes no other flat behaviour. journal_dir names the
-        // Saved Games folder when the default is wrong; unlisted, it reads "off" and the watcher looks in a folder named "off".
-        std::strcmp(key, "d3d11.journal_watch") == 0 ||
-        std::strcmp(key, "d3d11.journal_dir") == 0);
+    return runtimeFlatProfile() && flatProfileReadsKey(key);
 }
 } // namespace edvr
