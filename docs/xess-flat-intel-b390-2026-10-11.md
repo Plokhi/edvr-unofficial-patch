@@ -1473,3 +1473,14 @@ Units (each behind the full build; Haiku implementers, reviewed):
 - Hypotheses for the first flight: XH1 the bridge's copies and fences cost under 1 ms per eye at about 4032x4034 on the 5090 (read
   the totals line); XH2 the jitter sign matches (a wrong sign shows as shimmering or a half-pixel swim on static edges); XH3 two
   slots keep independent history (a wrong sharing shows as ghosting that alternates between eyes).
+### October 13: first XeSS-in-VR flight (Sean, Steam, build 314ac46a, edvr_gfx_20261013_093519)
+
+- Environment: RTX 5090, Pimax headset on Pimax's OpenXR runtime, 2016x2017 -> 4032x4034 per eye (Balanced, 2x), XeSS runtime
+  2.0.2 through the D3D12 bridge; DLSS, FSR 3.1 and XeSS toggled live in the menu, same scene.
+- Engaged cleanly: slot 0 and slot 1 contexts, 32-phase jitter cycle, every execute rc=0.
+- Cost (same session): temporal bracket per stereo pair, median: DLSS 3.45 ms, XeSS 4.61-4.70 ms (FSR's windows were too short for
+  a price line). Runtime frame GPU p50: XeSS 8.4-8.6 ms, FSR 5.8-6.0 ms, DLSS about 7.5 ms (one window). Render-thread CPU p50: XeSS
+  2.3-2.5 ms, others about 1.9 ms. Sean: "more expensive than FSR or DLSS even".
+- XH1 (bridge under 1 ms per eye): not decidable from the bracket alone (it holds XeSS's own compute, DP4a on NVIDIA, plus four copies
+  and two fence waits per eye). Next: an instrument splitting execute (D3D12 timestamps) from copy-in, wait and copy-out (D3D11
+  timestamps). XH2 (jitter sign) and XH3 (per-eye history): Sean's visual report pending.
