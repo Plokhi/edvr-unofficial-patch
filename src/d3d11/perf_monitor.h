@@ -37,6 +37,10 @@ namespace edvr {
 // Every frame, from the frame boundary: the interval ring.
 void perfMonitorFrame(ID3D11Device* dev);
 
+// Called at a profile switch, on the render thread, at the frame boundary: the next perfMonitorFrame starts a fresh interval, so the
+// stretch the other profile ran (no perfMonitorFrame) is no long frame.
+void perfMonitorProfileSwitch();
+
 // The page is showing (or not): starts and stops the once-a-second samplers.
 void perfMonitorSetActive(bool active);
 

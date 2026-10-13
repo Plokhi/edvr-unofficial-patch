@@ -10,6 +10,7 @@
 #include "fsr3_engine.h"        // fsr3ReleaseFeatures: FSR's features, released at every switch
 #include "menu.h"               // menuProfileSwitch: the menu closes and forgets the outgoing profile's first-time block
 #include "mode_watch_logic.h"
+#include "perf_monitor.h"       // perfMonitorProfileSwitch: the frame interval restarts at a switch
 #include "ui_layer.h"           // uiLayerProfileSwitch: the VR UI layers, torn down before a commit leaves VR
 #include "vr_ssaa_hold.h"       // vrSsaaHoldProfileChanged: the Supersampling hold follows the profile
 
@@ -386,6 +387,7 @@ void commitPosted(uint64_t packed) {
     Config::get().switchProfile();
     vrSsaaHoldProfileChanged();
     deviceHookRequestConfigRefresh();  // the forced configure sweep runs later in this presentFrameBoundary
+    perfMonitorProfileSwitch();        // the monitor's frame interval restarts; the other profile's stretch is no long frame
 
     std::string now[kPatchedCount];
     readPatched(now);

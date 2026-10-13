@@ -1004,6 +1004,11 @@ void logNativeBenchmark(State& s, const NativeBenchmarkReport& report) {
 
 }  // namespace
 
+void perfMonitorProfileSwitch() {
+    // A zero clock reads as "no previous frame", which perfMonitorFrame already gives the first frame and the 5 s loading gaps (presentMs 0).
+    g_s.lastQpc = 0;
+}
+
 void perfMonitorFrame(ID3D11Device* dev) {
     State& s = g_s;
     ++s.frameNo;
