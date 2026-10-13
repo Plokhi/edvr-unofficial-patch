@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <string>
 #include <thread>
@@ -2634,6 +2635,177 @@ static void testToolReceipts(const std::wstring& scratch) {
         const std::vector<ToolReceipt> got = readToolReceipts(dir);
         check(got.size() == 2 && got[0].native && !got[1].native && got[1].files[0].key == "graphics",
               "the native and the flat receipt are both read");
+    }
+}
+
+// A minimal x64 PE whose export directory names the functions given: enough for probeDll to read the file as the OpenVR runtime
+// (VR_InitInternal) or as EDVR's (an edvr* export). It is never loaded or run.
+static std::string syntheticPe(const std::vector<std::string>& exports) {
+    const DWORD sectionRva = 0x1000, sectionRaw = 0x200, sectionSize = 0x800;
+    const DWORD exportSize = 0x600;   // the directory and its tables; the code sits past it
+    const DWORD codeOffset = 0x600;
+    std::string img(sectionRaw + sectionSize, '\0');
+    IMAGE_DOS_HEADER dos{};
+    dos.e_magic = IMAGE_DOS_SIGNATURE;
+    dos.e_lfanew = 0x40;
+    memcpy(&img[0], &dos, sizeof dos);
+    IMAGE_NT_HEADERS64 nt{};
+    nt.Signature = IMAGE_NT_SIGNATURE;
+    nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt.FileHeader.NumberOfSections = 1;
+    nt.FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt.FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL;
+    nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt.OptionalHeader.SectionAlignment = 0x1000;
+    nt.OptionalHeader.FileAlignment = 0x200;
+    nt.OptionalHeader.SizeOfImage = sectionRva + sectionSize;
+    nt.OptionalHeader.SizeOfHeaders = sectionRaw;
+    nt.OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress = sectionRva;
+    nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = exportSize;
+    memcpy(&img[dos.e_lfanew], &nt, sizeof nt);
+    IMAGE_SECTION_HEADER section{};
+    memcpy(section.Name, ".edata", 6);
+    section.Misc.VirtualSize = sectionSize;
+    section.VirtualAddress = sectionRva;
+    section.SizeOfRawData = sectionSize;
+    section.PointerToRawData = sectionRaw;
+    section.Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+    memcpy(&img[dos.e_lfanew + sizeof nt], &section, sizeof section);
+
+    const DWORD n = static_cast<DWORD>(exports.size());
+    const DWORD functions = 0x40, names = functions + 4 * n, ordinals = names + 4 * n, text = ordinals + 2 * n;
+    IMAGE_EXPORT_DIRECTORY dir{};
+    dir.Base = 1;
+    dir.NumberOfFunctions = n;
+    dir.NumberOfNames = n;
+    dir.AddressOfFunctions = sectionRva + functions;
+    dir.AddressOfNames = sectionRva + names;
+    dir.AddressOfNameOrdinals = sectionRva + ordinals;
+    memcpy(&img[sectionRaw], &dir, sizeof dir);
+    const DWORD code = sectionRva + codeOffset;
+    DWORD cursor = text;
+    for (DWORD i = 0; i < n; ++i) {
+        const DWORD nameRva = sectionRva + cursor;
+        const WORD ordinal = static_cast<WORD>(i);
+        memcpy(&img[sectionRaw + functions + 4 * i], &code, sizeof code);
+        memcpy(&img[sectionRaw + names + 4 * i], &nameRva, sizeof nameRva);
+        memcpy(&img[sectionRaw + ordinals + 2 * i], &ordinal, sizeof ordinal);
+        memcpy(&img[sectionRaw + cursor], exports[i].c_str(), exports[i].size() + 1);
+        cursor += static_cast<DWORD>(exports[i].size() + 1);
+    }
+    img[sectionRaw + codeOffset] = '\xC3';
+    return img;
+}
+
+// The tool's layout over a stock game, as install_edvr.py leaves it: EDVR's runtime in place, the game's own runtime in the tool's backup
+// beside it, and the receipt naming both. Each step runs over real files: survey, update, re-survey, then either flat conversion or uninstall.
+static void testToolAdoption(const std::wstring& scratch) {
+    printf("\nthe original runtime the tool backed up, over real files\n");
+    const std::wstring gameDir = joinPath(scratch, L"tool-adoption\\game");
+    const std::wstring openvr = joinPath(gameDir, L"Openvr\\win64");
+    const std::wstring backup = joinPath(openvr, L"openvr_api.dll.pre-tool-20261013-101500.bak");
+    const std::string stock = syntheticPe({"VR_InitInternal", "VR_GetGenericInterface"});
+    const std::string edvr = syntheticPe({"VR_InitInternal", "edvrConfigureNativeRuntime"});
+    const std::string graphics = syntheticPe({"edvrAcquireNativeGraphics"});
+    // probeDll reads a file's hash only from a PE image, so the loader is one, as the real Khronos loader is.
+    const std::string loader = syntheticPe({"xrGetInstanceProcAddr"});
+    const std::string license(kTestLicenseBytes, sizeof kTestLicenseBytes - 1);
+
+    PayloadInfo vr = testPayload(kNextIni);
+    vr.openvrSha = shaOfText(edvr);
+    vr.d3d11Sha = shaOfText(graphics);
+    vr.openxrLoaderSha = shaOfText(loader);
+    vr.openxrLicenseSha = shaOfText(license);
+    PayloadInfo flat = flatPayloadFor(kTestFlatIni);
+    flat.d3d11Sha = shaOfText(graphics);
+    Options flatOptions = testOptions();
+    flatOptions.scope = "flat";
+    const PayloadProvider provide = [&](const std::string& item, const void** data, size_t* size) {
+        const std::string* bytes = item == "openvr" ? &edvr : item == "d3d11" ? &graphics
+                                 : item == "openxr_loader" ? &loader : item == "openxr_license" ? &license : nullptr;
+        if (!bytes) return false;
+        *data = bytes->data();
+        *size = bytes->size();
+        return true;
+    };
+    const GameInstall game = baseSurvey(gameDir).game;
+    auto survey = [&]() {
+        Survey s = surveyTarget(game);
+        s.eliteKind = EliteExeKind::OdysseyQualified;
+        s.gameRunningHere = s.gameRunningElsewhere = s.gameRunStateUnknown = false;
+        return s;
+    };
+    // The tool's receipt for this layout; `beforeSha` is what it records for the backup.
+    auto lay = [&](const std::string& beforeSha) {
+        removeTree(gameDir);
+        makeTree(openvr);
+        writeAll(joinPath(gameDir, L"EliteDangerous64.exe"), "not really the game");
+        writeAll(joinPath(openvr, L"openvr_api.dll"), edvr);
+        writeAll(backup, stock);
+        writeAll(joinPath(gameDir, L"edvr_native_receipt.json"),
+                 "{\"version\": 2, \"kind\": \"edvr-native-openxr\", \"target\": " + jsonString(gameDir) +
+                 ", \"state\": \"installed\", \"files\": [{\"key\": \"runtime\", \"target\": " +
+                 jsonString(joinPath(openvr, L"openvr_api.dll")) + ", \"backup\": " + jsonString(backup) +
+                 ", \"before_sha256\": \"" + beforeSha + "\", \"installed_sha256\": \"" + shaOfText(edvr) +
+                 "\"}]}");
+    };
+    // The update over the tool's layout, applied: the game's original is copied to the name the GUI keeps it under.
+    auto update = [&]() {
+        const Survey s = survey();
+        const Plan plan = planInstall(s, testOptions(), vr);
+        check(!plan.blocked, "the update over the tool's layout is not blocked", unifiedProblems(plan));
+        check(applyPlan(plan, provide).ok, "the update over the tool's layout applies");
+    };
+
+    lay(shaOfText(stock));
+    {
+        const Survey s = survey();
+        check(s.toolOriginal.kind == DllKind::OpenVrRuntime && s.toolOriginal.sha256 == shaOfText(stock) &&
+              s.openvrOrigInBackups.size() == 1,
+              "the receipt, its backup's hash and the file's identity prove the original: it is adopted");
+        const Plan plan = planInstall(s, testOptions(), vr);
+        check(plan.nextState.openvrOrigSha == shaOfText(stock),
+              "the update records the adopted original's hash, so the GUI can restore it later");
+    }
+    update();
+    {   // Re-survey: the GUI finds the original where it keeps it, and flat conversion puts it back.
+        const Survey s = survey();
+        check(s.state.present && s.openvrOrig.kind == DllKind::OpenVrRuntime,
+              "after the update the original is found at the GUI's own name");
+        expectEq(readAll(joinPath(openvr, L"openvr_api_orig.dll")), stock, "and it holds the game's own bytes");
+        const Plan conversion = planInstall(s, flatOptions, flat);
+        check(!conversion.blocked, "flat conversion over the adopted original is not blocked", unifiedProblems(conversion));
+        check(hasStep(conversion, Action::Rename, L"openvr_api_orig.dll", L"openvr_api.dll"),
+              "and it renames the original back into place");
+        check(applyPlan(conversion, provide).ok, "the flat conversion applies");
+        expectEq(readAll(joinPath(openvr, L"openvr_api.dll")), stock, "the game's own openvr_api.dll is back after conversion");
+    }
+
+    lay(shaOfText(stock));   // again, for the uninstall path
+    update();
+    {
+        const Survey s = survey();
+        const Plan removal = planUninstall(s, testOptions(), vr);
+        check(!removal.blocked, "uninstall over the adopted original is not blocked", unifiedProblems(removal));
+        check(applyPlan(removal, provide).ok, "the uninstall applies");
+        expectEq(readAll(joinPath(openvr, L"openvr_api.dll")), stock, "the game's own openvr_api.dll is back after uninstall");
+    }
+
+    // A receipt whose hash is not the backup's does not vouch for it: nothing is adopted, and conversion and uninstall stay blocked.
+    lay(shaOfText("a runtime the receipt never recorded"));
+    {
+        const Survey s = survey();
+        check(s.toolOriginal.kind != DllKind::OpenVrRuntime && s.openvrOrigInBackups.empty(),
+              "a backup whose hash the receipt does not record is not adopted");
+    }
+    update();
+    {
+        const Survey s = survey();
+        const Plan conversion = planInstall(s, flatOptions, flat);
+        check(conversion.blocked && notesMention(conversion, "Cannot prove EDVR's VR runtime and the game's original"),
+              "and flat conversion is still blocked with today's message");
+        check(planUninstall(s, testOptions(), vr).blocked, "and uninstall is still blocked");
     }
 }
 
@@ -6169,6 +6341,7 @@ int wmain(int argc, wchar_t** argv) {
     testContentOwnership(scratch);
     testSharedFilesKept();
     testToolReceipts(scratch);
+    testToolAdoption(scratch);
     testFlatSettingsPlanner();
     testApply(scratch);
     testMirror(scratch);

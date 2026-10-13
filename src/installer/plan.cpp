@@ -286,6 +286,34 @@ bool startupConfigOwned(const Survey& s) {
 // The note for a file whose bytes are EDVR's but which nothing shows EDVR placed: another mod's identical copy looks exactly like this.
 const char* kMatchesNoProof = "matches EDVR's copy but nothing shows EDVR placed it; left alone";
 
+// The game's original runtime that the tool kept when it installed over it: the native receipt's runtime entry, whose backup sits beside
+// the runtime. It is adopted only when every proof holds: the receipt names this folder (readToolReceipts), the entry is this folder's
+// openvr_api.dll, the backup is in the same Openvr folder, its hash is the one the receipt recorded, and probeDll reads it as a genuine
+// OpenVR runtime (not EDVR's). Anything else adopts nothing and stays rejected, as before.
+void adoptToolOriginal(Survey& s) {
+    const std::wstring runtimePath = joinPath(s.game.openvrDir, kOpenvr);
+    auto folderOf = [](const std::wstring& path) {
+        const size_t slash = path.find_last_of(L"\\/");
+        return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
+    };
+    for (const ToolReceipt& receipt : s.toolReceipts) {
+        if (!receipt.native) continue;
+        const ToolReceiptFile* runtime = nullptr;
+        for (const ToolReceiptFile& file : receipt.files) {
+            if (file.key == "runtime" || file.key == "native") { runtime = &file; break; }
+        }
+        if (!runtime || runtime->backup.empty() || runtime->beforeSha.empty()) return;
+        if (_wcsicmp(runtime->target.c_str(), runtimePath.c_str()) != 0) return;
+        if (_wcsicmp(folderOf(runtime->backup).c_str(), s.game.openvrDir.c_str()) != 0) return;
+        if (!fileExists(runtime->backup) || !sameSha(sha256File(runtime->backup), runtime->beforeSha)) return;
+        const DllInfo copy = probeDll(runtime->backup);
+        if (copy.kind != DllKind::OpenVrRuntime) return;
+        s.toolOriginal = copy;
+        s.openvrOrigInBackups.insert(s.openvrOrigInBackups.begin(), runtime->backup);
+        return;
+    }
+}
+
 }  // namespace
 
 // The descriptor on disk is what the DLL reads, so a canonical one names the scope and the record is only the fallback. A record
@@ -423,6 +451,8 @@ Survey surveyTarget(const GameInstall& game) {
             if (info.kind == DllKind::OpenVrRuntime) s.openvrOrigInBackups.push_back(candidate);
         }
     }
+    // The tool's backup of the original is adopted last and placed first: its receipt names exactly which runtime it replaced.
+    if (s.haveOpenvrDir) adoptToolOriginal(s);
     return s;
 }
 
@@ -874,6 +904,17 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     const DllInfo& saved=s.openvrOrig;
     next.openvrOrigName=originalName;
     next.openvrOrigSha=saved.kind==DllKind::OpenVrRuntime?saved.sha256:std::string();
+    // The tool kept the game's original under its own name. Copy it to the name this installer keeps it under, so the record and the
+    // next survey find it as any other original, and a later flat conversion or uninstall can restore it. The tool's backup stays put.
+    // Not when the game's own runtime is in place: that one is renamed to the original name below, as it always was.
+    if(saved.kind==DllKind::Absent && current.kind!=DllKind::OpenVrRuntime && s.toolOriginal.kind==DllKind::OpenVrRuntime) {
+        Step adopt;adopt.action=Action::Backup;adopt.from=s.toolOriginal.path;adopt.to=original;
+        adopt.expectSha=s.toolOriginal.sha256;adopt.required=true;
+        adopt.why="keeps the game's original VR library, from the backup the tool made, where EDVR can restore it";
+        body.push_back(adopt);changed=true;
+        next.openvrOrigSha=s.toolOriginal.sha256;
+        plan.notes.push_back("Adopting the game's original VR library from the backup the tool made, so it can be restored later.");
+    }
     if(current.kind==DllKind::Edvr && current.sha256==p.openvrSha && !o.repair) {
         plan.notes.push_back("Native OpenXR runtime is already this build -- left alone.");
     } else {

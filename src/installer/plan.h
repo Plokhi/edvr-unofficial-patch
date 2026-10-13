@@ -119,6 +119,9 @@ struct Survey {
     // The tool's receipts for this folder (state.h readToolReceipts). They are provenance for the files they list: a file the tool placed
     // is EDVR's, by its hash, whether or not the installer's own record lists it.
     std::vector<ToolReceipt> toolReceipts;
+    // The game's original runtime the tool kept beside EDVR's, when the tool's receipt and the file itself prove it (adoptToolOriginal in
+    // plan.cpp). Its kind is Absent when nothing is adopted; it is also first in openvrOrigInBackups when it is.
+    DllInfo toolOriginal;
 
     InstallState state;
     // Which Elite Dangerous the folder's executable is; the gate refuses
