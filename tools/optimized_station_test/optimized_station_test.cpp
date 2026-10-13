@@ -843,6 +843,140 @@ int main(int argc, char** argv) {
     }
 
 
+    // ---- Restored (test-only, 2026-10-13): retained behaviour whose tests the v14.23 prune removed, rewritten against the current APIs --------------
+    {
+        // v14.9, the absent-pad hold: a pad absent for a few frames keeps the trigger's request; a longer absence clears it.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        check(se::sealStep(inHangar(0), &st, &w) == se::SealAction::kRequestEngage, "v14.9 hold: the setup request");
+        se::SealInputs held = inHangar(100);
+        held.pickOk = false;
+        held.padHeld = true;
+        check(se::sealStep(held, &st, &w) == se::SealAction::kNone && st.requested,
+              "v14.9 hold: a pad absent for fewer than kHeldLostFrames keeps the request (no release, no new request)");
+        held.nowMs = 200;
+        check(se::sealStep(held, &st, &w) == se::SealAction::kNone && st.requested, "v14.9 hold: the same short absence again keeps it");
+        se::SealInputs lost = inHangar(300);
+        lost.pickOk = false;
+        lost.padHeld = false;
+        check(se::sealStep(lost, &st, &w) == se::SealAction::kNone && !st.requested, "v14.9 hold: a pad absent past the hold clears the request");
+        check(!se::heldCellDrops(29, 0, se::kHeldLostFrames) && se::heldCellDrops(30, 0, se::kHeldLostFrames),
+              "v14.9 hold: the held cell drops at kHeldLostFrames (30) absent frames, and not before");
+    }
+    {
+        // The hangar change releases a held seal, with its own reason (the ship swap and the held pad gone both come here).
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::SealInputs in = inHangar(0);
+        se::sealStep(in, &st, &w);
+        in.held = true;
+        in.hangarChanged = true;
+        in.nowMs = 100;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kHangarChanged,
+              "hangar change: a held seal is released by the hangar change");
+    }
+    {
+        // The pad moved against the shell (ShellMotion) releases a held seal; the next seal needs the r1 0 then 1 edge.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::SealInputs in = inHangar(0);
+        se::sealStep(in, &st, &w);
+        in.held = true;
+        in.padMoved = true;
+        in.nowMs = 100;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kPadMoved, "pad moved: a held seal is released by the pad moving");
+        in.held = false;
+        in.padMoved = false;
+        uint64_t early = 0;
+        for (uint64_t t = 200; t <= 2000; t += 100) {
+            in.nowMs = t;
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && early == 0) early = t;
+        }
+        check(early == 0, "pad moved: with r1 still 1, the pad's move does not re-seal until the r1 edge (2 s)");
+    }
+    {
+        // The mechanism latch (v14.14-16): a latched record that moves on two compared frames in a row is the launch; one move is not; a source change
+        // re-bases without counting; the own pad is index 0 and counts the same way.
+        se::LatchSet ls;
+        ls.n = 1;
+        ls.latched = true;
+        const float r0[3] = {0.0f, 0.0f, 0.0f};
+        const float r1[3] = {0.0f, 0.0f, 0.5f};
+        const float r2[3] = {0.0f, 0.0f, 1.0f};
+        const float a0[3] = {1.0f, 0.0f, 0.0f};
+        const float a2[3] = {0.0f, 0.0f, 1.0f};
+        ls.recs[0].step(1, r0, a0, a2, 1, 2, 100);
+        ls.recs[0].step(2, r1, a0, a2, 1, 2, 200);
+        check(ls.movedIndex() == -1, "latch: one compared move is not a release");
+        ls.recs[0].step(3, r2, a0, a2, 1, 2, 300);
+        check(ls.movedIndex() == 0, "latch: a record that moves on two compared frames in a row is the launch (the own pad is index 0)");
+        ls.recs[0].step(4, r2, a0, a2, 1, 2, 400);
+        check(ls.movedIndex() == -1, "latch: a still frame ends the run");
+        ls.recs[0].step(5, r0, a0, a2, 3, 2, 500);   // another centre source: a re-base, never a move
+        check(ls.movedIndex() == -1 && ls.recs[0].movedRun == 0, "latch: a change of centre source re-bases without counting as a move");
+        // The identity (review 2): a shell replacement is a genuine change too.
+        se::LatchIdentity id;
+        id.bind(0xA0, 0x5000);
+        check(id.step(true, 0xA0, true, 0x6000) && id.shell == 0x6000, "latch identity: a shell replacement is a change (rebuild the latch)");
+    }
+    {
+        // The camera (v14.7): out for kCameraFrames frames releases the seal (the 10th frame); back inside it re-seals after kCameraFrames
+        // frames inside the bay, with no in-hangar edge (r1 stayed 1).
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::SealInputs in = inHangar(0);
+        se::sealStep(in, &st, &w);
+        in.held = true;
+        in.cameraOutside = true;
+        int outTicks = 0;
+        for (int k = 1; k <= 12 && outTicks == 0; ++k) {
+            in.nowMs = 100 * static_cast<uint64_t>(k);
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kCameraLeft) outTicks = k;
+        }
+        check(outTicks == 10, "camera: out of the box for kCameraFrames (10) frames releases the seal, on the 10th frame");
+        in.held = false;
+        in.cameraOutside = false;
+        in.cameraInBox = false;
+        in.nowMs = 2000;
+        se::sealStep(in, &st, &w);
+        int inTicks = 0;
+        for (int k = 1; k <= 12 && inTicks == 0; ++k) {
+            in.cameraInBox = true;
+            in.nowMs = 2000 + 100 * static_cast<uint64_t>(k);
+            if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage) inTicks = k;
+        }
+        check(inTicks == 10, "camera: back inside the bay the re-seal waits kCameraFrames (10) frames, and needs no in-hangar edge");
+    }
+    {
+        // Review 1: a request whose pad or shell changed before its box was valid is never admitted to freeze a cell.
+        se::SealState st;
+        st.requested = true;
+        st.camInRun = se::kCameraFrames;
+        const se::EngageRequest r{true, 0x1000, 0x5000};
+        check(!se::engageAdmitted(r, st, 0x1000, 0x5000, false), "review 1: an invalid box at the request does not freeze a cell");
+        check(!se::engageAdmitted(r, st, 0x1000, 0x6000, true), "review 1: the shell replaced before the box was valid: no freeze");
+        check(!se::engageAdmitted(r, st, 0x2000, 0x5000, true), "review 1: the pad replaced before the box was valid: no freeze");
+        check(se::engageAdmitted(r, st, 0x1000, 0x5000, true), "review 1: control: the same pad and shell with a valid box freeze the cell");
+    }
+    {
+        // Store mode (v14.1): the store observer does nothing with the setting off or undocked and unsealed; gathers while docked and unsealed; judges
+        // while sealed. The promote is due when the frame stamp has moved on.
+        check(se::storeMode(false, false, true) == se::StoreMode::kNone && se::storeMode(true, false, false) == se::StoreMode::kNone,
+              "v14.1 store: setting off, or undocked and unsealed, the store observer does nothing");
+        check(se::storeMode(true, false, true) == se::StoreMode::kGather, "v14.1 store: docked and unsealed, the observer gathers (no judgement)");
+        check(se::storeMode(true, true, false) == se::StoreMode::kJudge && se::storeMode(true, true, true) == se::StoreMode::kJudge,
+              "v14.1 store: sealed, the observer judges, docked or not");
+        check(se::framePromoteDue(3, 4) && !se::framePromoteDue(4, 4),
+              "v14.2 promote: the frame's cell is promoted once per frame stamp (due when the stamp moved on)");
+    }
+    {
+        // v14.1: a pad that was not gathered (no pick) never requests the seal, however docked; the pad in the hangar with a pick does.
+        se::SealState st;
+        se::SealInputs noPick = inHangar(0);
+        noPick.pickOk = false;
+        check(firstEngage(&st, noPick, 0, 20000) == 0, "v14.1: no pad gathered (pickOk false): the seal is never requested");
+    }
+
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
