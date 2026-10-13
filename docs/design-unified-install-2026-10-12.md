@@ -52,9 +52,11 @@
     down; 3D on came back 1280x768 windowed and the game saved it.
 - **Ruled out while designing:** section 9.
 - **Temporary keys:** none. No user-facing key is added.
-- **Next:** a flight of the fixed build on Steam: `/vr` launch, 3D off and
-  on (the window keeps its mode; one switch line). Then a launch with
-  neither switch, if the launcher can make one (H1).
+- **Phase 2 BUILT, NOT FLOWN:** 190a2a12 `Config::switchProfile`; 113f1eca
+  hooks installed for the scope, gated per call; 0077832a switch entry
+  points; e1262071 the live switch at the frame boundary. No switch rig yet.
+- **Next:** the phase-2 flight on Steam (`/vr` launch, 3D off and on: two
+  switch lines, flat fixes after off, sharp UI after on); then the rig.
 
 ## 1. What exists today
 
