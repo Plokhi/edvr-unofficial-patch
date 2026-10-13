@@ -1703,7 +1703,8 @@ void optimizedStationFrame(uint32_t frame) {
     {
         // Built v14.17: the dock's arrival is read before the setting gate, so a toggle while undocked never misses the undock (DockWatch).
         std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
-        g_dock.step(journalDockedKnown(), journalDocked(), journalLoadGames(), journalUndocks());
+        // Built v14.21: an undocked reading counts for the arrival only in a vehicle (Flags bits 24-26): never the menu or the load.
+        g_dock.step(journalDockedKnown(), journalDocked(), journalLoadGames(), journalUndocks(), journalVehicleKnown() && journalVehicle());
     }
     if (++g_settingPoll >= kSettingPollFrames) {
         g_settingPoll = 0;

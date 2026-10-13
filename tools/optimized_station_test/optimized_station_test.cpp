@@ -1292,17 +1292,17 @@ int main(int argc, char** argv) {
         check(!startsDocked.arrived, "v14.17 dock: a session whose first reading is docked is not an arrival (the load-in rule stays)");
         se::DockWatch unknownFirst;
         unknownFirst.step(false, true);
-        unknownFirst.step(true, false);
+        unknownFirst.step(true, false, 0, 0, true);   // an undocked reading in a vehicle (Flags 24-26)
         unknownFirst.step(true, true);
         check(unknownFirst.arrived, "v14.17 dock: an unknown reading is no reading; an undock then a dock is an arrival");
         se::DockWatch arr;
-        arr.step(true, false);
+        arr.step(true, false, 0, 0, true);
         arr.step(true, true);
         check(arr.arrived, "v14.17 dock: a docked reading after an undocked one is an arrival in flight");
         arr.sealedThisDock = true;
         arr.step(true, true);
         check(arr.sealedThisDock, "v14.17 dock: a repeated docked reading is no new dock (its seal state stands)");
-        arr.step(true, false);
+        arr.step(true, false, 0, 0, true);
         arr.step(true, true);
         check(arr.arrived && !arr.sealedThisDock, "v14.17 dock: each new dock resets its seal state and is an arrival again");
 
@@ -1450,6 +1450,24 @@ int main(int argc, char** argv) {
             undo.step(true, false, 1, 1);
             undo.step(true, true, 1, 1);
             check(undo.arrived, "v14.19 load: a journal Undocked after the load, then a dock, is an arrival");
+
+            // v14.21: a load reads Status undocked with Flags 0 (no vehicle) before the hangar docks: that is no undock; the load-in seals at once.
+            se::DockWatch loadFlags0;
+            loadFlags0.step(true, false, 0, 0, false);   // the menu: Flags 0, undocked
+            loadFlags0.step(false, false, 1, 0);         // LoadGame
+            loadFlags0.step(true, false, 1, 0, false);   // the load: Flags 0, undocked (not in a vehicle)
+            loadFlags0.step(true, true, 1, 0, false);    // docked
+            se::SealState stF0;
+            se::SealInputs f0In = quiet(0);
+            f0In.arrived = loadFlags0.arrived;
+            check(!loadFlags0.arrived && firstEngage(&stF0, f0In, 100, 10000) == 100 && stF0.immediate,
+                  "v14.21 load: LoadGame, then a Flags 0 undocked reading, then docked: a load-in, sealed immediately (100 ms)");
+            // v14.21: an undocked reading with InMainShip set is a real undock: the dock that follows is an arrival.
+            se::DockWatch loadShip;
+            loadShip.step(false, false, 1, 0);           // LoadGame
+            loadShip.step(true, false, 1, 0, true);      // undocked, InMainShip (Flags bit 24) set
+            loadShip.step(true, true, 1, 0, false);      // docked
+            check(loadShip.arrived, "v14.21 load: LoadGame, then an undocked reading with InMainShip set, then docked: an arrival");
 
             // A dock reference: the pad at the outpost surface, lowered against the shell (rel -53.5, lateral 68.9), still. The reference is its first
             // reading; no descent is observed while it stays, so the dock never seals (no load-in path, no settled path, no 30 s fallback).

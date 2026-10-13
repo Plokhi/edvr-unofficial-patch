@@ -151,6 +151,9 @@ constexpr bool journalSeatedFromFlags(uint32_t flags, uint32_t flags2) {
 }
 bool journalSeatedKnown();
 bool journalSeated();
+// Built v14.21 (optimized station): Status.json Flags bits 24-26 alone (in a main ship, a fighter or an SRV). Flags 0 (menu, loading) is not in a vehicle.
+bool journalVehicleKnown();
+bool journalVehicle();
 
 // How many Status.json samples have been read: lets a caller require a sample
 // taken AFTER some event, since the previous one can be a second stale.

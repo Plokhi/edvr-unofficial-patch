@@ -1093,7 +1093,9 @@ struct DockWatch {
     // One tick. known: the Status reading exists. loads and undocks: the journal's LoadGame and Undocked counts (journalLoadGames, journalUndocks).
     // Built v14.19: a load is never an arrival. A LoadGame clears sawUndocked (the menu's undocked reading is no undock of this session) and the
     // arrival; an undocked Status reading or a journal Undocked after it sets sawUndocked again. The arrival stays the docked rising edge.
-    void step(bool known, bool docked, uint32_t loads = 0, uint32_t undocks = 0) noexcept {
+    // Built v14.21: an undocked Status reading counts only when Flags show the player in a vehicle (inVehicle: bits 24-26). Flags 0 (the menu and
+    // the load, where Status reads undocked) never counts, so a load-in is never an arrival.
+    void step(bool known, bool docked, uint32_t loads = 0, uint32_t undocks = 0, bool inVehicle = false) noexcept {
         if (loads != lastLoads) {
             lastLoads = loads;
             sawUndocked = false;
@@ -1104,7 +1106,7 @@ struct DockWatch {
             sawUndocked = true;
         }
         if (!known) return;
-        if (!docked) sawUndocked = true;
+        if (!docked && inVehicle) sawUndocked = true;   // built v14.21: an undocked reading in a vehicle only
         if (haveFlag && docked == prevDocked) return;
         if (haveFlag) {
             sealedThisDock = false;

@@ -115,6 +115,9 @@ struct Published {
     // not in a ship or SRV". Known whenever Flags is in the file.
     bool     seatedKnown = false;
     bool     seated = false;
+    // Built v14.21: Status.json Flags bits 24-26 only (InMainShip, InFighter, InSRV), the in-vehicle half of the seat test without Flags2.
+    bool     vehicleKnown = false;
+    bool     vehicle = false;
     // GuiFocus from Status.json: 9 is the Full System Scanner. The game
     // states the MODE outright -- entry and exit by any path (keybind,
     // ESC, an interdiction yanking the player out of supercruise) all
@@ -145,6 +148,8 @@ struct Visible {
     std::atomic<bool>     docked{false};
     std::atomic<bool>     seatedKnown{false};
     std::atomic<bool>     seated{false};
+    std::atomic<bool>     vehicleKnown{false};
+    std::atomic<bool>     vehicle{false};
     std::atomic<bool>     fssFocusKnown{false};
     std::atomic<bool>     fssFocus{false};
     std::atomic<uint32_t> guiFocus{0};
@@ -175,6 +180,8 @@ void applyPublished(const Published& p) {
     g_v.docked.store(p.docked, kRelaxed);
     g_v.seatedKnown.store(p.seatedKnown, kRelaxed);
     g_v.seated.store(p.seated, kRelaxed);
+    g_v.vehicleKnown.store(p.vehicleKnown, kRelaxed);
+    g_v.vehicle.store(p.vehicle, kRelaxed);
     g_v.fssFocusKnown.store(p.fssFocusKnown, kRelaxed);
     g_v.fssFocus.store(p.fssFocus, kRelaxed);
     g_v.guiFocus.store(p.guiFocus, kRelaxed);
@@ -451,6 +458,9 @@ void pollStatus(Session& s) {
         // as zero here; the pair is only consulted with onFootKnown too.
         s.pub.seatedKnown = sawFlags;
         s.pub.seated = sawFlags && journalSeatedFromFlags(flags, sawFlags2 ? flags2 : 0u);
+        // Built v14.21: the in-vehicle bits of Flags alone (the station's undock rule); the menu and the load read Flags 0 and are not in a vehicle.
+        s.pub.vehicleKnown = sawFlags;
+        s.pub.vehicle = sawFlags && (flags & kStatusFlagsSeated) != 0;
         // Bit 30 of Flags: the FSD jump itself -- the tunnel, not the
         // countdown before it. The distinction is what scopes the witchspace
         // star fix off the forming-wormhole phase, where the game still
@@ -485,6 +495,7 @@ void pollStatus(Session& s) {
         s.pub.onFootKnown = false;
         s.pub.dockedKnown = false;
         s.pub.seatedKnown = false;
+        s.pub.vehicleKnown = false;
         s.pub.fsdJumpKnown = false;
         s.pub.fssFocusKnown = false;
         s.pub.fssFocus = false;
@@ -1024,6 +1035,8 @@ bool journalDockedKnown() { return journalWatchActive() && peek(g_v.dockedKnown)
 bool journalDocked() { return !runtimeFlatProfile() && peek(g_v.docked); }
 bool journalSeatedKnown() { return journalWatchActive() && peek(g_v.seatedKnown); }
 bool journalSeated() { return !runtimeFlatProfile() && peek(g_v.seated); }
+bool journalVehicleKnown() { return journalWatchActive() && peek(g_v.vehicleKnown); }
+bool journalVehicle() { return !runtimeFlatProfile() && peek(g_v.vehicle); }
 uint32_t journalStatusSamples() { return runtimeFlatProfile() ? 0u : peek(g_v.statusSamples); }
 
 JournalRawStatus journalRawStatus() {
