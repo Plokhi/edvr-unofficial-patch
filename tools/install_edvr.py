@@ -59,10 +59,10 @@ spelling of --scope and still works, with a deprecation line.
 backups, no directories. The self-test asserts that, because a --dry-run
 that wrote files is a bug this project has already shipped once.
 
-The flat XeSS DLL and its notices are optional in this developer tool:
---xess includes them explicitly, and --all includes them when built. A plain
---verify-only also verifies XeSS runtime/notices when the effective flat ini
-selects xess; other modes need only the core profile.
+The XeSS-SR DLL and its notices are optional in this developer tool, for every
+scope: --xess includes them explicitly, and --all includes them when built. A
+plain --verify-only also verifies them when the scope's effective ini selects
+xess; other modes need only the core profile.
 
 Exit 0 when everything asked for landed and verified, 1 otherwise.
 """
@@ -1248,10 +1248,17 @@ def _ini_pairs(root, target, scope):
     return pairs
 
 
-def _flat_selects_xess(target):
-    """Read the flat profile's effective temporal mode, including its ini fallback."""
-    ini = _ini_target(target, "flat")
-    if not os.path.isfile(ini):
+def _selects_xess(target, scope):
+    """Whether the settings a scope's game reads select XeSS-SR. The flat half
+    reads edvr-flat.ini and falls back to edvr.ini; the VR half reads edvr.ini."""
+    halves = {"both": ("vr", "flat"), "vr": ("vr",), "flat": ("flat",)}[scope]
+    return any(_ini_selects_xess(target, half) for half in halves)
+
+
+def _ini_selects_xess(target, half):
+    """Read one half's effective temporal mode, including the flat half's ini fallback."""
+    ini = _ini_target(target, half)
+    if half == "flat" and not os.path.isfile(ini):
         ini = os.path.join(target, "edvr.ini")
     if not os.path.isfile(ini):
         return False
@@ -1305,9 +1312,7 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
         errors.append("missing optional DLSS source %s" % os.path.join(root, "build", "nvngx_dlss.dll"))
     xess_names = (("xess", "libxess.dll"), ("xess_license", "INTEL-XESS-LICENSE.txt"),
                   ("xess_third_party", "INTEL-XESS-THIRD-PARTY.txt"))
-    # XeSS is the flat half's upscaler, so it goes in with any scope that includes flat.
-    if include_xess and scope == "vr":
-        raise SystemExit("[edvr] --xess applies to a scope with the flat half (both or flat)")
+    # XeSS-SR ships with every scope: the flat half and the VR half both select it.
     if include_xess:
         for key, name in xess_names:
             if not os.path.isfile(os.path.join(root, "build", name)):
@@ -1379,7 +1384,7 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
                 src = os.path.join(root, "build", name); dst = os.path.join(target, name)
                 if not os.path.isfile(dst) or sha256(dst) != sha256(src):
                     print("[edvr] %s verify mismatch: %s" % (scope, dst)); ok = False
-        elif scope in ("both", "flat") and _flat_selects_xess(target):
+        elif _selects_xess(target, scope):
             # A plain install intentionally preserves a foreign optional DLL.
             # A selected XeSS mode must never be reported as fully verified
             # unless the runtime and its notices match this build.
@@ -1388,7 +1393,7 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
                        not os.path.isfile(os.path.join(target, name)) or
                        sha256(os.path.join(root, "build", name)) != sha256(os.path.join(target, name))]
             if missing:
-                print("[edvr] WARNING: flat ini selects XeSS but its runtime/notices are not verified "
+                print("[edvr] WARNING: the ini selects XeSS but its runtime/notices are not verified "
                       "(%s); install with --xess" % ", ".join(missing))
                 ok = False
         if include_ini:
@@ -1818,6 +1823,31 @@ def _scope_self_test():
         before = tree(g)
         code, _ = run(args_for(g, "--profile", "vr", "--scope", "vr", tag="alias"))
         check(code == "refused" and tree(g) == before, "--profile with --scope was accepted")
+
+        # XeSS-SR for the VR scope: --xess installs the three files beside the
+        # game (a dry run writes nothing), and verify flags a VR ini that selects
+        # xess while its runtime is missing.
+        for name, data in (("libxess.dll", b"XESS-RUNTIME"),
+                           ("INTEL-XESS-LICENSE.txt", b"XESS-LICENSE"),
+                           ("INTEL-XESS-THIRD-PARTY.txt", b"XESS-NOTICES")):
+            Path(root, "build", name).write_bytes(data)
+        g = game("vr-xess")
+        before = tree(g)
+        code, _ = run(args_for(g, "--scope", "vr", "--xess", "--dry-run", tag="vrxess"))
+        check(code == 0 and tree(g) == before, "--scope vr --xess --dry-run wrote files or directories")
+        code, text = run(args_for(g, "--scope", "vr", "--xess", tag="vrxess"))
+        check(code == 0, "--scope vr --xess failed: %r" % text)
+        check(Path(g, "libxess.dll").read_bytes() == b"XESS-RUNTIME" and
+              Path(g, "INTEL-XESS-LICENSE.txt").read_bytes() == b"XESS-LICENSE" and
+              Path(g, "INTEL-XESS-THIRD-PARTY.txt").read_bytes() == b"XESS-NOTICES",
+              "--scope vr --xess did not install the three XeSS files")
+        Path(g, "edvr.ini").write_bytes(b"[fix]\ntemporal_aa = xess\n")
+        code, _ = run(args_for(g, "--scope", "vr", "--verify-only", tag="vrxess"))
+        check(code == 0, "--scope vr verify rejected a selected XeSS with its files verified")
+        Path(g, "libxess.dll").unlink()
+        code, text = run(args_for(g, "--scope", "vr", "--verify-only", tag="vrxess"))
+        check(code == 1 and "ini selects XeSS" in text,
+              "--scope vr verify did not warn for a VR ini selecting XeSS without its runtime")
     finally:
         (globals()["validate_elite_game"], globals()["strict_game_running"],
          _scope_pe.validate_native_pair, _scope_loader.verify, _scope_pe.Image, _scope_pe._exports) = saved
@@ -1845,13 +1875,13 @@ def main(argv=None):
     ap.add_argument("--dlss", action="store_true",
                     help="also install build/nvngx_dlss.dll")
     ap.add_argument("--xess", action="store_true",
-                    help="also install the XeSS runtime and notices for --profile flat")
+                    help="also install the XeSS-SR runtime and its notices (either scope)")
     ap.add_argument("--ini", action="store_true",
                     help="also overwrite the scope's settings files (edvr.ini "
                          "for both and vr, edvr-flat.ini for both and flat) "
                          "with their templates -- this discards tuned settings")
     ap.add_argument("--all", action="store_true",
-                    help="selected scope plus available DLSS and, when the scope includes flat, XeSS (never ini)")
+                    help="selected scope plus available DLSS and XeSS (never ini)")
     ap.add_argument("--native-openxr", action="store_true",
                      help="stage the experimental native OpenXR DLL and its "
                          "paired native graphics DLL as d3d11.dll (requires --dll, plus a receipt "
@@ -1980,8 +2010,6 @@ def main(argv=None):
         ap.error("normal native installation requires a stopped game and transactional backups")
     if scope == "flat" and (args.dll or args.openvr):
         ap.error("--scope flat cannot be combined with --dll or --openvr")
-    if args.xess and scope == "vr":
-        ap.error("--xess requires a scope with the flat half (--scope both or flat)")
     if args.dlss and not os.path.isfile(dlss_source):
         ap.error("--dlss requested but build/nvngx_dlss.dll is missing")
     xess_source = os.path.join(root, "build", "libxess.dll")
@@ -1990,7 +2018,7 @@ def main(argv=None):
     return standard_native_install(root, target, tag, args.dry_run,
                                    args.verify_only,
                                    include_dlss=(args.dlss or (args.all and os.path.isfile(dlss_source))),
-                                   include_xess=(args.xess or (args.all and scope in ("both", "flat") and os.path.isfile(xess_source))),
+                                   include_xess=(args.xess or (args.all and os.path.isfile(xess_source))),
                                    include_ini=args.ini, scope=scope,
                                    keep_backups=args.keep_backups)
 

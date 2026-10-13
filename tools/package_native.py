@@ -71,7 +71,7 @@ def _files(root, no_dlss, profile="vr"):
     if not no_dlss or (build / "nvngx_dlss.dll").is_file():
         result.append((build / "nvngx_dlss.dll", "nvngx_dlss.dll"))
         result.append((build / "NVIDIA-DLSS-LICENSE.txt", "NVIDIA-DLSS-LICENSE.txt"))
-    if profile == "flat" and (build / "libxess.dll").is_file():
+    if (build / "libxess.dll").is_file():
         result.extend(((build / "libxess.dll", "libxess.dll"),
                        (build / "INTEL-XESS-LICENSE.txt", "INTEL-XESS-LICENSE.txt"),
                        (build / "INTEL-XESS-THIRD-PARTY.txt", "INTEL-XESS-THIRD-PARTY.txt")))

@@ -2092,6 +2092,21 @@ static void testXessPlanner() {
         check(plan.blocked && plan.steps.empty() && notesMention(plan, "license notices"),
               "XeSS payload missing a license notice is rejected");
     }
+    {   // The VR edition carries the same three files: its edvr.ini selects XeSS-SR too.
+        PayloadInfo vr = testPayload(kNextIni);
+        vr.haveXess = true;
+        vr.xessSha = "xess-runtime-new";
+        vr.xessLicenseSha = "xess-license-new";
+        vr.xessThirdPartySha = "xess-third-party-new";
+        const Plan plan = planInstall(baseSurvey(dir), options, vr);
+        check(!plan.blocked && hasStep(plan, Action::WritePayload, nullptr, L"libxess.dll") &&
+              hasStep(plan, Action::WritePayload, nullptr, L"INTEL-XESS-LICENSE.txt") &&
+              hasStep(plan, Action::WritePayload, nullptr, L"INTEL-XESS-THIRD-PARTY.txt"),
+              "a VR install carries libxess.dll and both license notices");
+        check(plan.nextState.xessSha == vr.xessSha && plan.nextState.xessLicenseSha == vr.xessLicenseSha &&
+              plan.nextState.xessThirdPartySha == vr.xessThirdPartySha,
+              "a VR install records the XeSS files it placed");
+    }
 }
 
 static void testFlatSettingsPlanner() {

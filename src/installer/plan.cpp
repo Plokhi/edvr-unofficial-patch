@@ -328,7 +328,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     next.profile = p.profile;
     next.descriptorSha = p.descriptorSha;
     next.components = flat ? "graphics,profile,ini,ngx-optional,xess-optional" :
-        "graphics,profile,ini,openvr,openxr-loader,openxr-license,openxr-config,ngx-optional";
+        "graphics,profile,ini,openvr,openxr-loader,openxr-license,openxr-config,ngx-optional,xess-optional";
     next.openvrDir = flat ? std::wstring() : relativeOpenvr(s.game.dir, nativeDir);
     next.nativeInstalled=!flat;
 
@@ -584,9 +584,10 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
             "is left where it is.");
     }
 
-    // XeSS-SR belongs only to the flat edition. Preserve foreign or changed
-    // files; replacement and uninstall are limited to hashes EDVR recorded.
-    if (flat && p.haveXess) {
+    // XeSS-SR ships with both editions, and is present only when the build
+    // carried it. Preserve foreign or changed files; replacement and uninstall
+    // are limited to hashes EDVR recorded.
+    if (p.haveXess) {
         if (p.xessLicenseSha.empty() || p.xessThirdPartySha.empty()) {
             plan.blocked = true;
             plan.problems.push_back("XeSS runtime lacks its license notices; nothing will be installed.");

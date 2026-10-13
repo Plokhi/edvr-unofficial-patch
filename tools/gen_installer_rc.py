@@ -332,7 +332,7 @@ def main(argv=None):
         print('  A manifest Windows cannot parse is an installer that cannot start.')
         return 1
 
-    if args.profile == 'flat' and os.path.exists(xess) and (
+    if os.path.exists(xess) and (
             not os.path.isfile(xess_license) or not os.path.isfile(xess_third_party)):
         print('gen_installer_rc: ERROR: XeSS runtime lacks license notices')
         return 1
@@ -399,7 +399,8 @@ def main(argv=None):
     else:
         lines.append('// no nvngx_dlss.dll in the build (no DLSS SDK): this installer ships without')
         lines.append("// NVIDIA's optional anti-aliasing runtime.")
-    if args.profile == 'flat' and os.path.exists(xess):
+    # XeSS-SR ships with both editions: the VR profile's edvr.ini selects it too.
+    if os.path.exists(xess):
         lines += ['%d RCDATA "%s"' % (IDR_XESS, rc_path(xess)),
                   '%d RCDATA "%s"' % (IDR_XESS_LICENSE, rc_path(xess_license)),
                   '%d RCDATA "%s"' % (IDR_XESS_THIRD_PARTY, rc_path(xess_third_party))]
@@ -492,6 +493,15 @@ def self_test():
             assert b'XeSS-SR needs libxess.dll' in readme
             with open(os.path.join(out, 'payload.rc'), encoding='utf-8') as stream:
                 assert 'graphics, edvr-flat.ini and flat profile descriptor' in stream.read()
+            # The VR installer carries the same XeSS files: its edvr.ini selects XeSS-SR too.
+            with open(os.path.join(build, 'edvr_openxr_runtime.dll'), 'wb') as stream: stream.write(b'x')
+            assert main(['--root', root, '--build', build, '--out', out,
+                         '--version', '1.2.3']) == 0
+            with open(os.path.join(out, 'payload.rc'), encoding='utf-8') as stream:
+                rc_text = stream.read()
+            assert all('%d RCDATA ' % resource_id in rc_text for resource_id in
+                       (IDR_XESS, IDR_XESS_LICENSE, IDR_XESS_THIRD_PARTY))
+            assert 'Intel XeSS-SR runtime and notices' in rc_text
         finally:
             openxr_pe.native_graphics_exports, openxr_pe.native_exports = old_g, old_r
             fetch_openxr_loader.verify = old_v
