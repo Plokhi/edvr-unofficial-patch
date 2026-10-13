@@ -506,4 +506,12 @@ launches. The phase-1 build switches to Passthrough rather than live.
   18:16:06.1, submits stopped 18:16:07.1), Passthrough. 3D on kept the window at 3840x2160 borderless (7b0358b4 works). After 3D
   on the UI was not sharp: Passthrough is a PARTIAL stand-down. Per-call gates stop the upscaler, but the UI layer still built a
   composite output at 2016x2017 (render size, not the 4032x4034 output) at 18:16:21. Phase 2's teardown must release the VR UI
-  layers at a switch (3.3's table, `releaseLayers`), and a stand-down must not leave half a pipeline running.
+  layers at a switch (3.3's table, `releaseLayers`), and a stand-down must not leave half a pipeline running.- F, 20:18 (`/steam /vr`, file 4, build 44161114, phase 2): the first live switches. 3D off posted flat at 20:19:23.815;
+  `profile switch: vr -> flat (... settings edvr-flat.ini; kept until restart: advanced.texture_anisotropy, advanced.texture_lod_bias,
+  fix.vscreen_res_width ...)` 19 ms later; the flat F8 panel configured and used. 3D on posted vr at 20:20:12.902;
+  `profile switch: flat -> vr (... settings edvr.ini; kept until restart: none)`; the VR menu opened at 20:20:18; Sean: menus sharp
+  in VR after 3D on. VRAM 6544 -> 7202 -> 7724 MB across one cycle (one cycle cannot show a leak). The game itself created 672
+  textures and 18521 buffers (9.2 GB) at 3D on, with two 150 ms driver stalls and one 366 ms frame: the game's cost, not EDVR's.
+  Artifact: `monitor: FREEZE -- 49118.3 ms` at the flat -> vr switch, because perfMonitorFrame runs only from the VR menu tick and
+  its clock paused while flat (frames 7770 -> 19442 in those 49 s); fixed in a6ee51a7. The `"off" is not WIDTHxHEIGHT` burst after
+  vr -> flat is the flat allow-list reading VR-only keys; a flat launch prints the same lines (13 at 16:03).
