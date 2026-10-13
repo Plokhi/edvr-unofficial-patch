@@ -6,8 +6,12 @@
 #include "../../src/d3d11/explorer_cam_core.h"
 #include "../../src/d3d11/station_gather_core.h"
 #include "../../src/d3d11/station_lockfree_core.h"
+#include "../../src/d3d11/station_pass_core.h"
 
+#include <algorithm>
 #include <atomic>
+#include <memory>
+#include <random>
 #include <thread>
 #include <vector>   // the build-332841 PE identity constants (store hook gate)
 
@@ -1273,30 +1277,42 @@ int main(int argc, char** argv) {
         struct Item {
             uint32_t thread = 0;
             uint32_t seq = 0;
+            uint32_t stamp = 0;
         };
-        se::GatherBuffers<Item, 2, 8> gb;
-        for (uint32_t k = 0; k < 10; ++k) {
-            Item it;
-            it.seq = k;
-            gb.push(it);
+        std::atomic<uint32_t> stamp{0};
+        se::PassGather<Item, 2, 8> gb(stamp);
+        {
+            se::PassGather<Item, 2, 8>::Writer w(gb);
+            w.call(0x1000);
+            for (uint32_t k = 0; k < 10; ++k) {
+                Item it;
+                it.seq = k;
+                w.push(it);
+            }
         }
+        stamp.fetch_add(1);
         std::vector<uint32_t> got;
-        const uint64_t lost = gb.drain([&](const Item& it) { got.push_back(it.seq); });
-        check(got.size() == 8 && lost == 2, "v14.26 gather, one thread: a full slot keeps its first entries and counts the rest as lost");
+        const se::PassDrain d = gb.drain([&](const Item& it) { got.push_back(it.seq); });
+        check(got.size() == 8 && d.lost == 2, "v14.26 gather, one thread: a full slot keeps its first entries and counts the rest as lost");
         bool inOrder = true;
         for (size_t k = 0; k < got.size(); ++k) inOrder = inOrder && got[k] == k;
         check(inOrder, "v14.26 gather, one thread: the entries come back in the order written");
+        check(d.complete && d.passes == 1 && d.calls == 1 && d.ctx == 0x1000, "v14.27 gather: the drain reports its pass, its callback count and the context");
         got.clear();
-        const uint64_t lostAgain = gb.drain([&](const Item& it) { got.push_back(it.seq); });
-        check(got.empty() && lostAgain == 0, "v14.26 gather, one thread: a drained entry is not delivered twice, and the loss is counted once");
+        stamp.fetch_add(1);
+        const se::PassDrain again = gb.drain([&](const Item& it) { got.push_back(it.seq); });
+        check(got.empty() && again.lost == 0 && again.calls == 0, "v14.26 gather, one thread: a drained entry is not delivered twice, and the loss is counted once");
     }
     {
         // Eight writers and a draining tick: every entry is delivered once or counted as lost, and each writer's entries keep their order.
         struct Item {
             uint32_t thread = 0;
             uint32_t seq = 0;
+            uint32_t stamp = 0;
         };
-        se::GatherBuffers<Item, 16, 512> gb;
+        std::atomic<uint32_t> stamp{0};
+        auto gbHeap = std::make_unique<se::PassGather<Item, 16, 512>>(stamp);   // 300 KB: not on the stack
+        se::PassGather<Item, 16, 512>& gb = *gbHeap;
         std::atomic<int> done{0};
         const uint32_t kPer = 4000;
         std::vector<std::thread> writers;
@@ -1306,7 +1322,9 @@ int main(int argc, char** argv) {
                     Item it;
                     it.thread = t;
                     it.seq = k;
-                    gb.push(it);
+                    se::PassGather<Item, 16, 512>::Writer w(gb);   // one callback, one entry
+                    w.call(0x2000 + t);
+                    w.push(it);
                 }
                 done.fetch_add(1);
             });
@@ -1320,12 +1338,20 @@ int main(int argc, char** argv) {
             if (it.seq < nextSeq[it.thread]) ordered = false;
             nextSeq[it.thread] = it.seq + 1;
         };
+        uint64_t incomplete = 0;
         while (done.load() < 8) {
-            lostTotal += gb.drain(visit);
+            stamp.fetch_add(1);
+            const se::PassDrain d = gb.drain(visit);
+            lostTotal += d.lost;
+            if (!d.complete) ++incomplete;
             std::this_thread::yield();
         }
         for (auto& th : writers) th.join();
-        lostTotal += gb.drain(visit);
+        for (int k = 0; k < 4; ++k) {
+            stamp.fetch_add(1);
+            lostTotal += gb.drain(visit).lost;
+        }
+        (void)incomplete;
         check(delivered + lostTotal == 8u * kPer, "v14.26 gather, threads: every entry is delivered once or counted as lost");
         check(ordered, "v14.26 gather, threads: each writer's entries come back in the order written");
         check(delivered > 0, "v14.26 gather, threads: the tick received entries while the writers ran");
@@ -1333,13 +1359,20 @@ int main(int argc, char** argv) {
     {
         // The rig publication, one thread: an outside rig is vetoed thirty calls in a row and let through once (the refresh), a mixed verdict resets the
         // run, and a rig the latest publication does not hold forwards.
-        se::RigPubTable pub;
+        auto pubHeap = std::make_unique<se::RigPubTable>();   // 400 KB: not on the stack
+        se::RigPubTable& pub = *pubHeap;
         pub.begin();
         const uintptr_t rig = 0x5000;
         const uintptr_t kColl = 0x123400000ull;
         size_t idx = 0;
         check(pub.insert(rig, 7, se::kRigVerdictOutside, kColl, &idx), "v14.26 rig publication: an outside rig is inserted");
         uint8_t v = 0;
+        {
+            uintptr_t cs = 0;
+            size_t is = 0;
+            check(!pub.lookup(rig, 7, &v, &cs, &is), "v14.27 rig publication: a staged rig is not visible until the publication is committed");
+        }
+        pub.commit();
         uintptr_t c = 0;
         size_t i2 = 0;
         check(pub.lookup(rig, 7, &v, &c, &i2) && v == se::kRigVerdictOutside && c == kColl, "v14.26 rig publication: the verdict and collection read back");
@@ -1356,21 +1389,25 @@ int main(int argc, char** argv) {
         const se::RigOutcome after = pub.decide(idx, se::kRigVerdictOutside, 1);
         check(m == se::RigOutcome::kMixed && after == se::RigOutcome::kVetoed, "v14.26 rig publication: a mixed verdict resets the run");
         pub.begin();
+        pub.commit();
         check(!pub.lookup(rig, 7, &v, &c, &i2), "v14.26 rig publication: a rig the latest publication does not hold is not found");
     }
     {
         // Eight readers decide and look up while the tick republishes two verdicts, each with its own collection. No reader sees a verdict paired with
         // the other collection, and the last publication is the one read at the end.
-        se::RigPubTable pub;
+        auto pubHeap = std::make_unique<se::RigPubTable>();   // 400 KB: not on the stack
+        se::RigPubTable& pub = *pubHeap;
         const uintptr_t kRig = 0x9000;
         const uintptr_t kCollOut = 0xAAAA00000ull;
         const uintptr_t kCollUnk = 0xBBBB00000ull;
         pub.begin();
         size_t i0 = 0;
         pub.insert(kRig, 9, se::kRigVerdictOutside, kCollOut, &i0);
+        pub.commit();
         std::atomic<bool> stop{false};
         std::atomic<uint64_t> torn{0};
         std::atomic<uint64_t> reads{0};
+        std::atomic<uint64_t> gaps{0};
         std::vector<std::thread> readers;
         for (int r = 0; r < 8; ++r) {
             readers.emplace_back([&] {
@@ -1383,6 +1420,8 @@ int main(int argc, char** argv) {
                         if (!ok) torn.fetch_add(1);
                         (void)pub.decide(idx, v, 1);
                         reads.fetch_add(1);
+                    } else {
+                        gaps.fetch_add(1);   // the rig is in every publication: a miss is a window between two publications
                     }
                 }
             });
@@ -1393,6 +1432,7 @@ int main(int argc, char** argv) {
             size_t idx = 0;
             const bool outside = (k & 1u) == 0;
             pub.insert(kRig, 9, outside ? se::kRigVerdictOutside : se::kRigVerdictUnknown, outside ? kCollOut : kCollUnk, &idx);
+            pub.commit();
         }
         stop.store(true);
         for (auto& th : readers) th.join();
@@ -1403,6 +1443,340 @@ int main(int argc, char** argv) {
         check(pub.lookup(kRig, 9, &v, &c, &idx) && v == se::kRigVerdictUnknown && c == kCollUnk,
               "v14.26 rig publication, threads: the last publication is the one read at the end");
         check(reads.load() > 0, "v14.26 rig publication, threads: the readers did read");
+        (void)gaps;   // a reader preempted across two republications may miss once (it forwards); the property is tested deterministically below
+    }
+    {
+        // Staging a publication leaves the committed one whole: every rig of the old publication is found until the commit, and the run of vetoes carries.
+        auto pubHeap = std::make_unique<se::RigPubTable>();   // 400 KB: not on the stack
+        se::RigPubTable& pub = *pubHeap;
+        pub.begin();
+        size_t idx[3] = {};
+        for (uintptr_t k = 0; k < 3; ++k) pub.insert(0x100 + 16 * k, 3 + k, se::kRigVerdictOutside, 0xC000 + k, &idx[k], 7);
+        pub.commit();
+        for (int call = 0; call < 10; ++call) (void)pub.decide(idx[0], se::kRigVerdictOutside, 5);
+        pub.begin();
+        size_t ni = 0;
+        pub.insert(0x100, 3, se::kRigVerdictOutside, 0xC000, &ni, 7, pub.runAt(idx[0]));   // staged, not committed
+        bool allFound = true;
+        for (uintptr_t k = 0; k < 3; ++k) {
+            uint8_t v = 0;
+            uintptr_t c = 0;
+            size_t i = 0;
+            uint32_t ep = 0;
+            allFound = allFound && pub.lookup(0x100 + 16 * k, 3 + k, &v, &c, &i, &ep) && v == se::kRigVerdictOutside && c == 0xC000 + k && ep == 7;
+        }
+        check(allFound, "v14.27 rig publication: while the next publication is staged, every rig of the committed one is still found, with its epoch");
+        pub.commit();
+        int refresh = 0;
+        int calls = 0;
+        for (; calls < 21; ++calls) {
+            if (pub.decide(ni, se::kRigVerdictOutside, 6) == se::RigOutcome::kRefresh) ++refresh;
+        }
+        check(refresh == 1, "v14.27 rig publication: the run of vetoes carries into the next publication (the refresh comes on the 31st call, not the 31st after each tick)");
+        uint8_t v = 0;
+        uintptr_t c = 0;
+        size_t i = 0;
+        check(!pub.lookup(0x110, 4, &v, &c, &i), "v14.27 rig publication: a rig left out of the new publication is gone after the commit");
+    }
+
+    // ---- Built v14.27 (2026-10-13): the pass rules. Callbacks of a frame land before, during and after its tick; an empty or unfinished pass is no evidence --
+    {
+        se::PassGate g;
+        check(g.step(false, 0, 0) == se::PassVerdict::kDeferred, "v14.27 pass gate: a drain with a writer still inside is deferred");
+        check(g.step(true, 0, 0) == se::PassVerdict::kEmpty, "v14.27 pass gate: no pass closed is empty");
+        check(g.step(true, 1, 0) == se::PassVerdict::kEmpty, "v14.27 pass gate: a closed pass with no store callback is empty");
+        check(g.step(true, 1, 1000) == se::PassVerdict::kInformative && g.run == 1, "v14.27 pass gate: a complete pass with callbacks is informative");
+        check(g.step(true, 1, 400) == se::PassVerdict::kInformative && g.thin == 1, "v14.27 pass gate: a pass under half the usual calls is informative and counted thin");
+        g.step(true, 0, 0);
+        check(g.run == 0 && g.empty == 3 && g.deferred == 1 && g.informative == 2, "v14.27 pass gate: the window counts each verdict and an empty pass ends the run");
+    }
+    {
+        struct P {
+            uintptr_t addr = 0;
+            int v = 0;
+        };
+        se::SeenWindow<P, 4> w;
+        P a;
+        a.addr = 0xA;
+        a.v = 1;
+        w.put(a);
+        a.v = 2;
+        w.put(a);
+        check(w.n == 1 && w.items[0].v == 2, "v14.27 seen window: one entry per address, the newest reading");
+        w.endPass();
+        w.endPass();
+        check(w.has(0xA), "v14.27 seen window: a record is kept through two passes that do not see it");
+        w.endPass();
+        check(!w.has(0xA), "v14.27 seen window: a record unseen for the whole window is gone");
+        for (uintptr_t k = 1; k <= 6; ++k) {
+            P p;
+            p.addr = k;
+            w.put(p);
+        }
+        check(w.n == 4, "v14.27 seen window: a full window replaces its oldest entry");
+        se::CamHold ch;
+        check(!ch.resolved(false) && ch.resolved(true) && ch.resolved(false), "v14.27 camera hold: a failure before any camera is unknown; one after a good one is held");
+        bool held = true;
+        for (uint32_t k = 1; k < se::kCamHoldTicks; ++k) held = held && ch.resolved(false);   // the first failure was counted above
+        check(held && !ch.resolved(false), "v14.27 camera hold: the last camera is held for kCamHoldTicks failures, then it is unknown");
+        se::StableGate sg;
+        bool early = false;
+        bool fired = false;
+        sg.step(true, 3);
+        for (int k = 1; k <= 5; ++k) {
+            const bool f = sg.step(false, 3);
+            if (k < 3) early = early || f;
+            if (k == 3) fired = f;
+        }
+        check(!early && fired, "v14.27 stable gate: a change counts once, after it has held for the required ticks");
+    }
+    {
+        // A writer still inside when the tick closes the pass: nothing is read, then both passes come back in order once it has left.
+        struct E {
+            uint32_t seq = 0;
+            uint32_t stamp = 0;
+        };
+        std::atomic<uint32_t> stamp{1};
+        se::PassGather<E, 4, 16> gb(stamp);
+        std::vector<std::pair<uint32_t, uint32_t>> got;   // (stamp, seq)
+        auto visit = [&](const E& e) { got.push_back({e.stamp, e.seq}); };
+        auto w = std::make_unique<se::PassGather<E, 4, 16>::Writer>(gb);
+        w->call(0x77);
+        E e;
+        e.seq = 1;
+        w->push(e);
+        stamp.fetch_add(1);
+        const se::PassDrain open = gb.drain(visit, 2);
+        check(!open.complete && got.empty() && open.passes == 0, "v14.27 gather: a pass with a writer still inside is not read");
+        {
+            se::PassGather<E, 4, 16>::Writer w2(gb);   // a callback of the next frame, on the same slot
+            w2.call(0x77);
+            E e2;
+            e2.seq = 2;
+            w2.push(e2);
+        }
+        w.reset();
+        stamp.fetch_add(1);
+        const se::PassDrain done = gb.drain(visit, 2);
+        check(done.complete && done.passes == 2 && done.calls == 2 && got.size() == 2 && got[0].second == 1 && got[1].second == 2 && got[0].first == 1 && got[1].first == 2,
+              "v14.27 gather: the unfinished pass is read with the next, oldest first, each entry naming its own pass");
+        // A pass the tick never read is overwritten by the writer three stamps later and counted as lost, not misread as a newer pass.
+        for (int k = 0; k < 3; ++k) {
+            {
+                se::PassGather<E, 4, 16>::Writer wl(gb);
+                wl.call(0);
+                E x;
+                x.seq = 10 + k;
+                wl.push(x);
+            }
+            stamp.fetch_add(1);
+        }
+        got.clear();
+        {
+            se::PassGather<E, 4, 16>::Writer wl(gb);
+            wl.call(0);
+        }
+        const se::PassDrain lap = gb.drain(visit, 2);
+        check(lap.lost >= 1 || got.size() <= 2, "v14.27 gather: a pass overwritten before it was read is counted lost");
+        bool namesOwn = true;
+        for (const auto& g : got) namesOwn = namesOwn && g.first == 3 + (g.second - 10);
+        check(namesOwn, "v14.27 gather: no entry is delivered under a pass it was not written in");
+    }
+    {
+        // Scripted: the own pad's callback lands on the far side of the tick every other frame (the pad is in pass N, then in no pass, then in two). The window
+        // keeps the pad, the camera stays known, and a latch sample never spans an empty pass.
+        struct E {
+            uint32_t kind = 0;
+            uint32_t stamp = 0;
+        };
+        std::atomic<uint32_t> stamp{1};
+        se::PassGather<E, 4, 64> gb(stamp);
+        struct P {
+            uintptr_t addr = 0;
+        };
+        se::SeenWindow<P, 4> pads;
+        se::PassGate gate;
+        se::CamHold cam;
+        int absent = 0;
+        int oldRuleAbsent = 0;
+        int camUnknown = 0;
+        bool firstSeen = false;
+        for (int f = 0; f < 200; ++f) {
+            // frame f: 30 callbacks; the pad's callback is before the tick on even frames and after it on odd frames, so passes hold 2 or 0 pads
+            const bool padAfter = (f & 1) != 0;
+            auto cb = [&](bool pad) {
+                se::PassGather<E, 4, 64>::Writer w(gb);
+                w.call(0x55);
+                E e;
+                e.kind = pad ? 1 : 2;
+                w.push(e);
+            };
+            for (int k = 0; k < 15; ++k) cb(false);
+            if (!padAfter) cb(true);
+            stamp.fetch_add(1);   // the tick of frame f
+            bool padInPass = false;
+            const se::PassDrain d = gb.drain([&](const E& e) {
+                if (e.kind == 1) {
+                    P p;
+                    p.addr = 0xAD;
+                    pads.put(p);
+                    padInPass = true;
+                }
+            });
+            const bool inf = gate.step(d.complete, d.passes, d.calls) == se::PassVerdict::kInformative;
+            if (inf) {
+                cam.resolved(d.ctx != 0);
+                if (firstSeen && !pads.has(0xAD)) ++absent;
+                if (firstSeen && !padInPass) ++oldRuleAbsent;
+                if (padInPass) firstSeen = true;
+                pads.endPass();
+            }
+            if (firstSeen && !cam.valid) ++camUnknown;
+            if (padAfter) cb(true);
+            for (int k = 0; k < 15; ++k) cb(false);
+        }
+        check(oldRuleAbsent > 50, "v14.27 scripted: the one-pass rule of v14.26 would have read the pad as absent on the passes the pad call missed");
+        check(absent == 0, "v14.27 scripted: the pad is never absent when its call lands on the other side of the tick");
+        check(camUnknown == 0, "v14.27 scripted: the camera is never unknown across those passes");
+    }
+    {
+        // Scripted: the latch compares a record only between consecutive informative ticks. A pad that moves between two samples with an empty tick between
+        // them is re-based, never counted as moving; the same motion on consecutive ticks is counted.
+        se::LatchRec held;
+        se::LatchRec live;
+        const float ax0[3] = {1, 0, 0};
+        const float ax2[3] = {0, 0, 1};
+        uint32_t frame = 10;
+        for (int k = 0; k < 8; ++k) {
+            const float rel[3] = {5.0f * static_cast<float>(k), 0, 0};
+            frame += 2;   // an empty tick between every two samples: the sample is skipped, so the stamps are two apart
+            held.step(frame, rel, ax0, ax2, 1, 1, 1000);
+        }
+        check(held.movedRun == 0, "v14.27 latch: samples with an empty tick between them are re-based, never counted as motion");
+        frame = 10;
+        for (int k = 0; k < 8; ++k) {
+            const float rel[3] = {5.0f * static_cast<float>(k), 0, 0};
+            live.step(++frame, rel, ax0, ax2, 1, 1, 1000);
+        }
+        check(live.movedRun >= 2, "v14.27 latch: the same motion on consecutive informative ticks is counted");
+    }
+    {
+        // Random interleavings: 1000 frames, callbacks spread over a burst, the tick landing anywhere in or around the burst, some callbacks long enough to
+        // straddle a tick. A steady pad must give a continuous seal: no absence, no unknown camera, no motion release, and the rig publication must stay.
+        struct E {
+            uint32_t kind = 0;
+            uint32_t stamp = 0;
+        };
+        using G = se::PassGather<E, 4, 128>;
+        struct Ev {
+            double t;
+            int type;   // 0 begin, 1 end, 2 tick
+            int id;
+            bool pad;
+        };
+        int totalAbsent = 0, totalCamUnknown = 0, totalMotion = 0, totalSeal = 0, totalInformative = 0, totalPassNoPad = 0, totalRigGaps = 0, totalDeferred = 0;
+        int totalOldRule = 0;
+        for (uint32_t seed = 1; seed <= 6; ++seed) {
+            std::mt19937 rng(seed);
+            std::uniform_real_distribution<double> u01(0.0, 1.0);
+            std::vector<Ev> evs;
+            int id = 0;
+            const int kFrames = 1000;
+            for (int f = 0; f < kFrames; ++f) {
+                const double base = 10.0 * f;
+                const double start = base + 6.0 * u01(rng);
+                const int n = 24;
+                const int padAt = static_cast<int>(u01(rng) * n) % n;
+                for (int k = 0; k < n; ++k) {
+                    const double t = start + 4.0 * k / n;
+                    const double dur = u01(rng) < 0.02 ? 3.0 : 0.01;   // some callbacks straddle a tick
+                    evs.push_back({t, 0, id, k == padAt});
+                    evs.push_back({t + dur, 1, id, false});
+                    ++id;
+                }
+                evs.push_back({base + 10.0 + (u01(rng) * 2.0 - 1.0) * 6.0, 2, -1, false});   // the tick: anywhere around the burst's end and next start
+            }
+            std::stable_sort(evs.begin(), evs.end(), [](const Ev& a, const Ev& b) { return a.t != b.t ? a.t < b.t : a.type < b.type; });
+            std::atomic<uint32_t> stamp{1};
+            G gb(stamp);
+            std::vector<std::unique_ptr<G::Writer>> open(static_cast<size_t>(id));
+            struct P {
+                uintptr_t addr = 0;
+            };
+            se::SeenWindow<P, 4> pads;
+            se::PassGate gate;
+            se::CamHold cam;
+            se::LatchRec rec;
+            auto pubHeap = std::make_unique<se::RigPubTable>();   // 400 KB: not on the stack
+        se::RigPubTable& pub = *pubHeap;
+            pub.begin();
+            pub.insert(0x500, 11, se::kRigVerdictOutside, 0xC0, nullptr, 3);
+            pub.commit();
+            bool firstSeen = false;
+            bool padInPass = false;
+            uint32_t sealedFrames = 0;
+            bool sealed = false;
+            const float ax0[3] = {1, 0, 0};
+            const float ax2[3] = {0, 0, 1};
+            for (const Ev& ev : evs) {
+                if (ev.type == 0) {
+                    open[static_cast<size_t>(ev.id)] = std::make_unique<G::Writer>(gb);
+                    G::Writer& w = *open[static_cast<size_t>(ev.id)];
+                    w.call(0x99);
+                    E e;
+                    e.kind = ev.pad ? 1 : 2;
+                    w.push(e);
+                } else if (ev.type == 1) {
+                    open[static_cast<size_t>(ev.id)].reset();
+                } else {
+                    stamp.fetch_add(1);
+                    padInPass = false;
+                    const se::PassDrain d = gb.drain(
+                        [&](const E& e) {
+                            if (e.kind == 1) {
+                                P p;
+                                p.addr = 0xAD;
+                                pads.put(p);
+                                padInPass = true;
+                            }
+                        },
+                        1);
+                    const se::PassVerdict v = gate.step(d.complete, d.passes, d.calls);
+                    if (v == se::PassVerdict::kDeferred) ++totalDeferred;
+                    if (v == se::PassVerdict::kInformative) {
+                        ++totalInformative;
+                        cam.resolved(d.ctx != 0);
+                        if (firstSeen && !padInPass) ++totalOldRule;
+                        if (firstSeen && !padInPass) ++totalPassNoPad;
+                        if (firstSeen && !pads.has(0xAD)) ++totalAbsent;
+                        if (padInPass) firstSeen = true;
+                        pads.endPass();
+                        const float rel[3] = {3.0f, 4.0f, -48.0f};   // a steady pad against its shell
+                        rec.step(stamp.load(), rel, ax0, ax2, 1, 1, 1000);
+                        if (rec.movedRun >= 2) ++totalMotion;
+                        if (!sealed && gate.run >= 10) sealed = true;   // the camera-in-box rule: ten informative passes in a row (and it holds across holds below)
+                        pub.begin();
+                        pub.insert(0x500, 11, se::kRigVerdictOutside, 0xC0, nullptr, 3);
+                        pub.commit();
+                    }
+                    if (firstSeen && !cam.valid) ++totalCamUnknown;
+                    if (sealed) ++sealedFrames;
+                    uint8_t vv = 0;
+                    uintptr_t cc = 0;
+                    size_t ii = 0;
+                    if (firstSeen && !pub.lookup(0x500, 11, &vv, &cc, &ii)) ++totalRigGaps;
+                }
+            }
+            totalSeal += static_cast<int>(sealedFrames);
+        }
+        check(totalInformative > 4000, "v14.27 random interleavings: most ticks read an informative pass");
+        check(totalDeferred > 0, "v14.27 random interleavings: callbacks that straddle a tick did defer some passes (the cases are exercised)");
+        check(totalOldRule > 200, "v14.27 random interleavings: the v14.26 one-pass rule would have lost the pad on many passes (the cases are exercised)");
+        check(totalAbsent == 0, "v14.27 random interleavings: the own pad is never absent from the window, whatever the interleaving");
+        check(totalCamUnknown == 0, "v14.27 random interleavings: the camera is never unknown");
+        check(totalMotion == 0, "v14.27 random interleavings: a steady pad never reads as moving");
+        check(totalRigGaps == 0, "v14.27 random interleavings: the rig publication stays across empty and unfinished passes");
+        check(totalSeal > 0, "v14.27 random interleavings: the seal's pass condition is met");
     }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);

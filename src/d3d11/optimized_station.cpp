@@ -21,6 +21,7 @@
 #include "optimized_station_core.h"
 #include "station_gather_core.h"
 #include "station_lockfree_core.h"
+#include "station_pass_core.h"
 #include "pad_state_probe.h"
 #include "store_hook.h"
 #include "view_source.h"
@@ -34,15 +35,26 @@ std::atomic<uint32_t> g_frameStamp{0};     // advanced at every frame tick: the 
 std::atomic<bool> g_cameraKnown{false};
 std::atomic<uint64_t> g_kept{0}, g_keptUnknown{0}, g_culled{0}, g_faults{0};
 std::atomic<uint64_t> g_worldSrc[5] = {};               // the named rule's world centre by source (worldOfRecord)
+// Built v14.27: the faults by reason (the window's counts; the summary names each). g_winFaults is their sum.
+enum FaultReason : size_t { kFaultBucket, kFaultCullRead, kFaultCullRestored, kFaultCullTorn, kFaultTickView, kFaultReasons };
+std::atomic<uint64_t> g_winFaultBy[kFaultReasons] = {};
+std::atomic<uint64_t> g_winFaults{0};                  // reads or writes that failed in the window
+std::atomic<uint64_t> g_winNoCamera{0};                // callbacks that found no camera yet (not faults: the first pass after the gate opens)
+void faultNote(FaultReason r) noexcept {
+    g_faults.fetch_add(1, std::memory_order_relaxed);
+    g_winFaults.fetch_add(1, std::memory_order_relaxed);
+    g_winFaultBy[r].fetch_add(1, std::memory_order_relaxed);
+}
 float g_margin = sealed::kMarginDefaultM;  // the box's margin (fixed; the trial's tuning ladder is removed)
 // The sealed rule's sphere radius while no cell is held (the trial's starting radius; the named cell does not use it).
 constexpr float kFallbackSphereM = 80.0f;
-std::atomic<uint64_t> g_winFaults{0};                  // reads or writes that failed in the window
 // Forward: the held cell is localized and the shell picked by setHeldFrame (below), called from the engage.
 void setHeldFrame(const sealed::OwnCell& cell, uint32_t frame);
 struct RigTally {   // built v14.26: atomic (the callbacks count their vetoes)
     std::atomic<uint64_t> seen{0}, vetoed{0}, mixed{0}, unknown{0}, refresh{0};
     std::atomic<uint64_t> assocSync{0}, assocJob{0}, assocNone{0}, matched{0}, unevaluated{0};
+    // Built v14.27: what a rig veto's lookup found in the publication (the window's counts; the cost line names each).
+    std::atomic<uint64_t> hitVetoed{0}, hitKept{0}, hitMoved{0}, miss{0}, stale{0}, asked{0};
 };
 RigTally g_rigTally;
 sealed::OwnCell g_heldCell;                // the sealed cell, in the world frame of the frame that reads it (refreshed each frame)
@@ -71,15 +83,30 @@ constexpr size_t kPrefixSlots = 24;
 PrefixTally g_prefixTally[kPrefixSlots];
 size_t g_prefixTallyN = 0;
 float g_ownCandidateDist = -1.0f;
-sealed::PadObs g_pads[sealed::kPadSlots];
+// Built v14.27: the pads and explicit parts are windows over the informative passes (station_pass_core.h): a record stays for kSeenKeep passes after the
+// pass that saw it, so a pass that carries only part of a frame's callbacks cannot make the own pad absent. g_pads and g_padCount keep their old names.
+sealed::SeenWindow<sealed::PadObs, sealed::kPadSlots> g_padWin;
+sealed::PadObs (&g_pads)[sealed::kPadSlots] = g_padWin.items;
+size_t& g_padCount = g_padWin.n;
 sealed::OwnPadSticky g_ownSticky;   // Built v14 (fix 1): the own pad, kept while its record is seen (reset when it is replaced)
-size_t g_padCount = 0;
-sealed::ExplicitObs g_explicits[sealed::kExplicitSlots];
-size_t g_explicitCount = 0;
+sealed::SeenWindow<sealed::ExplicitObs, sealed::kExplicitSlots> g_explicitWin;
+sealed::ExplicitObs (&g_explicits)[sealed::kExplicitSlots] = g_explicitWin.items;
+size_t& g_explicitCount = g_explicitWin.n;
 float g_frameCam[3] = {};
 bool g_frameCamValid = false;
-std::atomic<uint32_t> g_recordsFrame{0};   // the callbacks count the records they took (built v14.26: atomic)
-uint32_t g_recordsLast = 0;   // store records the observer took this frame, and last frame (the waiting line's evidence)
+sealed::CamHold g_camHold;                  // built v14.27: the camera is held through a failed resolution
+// Built v14.27: the pass rules. g_passInformative is this tick's verdict on the drained passes: complete and at least one store callback in them.
+// Everything that reads the passes (the promote, the latch samples, the shell motion sample, the rig publication) runs only on an informative tick.
+sealed::PassGate g_passGate;
+bool g_passInformative = false;
+uint64_t g_passCalls = 0;                   // callbacks the last drained passes held
+uint64_t g_winPadSeen = 0, g_winPadMissed = 0, g_winPadAbsentWindow = 0;   // informative passes with / without the sticky pad's record, and without it in the window
+uint64_t g_winCamHold = 0, g_winCamJump = 0, g_winCtxChange = 0;           // camera resolutions covered by the hold, jumps over kCamJumpM, context changes
+uintptr_t g_lastPassCtx = 0;
+uintptr_t g_passCtx = 0;                    // the context the last informative pass's busiest thread saw (the camera is resolved from it)
+uint32_t g_recordsLast = 0;                 // store callbacks the last drained passes held (the waiting line's evidence)
+bool g_stickyPadInPass = false;
+constexpr float kCamJumpM = 2.0f;
 sealed::OwnCell g_pickCell;                // the frame's pick before the seal (what the seal rule reads)
 sealed::OwnCell g_cellPrev;                // the cell the observer judges against this frame
 uintptr_t g_explicitPrev[sealed::kExplicitNodes] = {};
@@ -90,7 +117,6 @@ uint32_t g_viewStamp = 0;
 bool g_viewReady = false;
 uint32_t g_viewTries = 0;
 view::Resolved g_view;
-std::atomic<uintptr_t> g_ctxSeen{0};   // the context the last callback saw: the tick resolves the view from it (built v14.26)
 // The pad-local frame and the shell (the release by the pad's motion along the shaft).
 sealed::OwnCell g_heldLocal;
 bool g_heldLocalValid = false;
@@ -409,7 +435,8 @@ struct GatherEntry {
 };
 constexpr size_t kGatherSlots = 16;
 constexpr size_t kGatherCap = 1024;
-sealed::GatherBuffers<GatherEntry, kGatherSlots, kGatherCap> g_gather;
+sealed::PassGather<GatherEntry, kGatherSlots, kGatherCap> g_gather(g_frameStamp);
+using GatherWriter = sealed::PassGather<GatherEntry, kGatherSlots, kGatherCap>::Writer;
 bool g_lossPublished = false;                // the tick: entries were lost in the pass it last drained (the next publication keeps every record)
 uint64_t g_winLost = 0;                      // entries lost in the window (the cost line)
 std::atomic<uint64_t> g_lockOnCallback{0};   // state-lock acquisitions made by a callback (must stay 0; the cost line reports it)
@@ -444,7 +471,8 @@ void costPush(uint8_t which, double ms) noexcept {
     e.kind = GKind::kCost;
     e.flags = which;
     e.ms = static_cast<float>(ms);
-    g_gather.push(e);
+    GatherWriter w(g_gather);
+    w.push(e);
 }
 
 // The record's name, cached per thread and per frame: the one name reader on every path (built v14.25; lock-free since v14.26).
@@ -663,6 +691,7 @@ void refreshHeldWorld() {
     // One sample a frame: the tick and the observer both refresh the held cell.
     const uint32_t shellStamp = g_frameStamp.load(std::memory_order_relaxed);
     if (g_shellSampleStamp == shellStamp) return;
+    if (!g_passInformative) return;   // built v14.27: the motion sample is taken on an informative pass only (an empty or unfinished pass is no reading)
     g_shellSampleStamp = shellStamp;
     char nm[48] = {};
     const WorldRead sw = worldOfRecord(g_shellAddr);
@@ -722,7 +751,9 @@ constexpr size_t kCollSlots = 1024;
 // Built v14.20 (review 4): every association carries the lifecycle epoch it was made in. An association from an earlier epoch is free: a lookup misses
 // it and an insert reuses it. The epoch is bumped at undock, hangar change, ship change, setting toggle and an association change (bumpRigEpoch).
 uint32_t g_rigEpoch = 1;
+std::atomic<uint32_t> g_rigEpochA{1};   // built v14.27: the epoch the rig veto compares a published cell's epoch to (a cell of an older epoch forwards)
 uint64_t g_rigEpochs = 0;          // the lifecycle bumps this window (the summary's count)
+uint64_t g_winRigPublications = 0, g_winRigPublished = 0;   // built v14.27: publications committed this window, and the rigs they held
 
 struct CollSlot {
     uintptr_t coll = 0;
@@ -802,8 +833,12 @@ RigSlot* rigFind(uintptr_t rig, bool insert) noexcept {
 void refreshRigVerdicts() noexcept {
     g_rigPub.begin();
     // No cell held, no verdict is published (the veto answers only while sealed).
-    if (!g_heldValid) return;
+    if (!g_heldValid) {
+        g_rigPub.commit();
+        return;
+    }
     const bool allMode = false;
+    uint32_t published = 0;
     for (RigSlot& s : g_rigSlots) {
         if (s.rig == 0 || s.epoch != g_rigEpoch) continue;
         const float* mn = nullptr;
@@ -834,10 +869,19 @@ void refreshRigVerdicts() noexcept {
         if (!allMode && bounded && g_frameCamValid) ownRig = sealed::containsCamera(c, r, g_frameCam) && r < sealed::kOwnShipRadiusM;
         if (!allMode && !ownRig && g_ownPrefix[0] != '\0') ownRig = sealed::ownShipExempt(false, 0.0f, s.name, g_ownPrefix);
         s.verdict = ownRig ? kVerdictUnknown : sealed::verdictCode(v);   // 2 outside, 1 mixed, 0 unknown
-        const uint8_t published = g_lossPublished ? kVerdictUnknown : s.verdict;
+        const uint8_t code = g_lossPublished ? kVerdictUnknown : s.verdict;
+        // The run of vetoes the rig has in the committed publication moves into this one (the refresh every kRigRefreshN calls needs it across ticks).
+        uint32_t carried = 0;
+        uint8_t ov = 0;
+        uintptr_t oc = 0;
+        size_t oidx = 0;
+        if (g_rigPub.lookup(s.rig, rigIndex(s.rig), &ov, &oc, &oidx)) carried = g_rigPub.runAt(oidx);
         size_t idx = 0;
-        g_rigPub.insert(s.rig, rigIndex(s.rig), published, s.coll, &idx);
+        if (g_rigPub.insert(s.rig, rigIndex(s.rig), code, s.coll, &idx, g_rigEpoch, carried)) ++published;
     }
+    g_rigPub.commit();
+    ++g_winRigPublications;
+    g_winRigPublished += published;
 }
 
 // ---- Built v14.24 (2026-10-13): the station's own costs, clocked with QPC and reported in the 30 s summary ---------------------------------------
@@ -932,6 +976,7 @@ public:
 // slot, association and verdict of the old epoch is free; a rig forwards until it has a fresh bound. Caller holds g_sealedMutex.
 void bumpRigEpoch() noexcept {
     ++g_rigEpoch;
+    g_rigEpochA.store(g_rigEpoch, std::memory_order_release);
     ++g_rigEpochs;
     g_rigStats.used = 0;
     g_collStats.used = 0;
@@ -951,20 +996,49 @@ bool rigVetoLockFree(uintptr_t rig) noexcept {
     uint8_t verdict = kVerdictUnknown;
     uintptr_t published = 0;
     size_t idx = 0;
-    if (!g_rigPub.lookup(rig, rigIndex(rig), &verdict, &published, &idx)) {
+    uint32_t epoch = 0;
+    uintptr_t coll = 0;
+    const bool haveColl = readVal(&coll, rig + 0x348) && coll != 0;
+    if (!g_rigPub.lookup(rig, rigIndex(rig), &verdict, &published, &idx, &epoch)) {
+        // Built v14.27: a rig the publication does not hold asks the tick to register it (once per thread per frame). v14.26 only asked for rigs already
+        // published, and the tick learns a rig no other way on the job path, so no rig was ever published and the veto never fired.
+        ++g_rigTally.miss;
+        ++g_rigTally.unknown;
+        if (haveColl) {
+            struct Asked {
+                uintptr_t rig = 0;
+                uint32_t stamp = 0;
+            };
+            thread_local Asked asked[256];
+            Asked& a = asked[(rig >> 4) & 255];
+            if (a.rig != rig || a.stamp != stamp) {
+                a.rig = rig;
+                a.stamp = stamp;
+                GatherEntry e;
+                e.kind = GKind::kRigAssoc;
+                e.aux = rig;
+                e.coll = coll;
+                GatherWriter w(g_gather);
+                if (w.push(e)) ++g_rigTally.asked;
+            }
+        }
+        return false;
+    }
+    if (epoch != g_rigEpochA.load(std::memory_order_acquire)) {
+        ++g_rigTally.stale;   // published in an earlier lifecycle epoch: forwards until the tick republishes
         ++g_rigTally.unknown;
         return false;
     }
-    uintptr_t coll = 0;
-    if (readVal(&coll, rig + 0x348) && coll != 0 && coll != published) {
+    if (haveColl && coll != published) {
         g_rigPub.touch(idx, stamp);
+        ++g_rigTally.hitMoved;
         if (g_rigPub.askOnce(idx, stamp)) {
             GatherEntry e;
             e.kind = GKind::kRigAssoc;
-            e.stamp = stamp;
             e.aux = rig;
             e.coll = coll;
-            g_gather.push(e);
+            GatherWriter w(g_gather);
+            w.push(e);
         }
         ++g_rigTally.unknown;
         return false;
@@ -972,15 +1046,19 @@ bool rigVetoLockFree(uintptr_t rig) noexcept {
     switch (g_rigPub.decide(idx, verdict, stamp)) {
         case sealed::RigOutcome::kVetoed:
             ++g_rigTally.vetoed;
+            ++g_rigTally.hitVetoed;
             return true;
         case sealed::RigOutcome::kRefresh:
             ++g_rigTally.refresh;
+            ++g_rigTally.hitKept;
             return false;
         case sealed::RigOutcome::kMixed:
             ++g_rigTally.mixed;
+            ++g_rigTally.hitKept;
             return false;
         default:
             ++g_rigTally.unknown;
+            ++g_rigTally.hitKept;
             return false;
     }
 }
@@ -997,10 +1075,13 @@ bool cullCounted(uintptr_t record, bool containing) noexcept {
             g_culled.fetch_add(1, std::memory_order_relaxed);
             return true;
         case sealed::Cull::kUntouched:
+            faultNote(kFaultCullRead);
+            return false;
         case sealed::Cull::kRestored:
+            faultNote(kFaultCullRestored);
+            return false;
         case sealed::Cull::kTorn:
-            g_faults.fetch_add(1, std::memory_order_relaxed);
-            ++g_winFaults;
+            faultNote(kFaultCullTorn);
             return false;
     }
     return false;
@@ -1014,6 +1095,9 @@ bool g_dockedWasNow = false;               // built v14.20 (review 4): the docke
 std::atomic<bool> g_dockedKnownNow{false};// Status.json has a Flags sample (the waiting line says unknown until then)
 sealed::GameView g_waitLast;              // the waiting line last written (built v14.23: the game's pad state)
 bool g_waitLastSet = false;
+sealed::GameView g_waitCand;              // built v14.27: the key this tick had, and how long it has held (the line is written on a stable change)
+bool g_waitCandSet = false;
+sealed::StableGate g_waitStable;
 uint64_t g_waitLastMs = 0;                // when the waiting line was last written (at most every 10 s while docked)
 sealed::SealState g_sealState;             // the seal trigger (optimized_station_core.h sealStep)
 bool g_flagHangarChanged = false;          // promote saw the held pad go or another own pad nearest: the tick releases on it
@@ -1158,12 +1242,12 @@ bool bayWatchKeep() noexcept {
 
 // Built v14.12, v14.26: a gathered record that may be a mechanism record (its name from the cache), within 400 m of the camera. Only while a latch is
 // pending (the view says so). The tick applies it.
-void latchCandNote(uintptr_t record, const float* centre, const PadSnapshot& s) noexcept {
+void latchCandNote(GatherWriter& w, uintptr_t record, const float* centre, const PadSnapshot& s) noexcept {
     if (!s.latchPending) return;
     if (s.camValid && sealed::distance(centre, s.cam) > 400.0f) return;   // a bay's span reaches ~270 m along the shaft (built v14.15)
     char nm[64] = {};
     if (!cachedName(record, nm, sizeof(nm)) || !sealed::mechanismName(nm)) return;
-    g_gather.push(gatherEntry(GKind::kLatch, record, centre, 0.0f, g_frameStamp.load(std::memory_order_relaxed), nm));
+    w.push(gatherEntry(GKind::kLatch, record, centre, 0.0f, 0, nm));
 }
 
 // Built v14.12: latch the bay's mechanism once: the own pad's shaft (its up axis), the pads of its size and the mechanism records near the shaft.
@@ -1233,15 +1317,15 @@ const char* engageHow() noexcept {
 }
 
 // Built v14.13, v14.26: a gathered record that may name the hangar, near the pad, while the names are wanted (the view says so). The tick applies it.
-void hangarNameNote(uintptr_t record, const float* centre, float radius, const PadSnapshot& s) noexcept {
+void hangarNameNote(GatherWriter& w, uintptr_t record, const float* centre, float radius, const PadSnapshot& s) noexcept {
     if (!s.namesPending) return;
     const float d = sealed::distance(centre, s.padC);
     if (d > 150.0f) return;
     char nm[64] = {};
     if (!cachedName(record, nm, sizeof(nm)) || !sealed::hangarLikeName(nm)) return;
-    GatherEntry e = gatherEntry(GKind::kHangar, record, centre, radius, g_frameStamp.load(std::memory_order_relaxed), nm);
+    GatherEntry e = gatherEntry(GKind::kHangar, record, centre, radius, 0, nm);
     e.dist = d;
-    g_gather.push(e);
+    w.push(e);
 }
 
 // Built v14.13: the once-per-dock note with no sized shell: the hangar-like and pad records near the pad (the first carrier dock tells us its
@@ -1289,11 +1373,37 @@ void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
 // The 30 s summary: what the station did in the window. A user's log shows the station's work here.
 void summaryLine(uint64_t now) noexcept {
     Log::get().note("optimized station: last %llu s: sealed for %llu of %llu frames; rigs vetoed early %llu, records vetoed early %llu, "
-                    "records culled after the store %llu, records kept unread %llu, faults %llu.",
+                    "records culled after the store %llu, records kept unread %llu, faults %llu (unreadable bucket %llu, cull read %llu, cull restored "
+                    "%llu, cull torn %llu, tick view %llu; callbacks before the first camera %llu, not faults).",
                     static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(g_winSealedFrames),
                     static_cast<unsigned long long>(g_winFrames), static_cast<unsigned long long>(g_winRigVetoes),
                     static_cast<unsigned long long>(g_winProducerVetoes), static_cast<unsigned long long>(g_winCulled),
-                    static_cast<unsigned long long>(g_winKeptUnknown), static_cast<unsigned long long>(g_winFaults));
+                    static_cast<unsigned long long>(g_winKeptUnknown), static_cast<unsigned long long>(g_winFaults.load()),
+                    static_cast<unsigned long long>(g_winFaultBy[kFaultBucket].load()), static_cast<unsigned long long>(g_winFaultBy[kFaultCullRead].load()),
+                    static_cast<unsigned long long>(g_winFaultBy[kFaultCullRestored].load()),
+                    static_cast<unsigned long long>(g_winFaultBy[kFaultCullTorn].load()),
+                    static_cast<unsigned long long>(g_winFaultBy[kFaultTickView].load()), static_cast<unsigned long long>(g_winNoCamera.load()));
+    // Built v14.27: the passes the tick read, and what it did with them; the rig veto's lookups. A dead veto or a flapping pad shows here.
+    {
+        const sealed::PassGate& g = g_passGate;
+        const double avg = g.informative > 0 ? static_cast<double>(g.callsSum) / static_cast<double>(g.informative) : 0.0;
+        Log::get().note("optimized station: last %llu s passes: %llu informative, %llu empty, %llu unfinished (a writer was still inside), %llu thin (under "
+                        "half the usual calls); callbacks per informative pass min/avg/max %llu/%.0f/%llu; the own pad's record in %llu informative passes, "
+                        "missing from %llu, missing from the whole window %llu; camera held through %llu failed resolutions, %llu jumps over %.0f m, %llu "
+                        "context changes; rig publications %llu (%.0f rigs each); rig requests sent %llu.",
+                        static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(g.informative),
+                        static_cast<unsigned long long>(g.empty), static_cast<unsigned long long>(g.deferred), static_cast<unsigned long long>(g.thin),
+                        static_cast<unsigned long long>(g.informative > 0 ? g.callsMin : 0), avg, static_cast<unsigned long long>(g.callsMax),
+                        static_cast<unsigned long long>(g_winPadSeen), static_cast<unsigned long long>(g_winPadMissed),
+                        static_cast<unsigned long long>(g_winPadAbsentWindow), static_cast<unsigned long long>(g_winCamHold),
+                        static_cast<unsigned long long>(g_winCamJump), static_cast<double>(kCamJumpM), static_cast<unsigned long long>(g_winCtxChange),
+                        static_cast<unsigned long long>(g_winRigPublications),
+                        g_winRigPublications > 0 ? static_cast<double>(g_winRigPublished) / static_cast<double>(g_winRigPublications) : 0.0,
+                        static_cast<unsigned long long>(g_rigTally.asked.load()));
+        g_passGate.clearWindow();
+        g_winPadSeen = g_winPadMissed = g_winPadAbsentWindow = g_winCamHold = g_winCamJump = g_winCtxChange = 0;
+        g_winRigPublications = g_winRigPublished = 0;
+    }
     // Built v14.20 (review 5): the tables' occupancy now, the longest probe and the bounded (full) count this window, and the rig epoch count.
     Log::get().note("optimized station: last %llu s tables: producer %u of %u used, longest probe %u, bounded %llu; rigs %u of %u, longest %u, "
                     "bounded %llu; collections %u of %u, longest %u, bounded %llu; rig epochs %llu (epoch %u).",
@@ -1349,7 +1459,8 @@ void summaryLine(uint64_t now) noexcept {
                         "ms per call, %llu sampled), producer veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu "
                         "sampled), rig veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu sampled), frame tick "
                         "%.3f/%.3f/%.3f ms per frame (%llu frames), mutex wait total %.3f ms max %.3f ms (blocked over 0.1 ms: %llu), waiting lines "
-                        "written %llu; gathered entries lost %llu; state lock taken from a callback %llu.",
+                        "written %llu; gathered entries lost %llu; state lock taken from a callback %llu; rig veto lookups: hit vetoed %llu, hit kept %llu, "
+                        "collection moved %llu, miss %llu, stale epoch %llu (rig requests sent %llu).",
                         static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(callsStore),
                         static_cast<double>(callsStore) / fr, meanStore * static_cast<double>(callsStore) / fr, s50, s95, smax,
                         static_cast<unsigned long long>(nStore), static_cast<unsigned long long>(callsProd), static_cast<double>(callsProd) / fr,
@@ -1357,7 +1468,16 @@ void summaryLine(uint64_t now) noexcept {
                         static_cast<unsigned long long>(callsRig), static_cast<double>(callsRig) / fr, meanRig * static_cast<double>(callsRig) / fr,
                         r50, r95, rmax, static_cast<unsigned long long>(nRig), f50, f95, fmax, static_cast<unsigned long long>(nFrame), waitTotal,
                         waitMax, static_cast<unsigned long long>(blocked), static_cast<unsigned long long>(waitingLines),
-                        static_cast<unsigned long long>(lost), static_cast<unsigned long long>(onCallback));
+                        static_cast<unsigned long long>(lost), static_cast<unsigned long long>(onCallback),
+                        static_cast<unsigned long long>(g_rigTally.hitVetoed.load()), static_cast<unsigned long long>(g_rigTally.hitKept.load()),
+                        static_cast<unsigned long long>(g_rigTally.hitMoved.load()), static_cast<unsigned long long>(g_rigTally.miss.load()),
+                        static_cast<unsigned long long>(g_rigTally.stale.load()), static_cast<unsigned long long>(g_rigTally.asked.load()));
+        g_rigTally.hitVetoed = 0;
+        g_rigTally.hitKept = 0;
+        g_rigTally.hitMoved = 0;
+        g_rigTally.miss = 0;
+        g_rigTally.stale = 0;
+        g_rigTally.asked = 0;
     }
 
     g_prodStats.maxProbes.store(0, std::memory_order_relaxed);
@@ -1368,6 +1488,8 @@ void summaryLine(uint64_t now) noexcept {
     g_summaryStartMs = now;
     g_winFrames = g_winSealedFrames = g_winRigVetoes = g_winProducerVetoes = 0;
     g_winCulled = g_winKeptUnknown = g_winFaults = 0;
+    g_winNoCamera = 0;
+    for (auto& f : g_winFaultBy) f = 0;
 }
 
 // The producer-B and rig vetoes: attached while the setting is on, and they answer only while sealed.
@@ -1559,26 +1681,26 @@ void applyRigAssoc(uintptr_t rig, uintptr_t coll) {
 
 void applyEntry(const GatherEntry& e) {
     switch (e.kind) {
-        case GKind::kPad:
-            if (g_padCount < sealed::kPadSlots) {
-                sealed::PadObs& p = g_pads[g_padCount];
-                p.addr = e.record;
-                for (int k = 0; k < 3; ++k) p.centre[k] = e.centre[k];
-                p.radius = e.radius;
-                p.size = static_cast<sealed::PadSize>(e.flags);
-                std::snprintf(p.name, sizeof(p.name), "%s", e.name);
-                if (p.size != sealed::PadSize::kNone) ++g_padCount;
-            }
+        case GKind::kPad: {
+            sealed::PadObs p;
+            p.addr = e.record;
+            for (int k = 0; k < 3; ++k) p.centre[k] = e.centre[k];
+            p.radius = e.radius;
+            p.size = static_cast<sealed::PadSize>(e.flags);
+            std::snprintf(p.name, sizeof(p.name), "%s", e.name);
+            if (p.size != sealed::PadSize::kNone) g_padWin.put(p);
+            if (e.record == g_ownSticky.pad) g_stickyPadInPass = true;
             break;
-        case GKind::kExplicit:
-            if (g_explicitCount < sealed::kExplicitSlots) {
-                sealed::ExplicitObs& x = g_explicits[g_explicitCount++];
-                x.addr = e.record;
-                x.node = e.aux;
-                for (int k = 0; k < 3; ++k) x.centre[k] = e.centre[k];
-                std::snprintf(x.name, sizeof(x.name), "%s", e.name);
-            }
+        }
+        case GKind::kExplicit: {
+            sealed::ExplicitObs x;
+            x.addr = e.record;
+            x.node = e.aux;
+            for (int k = 0; k < 3; ++k) x.centre[k] = e.centre[k];
+            std::snprintf(x.name, sizeof(x.name), "%s", e.name);
+            g_explicitWin.put(x);
             break;
+        }
         case GKind::kNear:
             if (g_nearCurN < kNearSlots) {
                 NearRec& nr = g_nearCur[g_nearCurN++];
@@ -1634,9 +1756,25 @@ void applyEntry(const GatherEntry& e) {
 void drainGather() {
     g_rigBucketCache = 0;
     g_rigBucketRig = 0;
-    const uint64_t lost = g_gather.drain([](const GatherEntry& e) { applyEntry(e); });
-    g_winLost += lost;
-    g_lossPublished = lost != 0;
+    g_stickyPadInPass = false;
+    const sealed::PassDrain d = g_gather.drain([](const GatherEntry& e) { applyEntry(e); });
+    g_winLost += d.lost;
+    // Built v14.27: the verdict on the drained passes. Only a complete pass that held a store callback is evidence; an empty or unfinished one leaves the
+    // pad, the camera, the latch samples and the rig publication as they were.
+    const sealed::PassVerdict v = g_passGate.step(d.complete, d.passes, d.calls);
+    g_passInformative = v == sealed::PassVerdict::kInformative;
+    g_passCalls = d.calls;
+    g_recordsLast = static_cast<uint32_t>(d.calls > 0xFFFFFFFFull ? 0xFFFFFFFFull : d.calls);
+    // A loss keeps every record in the next publication; it ends with the first informative pass that lost nothing.
+    if (d.lost != 0) g_lossPublished = true;
+    else if (g_passInformative) g_lossPublished = false;
+    if (g_passInformative) {
+        if (d.ctx != 0 && g_lastPassCtx != 0 && d.ctx != g_lastPassCtx) ++g_winCtxChange;
+        if (d.ctx != 0) g_lastPassCtx = d.ctx;
+        g_passCtx = d.ctx;
+    } else {
+        g_passCtx = 0;
+    }
 }
 
 void promoteFrame(uint32_t stamp, uint32_t frame) {
@@ -1772,8 +1910,8 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
     else
         g_explicitPrevCount = next.has ? sealed::pickExplicit(g_explicits, g_explicitCount, next.centre, g_explicitPrev, sealed::kExplicitNodes) : 0;
     g_cellPrev = next;
-    g_padCount = 0;
-    g_explicitCount = 0;
+    g_padWin.endPass();        // built v14.27: the windows age by one informative pass; a record unseen for kSeenKeep passes is gone
+    g_explicitWin.endPass();
     g_cellStamp = stamp;
 }
 
@@ -1829,26 +1967,30 @@ void publishSnapshot() noexcept {
 // The tick's view of the camera: resolved from the context the last callback saw (built v14.26: one frame behind the callbacks that read it). Up to
 // kViewTries resolves while the centre the consumer uses is not ready, as the callbacks did.
 void resolveTickView() noexcept {
-    const uintptr_t ctx = g_ctxSeen.load(std::memory_order_relaxed);
-    if (ctx == 0) return;   // no callback has seen a store yet: the camera stays unknown
+    // Built v14.27: only an informative pass resolves the camera, from the context its busiest thread's callbacks saw (not "the last callback's"). An
+    // empty or unfinished pass holds the camera as it was.
+    if (!g_passInformative) return;
+    const uintptr_t ctx = g_passCtx;
+    if (ctx == 0) return;   // the pass named no context: nothing to resolve from; the camera is held
     view::resolveView(ctx, &g_view);
     for (uint32_t t = 1; t < kViewTries && !sealed::viewCentreReady(g_view.originOk, g_view.poseOk, g_view.source == view::Source::kExplorerCam); ++t)
         view::resolveView(ctx, &g_view);
     float cam[3] = {};
-    if (cameraOf(g_view, cam)) {
+    const bool ok = cameraOf(g_view, cam);
+    if (ok) {
+        if (g_frameCamValid && sealed::distance(cam, g_frameCam) > kCamJumpM) ++g_winCamJump;
         std::memcpy(g_frameCam, cam, sizeof(g_frameCam));
-        g_frameCamValid = true;
         g_cameraKnown.store(true, std::memory_order_relaxed);
     } else {
-        g_frameCamValid = false;
-        g_faults.fetch_add(1, std::memory_order_relaxed);
-        ++g_winFaults;
+        faultNote(kFaultTickView);
+        ++g_winCamHold;
     }
+    g_frameCamValid = g_camHold.resolved(ok);   // a failed resolution is covered by the last good camera for kCamHoldTicks passes
 }
 
 // The gathered rig sphere of one judged record: the rig on the synchronous path (the evaluation's own stack), or the bucket's owner on the job path (the
 // tick resolves its collection). A record without a sphere is not gathered.
-void gatherRigNote(uintptr_t bucket, uintptr_t record, const float c[3], float r, uint32_t stamp) noexcept {
+void gatherRigNote(GatherWriter& w, uintptr_t bucket, uintptr_t record, const float c[3], float r, uint32_t stamp) noexcept {
     if (!(r > 0.0f) || !std::isfinite(r)) return;
     GatherEntry e = gatherEntry(GKind::kRigNote, record, c, r, stamp, nullptr);
     e.bucket = bucket;
@@ -1861,7 +2003,7 @@ void gatherRigNote(uintptr_t bucket, uintptr_t record, const float c[3], float r
         if (bucket != 0) readVal(&owner, bucket + 0x10);
         e.aux = owner;
     }
-    g_gather.push(e);
+    w.push(e);
 }
 
 // The store observer's judgement, for one record the store has written. Built v14.26: no lock. The callback reads the published view, gathers the parts
@@ -1869,30 +2011,31 @@ void gatherRigNote(uintptr_t bucket, uintptr_t record, const float c[3], float r
 // the near list, the own candidate, the ship's tally, the latch and the hangar names), then (judge only) the named keep, the bay keep, the own ship, and
 // otherwise culled. judge: the sealed judgement; false: gathering only.
 void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
-    g_recordsFrame.fetch_add(1, std::memory_order_relaxed);
+    // Built v14.27: the callback is one Writer. Its entries all go to the pass of the stamp it read on entry, and the pass is not read while it is inside.
+    GatherWriter w(g_gather);
+    w.call(0);
     SnapshotPin pin;
     const PadSnapshot& s = pin.get();
     if (judge && !s.held) return;
     uintptr_t ctx = 0;
     uint32_t count = 0;
     if (!bucket || !record || !readVal(&ctx, bucket) || !ctx || !readVal(&count, ctx + kCtxCount) || count == 0) {
-        g_faults.fetch_add(1, std::memory_order_relaxed);
-        ++g_winFaults;
+        faultNote(kFaultBucket);
         return;
     }
-    g_ctxSeen.store(ctx, std::memory_order_relaxed);   // the tick resolves the view from it (one frame behind)
+    w.context(ctx);   // names the context for the pass (the call itself was counted above)
     if (!s.camValid) {
-        g_faults.fetch_add(1, std::memory_order_relaxed);
-        ++g_winFaults;
+        // Not a fault: the first pass after the gate opens has no camera yet (v14.26 counted the whole pass, 1268 records, as faults here).
+        g_winNoCamera.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const float* cam = s.cam;
-    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
-    const bool lost = s.lost || g_gather.lostSinceDrain() != 0;   // a loss keeps every record (fail-safe)
+    const uint32_t stamp = w.stamp();
+    const bool lost = s.lost || w.lostSinceDrain() != 0;   // a loss keeps every record (fail-safe)
     const WorldRead wr = worldOfRecord(record);
     if (judge) {
         g_worldSrc[wr.source].fetch_add(1, std::memory_order_relaxed);
-        if (wr.source != 4) gatherRigNote(bucket, record, wr.world, wr.radius, stamp);
+        if (wr.source != 4) gatherRigNote(w, bucket, record, wr.world, wr.radius, stamp);
     }
     const float* centre = wr.world;
     const float radius = wr.radius;
@@ -1913,7 +2056,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
             if (size != sealed::PadSize::kNone) {
                 GatherEntry e = gatherEntry(GKind::kPad, record, centre, radius, stamp, name);
                 e.flags = static_cast<uint8_t>(size);
-                g_gather.push(e);
+                w.push(e);
             }
         }
     } else if (cls == sealed::NameClass::kExplicit && !s.giveUp) {   // built v14.13: stops after the give-up
@@ -1921,7 +2064,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         cachedName(record, xn, sizeof(xn));   // no name: the explicit part is still gathered, with an empty name
         GatherEntry e = gatherEntry(GKind::kExplicit, record, centre, radius, stamp, xn);
         e.aux = node;
-        g_gather.push(e);
+        w.push(e);
     }
     // The own ship: the own candidate (the nearest small containing sphere), the prefix rule, then the live own sphere.
     const bool containsCam = sealed::containsCamera(centre, radius, cam);
@@ -1931,7 +2074,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         if (cachedName(record, nn, sizeof(nn))) {
             GatherEntry e = gatherEntry(GKind::kNear, record, centre, radius, stamp, nn);
             e.dist = dCam;
-            g_gather.push(e);
+            w.push(e);
         }
     }
     if (containsCam && radius < sealed::kOwnShipRadiusM) {
@@ -1939,15 +2082,15 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         if (cachedName(record, cn, sizeof(cn))) {
             GatherEntry e = gatherEntry(GKind::kOwnCand, record, centre, radius, stamp, cn);
             e.dist = dCam;
-            g_gather.push(e);
+            w.push(e);
         }
     }
     if (dCam <= sealed::kShipRecordsM) {   // the ship's part count by prefix (built v14.8)
         char tn[64] = {};
-        if (cachedName(record, tn, sizeof(tn))) g_gather.push(gatherEntry(GKind::kTally, record, centre, radius, stamp, tn));
+        if (cachedName(record, tn, sizeof(tn))) w.push(gatherEntry(GKind::kTally, record, centre, radius, stamp, tn));
     }
-    latchCandNote(record, centre, s);   // built v14.12: gathered only while a latch is pending
-    hangarNameNote(record, centre, radius, s);   // built v14.13: only while the names are wanted
+    latchCandNote(w, record, centre, s);   // built v14.12: gathered only while a latch is pending
+    hangarNameNote(w, record, centre, radius, s);   // built v14.13: only while the names are wanted
     if (!judge) return;   // gathering only: the judgement is sealed-only
     if (lost) {
         g_kept.fetch_add(1, std::memory_order_relaxed);
@@ -2148,12 +2291,11 @@ void optimizedStationFrameBody(uint32_t frame) {
     }
     if (g_summaryStartMs == 0) g_summaryStartMs = now;
     // Built v14.2: the frame advances here, once per tick. The observer's promote and view resolve run once per frame off this stamp.
-    g_frameStamp.fetch_add(1, std::memory_order_relaxed);
+    g_frameStamp.fetch_add(1, std::memory_order_seq_cst);   // built v14.27: the callbacks that read the old stamp are the old pass's writers
     TimedStateLock lock;
     prodSync();   // built v14.26: the producer generation moves with the frame (the callbacks never move it)
-    g_recordsLast = g_recordsFrame.exchange(0, std::memory_order_relaxed);
-    drainGather();          // the entries the callbacks gathered in the previous pass, in the order they were written
-    resolveTickView();      // the view from the last callback's context (one frame behind)
+    drainGather();          // the entries of the passes the stamp just closed, if every writer of them has left (built v14.27)
+    resolveTickView();      // the camera from the pass's busiest context; held when the pass is empty or unfinished (built v14.27)
     ++g_winFrames;
     if (g_heldValid) ++g_winSealedFrames;
     g_dockedKnownNow.store(journalDockedKnown(), std::memory_order_release);
@@ -2284,7 +2426,7 @@ void optimizedStationFrameBody(uint32_t frame) {
     g_latchPending = g_bayWatching && !g_latch.latched;
     if (g_latchPending && g_pickCell.has) latchNow(now);
     g_latchCandN = 0;
-    if (g_latch.latched && g_bayNoting) latchRead(now);
+    if (g_latch.latched && g_bayNoting && g_passInformative) latchRead(now);   // built v14.27: no sample from an empty or unfinished pass (the next sample re-bases)
     // Built v14.14: a latched mechanism record moved on two frames in a row while sealed: the launch releases the seal.
     g_mechanismMoved = false;
     if (g_sealedFlag.load(std::memory_order_acquire)) {
@@ -2407,13 +2549,20 @@ void optimizedStationFrameBody(uint32_t frame) {
             else if (!g_pickCell.has) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_pickCell.reason);
             else std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", sealed::cellInvalidWhy(g_pickCell));
         }
-        const bool changed = !g_waitLastSet || sealed::gameKeyChanged(g_waitLast, w);
+        // Built v14.27: a change is written once it has held kWaitStableTicks ticks (the key flipping every frame wrote 231 to 800 lines per 30 s in v14.26).
+        const bool candChanged = !g_waitCandSet || sealed::gameKeyChanged(g_waitCand, w);
+        if (candChanged) {
+            g_waitCand = w;
+            g_waitCandSet = true;
+        }
+        const bool stable = g_waitStable.step(candChanged, sealed::kWaitStableTicks);
+        const bool changed = !g_waitLastSet || (stable && sealed::gameKeyChanged(g_waitLast, g_waitCand));
         const bool periodic = w.docked && g_waitLastSet && now - g_waitLastMs >= 10000;
         if (changed || periodic) {
             char line[480] = {};
-            sealed::gameWaitingLine(w, line, sizeof(line));
+            if (changed) g_waitLast = g_waitCand;   // the periodic line repeats the last stable key
+            sealed::gameWaitingLine(g_waitLast, line, sizeof(line));
             Log::get().note("%s", line);
-            g_waitLast = w;
             ++g_waitingLinesWritten;   // built v14.24: the waiting lines written this window (the summary's count)
             g_waitLastSet = true;
             g_waitLastMs = now;
@@ -2422,9 +2571,17 @@ void optimizedStationFrameBody(uint32_t frame) {
     {
         // Built v14.26: the pads, explicit parts and camera of the pass just drained make the cell for the next pass (the observer's promote, moved here).
         const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
-        if (g_recordsLast != 0 && sealed::framePromoteDue(g_cellStamp, stamp)) promoteFrame(stamp, stamp);
+        // Built v14.27: only an informative pass makes the cell. An empty or unfinished one leaves the pick, the pad and the windows as they were.
+        if (g_passInformative && sealed::framePromoteDue(g_cellStamp, stamp)) promoteFrame(stamp, stamp);
     }
-    refreshRigVerdicts();
+    if (g_passInformative && g_ownSticky.pad != 0) {
+        if (g_stickyPadInPass) ++g_winPadSeen;
+        else ++g_winPadMissed;
+        if (!g_padWin.has(g_ownSticky.pad)) ++g_winPadAbsentWindow;
+    }
+    // Built v14.27: the rig verdicts are republished from an informative pass only; the last publication stands otherwise. Without a held cell the
+    // publication is emptied at once (the veto answers only while sealed).
+    if (g_passInformative || !g_heldValid) refreshRigVerdicts();
     publishSnapshot();   // built v14.25: the tick's view for the per-record path (under the lock)
     if (now - g_summaryStartMs >= kSummaryMs) summaryLine(now);
     (void)frame;
