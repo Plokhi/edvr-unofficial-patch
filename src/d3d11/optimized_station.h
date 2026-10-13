@@ -12,6 +12,8 @@ bool optimizedStationOn() noexcept;
 bool optimizedStationGathers() noexcept;
 // Whether the station is sealed in a hangar this frame (one atomic load). The draw path and the hooks read it.
 bool optimizedStationSealed() noexcept;
+// Whether the station's sun skip is on now (one atomic load; built v14.30: the sun-shadow probe and the dispatch hook read it).
+bool optimizedStationSunOff() noexcept;
 // The draw path asks: true skips the draw (the sun pair, while sealed).
 bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps) noexcept;
 // The admission store calls this after it has written a record (bucket = the collection, record = its record).

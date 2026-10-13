@@ -23,6 +23,8 @@
 #include "station_lockfree_core.h"
 #include "station_pass_core.h"
 #include "pad_state_probe.h"
+#include "cluster_probe_hook.h"
+#include "sun_shadow_probe.h"
 #include "store_hook.h"
 #include "view_source.h"
 
@@ -1673,6 +1675,10 @@ void summaryLine(uint64_t now) noexcept {
         g_rigTally.asked = 0;
     }
 
+    // Built v14.30: the log-only probes' windows (each writes its own line and starts afresh).
+    clusterProbeReport((now - g_summaryStartMs) / 1000);
+    sunShadowProbeReport((now - g_summaryStartMs) / 1000);
+
     g_prodStats.maxProbes.store(0, std::memory_order_relaxed);
     g_rigStats.maxProbes = g_collStats.maxProbes = 0;
     g_prodStats.full.store(0, std::memory_order_relaxed);
@@ -1769,6 +1775,7 @@ void applySetting(bool on, uint32_t frame) noexcept {
     } else {
         Log::get().note("optimized station: off (frame %u).", frame);
     }
+    clusterProbeSetOn(on);   // built v14.30: the cluster builder's probe follows the setting (log only)
     padStateSetOn(on);   // built v14.22: the pad-state probe (temporary, log only) installs with the setting
     g_vetoesAttached = on;
 }
@@ -2367,8 +2374,12 @@ bool optimizedStationSealed() noexcept { return g_sealedFlag.load(std::memory_or
 
 // The draw path asks: while sealed, the sun pair is not drawn.
 bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps) noexcept {
-    return g_sunOff.load(std::memory_order_acquire) && vs == kSunVs && ps == kSunPs;   // the sun skip follows the pad, not the seal (built v14.13)
+    if (!g_sunOff.load(std::memory_order_acquire)) return false;
+    sunShadowProbeDraw(vs, ps);   // built v14.30: log only; counts the draws into and the samplers of the sun's shadow map while the sun is skipped
+    return vs == kSunVs && ps == kSunPs;   // the sun skip follows the pad, not the seal (built v14.13)
 }
+
+bool optimizedStationSunOff() noexcept { return g_sunOff.load(std::memory_order_acquire); }
 
 // The store calls this after it has written a record (bucket = the collection, record = its record). While sealed it judges the record; while
 // docked and unsealed it only gathers the frame's pads, explicit parts and camera for the seal trigger (built v14.1).
@@ -2527,6 +2538,8 @@ void optimizedStationFrameBody(uint32_t frame) {
     }
     if (g_summaryStartMs == 0) g_summaryStartMs = now;
     // Built v14.2: the frame advances here, once per tick. The observer's promote and view resolve run once per frame off this stamp.
+    clusterProbeFrame();                                              // built v14.30: log-only probes' frame clocks
+    sunShadowProbeFrame(g_sunOff.load(std::memory_order_acquire));
     g_frameStamp.fetch_add(1, std::memory_order_seq_cst);   // built v14.27: the callbacks that read the old stamp are the old pass's writers
     TimedStateLock lock;
     prodSync();   // built v14.26: the producer generation moves with the frame (the callbacks never move it)
