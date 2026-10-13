@@ -1488,4 +1488,11 @@ Units (each behind the full build; Haiku implementers, reviewed):
   (wait - execute) ~0.7 ms (15%), copies ~0.16 ms (3%); the sum matches the 4.7 ms bracket. XH1 holds for the copies; the handoff is
   the bridge's real cost. ruled out: removing the copies (shared pass textures) as worth building, because they are 0.16 ms per pair.
   The rest is XeSS's own DP4a compute on NVIDIA. Render-thread CPU p50 rose from ~1.9 to 2.4-2.9 ms with XeSS: leading suspect the
-  allocator-reuse wait (xess_engine.cpp:932, three allocators per slot, two evals a frame); unmeasured.
+  allocator-reuse wait (xess_engine.cpp:932, three allocators per slot, two evals a frame); unmeasured.- Shimmer (Sean: "some shimmering in places on my ship"; DLSS shows it too, "more muted"): eye dumps 102338 (XeSS) and 102353 (DLSS),
+  16 frames per eye, main-menu hangar, 2016x2017 -> 4032x4034. Code check: XeSS's flags (0x42 = INVERTED_DEPTH | LDR_INPUT_COLOR,
+  unjittered low-res motion vectors) match DLSS's VR feature (MVLowRes | DepthInverted, hdr_backend_flags.h:27-29); jitter and
+  motion-vector units and sign match the flat XeSS path that flew clean. ruled out: a jitter-sign or jittered-MV mismatch, because
+  the conventions match DLSS's and flat XeSS's. Frame-to-frame change after aligning each frame's head drift (6-9 px): XeSS L/R mean
+  1.47/1.55, DLSS 1.66/2.15; both hot on the same fine detail (an engraved disc, grilles, thin seams), with no XeSS-only pattern
+  (no eye disagreement, no whole-image swim). Residual head motion dominates the numbers, so they do not rank the engines. Reading:
+  input-limited fine detail at a 2x upscale, present for both; XH2 and XH3 hold. Check: a higher HMD Image Quality calms both.
