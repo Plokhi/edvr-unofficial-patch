@@ -1013,13 +1013,14 @@ constexpr float kCameraLeaveM = 2.0f;
 constexpr uint32_t kCameraFrames = 10;
 
 enum class SealAction : uint8_t { kNone = 0, kRequestEngage = 1, kRelease = 2 };
-enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kCameraLeft, kPadMoved, kHangarChanged, kLaunch };
+enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kCameraLeft, kPadMoved, kHangarChanged, kLaunch, kMechanism };
 
 struct SealInputs {
     bool setting = false;        // fix.optimized_station is on
     bool docked = false;         // Status.json Flags bit 0
     bool pickOk = false;         // the own pad is found this frame, with a pose
     bool padHeld = false;        // built v14.9: the own pad is absent this frame, held for fewer than kHeldLostFrames: the trigger keeps its state
+    bool mechanismMoved = false;  // built v14.14: a latched bay mechanism record moved on two frames in a row (sealed: the launch)
     uint64_t bayLastMotionMs = 0;  // built v14.10: the last time a watched, non-continuous record moved (0: none); the bay's quiet time
     uint64_t padLastMotionMs = 0;  // built v14.11: the last time the own pad moved (its own still watch)
     float rel = 0.0f;            // the pad's height above the hangar shell along its up axis now (metres; frame-independent)
@@ -1179,6 +1180,7 @@ struct LatchRec {
     uint8_t ss = 4;
     uint64_t lastMovedMs = 0;
     bool haveMotion = false;
+    uint32_t movedRun = 0;   // consecutive compared frames the record moved (built v14.14)
     // Reads the record for this frame: a reading one frame after the last, from the same sources, is compared (poseMoved); a missing frame or another
     // source re-bases without counting. Returns true when the record moved.
     bool step(uint32_t frame, const float r[3], const float a0[3], const float a2[3], uint8_t p, uint8_t s, uint64_t nowMs) noexcept {
@@ -1190,6 +1192,7 @@ struct LatchRec {
                 haveMotion = true;
             }
         }
+        movedRun = moved ? movedRun + 1 : 0;   // a re-base or a missing frame resets the run: never a move from a source change
         stamp = frame;
         std::memcpy(rel, r, sizeof(rel));
         std::memcpy(ax0, a0, sizeof(ax0));
@@ -1218,6 +1221,13 @@ struct LatchSet {
             if (recs[i].haveMotion && recs[i].lastMovedMs > m) m = recs[i].lastMovedMs;
         }
         lastMotionMs = m;
+    }
+    // The latched mechanism record (not the own pad) that moved on two frames in a row, or nullptr (built v14.14).
+    const LatchRec* movedRecord() const noexcept {
+        for (size_t i = 1; i < n; ++i) {
+            if (recs[i].movedRun >= 2) return &recs[i];
+        }
+        return nullptr;
     }
     uint64_t padLastMotionMs() const noexcept { return n > 0 ? recs[0].lastMovedMs : 0; }
     // The names of the latched records that moved within kBayStillMs, up to maxNames, joined with ", ".
@@ -1402,6 +1412,7 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         ReleaseWhy w = ReleaseWhy::kNone;
         if (!in.docked) w = ReleaseWhy::kUndocked;
         else if (st->camOutRun >= kCameraFrames) w = ReleaseWhy::kCameraLeft;
+        else if (in.mechanismMoved) w = ReleaseWhy::kMechanism;   // the hatch or the lift moved: the launch (built v14.14)
         else if (in.padMoved) w = ReleaseWhy::kPadMoved;
         else if (in.hangarChanged) w = ReleaseWhy::kHangarChanged;
         else if (in.launched) w = ReleaseWhy::kLaunch;

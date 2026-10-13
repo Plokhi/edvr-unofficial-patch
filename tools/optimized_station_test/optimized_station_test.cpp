@@ -669,6 +669,76 @@ int main(int argc, char** argv) {
         check(req == 4000 + se::kBayStillMs, "v14.12: the own pad must be still for 2 s too: sealed 2 s after the pad's last move");
     }
 
+    // ---- Built v14.14: sealed, the latched bay mechanism moves -> the launch releases the seal; still for a minute -> no release; a source change -> no release
+    {
+        const float a0[3] = {1.0f, 0.0f, 0.0f};
+        const float a2[3] = {0.0f, 0.0f, 1.0f};
+        const float padRel[3] = {0.0f, 0.0f, -45.0f};
+        const float hatchStill[3] = {5.0f, 0.0f, -45.0f};
+        se::LatchSet set;
+        set.latched = true;
+        set.n = 2;
+        std::snprintf(set.recs[0].name, sizeof(set.recs[0].name), "%s", "LandingPadMediumA");
+        set.recs[0].addr = 0x1;
+        std::snprintf(set.recs[1].name, sizeof(set.recs[1].name), "%s", "BlastShieldBase");
+        set.recs[1].addr = 0x7;
+        // (1) the hatch starts moving at frame 50 (every frame): released within 2 frames (at frame 51)
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::sealStep(quiet(100), &st, &w);   // the seal (the state of a sealed station)
+        uint64_t relAt = 0;
+        for (uint32_t f = 1; f <= 100 && relAt == 0; ++f) {
+            float hatch[3] = {5.0f, 0.0f, -45.0f};
+            if (f >= 50) hatch[2] = (f % 2 == 0) ? -44.9f : -45.0f;
+            set.recs[0].step(f, padRel, a0, a2, 1, 1, f * 100ull);
+            set.recs[1].step(f, hatch, a0, a2, 1, 1, f * 100ull);
+            se::SealInputs h = quiet(f * 100ull);
+            h.held = true;
+            h.mechanismMoved = set.movedRecord() != nullptr;
+            if (se::sealStep(h, &st, &w) == se::SealAction::kRelease) relAt = f;
+        }
+        check(relAt == 51 && w == se::ReleaseWhy::kMechanism, "v14.14: sealed, the hatch starts moving at frame 50: released within 2 frames (at 51), as the launch");
+        // (2) still for a minute (600 frames): no release
+        se::LatchSet still;
+        still.latched = true;
+        still.n = 2;
+        still.recs[0].addr = 0x1;
+        still.recs[1].addr = 0x7;
+        se::SealState st2;
+        se::sealStep(quiet(100), &st2, &w);
+        bool released = false;
+        for (uint32_t f = 1; f <= 600; ++f) {
+            still.recs[0].step(f, padRel, a0, a2, 1, 1, f * 100ull);
+            still.recs[1].step(f, hatchStill, a0, a2, 1, 1, f * 100ull);
+            se::SealInputs h = quiet(f * 100ull);
+            h.held = true;
+            h.mechanismMoved = still.movedRecord() != nullptr;
+            released = released || se::sealStep(h, &st2, &w) == se::SealAction::kRelease;
+        }
+        check(!released && still.movedRecord() == nullptr, "v14.14: sealed and still for 60 s: no release");
+        // (3) a centre-source change (the hatch read from another source each frame): re-based, never counted as moving: no release
+        se::LatchSet src;
+        src.latched = true;
+        src.n = 2;
+        src.recs[0].addr = 0x1;
+        src.recs[1].addr = 0x7;
+        se::SealState st3;
+        se::sealStep(quiet(100), &st3, &w);
+        bool srcReleased = false;
+        for (uint32_t f = 1; f <= 100; ++f) {
+            float hatch[3] = {5.0f, 0.0f, -45.0f};
+            hatch[2] = (f % 2 == 0) ? -44.5f : -45.0f;   // it does move, but each read comes from another source
+            const uint8_t srcNow = (f % 2 == 0) ? 1 : 2;
+            src.recs[0].step(f, padRel, a0, a2, 1, 1, f * 100ull);
+            src.recs[1].step(f, hatch, a0, a2, srcNow, 1, f * 100ull);
+            se::SealInputs h = quiet(f * 100ull);
+            h.held = true;
+            h.mechanismMoved = src.movedRecord() != nullptr;
+            srcReleased = srcReleased || se::sealStep(h, &st3, &w) == se::SealAction::kRelease;
+        }
+        check(!srcReleased && src.movedRecord() == nullptr, "v14.14: a centre-source change re-bases the record and never counts as a move: no release");
+    }
+
     // ---- Built v14.13: the sun inside the hangar (its own state), the hangar watch, the no-hangar pad, the names --------------------------
     {
         se::SunState su;

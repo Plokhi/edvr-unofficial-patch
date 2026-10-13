@@ -901,6 +901,7 @@ uint32_t g_engageWatched = 0;
 float g_engageSinceLowerS = 0.0f;
 char g_engageLastMover[48] = {};
 char g_engageMovers[160] = {};
+bool g_mechanismMoved = false;             // built v14.14: a latched bay mechanism moved while sealed
 bool g_flagPadMoved = false;               // promote saw the held pad move along the shaft against the shell: the tick releases on it
 char g_releaseWhy[160] = {};               // the release text for the flags above (the pad move or the hangar change, with its names)
 uint32_t g_settingPoll = 0;                // frames since the setting was last read
@@ -946,6 +947,7 @@ const char* releaseText(sealed::ReleaseWhy w) noexcept {
         case sealed::ReleaseWhy::kPadMoved: return g_releaseWhy;
         case sealed::ReleaseWhy::kHangarChanged: return g_releaseWhy;
         case sealed::ReleaseWhy::kLaunch: return "launch (the pad's state object flipped)";
+        case sealed::ReleaseWhy::kMechanism: return g_releaseWhy;
         default: return "released";
     }
 }
@@ -966,11 +968,12 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
     g_engagePending = false;
     sealed::clearTrigger(&g_sealState);   // the pad's motion memory stays: a release by motion makes the next seal wait its delay (built v14.4)
     g_sealedFlag.store(false, std::memory_order_release);
+    g_latch.reset();   // the next seal latches the bay again (built v14.14)
 }
 
 // Built v14.12: the latch is kept while docked, unsealed, after a descent; it is cleared on a hangar change, a ship change, an undock or a seal.
 bool bayWatchKeep() noexcept {
-    return g_setting.load(std::memory_order_acquire) && !g_sealedFlag.load(std::memory_order_acquire) &&
+    return g_setting.load(std::memory_order_acquire) &&   // kept through the seal too (built v14.14)
            g_dockedNow.load(std::memory_order_acquire) && g_sealState.moved;
 }
 
@@ -1653,6 +1656,15 @@ void optimizedStationFrame(uint32_t frame) {
     if (g_latchPending && g_pickCell.has) latchNow(now);
     g_latchCandN = 0;
     if (g_latch.latched && g_bayNoting) latchRead(now);
+    // Built v14.14: a latched mechanism record moved on two frames in a row while sealed: the launch releases the seal.
+    g_mechanismMoved = false;
+    if (g_sealedFlag.load(std::memory_order_acquire)) {
+        const sealed::LatchRec* mech = g_latch.movedRecord();
+        if (mech != nullptr) {
+            std::snprintf(g_releaseWhy, sizeof(g_releaseWhy), "the bay mechanism moved (%s): launch", mech->name);
+            g_mechanismMoved = true;
+        }
+    }
     // Built v14.13: the hangar watch (a sized shell near the pad) and its once-per-dock names; the sun inside the hangar (its own state).
     const bool shellFound = g_preShellValid;
     const bool padChanged = g_pickCell.has && g_pickCell.pad != g_hangarPad;
@@ -1683,6 +1695,7 @@ void optimizedStationFrame(uint32_t frame) {
     in.docked = g_dockedNow;
     in.pickOk = g_pickCell.has && g_preShellValid;   // no sized shell: the trigger stays idle (built v14.13)
     in.padHeld = padHeld;
+    in.mechanismMoved = g_mechanismMoved;
     in.bayLastMotionMs = g_latch.lastMotionMs;
     in.padLastMotionMs = padLastMotion();
     in.rel = g_relM;
