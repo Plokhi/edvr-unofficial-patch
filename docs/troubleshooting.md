@@ -41,15 +41,18 @@ display profiles from `%LOCALAPPDATA%`.
 
 ### Elite always starts in VR (or flat) whatever I set
 
-- **Symptom:** Elite starts in VR (or in flat) whatever its 3D setting says, so
-  EDVR runs the other profile's fixes.
+- **Symptom:** Elite starts in VR (or in flat) whatever its 3D setting says.
 - **Why it happens:** a launch switch overrides the 3D setting for that launch.
   `/vr` forces VR and `/novr` forces flat. Steam's VR and non-VR launch
-  choices, and EDLaunch, add one of them to the command line.
-- **Fix:** start Elite with the launch choice that sets neither switch, so the
-  3D setting decides. Switching 3D in the game's graphics options changes the
-  profile within about half a second, and settings fixed at startup follow at
-  the next launch.
+  choices add one of them to the command line, and EDLaunch passes it on. EDVR
+  follows the same switch, so it always runs the fixes for the mode the game
+  is actually in.
+- **Fix:** pick the launch choice for the mode you want: Steam's VR option for
+  VR, its normal option for flat. After a flat (`/novr`) launch the game offers
+  no headset option in its 3D menu, so restart with the VR option to go back
+  to VR. After a VR launch, turning 3D off and on in the game's graphics
+  options switches EDVR's fixes within about half a second; settings fixed at
+  startup follow at the next launch.
 
 ## Flat Screen Troubleshooting
 
