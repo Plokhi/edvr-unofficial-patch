@@ -9734,14 +9734,6 @@ WATCH_READ_RE = re.compile(r"^mode watch: read t=(?P<t>\d+) mode (?P<mode>\d+|un
 WATCH_FAIL_RE = re.compile(r"^mode watch: read failed t=(?P<t>\d+) \(error (?P<err>\d+)\); (?P<what>.*?)" + SUBMIT_SUFFIX + "$")
 WATCH_LIVE_RE = re.compile(r"^mode watch: live-rise t=(?P<t>\d+) -> (?P<result>posted vr|nothing)$")
 WATCH_OPENVR_RE = re.compile(r"^mode watch: openvr_api\.dll (?P<state>loaded|unloaded) t=(?P<t>\d+)$")
-# The stereo table probe (mode_watch.cpp): the table at its first read and at each change, seven signed 32-bit values. The no-context line,
-# the failed read and the context change carry no table and stay notes.
-STEREO_VALUES = r"(?P<%s>-?\d+(?:,-?\d+){6})"
-WATCH_STEREO_FIRST_RE = re.compile(r"^mode watch: stereo table first t=(?P<t>\d+) frame=(?P<frame>\d+) ctx=0x[0-9A-Fa-f]+ \["
-                                   + (STEREO_VALUES % "values") + r"\]$")
-WATCH_STEREO_CHANGE_RE = re.compile(r"^mode watch: stereo table t=(?P<t>\d+) frame=(?P<frame>\d+) \[" + (STEREO_VALUES % "values")
-                                    + r"\] \(was \[" + (STEREO_VALUES % "was") + r"\]\)"
-                                    r"(?: \((?P<dropped>\d+) change lines over the limit before this one\))?$")
 # The eye-submit transitions: a second with none after one with some (stopped), and the reverse (resumed, with that second's count).
 WATCH_SUBMIT_STOP_RE = re.compile(r"^mode watch: eye submits stopped t=(?P<t>\d+)$")
 WATCH_SUBMIT_RESUME_RE = re.compile(r"^mode watch: eye submits resumed t=(?P<t>\d+) \((?P<n>\d+)/s\)$")
@@ -9833,14 +9825,6 @@ def _switch_event(body):
     m = WATCH_OPENVR_RE.match(body)
     if m:
         return {"kind": "openvr", "t": int(m.group("t")), "state": m.group("state")}
-    m = WATCH_STEREO_FIRST_RE.match(body)
-    if m:
-        return {"kind": "stereo", "t": int(m.group("t")), "frame": int(m.group("frame")), "values": m.group("values"), "was": None,
-                "dropped": 0}
-    m = WATCH_STEREO_CHANGE_RE.match(body)
-    if m:
-        return {"kind": "stereo", "t": int(m.group("t")), "frame": int(m.group("frame")), "values": m.group("values"),
-                "was": m.group("was"), "dropped": int(m.group("dropped") or 0)}
     for result, rx in SWITCH_RES:
         m = rx.match(body)
         if m:
@@ -9932,11 +9916,6 @@ def print_switches(text):
         print("       switches: %d (%s)" % (len(switches), ", ".join("%s %d" % kv for kv in counts if kv[1])))
     else:
         print("       switches: 0")
-    stereo = [r for r in rows if r["kind"] == "stereo"]
-    if stereo:
-        changes = [r for r in stereo if r["was"] is not None]
-        print("       stereo table: first at t=%d (frame %d), %d change line(s), %d reported over the limit; last %s" % (
-            stereo[0]["t"], stereo[0]["frame"], len(changes), sum(r["dropped"] for r in changes), stereo[-1]["values"]))
     for i in posts:
         row = rows[i]
         hint = _nearest_before(rows, i, "hint")
@@ -10431,37 +10410,6 @@ def self_test_switches():
             print_switches(submit)
         if "eye submits: 1 stopped, 1 resumed" not in shown.getvalue():
             fail("--switches summary lacks the eye-submit counts: %r" % shown.getvalue()[-300:])
-
-    # The stereo table probe's lines (mode_watch.cpp): the no-context note, the first read, a change with its dropped count, a context change
-    # and a failed read. The table lines are rows with t, frame and values; the others are notes, and the summary names the first and last.
-    stereo = "\n".join([
-        "[00:00:00.020] mode watch: started on C:\\Game\\Options\\Graphics; launch file mode 0 (flat); scope both",
-        "[00:00:00.030] mode watch: stereo table: no render context yet",
-        "[00:00:01.000] mode watch: stereo table first t=1000 frame=60 ctx=0x1A2B3C4D5E0 [0,0,0,0,0,0,0]",
-        "[00:00:02.000] mode watch: stereo table t=2000 frame=120 [0,0,1,0,0,0,0] (was [0,0,0,0,0,0,0])",
-        "[00:00:02.500] mode watch: stereo table t=2500 frame=150 [-1,0,1,0,0,0,0] (was [0,0,1,0,0,0,0]) "
-        "(3 change lines over the limit before this one)",
-        "[00:00:03.000] mode watch: stereo table render context now 0x1A2B3C4D600 (was 0x1A2B3C4D5E0) t=3000 frame=180",
-        "[00:00:03.100] mode watch: stereo table read failed at ctx=0x1A2B3C4D600",
-        "",
-    ])
-    srows_stereo = switch_rows(switch_events(stereo))
-    if [r["kind"] for r in srows_stereo] != ["start", "note", "stereo", "stereo", "stereo", "note", "note"]:
-        fail("stereo kinds %r" % [r["kind"] for r in srows_stereo])
-    else:
-        if [r["d_prev"] for r in srows_stereo if r["kind"] == "stereo"] != [None, 1000, 500]:
-            fail("stereo rows' +prev ms %r" % [r["d_prev"] for r in srows_stereo if r["kind"] == "stereo"])
-        if (srows_stereo[3]["values"], srows_stereo[3]["was"], srows_stereo[3]["dropped"]) != ("0,0,1,0,0,0,0", "0,0,0,0,0,0,0", 0):
-            fail("stereo change parsed as %r" % srows_stereo[3])
-        if (srows_stereo[4]["values"], srows_stereo[4]["was"], srows_stereo[4]["dropped"]) != ("-1,0,1,0,0,0,0", "0,0,1,0,0,0,0", 3):
-            fail("stereo change with a dropped count parsed as %r" % srows_stereo[4])
-        if srows_stereo[2]["frame"] != 60 or srows_stereo[2]["was"] is not None:
-            fail("stereo first read parsed as %r" % srows_stereo[2])
-        shown = io.StringIO()
-        with contextlib.redirect_stdout(shown):
-            print_switches(stereo)
-        if "stereo table: first at t=1000 (frame 60), 2 change line(s), 3 reported over the limit; last -1,0,1,0,0,0,0" not in shown.getvalue():
-            fail("--switches summary lacks the stereo table line: %r" % shown.getvalue()[-300:])
 
     # The live switch's line (mode_watch.cpp's commit, phase 2): with kept settings, with none and from a live rise, from a missing file, the
     # stays and refused lines, and a kept list that does not parse (a note, so drift shows in the table).

@@ -31,7 +31,6 @@ constexpr uint32_t kWrapperRva = 0x2862780;
 constexpr uint32_t kLoaderRva = 0x2855A50;
 constexpr uint32_t kSsFieldOff = 0x13C;     // the loader object's SS field (a stack temporary the game copies from)
 constexpr uintptr_t kCtxSsOff = 0x3564;     // the render context's Supersampling field, the one every sizing consumer reads
-constexpr uintptr_t kStereoTableOff = 0x3678;  // Elite's per-3D-mode table: 7 dwords, indexed by mode 0..6 (the stereo table probe reads it)
 constexpr uint32_t kNoneBits = 0xFFFFFFFFu;  // "no value yet" in the float-bits atomics below
 // The wrapper's bytes: sub rsp,0x28; mov rcx,r8; call rel32 (the loader); mov al,1; add rsp,0x28; ret.
 constexpr uint8_t kWrapperBytes[19] = {0x48, 0x83, 0xEC, 0x28, 0x49, 0x8B, 0xC8, 0xE8, 0xC4, 0x32, 0xFF, 0xFF,
@@ -445,12 +444,6 @@ unsigned long long vrSsaaHoldLoaderObject() {
 int vrSsaaHoldLastMode(bool* known) {
     if (known) *known = g_modeKnown.load(std::memory_order_acquire);
     return g_mode.load(std::memory_order_acquire);
-}
-
-uintptr_t vrSsaaHoldRenderContext() { return g_ctx.load(std::memory_order_acquire); }
-
-bool vrSsaaHoldReadStereoTable(uintptr_t ctx, int32_t* out) {
-    return ctx != 0 && readGame(reinterpret_cast<const uint8_t*>(ctx + kStereoTableOff), out, 7 * sizeof(int32_t));
 }
 
 }  // namespace edvr
