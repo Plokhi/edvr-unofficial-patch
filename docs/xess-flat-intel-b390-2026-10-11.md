@@ -50,7 +50,8 @@
   Temporary paths identify historical artifacts rather than portable evidence.
 - XeSS in VR (Sean, 2026-10-13): designed on branch
   `claude/unified-install-feature-74bc24`, section "October 13: XeSS in VR"
-  at the end; units X1-X3, NOT BUILT.
+  at the end; X1 d150a2bd, X2 252c53c8, X3 314ac46a BUILT, NOT FLOWN
+  (Steam, `--scope both --xess`). World route (on foot) stays on its fallback.
 
 ## October 11: D3D11 capability probe
 
