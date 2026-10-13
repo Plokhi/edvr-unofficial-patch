@@ -64,6 +64,7 @@
 #include "eye_capture.h"
 #include "skybox_capture.h"
 #include "loading_state.h"
+#include "flat_clear_state.h"
 #include "openvr_compositor.h"
 #include "compositor_publication.h"
 #include "space_pose.h"
@@ -297,6 +298,11 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   LoadingState loading;
   uint64_t loadingClears=0;
   uint64_t skyboxSets=0,skyboxClears=0,loadingFrames=0,loadingLayers=0,loadingEmpty=0,loadingToScene=0;
+  // The headset while flat (flat_clear_state.h). The game's last WaitGetPoses or Submit, from any thread, in GetTickCount64 ms; the
+  // owner's empty frames and their counts.
+  std::atomic<uint64_t> gameFrameCallMs{0};
+  FlatClearState flatClear;
+  uint64_t flatClearFrames=0,flatClearStretchFrames=0,flatClearSummaryMs=0;
   SeatedSpace seated;ReferenceChanges changes;ResetEvents resetEvents;
   XrSpace frameSpace=XR_NULL_HANDLE;
   uint64_t recenters=0,resetPolls=0,referenceChanges=0;
@@ -871,6 +877,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     // Idle service work is CPU/XR only. A loading projection needs an explicit
     // render-caller boundary; it cannot borrow the game context between calls.
     if(visibilityMaskDirty&&state.running())refreshHiddenMasks("runtime_event");
+    flatClearTick();
   }
   void loadingBoundary() {
     if(GetCurrentThreadId()!=ownerThread||serviceStopped||serviceFailed)return;
@@ -933,6 +940,41 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     r=boundary.background();
     if(r==XR_SUCCESS){++loadingFrames;if(valid&&frame.shouldRender)++loadingLayers;else ++loadingEmpty;}
     return r;
+  }
+  // The headset while flat (flat_clear_state.h): one empty frame per owner pump at most. The xrWaitFrame inside waitAndBegin paces it to
+  // the headset, and a game call queues behind this pump, so the game waits for at most the frame in progress.
+  void flatClearTick() {
+    const uint64_t now=GetTickCount64();
+    const uint64_t last=gameFrameCallMs.load(std::memory_order_relaxed);
+    const uint64_t quiet=now>last?now-last:0;
+    const bool vrProfile=vrProfileActive();
+    const bool running=state.running()&&!state.terminal();
+    const auto step=flatClear.decide(vrProfile,state.frameOpen(),running,quiet);
+    if(step.started){flatClearStretchFrames=0;nativeTracePrintf("flat_clear,start,quiet_ms=%llu\n",(unsigned long long)quiet);}
+    if(step.run){
+      const XrResult r=flatClearFrame();
+      if(r!=XR_SUCCESS){publishFatalFailure(boundary.failed()?boundary.lastResult():r,"flat_clear_frame");return;}
+      ++flatClearFrames;++flatClearStretchFrames;
+    }
+    if(step.stopped)nativeTracePrintf("flat_clear,stop,reason=%s,frames=%llu\n",
+      step.reason==FlatClearState::Stop::VrProfile?"vr_profile":step.reason==FlatClearState::Stop::Session?"session":"game_frame",
+      (unsigned long long)flatClearStretchFrames);
+    // Every 30 s while the graphics half says flat, whether or not the owner is clearing, so a flat stretch with no clear frames shows
+    // why: frames stays 0 and game_frame_open or quiet_ms names the blocker.
+    if(!vrProfile&&now-flatClearSummaryMs>=30000){
+      flatClearSummaryMs=now;
+      nativeTracePrintf("flat_clear,summary,frames=%llu,clearing=%u,game_frame_open=%u,quiet_ms=%llu,running=%u\n",
+        (unsigned long long)flatClearFrames,unsigned(flatClear.active()),unsigned(state.frameOpen()),(unsigned long long)quiet,unsigned(running));
+    }
+  }
+  // One empty frame, begun and ended with zero layers: the shape of loadingStep's empty work. clear() ends whatever begin opened on
+  // every path, so no frame is left open on return.
+  XrResult flatClearFrame() {
+    auto r=boundary.waitAndBegin();
+    if(r!=XR_SUCCESS&&r!=XR_FRAME_DISCARDED&&r!=XR_SESSION_LOSS_PENDING)return r;
+    auto frame=boundary.frame();
+    if(!applyFrameSequence(frame)){boundary.clear();return XR_ERROR_LIMIT_REACHED;}
+    return boundary.clear();
   }
   static void referenceEvent(const XrEventDataBuffer& buffer,void* context) noexcept {
     auto& host=*static_cast<NativeRuntimeHost*>(context);
@@ -1004,6 +1046,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   CompositorRead compositorRead() const override {return poses.read();}
   void compositorUnsupported(unsigned slot) noexcept override {nativeTracePrintf("compositor_unavailable,slot=%u\n",slot);}
   vr::EVRCompositorError waitPoses(uint64_t generation,CompositorRead& out) override {
+    gameFrameCallMs.store(GetTickCount64(),std::memory_order_relaxed); // the game's call, from any thread: flatClearTick's quiet window
     clearOverlapHandoff();
     if(!service.isOwner()) {
       const uint64_t callerBegan=frameCycleUs();const DWORD caller=GetCurrentThreadId();
@@ -1294,6 +1337,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   }
   vr::EVRCompositorError submitEye(uint64_t generation,vr::EVREye eye,const vr::Texture_t* texture,
       const vr::VRTextureBounds_t* bounds,vr::EVRSubmitFlags flags) override {
+    gameFrameCallMs.store(GetTickCount64(),std::memory_order_relaxed); // the game's call, from any thread: flatClearTick's quiet window
     const auto admission=clearOverlapHandoff();
     return submitEyeAdmitted(generation,eye,texture,bounds,flags,admission);
   }

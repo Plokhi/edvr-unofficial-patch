@@ -3538,6 +3538,21 @@ if errorlevel 1 ( echo [edvr] ERROR: mode_watch_test build failed & exit /b 1 )
 "%OBJ%\modewatch\mode_watch_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_flat_clear_test
+echo [edvr] === flat_clear_test.exe ===
+REM The headset while flat's policy (src\openxr\flat_clear_state.h, docs\design-unified-install-2026-10-12.md section 12): the 250 ms quiet
+REM window at its edges, the four gates, the start and stop transitions with their reasons, and the word the graphics half writes that
+REM reads as VR when nobody has written it. No Windows API: the rig includes only the pure headers.
+if not exist "%OBJ%\flatclear" mkdir "%OBJ%\flatclear"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\flatclear\\" /Fe"%OBJ%\flatclear\flat_clear_test.exe" ^
+    "tools\flat_clear_test\flat_clear_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: flat_clear_test build failed & exit /b 1 )
+"%OBJ%\flatclear\flat_clear_test.exe" --dry-run || exit /b 1
+"%OBJ%\flatclear\flat_clear_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_orbital_width_test
 echo [edvr] === orbital_width_test.exe ===
 REM fix.ui_quality's orbit lines (src\d3d11\orbital_width*.h; docs\ui-layer-2026-09-23.md, "2026-10-06: the orbit lines"): the game's own

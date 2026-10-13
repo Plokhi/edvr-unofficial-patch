@@ -288,6 +288,8 @@ BOOL CALLBACK initOnceCallback(PINIT_ONCE, PVOID, PVOID*) {
     // this.
     edvr::pinGraphicsModuleOnce(reinterpret_cast<const void*>(&initOnceCallback));
     edvr::Log::get().note("%s", edvr::runtimeProfileLogLine().c_str());
+    // The launch's profile, for the runtime's headset-while-flat frames (frame_flag.h).
+    edvr::setVrProfileActive(edvr::runtimeVrProfile());
     edvr::Log::get().note("game command line: %s", edvr::runtimeGameCommandLine().c_str());
     edvr::modeWatchStart();  // after the profile lines: the watch's first line follows them (mode_watch.h)
     edvr::oculusRouteReport();

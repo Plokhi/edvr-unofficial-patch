@@ -15,6 +15,7 @@
 #include "vr_ssaa_hold.h"       // vrSsaaHoldProfileChanged: the Supersampling hold follows the profile
 
 #include "../common/config.h"
+#include "../common/frame_flag.h"              // setVrProfileActive: the runtime's own frames stand down while the game is flat
 #include "../common/ini_name.h"
 #include "../common/install_scope.h"
 #include "../common/log.h"
@@ -396,6 +397,7 @@ void commitPosted(uint64_t packed) {
     g_switches.fetch_add(1, std::memory_order_relaxed);
 
     runtimeProfileSet(target);
+    setVrProfileActive(target == RuntimeProfile::Vr || target == RuntimeProfile::LegacyVr);
     Config::get().switchProfile();
     vrSsaaHoldProfileChanged();
     deviceHookRequestConfigRefresh();  // the forced configure sweep runs later in this presentFrameBoundary
