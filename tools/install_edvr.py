@@ -1359,7 +1359,9 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
             leftovers.append(descriptor)
         if leftovers:
             raise SystemExit("[edvr] flat preflight refused existing VR or unknown profile state; "
-                             "use edvr-installer.exe to convert and restore originals:\n       " +
+                             "use edvr-installer.exe to convert and restore originals (run its "
+                             "update/repair once first if this install was made by this tool, so "
+                             "it records the files it must prove before converting):\n       " +
                              "\n       ".join(leftovers))
     if verify_only:
         ok = True
