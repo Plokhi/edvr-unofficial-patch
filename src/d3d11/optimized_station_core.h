@@ -786,8 +786,6 @@ inline bool pickTargetOnLine(const ExplicitObs* obs, size_t n, const float pad[3
     return true;
 }
 
-// Built v13 (fix 2): the pad is lowered when its height along its up axis is within tol of the lowest height seen this session.
-inline bool padLowered(float along, float lowest, float tol) noexcept { return along - lowest <= tol; }
 
 // Built v12.1: the precomputed verdict's code, one byte per rig (the frame tick writes it, the decision reads it): 2 outside, 1 mixed, 0 unknown or
 // a refresh (the decision decides the refresh from its own run count).
@@ -950,8 +948,14 @@ inline Cull cullRecordFaultSafe(Mem& m, CullField* failed, uint64_t* value) noex
 
 // ---- The seal's trigger (the station's state machine). Pure: the engine feeds the inputs each tick and acts on the result. ----------------------
 
-// The pad must be at its lowest seen height, and still to within kSealStillM, for kSealDelayMs before the seal. kSealDelayMs is the hatch's close
-// time: a guess (6 s) that the maintainer will measure in flight. Change it here and nowhere else.
+// The pad is LOWERED when its height above the hangar shell along the pad's up axis is below kLoweredM. Built v14.5: this replaces the lowest
+// height seen (the v14.4 flight never re-sealed: the origin rebase on foot and in Explorer Cam shifted the frame, so a static pad was never "at its
+// lowest" again, and the toggles did not reset it). The height is the shell-relative quantity the motion check uses (same function, same centre
+// sources), so a frame shift of pad and shell together leaves it unchanged. Lowered pads read about -45 m (small) and -89 m (medium) above the shell;
+// raised pads +35 m and +76 m (the v13.9 data).
+constexpr float kLoweredM = -10.0f;
+// Still: the height above the shell changes less than kSealStillM over kSealDelayMs before the seal. kSealDelayMs is the hatch's close time: a guess
+// (6 s) that the maintainer will measure in flight. Change it here and nowhere else.
 constexpr float kSealStillM = 0.2f;
 constexpr uint64_t kSealDelayMs = 6000;
 // The camera has left the held box by more than this: the seal is released (riding the elevator down, an external camera flying out).
@@ -965,8 +969,10 @@ struct SealInputs {
     bool docked = false;         // Status.json Flags bit 0
     bool explorerOn = false;     // Explorer Cam is on: the station neither seals nor stays sealed
     bool pickOk = false;         // the own pad is found this frame, with a pose
-    float along = 0.0f;          // the pad's height along its up axis now
-    float lowest = 0.0f;         // the lowest height seen for this pad record
+    float rel = 0.0f;            // the pad's height above the hangar shell along its up axis now (metres; frame-independent)
+    bool relOk = false;          // rel is readable this frame (an unreadable frame holds the trigger's state)
+    bool sourceChanged = false;  // a centre source changed since the last reading: the still test restarts, the motion reference follows
+    bool cameraInBox = false;    // the camera is inside the candidate box: the seal needs the camera in the bay (not used while held)
     uintptr_t pad = 0;           // the own pad's record: its motion memory is kept per pad (built v14.3)
     bool held = false;           // sealed now
     bool cameraOutside = false;  // the camera is outside the held box by more than kCameraLeaveM (only meaningful while held)
@@ -978,15 +984,15 @@ struct SealInputs {
 
 struct SealState {
     bool stillValid = false;     // the stillness timer is running
-    float anchor = 0.0f;         // the pad's height when the timer last restarted
+    float anchor = 0.0f;         // the height above the shell when the timer last restarted
     uint64_t stillSinceMs = 0;   // when the timer last restarted
     bool requested = false;      // one engage per still period
     bool immediate = false;      // the request in force was made at load-in (no descent observed): the delay did not apply
-    // Built v14.3 (the load-in rule): the own pad in hand, its height when first seen, and whether it has moved off that height since (a descent
-    // observed this session). The memory is per pad and survives a release; a release by motion counts as a descent.
+    // Built v14.3 (the load-in rule): the own pad in hand, its height above the shell when first seen, and whether it has moved off that height since
+    // (a descent observed this session). The memory is per pad and survives a release; a release by motion counts as a descent.
     bool seen = false;
     uintptr_t padAddr = 0;
-    float firstAlong = 0.0f;
+    float firstRel = 0.0f;
     bool moved = false;
 };
 
@@ -997,10 +1003,57 @@ inline void clearTrigger(SealState* st) noexcept {
     st->immediate = false;
 }
 
+// Built v14.5: the centre sources a height was read from. A change is a different reading: the still test restarts.
+struct ShellHeightSources {
+    bool have = false;
+    uint8_t pad = 4;
+    uint8_t shell = 4;
+    // Notes the sources of this reading; returns true when they differ from the last reading's.
+    bool note(uint8_t p, uint8_t s) noexcept {
+        const bool changed = have && (p != pad || s != shell);
+        have = true;
+        pad = p;
+        shell = s;
+        return changed;
+    }
+};
+
+// Built v14.6: the own ship's type prefix, read from the candidate record each tick. A change of prefix is a ship change, but only after
+// kShipChangeTicks readings in a row of the new prefix: a flicker between two near records is not a swap. The first reading only sets the prefix.
+constexpr uint32_t kShipChangeTicks = 10;
+
+struct ShipWatch {
+    char prefix[32] = {};
+    char pending[32] = {};
+    uint32_t run = 0;
+    // Returns true when the ship changed (the prefix is now the new one). A missing reading (empty) is no reading.
+    bool step(const char* cur) noexcept {
+        if (cur == nullptr || cur[0] == '\0') return false;
+        if (prefix[0] == '\0') {
+            std::snprintf(prefix, sizeof(prefix), "%s", cur);
+            run = 0;
+            return false;
+        }
+        if (std::strcmp(cur, prefix) == 0) {
+            run = 0;
+            pending[0] = '\0';
+            return false;
+        }
+        if (std::strcmp(cur, pending) != 0) {
+            std::snprintf(pending, sizeof(pending), "%s", cur);
+            run = 0;
+        }
+        if (++run < kShipChangeTicks) return false;
+        std::snprintf(prefix, sizeof(prefix), "%s", cur);
+        run = 0;
+        pending[0] = '\0';
+        return true;
+    }
+};
+
 // Advances the state and returns the action. With kRelease, *why says which rule released (the order of the brief: setting off, undocked,
-// Explorer Cam, camera left, pad moved, hangar changed, launch). Built v14.3 (the load-in rule): a pad first seen at rest, with no descent
-// observed, seals on the first eligible frame, because the hatch is already shut when the game loads into a closed bay. After an observed
-// descent the still delay applies (kSealDelayMs from the pad settling at its lowest).
+// Explorer Cam, camera left, pad moved, hangar changed, launch). A pad first seen lowered with no descent observed seals on the first eligible
+// frame (the load-in rule, v14.3); after an observed descent the still delay applies. A raised pad never seals. The camera must be in the bay.
 inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why) noexcept {
     *why = ReleaseWhy::kNone;
     if (!in.setting) {
@@ -1031,23 +1084,29 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         clearTrigger(st);
         return SealAction::kNone;
     }
-    if (!st->seen || st->padAddr != in.pad) {   // a pad first in hand: its height is the reference for a descent
+    if (!in.relOk) return SealAction::kNone;   // unreadable this frame: the trigger keeps its state
+    if (!st->seen || st->padAddr != in.pad) {  // a pad first in hand: its height is the reference for a descent
         st->seen = true;
         st->padAddr = in.pad;
-        st->firstAlong = in.along;
+        st->firstRel = in.rel;
         st->moved = false;
     }
-    if (std::fabs(in.along - st->firstAlong) > kSealStillM) st->moved = true;
-    const bool atLowest = (in.along - in.lowest) <= kSealStillM;
-    if (!st->moved && atLowest) {   // load-in: no descent observed, the pad rests at its height: seal at the first eligible frame
+    if (in.sourceChanged) st->firstRel = in.rel;   // a different centre source is a different reading: the motion reference follows it
+    if (std::fabs(in.rel - st->firstRel) > kSealStillM) st->moved = true;
+    const bool lowered = in.rel < kLoweredM;
+    if (!lowered || !in.cameraInBox) {
+        clearTrigger(st);
+        return SealAction::kNone;
+    }
+    if (!st->moved) {   // load-in: no descent observed, the pad rests lowered: seal at the first eligible frame
         if (st->requested) return SealAction::kNone;
         st->requested = true;
         st->immediate = true;
         return SealAction::kRequestEngage;
     }
-    if (!st->stillValid || std::fabs(in.along - st->anchor) > kSealStillM || !atLowest) {
+    if (!st->stillValid || in.sourceChanged || std::fabs(in.rel - st->anchor) > kSealStillM) {
         st->stillValid = true;
-        st->anchor = in.along;
+        st->anchor = in.rel;
         st->stillSinceMs = in.nowMs;
         st->requested = false;
         st->immediate = false;
@@ -1059,6 +1118,63 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
     }
     return SealAction::kNone;
 }
+
+// Built v14.4 (the flicker fix): the pad's motion against its shell, measured along the shaft. The reference is captured ONCE, at the first sample after
+// the seal is held, by the same function and inputs as every later sample (the v14.3 flight took it from the gather snapshot, a different centre by a
+// constant: the pad read 2.4 m off its shell at once). A sample whose centre sources differ from the reference's is another centre: it is not
+// compared, and the run is kept. A release needs the offset beyond kPadMoveReleaseM on kPadMoveFrames consecutive samples: motion is continuous.
+constexpr uint32_t kPadMoveFrames = 10;
+
+struct ShellMotion {
+    bool captured = false;
+    float ref = 0.0f;        // the pad's height along the shaft above the shell, at the capture
+    uint8_t padSrc = 4;      // the centre sources the reference was read from
+    uint8_t shellSrc = 4;
+    uint32_t run = 0;        // consecutive samples beyond the limit
+    float delta = 0.0f;      // the latest sample minus the reference
+    // Returns true when the pad has been beyond the limit for kPadMoveFrames samples in a row.
+    bool sample(const float pad[3], uint8_t ps, const float shell[3], uint8_t ss, const float up[3]) noexcept {
+        if (!captured) {
+            ref = shellRelative(pad, shell, up);
+            padSrc = ps;
+            shellSrc = ss;
+            captured = true;
+            run = 0;
+            delta = 0.0f;
+            return false;
+        }
+        if (ps != padSrc || ss != shellSrc) return false;
+        const float now = shellRelative(pad, shell, up);
+        delta = now - ref;
+        run = padMovedAway(ref, now) ? run + 1 : 0;
+        return run >= kPadMoveFrames;
+    }
+};
+
+// Built v14.4 (the safety net): more than kSealRateMax seals in kSealRateWindowMs, in one hangar, stops the sealing until a hangar change or a
+// setting toggle. A user must never see the sun flicker from this feature again.
+constexpr uint32_t kSealRateMax = 6;
+constexpr uint64_t kSealRateWindowMs = 60000;
+
+struct SealRateGuard {
+    uint64_t times[kSealRateMax + 1] = {};
+    uint32_t n = 0;
+    uint32_t head = 0;
+    bool tripped = false;
+    // Records a seal request at now. Returns true when it trips the guard (the first time, and every time after while tripped).
+    bool note(uint64_t now) noexcept {
+        if (tripped) return true;
+        times[head] = now;
+        head = (head + 1) % (kSealRateMax + 1);
+        if (n < kSealRateMax + 1) ++n;
+        uint32_t inWindow = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (now >= times[i] && now - times[i] <= kSealRateWindowMs) ++inWindow;
+        }
+        if (inWindow > kSealRateMax) tripped = true;
+        return tripped;
+    }
+};
 
 // Built v14 (fix 1): the own pad is sticky. Once chosen it stays the own pad while its record is in the store; another pad can replace it only after
 // the held one has been unseen for kHeldLostFrames frames (the hangar-change rule). While it is unseen and not yet replaced there is no pick.
@@ -1126,63 +1242,6 @@ inline size_t pickShell(const ExplicitObs* obs, size_t n, const float centre[3],
     return best;
 }
 
-// Built v14.4 (the flicker fix): the pad's motion against its shell, measured along the shaft. The reference is captured ONCE, at the first sample after
-// the seal is held, by the same function and inputs as every later sample (the v14.3 flight took it from the gather snapshot, a different centre by a
-// constant: the pad read 2.4 m off its shell at once). A sample whose centre sources differ from the reference's is another centre: it is not
-// compared, and the run is kept. A release needs the offset beyond kPadMoveReleaseM on kPadMoveFrames consecutive samples: motion is continuous.
-constexpr uint32_t kPadMoveFrames = 10;
-
-struct ShellMotion {
-    bool captured = false;
-    float ref = 0.0f;        // the pad's height along the shaft above the shell, at the capture
-    uint8_t padSrc = 4;      // the centre sources the reference was read from
-    uint8_t shellSrc = 4;
-    uint32_t run = 0;        // consecutive samples beyond the limit
-    float delta = 0.0f;      // the latest sample minus the reference
-    // Returns true when the pad has been beyond the limit for kPadMoveFrames samples in a row.
-    bool sample(const float pad[3], uint8_t ps, const float shell[3], uint8_t ss, const float up[3]) noexcept {
-        if (!captured) {
-            ref = shellRelative(pad, shell, up);
-            padSrc = ps;
-            shellSrc = ss;
-            captured = true;
-            run = 0;
-            delta = 0.0f;
-            return false;
-        }
-        if (ps != padSrc || ss != shellSrc) return false;
-        const float now = shellRelative(pad, shell, up);
-        delta = now - ref;
-        run = padMovedAway(ref, now) ? run + 1 : 0;
-        return run >= kPadMoveFrames;
-    }
-};
-
-// Built v14.4 (the safety net): more than kSealRateMax seals in kSealRateWindowMs, in one hangar, stops the sealing until a hangar change or a
-// setting toggle. A user must never see the sun flicker from this feature again.
-constexpr uint32_t kSealRateMax = 6;
-constexpr uint64_t kSealRateWindowMs = 60000;
-
-struct SealRateGuard {
-    uint64_t times[kSealRateMax + 1] = {};
-    uint32_t n = 0;
-    uint32_t head = 0;
-    bool tripped = false;
-    // Records a seal request at now. Returns true when it trips the guard (the first time, and every time after while tripped).
-    bool note(uint64_t now) noexcept {
-        if (tripped) return true;
-        times[head] = now;
-        head = (head + 1) % (kSealRateMax + 1);
-        if (n < kSealRateMax + 1) ++n;
-        uint32_t inWindow = 0;
-        for (uint32_t i = 0; i < n; ++i) {
-            if (now >= times[i] && now - times[i] <= kSealRateWindowMs) ++inWindow;
-        }
-        if (inWindow > kSealRateMax) tripped = true;
-        return tripped;
-    }
-};
-
 // Built v14.1: what the store observer does with a record. Judging (the keep and the cull) is sealed-only. Gathering (the camera, the frame's
 // pads, the explicit parts and so the own-pad pick the seal trigger needs) runs while docked and unsealed, so a pad is in hand before the seal.
 // Setting off: nothing. The v14 flight never sealed because the gathering was inside the sealed-only judge (no pad, so no seal, ever).
@@ -1200,7 +1259,9 @@ struct WaitView {
     bool docked = false;        // Flags bit 0
     bool havePad = false;       // the own pad is picked this frame
     char padName[64] = {};      // when havePad
-    bool atLowest = false;      // the pad is at its lowest seen height (within kSealStillM)
+    bool lowered = false;       // the pad is lowered: its height above the shell is below kLoweredM (built v14.5)
+    float relM = 0.0f;          // the pad's height above the shell along its up axis, metres
+    bool relOk = false;         // relM is readable this frame
     float stillS = 0.0f;        // seconds the stillness timer has run
     bool cellBuilt = false;     // the pad's cell can be built (a pad with a radius and a readable height)
     char cellReason[96] = {};   // when not built: why
@@ -1221,7 +1282,7 @@ struct WaitView {
 // True when the seal's state changed: docked, the pad, at lowest, the cell.
 inline bool waitingKeyChanged(const WaitView& a, const WaitView& b) noexcept {
     return a.dockedKnown != b.dockedKnown || a.docked != b.docked || a.havePad != b.havePad || std::strcmp(a.padName, b.padName) != 0 ||
-           a.atLowest != b.atLowest || a.cellBuilt != b.cellBuilt || std::strcmp(a.cellReason, b.cellReason) != 0;
+           a.lowered != b.lowered || a.cellBuilt != b.cellBuilt || std::strcmp(a.cellReason, b.cellReason) != 0;
 }
 
 // The waiting line, with the unmet condition in its words: docked, pad, at lowest, still for X of the delay, cell.
@@ -1243,8 +1304,11 @@ inline void waitingLine(const WaitView& w, float delayS, char* out, size_t cap) 
             used += static_cast<size_t>(n);
         }
     }
-    std::snprintf(out, cap, "optimized station: waiting (docked=%s, pad=%s, at lowest=%s, still for %.1f of %.0f s, cell=%s; descent=%s; gathered=%u, camera=%s, pads=%u [%s])",
-                  docked, w.havePad ? w.padName : "none", w.atLowest ? "yes" : "no", static_cast<double>(w.stillS), static_cast<double>(delayS), cell, w.descent ? "seen" : "none yet",
+    char lowerText[64] = {};
+    if (!w.relOk) std::snprintf(lowerText, sizeof(lowerText), "unknown");
+    else std::snprintf(lowerText, sizeof(lowerText), "%s (%.1f m above the shell)", w.lowered ? "yes" : "no", static_cast<double>(w.relM));
+    std::snprintf(out, cap, "optimized station: waiting (docked=%s, pad=%s, lowered=%s, still for %.1f of %.0f s, cell=%s; descent=%s; gathered=%u, camera=%s, pads=%u [%s])",
+                  docked, w.havePad ? w.padName : "none", lowerText, static_cast<double>(w.stillS), static_cast<double>(delayS), cell, w.descent ? "seen" : "none yet",
                   static_cast<unsigned>(w.gathered), w.cameraKnown ? "yes" : "no", static_cast<unsigned>(w.padCount), pads);
 }
 

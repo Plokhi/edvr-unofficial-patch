@@ -47,9 +47,16 @@ sealed::OwnCell g_heldCell;                // the sealed cell, in the world fram
 bool g_heldValid = false;                  // sealed
 bool g_engagePending = false;
 uint32_t g_engageTries = 0;
-float g_padAlong = 0.0f, g_padLowest = 0.0f;
-bool g_padAlongValid = false, g_padLowestSet = false;
-uintptr_t g_lowestPad = 0;
+// Built v14.5: the pad's height above the hangar shell, read live each tick (frame-independent). The shell is picked once per pad.
+bool g_relOk = false;
+sealed::ShipWatch g_shipWatch;   // the own ship's type prefix, read every tick: a change is a ship change (built v14.6)
+float g_relM = 0.0f;
+bool g_heightChanged = false;
+sealed::ShellHeightSources g_heightSrc;
+bool g_preShellValid = false;
+uintptr_t g_preShellAddr = 0;
+uintptr_t g_preShellPad = 0;
+char g_preShellName[48] = {};
 char g_ownPrefix[32] = {};
 char g_ownCandidateName[48] = {};
 float g_ownCandidateDist = -1.0f;
@@ -945,6 +952,8 @@ bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
 void applySetting(bool on, uint32_t frame) noexcept {
     if (on == g_vetoesAttached) return;
     g_sealState = sealed::SealState{};   // a setting toggle starts the trigger and its memory afresh (built v14.4)
+    g_heightSrc = sealed::ShellHeightSources{};
+    g_preShellValid = false;
     g_sealGuard = sealed::SealRateGuard{};
     if (on) {
         const char* direct = kinematicEvalDirectVetoAttach();
@@ -1019,18 +1028,8 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
             bool extOk = false;
             uint8_t src = 4;
             const bool haveAxes = poseOrientOf(next.pad, axes, ext, &extOk, &src);
-            g_padAlongValid = false;
             if (haveAxes) {
                 for (int k = 0; k < 3; ++k) e2[k] = axes[2][k];
-                g_padAlong = next.centre[0] * e2[0] + next.centre[1] * e2[1] + next.centre[2] * e2[2];
-                g_padAlongValid = true;
-                if (!g_padLowestSet || g_lowestPad != next.pad) {
-                    g_padLowest = g_padAlong;
-                    g_padLowestSet = true;
-                    g_lowestPad = next.pad;
-                } else if (g_padAlong < g_padLowest) {
-                    g_padLowest = g_padAlong;
-                }
             }
             float q[3] = {};
             char qn[48] = {};
@@ -1090,7 +1089,7 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
     // The engage: the cell is frozen from the pad when the seal rule asked for it. Held frames take the held cell.
     if (g_engagePending) {
         ++g_engageTries;
-        if (next.has && next.radius > 0.0f && g_padAlongValid) {
+        if (next.has && next.radius > 0.0f && g_relOk) {
             setOwnPrefixAtEngage(frame);
             pickOwnRecord(frame);
             g_heldCell = next;
@@ -1225,19 +1224,6 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         if (cachedName(record, xn, sizeof(xn))) std::snprintf(x.name, sizeof(x.name), "%s", xn);
         else x.name[0] = '\0';
     }
-    if (!judge) return;   // gathering only: the pads and the explicit parts are in hand; the judgement is sealed-only
-    const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, record);
-    keep = v.keep;
-    containing = v.containing;
-    // The bay: the own hangar's parts inside the bay volume, even where the box alone would cull them. The shaft is the cell's.
-    if (!keep && g_cellPrev.capsule) {
-        float u[3] = {};
-        if (sealed::unitBetween(g_cellPrev.capA, g_cellPrev.capB, u) &&
-            sealed::inBayVolume(centre, g_cellPrev.capA, u, g_cellPrev.capLen, belowFor(g_cellPrev.size))) {
-            char bn[48] = {};
-            if (cachedName(record, bn, sizeof(bn)) && sealed::bayPartName(bn)) keep = true;
-        }
-    }
     // The own ship: the own candidate (the nearest small containing sphere), the prefix rule, then the live own sphere.
     const bool containsCam = sealed::containsCamera(centre, radius, cam);
     {
@@ -1262,6 +1248,19 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
                 }
             }
         }
+    if (!judge) return;   // gathering only: the pads and the explicit parts are in hand; the judgement is sealed-only
+    const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, record);
+    keep = v.keep;
+    containing = v.containing;
+    // The bay: the own hangar's parts inside the bay volume, even where the box alone would cull them. The shaft is the cell's.
+    if (!keep && g_cellPrev.capsule) {
+        float u[3] = {};
+        if (sealed::unitBetween(g_cellPrev.capA, g_cellPrev.capB, u) &&
+            sealed::inBayVolume(centre, g_cellPrev.capA, u, g_cellPrev.capLen, belowFor(g_cellPrev.size))) {
+            char bn[48] = {};
+            if (cachedName(record, bn, sizeof(bn)) && sealed::bayPartName(bn)) keep = true;
+        }
+    }
         if (!keep) {
             char nm[48] = {};
             if (g_ownPrefix[0] != '\0') cachedName(record, nm, sizeof(nm));
@@ -1348,18 +1347,93 @@ void optimizedStationFrame(uint32_t frame) {
             cameraOutside = sealed::distance(g_heldCell.centre, g_frameCam) > g_heldCell.radius + sealed::kCameraLeaveM;
         }
     }
+    // Built v14.6: a ship change (the own ship's type prefix, from the candidate record, changes for kShipChangeTicks readings in a row). It
+    // releases the seal, resets the trigger and the safety net, and rebuilds the own-ship rule: a swapped ship in a closed bay then seals at once.
+    if (g_ownCandidateDist >= 0.0f) {
+        char curPrefix[32] = {};
+        sealed::ownPrefixOf(g_ownCandidateName, curPrefix, sizeof(curPrefix));
+        char oldPrefix[32] = {};
+        std::snprintf(oldPrefix, sizeof(oldPrefix), "%s", g_shipWatch.prefix);
+        if (g_shipWatch.step(curPrefix)) {
+            char why[160];
+            std::snprintf(why, sizeof(why), "ship changed (%s -> %s)", oldPrefix, curPrefix);
+            if (g_heldValid) {
+                releaseSeal(why, frame);
+            } else {
+                Log::get().note("optimized station: %s; the trigger starts afresh", why);
+            }
+            g_sealState = sealed::SealState{};
+            g_sealGuard = sealed::SealRateGuard{};
+            g_heightSrc = sealed::ShellHeightSources{};
+            g_preShellValid = false;
+            setOwnPrefixAtEngage(frame);
+            g_ownRecAddr = 0;
+            g_ownLiveValid = false;
+        }
+    }
+    // Built v14.5: the height above the shell along the pad's own up axis, read live, with the shell picked once per pad (the same pick as the
+    // freeze, from the gathered parts). The camera in the candidate box is the seal's other condition.
+    g_relOk = false;
+    g_heightChanged = false;
+    if (g_pickCell.has) {
+        if (!g_preShellValid || g_preShellPad != g_pickCell.pad) {
+            const size_t pick = sealed::pickShell(g_explicits, g_explicitCount, g_pickCell.centre, g_pickCell.size, 150.0f);
+            g_preShellValid = pick < g_explicitCount;
+            g_preShellPad = g_pickCell.pad;
+            if (g_preShellValid) {
+                g_preShellAddr = g_explicits[pick].addr;
+                std::snprintf(g_preShellName, sizeof(g_preShellName), "%s", g_explicits[pick].name);
+            }
+        }
+        if (g_preShellValid) {
+            char nm[48] = {};
+            if (!cachedName(g_preShellAddr, nm, sizeof(nm)) || std::strcmp(nm, g_preShellName) != 0) {
+                g_preShellValid = false;   // the record moved on: the next tick picks again
+            } else {
+                const WorldRead pw = worldOfRecord(g_pickCell.pad);
+                const WorldRead sw = worldOfRecord(g_preShellAddr);
+                float axes[3][3] = {};
+                float ext[3] = {};
+                bool extOk = false;
+                uint8_t src = 4;
+                if (pw.source != 4 && sw.source != 4 && poseOrientOf(g_pickCell.pad, axes, ext, &extOk, &src)) {
+                    const float up[3] = {axes[2][0], axes[2][1], axes[2][2]};
+                    g_relM = sealed::shellRelative(pw.world, sw.world, up);
+                    g_relOk = true;
+                    g_heightChanged = g_heightSrc.note(pw.source, sw.source);
+                }
+            }
+        }
+    }
+    bool camIn = false;
+    if (g_frameCamValid && g_pickCell.has) {
+        if (g_pickCell.box) {
+            float x[3] = {};
+            sealed::boxCoordsOf(g_pickCell, g_frameCam, x);
+            camIn = std::fabs(x[0]) <= g_pickCell.boxHalf[0] && std::fabs(x[1]) <= g_pickCell.boxHalf[1] && std::fabs(x[2]) <= g_pickCell.boxHalf[2];
+        } else {
+            camIn = sealed::distance(g_pickCell.centre, g_frameCam) <= g_pickCell.radius;
+        }
+    }
     sealed::SealInputs in;
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
     in.explorerOn = explorerCamSessionActive();
-    in.pickOk = g_pickCell.has && g_padAlongValid;
-    in.along = g_padAlong;
-    in.lowest = g_padLowest;
+    in.pickOk = g_pickCell.has;
+    in.rel = g_relM;
+    in.relOk = g_relOk;
+    in.sourceChanged = g_heightChanged;
+    in.cameraInBox = camIn;
     in.pad = g_pickCell.has ? g_pickCell.pad : 0;
     in.held = g_heldValid;
     in.cameraOutside = cameraOutside;
     in.padMoved = g_flagPadMoved;
     if (g_flagHangarChanged) g_sealGuard = sealed::SealRateGuard{};   // a new hangar: the safety net starts afresh
+    if (g_flagHangarChanged) {   // a new hangar: the trigger and its memory start afresh (built v14.5)
+        g_sealState = sealed::SealState{};
+        g_heightSrc = sealed::ShellHeightSources{};
+        g_preShellValid = false;
+    }
     in.hangarChanged = g_flagHangarChanged;
     in.launched = false;   // the pad state object's reader is not in this build (optimized-station doc, "Not yet")
     in.nowMs = now;
@@ -1388,9 +1462,11 @@ void optimizedStationFrame(uint32_t frame) {
         w.docked = g_dockedNow.load(std::memory_order_acquire);
         w.havePad = g_pickCell.has;
         if (g_pickCell.has) std::snprintf(w.padName, sizeof(w.padName), "%s", g_pickCell.padName);
-        w.atLowest = g_padAlongValid && (g_padAlong - g_padLowest) <= sealed::kSealStillM;
+        w.lowered = g_relOk && g_relM < sealed::kLoweredM;
+        w.relM = g_relM;
+        w.relOk = g_relOk;
         w.stillS = g_sealState.stillValid ? static_cast<float>(now - g_sealState.stillSinceMs) / 1000.0f : 0.0f;
-        w.cellBuilt = g_pickCell.has && g_pickCell.radius > 0.0f && g_padAlongValid;
+        w.cellBuilt = g_pickCell.has && g_pickCell.radius > 0.0f && g_relOk;
         w.gathered = g_recordsLast;
         w.descent = g_sealState.moved;
         w.cameraKnown = g_frameCamValid;

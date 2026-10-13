@@ -30,8 +30,9 @@ se::SealInputs quiet(uint64_t now) {
     in.setting = true;
     in.docked = true;
     in.pickOk = true;
-    in.along = 10.0f;
-    in.lowest = 10.0f;
+    in.rel = -45.0f;   // lowered: 45 m below the shell
+    in.relOk = true;
+    in.cameraInBox = true;
     in.nowMs = now;
     return in;
 }
@@ -51,8 +52,7 @@ se::SealState descended() {
     se::SealState st;
     se::ReleaseWhy w = se::ReleaseWhy::kNone;
     se::SealInputs a = quiet(0);
-    a.along = 14.0f;
-    a.lowest = 10.0f;
+    a.rel = 14.0f;     // raised above the shell
     se::sealStep(a, &st, &w);
     se::sealStep(quiet(100), &st, &w);
     return st;
@@ -108,8 +108,8 @@ int main(int argc, char** argv) {
     {
         se::SealState st;
         se::SealInputs in = quiet(0);
-        in.along = 10.6f;   // 0.6 m above its lowest seen height: not at the lowest
-        check(firstEngage(&st, in, 0, 10000) == 0, "a pad above its lowest seen height (by more than 0.2 m) does not seal");
+        in.rel = 35.0f;   // raised above the shell
+        check(firstEngage(&st, in, 0, 10000) == 0, "a raised pad (above the shell) never seals, however still it is");
     }
     {
         se::SealState st;
@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
         uint64_t sealedAt = 0;
         for (uint64_t t = 0; t <= 12000; t += 100) {
             in.nowMs = t;
-            in.along = t == 0 ? 14.0f : ((t >= 3000 && t < 3100) ? 10.5f : 10.0f);   // first seen 4 m up, then descends
+            in.rel = t == 0 ? 35.0f : ((t >= 3000 && t < 3100) ? -44.5f : -45.0f);   // first seen raised, then lowered; a 0.5 m move at 3 s
             if (se::sealStep(in, &st, &why) == se::SealAction::kRequestEngage && sealedAt == 0) sealedAt = t;
         }
         check(sealedAt == 9100, "a move of 0.5 m restarts the still period: the seal comes 6 s after the pad settles (9.1 s), not at 6 s");
@@ -127,9 +127,8 @@ int main(int argc, char** argv) {
     {
         se::SealState st;
         se::SealInputs in = quiet(0);
-        in.along = 10.1f;   // within 0.2 m of its lowest and still: seals
-        in.lowest = 10.0f;
-        check(firstEngage(&st, in, 100, 10000) == 100, "load-in: a pad first seen within 0.2 m of its lowest, with no descent, seals on the first eligible frame");
+        in.rel = -10.5f;   // just below the lowered line (-10 m above the shell)
+        check(firstEngage(&st, in, 100, 10000) == 100, "load-in: a pad first seen lowered (-10.5 m above the shell), with no descent, seals on the first eligible frame");
     }
     {
         se::SealState st;
@@ -230,7 +229,7 @@ int main(int argc, char** argv) {
         se::ReleaseWhy w2 = se::ReleaseWhy::kNone;
         se::SealInputs d0 = quiet(20000);
         d0.pad = 0x2000;
-        d0.along = 14.0f;
+        d0.rel = 35.0f;
         se::sealStep(d0, &st2, &w2);
         se::SealInputs d1 = quiet(20100);
         d1.pad = 0x2000;
@@ -349,19 +348,21 @@ int main(int argc, char** argv) {
         v.docked = true;
         v.havePad = true;
         std::snprintf(v.padName, sizeof(v.padName), "%s", "LandingPadMediumA");
-        v.atLowest = true;
+        v.lowered = true;
+        v.relM = -45.0f;
+        v.relOk = true;
         v.stillS = 2.5f;
         v.cellBuilt = true;
         se::waitingLine(v, 6.0f, line, sizeof(line));
         check(std::strstr(line, "docked=yes") != nullptr && std::strstr(line, "pad=LandingPadMediumA") != nullptr &&
-                  std::strstr(line, "at lowest=yes") != nullptr && std::strstr(line, "still for 2.5 of 6 s") != nullptr &&
+                  std::strstr(line, "lowered=yes") != nullptr && std::strstr(line, "still for 2.5 of 6 s") != nullptr &&
                   std::strstr(line, "cell=built") != nullptr,
               "v14.1: the waiting line names docked, the pad, at lowest, the still time of the delay, and the cell");
         se::WaitView v2 = v;
         v2.stillS = 3.0f;
         check(!se::waitingKeyChanged(v, v2), "v14.1: the still time alone is not a state change (no line per frame)");
         v2 = v;
-        v2.atLowest = false;
+        v2.lowered = false;
         check(se::waitingKeyChanged(v, v2), "v14.1: at lowest changing is a state change");
         v2 = v;
         v2.docked = false;
@@ -416,6 +417,78 @@ int main(int argc, char** argv) {
             }
             check(promotes == 3, "v14.2: the stamp advanced once per tick: one promote per frame, at its first record");
         }
+    }
+
+    // ---- Built v14.6: a ship change (the own ship's type prefix) resets the trigger; a flicker is not a change -----------------------------
+    {
+        se::ShipWatch w;
+        check(!w.step("Anaconda"), "v14.6: the first reading sets the own ship's prefix: no change");
+        bool any = false;
+        for (int k = 0; k < 20; ++k) any = any || w.step("Anaconda");
+        check(!any, "v14.6: the same prefix every tick is no change");
+        any = false;
+        for (int k = 0; k < 9; ++k) any = any || w.step("Cobra");
+        check(!any, "v14.6: a different prefix for nine readings is not yet a ship change");
+        check(!w.step("Anaconda") && std::strcmp(w.prefix, "Anaconda") == 0, "v14.6: a flicker back to the old prefix resets the count");
+        any = false;
+        for (int k = 0; k < 9; ++k) any = any || w.step("Asp");
+        check(!any, "v14.6: nine readings of the new prefix: still not a change");
+        check(w.step("Asp") && std::strcmp(w.prefix, "Asp") == 0, "v14.6: the tenth reading of the new prefix is the ship change (the prefix is now Asp)");
+        check(!w.step(nullptr) && !w.step(""), "v14.6: a missing reading is no change");
+    }
+    {
+        // The ship change resets the trigger: a swapped ship in a closed bay (lowered, camera in) seals on the first eligible frame, load-in.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        check(se::sealStep(quiet(100), &st, &w) == se::SealAction::kRequestEngage && st.immediate, "v14.6 swap: the first ship's load-in seal");
+        se::SealInputs held = quiet(150);
+        held.held = true;
+        check(se::sealStep(held, &st, &w) == se::SealAction::kNone, "v14.6 swap: held, nothing to release yet");
+        st = se::SealState{};   // the ship change: the engine resets the trigger and its memory
+        check(firstEngage(&st, quiet(0), 200, 20000) == 200, "v14.6 swap: the new ship in a closed bay seals on the first eligible frame");
+    }
+
+    // ---- Built v14.5: the lowered test is the height above the shell (frame-independent) ----------------------------------------------------
+    {
+        // A frame shift of the pad and the shell together (the origin rebase) leaves the height above the shell, so the lowered pad seals as before.
+        const float up[3] = {0.0f, 0.0f, 1.0f};
+        const float padP[3] = {5.0f, 6.0f, -45.0f};
+        const float shellP[3] = {0.0f, 0.0f, 0.0f};
+        const float v[3] = {123.0f, -40.0f, 900.0f};
+        const float padS[3] = {padP[0] + v[0], padP[1] + v[1], padP[2] + v[2]};
+        const float shellS[3] = {shellP[0] + v[0], shellP[1] + v[1], shellP[2] + v[2]};
+        const float r1 = se::shellRelative(padP, shellP, up);
+        const float r2 = se::shellRelative(padS, shellS, up);
+        check(std::fabs(r1 - r2) < 1e-3f && r1 < se::kLoweredM, "v14.5: a frame shift of pad and shell together keeps the height above the shell");
+        se::SealState st;
+        se::SealInputs in = quiet(0);
+        in.rel = r2;
+        check(firstEngage(&st, in, 100, 20000) == 100, "v14.5: the pad lowered after a frame shift seals at load-in, as before the shift");
+    }
+    {
+        // A raised pad (positive height above the shell) never seals at load-in, however long it stays.
+        se::SealState st;
+        se::SealInputs in = quiet(0);
+        in.rel = 76.0f;   // a raised medium pad (the v13.9 data)
+        check(firstEngage(&st, in, 100, 60000) == 0, "v14.5: a raised pad (+76 m above the shell) never seals at load-in, in a minute");
+        in.rel = -9.9f;
+        check(firstEngage(&st, in, 100, 60000) == 0, "v14.5: a pad 9.9 m above the lowered line (-10 m) does not seal");
+    }
+    {
+        // The Explorer Cam release and the re-seal: no pad motion, the camera back in the bay: the seal is immediate.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        check(se::sealStep(quiet(100), &st, &w) == se::SealAction::kRequestEngage && st.immediate, "v14.5 explorer: the load-in seal");
+        se::SealInputs ex = quiet(150);
+        ex.held = true;
+        ex.explorerOn = true;
+        check(se::sealStep(ex, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kExplorerCam, "v14.5 explorer: Explorer Cam releases");
+        se::clearTrigger(&st);
+        se::SealInputs away = quiet(200);
+        away.cameraInBox = false;
+        check(se::sealStep(away, &st, &w) == se::SealAction::kNone, "v14.5 explorer: the camera still outside the bay: no seal yet");
+        check(se::sealStep(quiet(300), &st, &w) == se::SealAction::kRequestEngage && st.immediate,
+              "v14.5 explorer: the camera back in the bay, no pad motion: the re-seal is immediate");
     }
 
     // ---- Built v14.4: the flicker fix (the reference, the hysteresis, the sequence after a motion release, the safety net) ----------------------
