@@ -164,6 +164,29 @@ void failureLatch() {
     check(again.run && again.started, "VR then flat again re-arms clearing and runs");
 }
 
+// The panel's clock (kPanelTextMs = 120 s from a stretch's first panel frame): the text shows up to 119.999 s, the eye images are
+// black from 120 s, the dark is traced once, and a new stretch starts the clock again.
+void panelClock() {
+    FlatClearState s;
+    pump(s, flatQuiet());
+    const uint64_t t0 = 5000;
+    const auto first = s.panelFrame(t0);
+    check(first.text && !first.wentDark, "the first panel frame of a stretch shows the text and starts the clock");
+    check(s.panelFrame(t0 + 119999).text, "119.999 s after the first panel frame the text still shows");
+    const auto dark = s.panelFrame(t0 + 120000);
+    check(!dark.text && dark.wentDark && dark.afterMs == 120000, "120 s after it the text is gone, traced once with after_ms 120000");
+    const auto later = s.panelFrame(t0 + 150000);
+    check(!later.text && !later.wentDark, "the dark frames after that trace nothing more");
+    Pump vr = flatQuiet();
+    vr.vrProfile = true;
+    pump(s, vr);
+    pump(s, flatQuiet());
+    const uint64_t t1 = t0 + 130000;
+    check(s.panelFrame(t1).text && s.panelFrame(t1 + 119999).text, "a new stretch starts the clock again: the text shows 119.999 s in");
+    const auto again = s.panelFrame(t1 + 120000);
+    check(!again.text && again.wentDark && again.afterMs == 120000, "the new stretch goes dark 120 s after its own first panel frame, traced once");
+}
+
 // The notice's placement (flat_notice_placement.h): the panel's centre is the eye's optical centre from its own tangents.
 void noticeGeometry() {
     using namespace edvr::openxr;
@@ -217,6 +240,7 @@ int main(int argc, char** argv) {
     vrFromTheStart();
     staleEdges();
     failureLatch();
+    panelClock();
     noticeGeometry();
     defaultWordReadsVr();
     if (g_fails) {
@@ -224,6 +248,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("PASS: flat_clear_test %d checks (quiet edges 249/250 ms, gates, start and stop transitions with reasons, "
-                "restart, stale game frame edges 999/1000 ms, failure latch re-armed by VR, default word reads VR)\n", g_checks);
+                "restart, stale game frame edges 999/1000 ms, failure latch re-armed by VR, panel text 119.999 s and dark at 120 s, "
+                "default word reads VR)\n", g_checks);
     return 0;
 }

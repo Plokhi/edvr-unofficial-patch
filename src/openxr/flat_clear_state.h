@@ -34,7 +34,34 @@ class FlatClearState final {
     if (step.stopped)
       step.reason = vrProfileActive ? Stop::VrProfile : !sessionRunning ? Stop::Session : Stop::GameFrame;
     active_ = step.run;
+    // A new stretch starts the panel's clock again.
+    if (step.started) panelStarted_ = darkNoted_ = false;
     return step;
+  }
+
+  // The notice's text shows for kPanelTextMs from the stretch's first panel frame; after that the eye images are black, still
+  // as a projection layer (an empty frame does not clear the compositor). panelFrame runs once per panel frame with the owner's
+  // ms clock. wentDark is set on the one frame the text first goes dark, with afterMs its age then.
+  static constexpr uint64_t kPanelTextMs = 120000;
+  struct PanelFrame {
+    bool text = true;
+    bool wentDark = false;
+    uint64_t afterMs = 0;
+  };
+  PanelFrame panelFrame(uint64_t nowMs) {
+    if (!panelStarted_) {
+      panelStarted_ = true;
+      panelStartMs_ = nowMs;
+    }
+    PanelFrame frame;
+    const uint64_t after = nowMs >= panelStartMs_ ? nowMs - panelStartMs_ : 0;
+    frame.text = after < kPanelTextMs;
+    if (!frame.text && !darkNoted_) {
+      darkNoted_ = true;
+      frame.wentDark = true;
+      frame.afterMs = after;
+    }
+    return frame;
   }
 
   // An empty frame failed. Clearing is optional, so it stops and stays stopped until the graphics half reads VR again: the
@@ -54,6 +81,8 @@ class FlatClearState final {
  private:
   bool active_ = false;
   bool failed_ = false;
+  bool panelStarted_ = false, darkNoted_ = false;
+  uint64_t panelStartMs_ = 0;
 };
 
 }  // namespace edvr::openxr
