@@ -41,6 +41,7 @@
 #include "menu_edit_hold.h"
 #include "menu_flat_rows.h"
 #include "menu_keys.h"
+#include "menu_pad.h"
 #include "menu_panel.h"
 #include "native_menu.h"
 #include "native_render_labels.h"
@@ -239,6 +240,10 @@ struct State {
 
     KeyRepeat keys[12];
     bool shiftHeld = false;
+    MenuPadNavigation padNavigation;
+    int padIndex = -1;
+    bool padReady = false;
+    bool padReadyNoted = false;
 
     // Elite's own panel keys as aliases of the menu's actions (menu_keys.h
     // holds the rules; docs/settings-menu.md, "Your Elite keys"). The raw
@@ -937,6 +942,9 @@ std::vector<ChoiceItem> choicesOf(const MenuRowDef& d) {
         }
         pos = bar + 1;
     }
+    // The shipped row is shared with VR; XeSS is a flat-only choice.
+    if (runtimeFlatProfile() && strcmp(d.section, "fix") == 0 && strcmp(d.key, "temporal_aa") == 0)
+        out.push_back({"xess", "XeSS-SR"});
     return out;
 }
 
@@ -2307,12 +2315,16 @@ void buildContent(MenuContent& c) {
     // side (menu_panel.cpp: pad = cap * 8 / 10).
     if (runtimeFlatProfile()) {
         const char* status = "";
-        if (!s.flatKeysReadyShown) status = " | keyboard gate unavailable";
+        if (s.lastWrite.compare(0, 7, "FAILED:") == 0) status = " | write failed";
         else if (s.lastWrite.compare(0, 8, "writing ") == 0) status = " | saving";
-        else if (s.lastWrite.compare(0, 7, "FAILED:") == 0) status = " | write failed";
+        else if (!s.flatKeysReadyShown) status = " | keyboard gate unavailable";
         else if (!s.lastWrite.empty()) status = " | saved";
-        snprintf(c.footer, sizeof(c.footer), "Up/Down row  Left/Right change\n%s/Esc close%s",
-                 s.summonName.c_str(), status);
+        if (s.padReady)
+            snprintf(c.footer, sizeof(c.footer), "D-pad move/change  A select  B back\nLB/RB pages  %s close%s",
+                     s.summonName.c_str(), status);
+        else
+            snprintf(c.footer, sizeof(c.footer), "Up/Down row  Left/Right change\n%s/Esc close%s",
+                     s.summonName.c_str(), status);
         // The installed version, on every page, drawn at the right end of this same
         // footer line (menu_panel.cpp). Flat only: VR's footer does not carry it.
         snprintf(c.footerTag, sizeof(c.footerTag), "EDVR %s", EDVR_VERSION_STRING);
@@ -3129,6 +3141,9 @@ void primeNavigationKeys() {
     for (KeyRepeat& k : s.keys) keyRepeatPrime(k, rawKeyDown(k.vk));
     for (KeyRepeat& k : s.editKeys) keyRepeatPrime(k, rawKeyDown(k.vk));
     for (int i = 0; i < s.aliases.count; ++i) keyRepeatPrime(s.aliasKeys[i], rawKeyDown(s.aliasKeys[i].vk));
+    uint16_t buttons = 0;
+    if (s.padIndex >= 0) xinputSlotSnapshot(static_cast<unsigned>(s.padIndex), &buttons);
+    s.padNavigation.prime(buttons);
 }
 
 void endCapture() {
@@ -3203,6 +3218,7 @@ void buildRowContext(int def, RowDecisionInput* in) {
     in->ctx.nUses = static_cast<int>(in->uses.size());
     in->ctx.scope = clashScopeOf(kMenuRows[def]);
     in->ctx.explorerCamSession = explorerCamSessionActive();
+    in->ctx.flatPadNavigation = runtimeFlatProfile();
 }
 
 // A locked row says so on the row, in the footer and in the log, and nothing is written.
@@ -3216,6 +3232,12 @@ void noteLocked(int def) {
 // Enter on a hotkey row. Explorer Cam's key is locked while a session is on (the key being
 // edited is the key that gets the player out): the row says so and nothing starts.
 void beginCapture(int entryIndex, int defIndex) {
+    if (runtimeFlatProfile() && !g_s.flatKeysReadyShown) {
+        const char* note = "Hotkey capture needs the keyboard gate";
+        Log::get().note("menu: %s; the game's keyboard has not reached the gate.", note);
+        setHotkeyNote(defIndex, "capture unavailable", note);
+        return;
+    }
     HotkeyRowContext c;
     c.rowKey = kMenuRows[defIndex].key;
     c.explorerCamSession = explorerCamSessionActive();
@@ -3264,8 +3286,10 @@ void applyDecision(int def, const CaptureDecision& dec) {
             Log::get().note("menu: %s: %s refused -- it is one of the menu's own navigation keys.", dotted.c_str(),
                             text.c_str());
             setHotkeyNote(def, "the menu's own key",
-                          text + " has a key this menu navigates with (arrows, Enter, Space, Tab, PageUp/Down, Home, End, R, Esc), "
-                          "with any modifier; pick another key.");
+                          dec.binding.kind == HotkeyKind::Pad
+                              ? text + " navigates the flat panel (D-pad, A/B, LB/RB); pick another button."
+                              : text + " has a key this menu navigates with (arrows, Enter, Space, Tab, PageUp/Down, Home, End, R, Esc), "
+                                "with any modifier; pick another key.");
             return;
         case CaptureOutcome::Duplicate: {
             const int other = hotkeyRowByDotted(dec.check.duplicateOf);
@@ -3424,6 +3448,7 @@ void dispatchNav(MenuNav nav, uint64_t now) {
 // the menu's own and Elite's adopted ones), which row is highlighted, which page is shown.
 bool stepKeyHeld() {
     const State& s = g_s;
+    if (s.padReady && s.padNavigation.stepHeld()) return true;
     for (int i = 0; i < 12; ++i)
         if ((kFixedNavs[i] == kNavLeft || kFixedNavs[i] == kNavRight) && s.keys[i].down) return true;
     for (int i = 0; i < s.aliases.count; ++i)
@@ -3566,6 +3591,80 @@ void handleKeys(uint64_t now) {
     }
 }
 
+// The flat panel chooses one slot actually used by Elite. Merely seeing a
+// connected controller in EDVR's own raw watcher is not proof of a game door.
+void preparePadNavigation(uint64_t now, bool visibleFocused) {
+    State& s = g_s;
+    const bool wasReady = s.padReady;
+    if (!s.open) {
+        inputGateSetPadPrivate(false, -1);
+        s.padReady = false;
+        if (wasReady) s.contentDirty = true;
+        return;
+    }
+    xinputWatchTick();
+    uint16_t buttons = 0;
+    if (s.padIndex >= 0 &&
+        (!xinputSlotSnapshot(static_cast<unsigned>(s.padIndex), &buttons) ||
+         !inputGatePadSeen(s.padIndex))) {
+        inputGateSetPadPrivate(false, -1);
+        s.padIndex = -1;
+        s.padNavigation.prime(0);
+    }
+    if (visibleFocused && s.padIndex < 0) {
+        for (unsigned i = 0; i < 4; ++i) {
+            if (!inputGatePadSeen(static_cast<int>(i)) || !xinputSlotSnapshot(i, &buttons)) continue;
+            s.padIndex = static_cast<int>(i);
+            s.padNavigation.prime(buttons);
+            break;
+        }
+    }
+    const bool connected = s.padIndex >= 0 &&
+        xinputSlotSnapshot(static_cast<unsigned>(s.padIndex), &buttons);
+    inputGateSetPadPrivate(visibleFocused && connected, s.padIndex);
+    s.padReady = visibleFocused && connected && inputGatePadPrivate(s.padIndex);
+    if (s.padReady != wasReady) s.contentDirty = true;
+    if (!s.padReady) s.padNavigation.prime(buttons);
+    if (s.padReady && !s.padReadyNoted) {
+        s.padReadyNoted = true;
+        Log::get().note("menu: flat controller navigation active in proven private slot %d; "
+                        "DPad moves/steps, A selects/commits, B cancels/closes, LB/RB change page.",
+                        s.padIndex);
+    }
+    (void)now;
+}
+
+void handlePadNavigation(uint64_t now) {
+    State& s = g_s;
+    if (!s.open || !s.padReady) return;
+    // Controller ownership is independent of the keyboard door. Do not reuse
+    // a stale modifier from a frame where handleKeys could not run.
+    s.shiftHeld = rawKeyDown(VK_SHIFT);
+    uint16_t buttons = 0;
+    if (!xinputSlotSnapshot(static_cast<unsigned>(s.padIndex), &buttons)) return;
+    if (s.captureEntry >= 0) {
+        // Captured inputs never double as navigation, even on the completion tick.
+        s.padNavigation.prime(buttons);
+        return;
+    }
+    for (int i = 0; i < kMenuPadCount; ++i) {
+        const bool editing = s.editEntry >= 0;
+        const int n = s.padNavigation.step(i, buttons, now, !editing || i == 4 || i == 5);
+        if (!n) continue;
+        s.lastInputMs = now;
+        s.aimParked = true;
+        if (editing) {
+            if (i == 4) commitEdit();
+            else if (i == 5) cancelEdit();
+        } else dispatchNav(kMenuPadNavs[i], now);
+        if (!s.open) return;
+        if (s.captureEntry >= 0) {
+            s.padNavigation.prime(buttons);
+            return;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Head-aim
 
@@ -3692,6 +3791,11 @@ void openMenu(uint64_t now) {
     State& s = g_s;
     if (runtimeFlatProfile()) {
         inputGateInstall();
+        s.padIndex = -1;
+        s.padReady = false;
+        s.padReadyNoted = false;
+        s.padNavigation.prime(0);
+        inputGateSetPadPrivate(false, -1);
         for (KeyRepeat& k : s.keys) keyRepeatPrime(k, rawKeyDown(k.vk));
         for (KeyRepeat& k : s.editKeys) keyRepeatPrime(k, rawKeyDown(k.vk));
         buildPages();
@@ -3775,11 +3879,25 @@ void closeMenu(const char* why) {
     endCapture();
     s.resetArmedEntry = -1;
     inputGateSetPrivate(false);
+    inputGateSetPadPrivate(false, -1);
+    s.padReady = false;
+    if (runtimeFlatProfile()) hotkeysPrimeAll(); // a held navigation key must not become a hotkey on close
     perfMonitorNoteEvent(kEvMenu);
     Log::get().note("menu: closed (%s).", why);
 }
 
 }  // namespace
+
+bool menuFlatPadOwnsHotkey(uint16_t buttons, uint8_t trigger) {
+    const State& s = g_s;
+    if (!runtimeFlatProfile() || !s.open || !s.padReady || !gameHasFocus() ||
+        !inputGatePadPrivate(s.padIndex) || !menuPadOwnsButton(buttons, trigger)) return false;
+    // The existing menu binding still has to reach menuTick, which decides
+    // whether a press closes the panel or becomes navigation.
+    const HotkeyBinding& summon = s.summon.binding();
+    return summon.kind != HotkeyKind::Pad || summon.padButtons != buttons ||
+           summon.padTrigger != trigger;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -4083,6 +4201,8 @@ void menuFlatResize() {
     g_s.lastDrawnMs = 0;
     g_s.contentDirty = true;
     inputGateSetPrivate(false);
+    inputGateSetPadPrivate(false, -1);
+    g_s.padReady = false;
 }
 
 void menuTick(ID3D11Device* dev) {
@@ -4094,7 +4214,14 @@ void menuTick(ID3D11Device* dev) {
             tickHeldEdit(now);   // a held numeric edit whose burst has ended is written now (menu_edit_hold.h)
             s.tickMs = now;
             drainWrites();
-            if (s.summon.pressed()) {
+            const bool summonPressed = s.summon.pressed();
+            // A pad binding in an existing ini may overlap panel navigation.
+            // Its opening edge still works; once open, the panel owns that
+            // button (A selects, B backs out, and the others navigate).
+            const HotkeyBinding& summonBinding = s.summon.binding();
+            const bool padNavSummon = summonBinding.kind == HotkeyKind::Pad &&
+                menuPadOwnsButton(summonBinding.padButtons, summonBinding.padTrigger);
+            if (summonPressed && !(s.open && padNavSummon && s.padReady)) {
                 if (s.open) closeMenu("the menu key");
                 else openMenu(now);
             }
@@ -4128,13 +4255,20 @@ void menuTick(ID3D11Device* dev) {
                 s.flatKeysReadyShown = keysReady;
                 s.contentDirty = true;
             }
+            if (!keysReady && s.captureEntry >= 0) {
+                const int def = s.captureDef;
+                endCapture();
+                setHotkeyNote(def, "capture cancelled", "Keyboard gate unavailable");
+            }
             const bool nativeScale = flatRuntimeNativeScale();
             if (nativeScale != s.flatNativeScaleShown) {
                 s.flatNativeScaleShown = nativeScale;
                 s.contentDirty = true;
             }
             flatWarningTick(now);
+            preparePadNavigation(now, drawnFresh && gameHasFocus());
             if (keysReady) handleKeys(now);
+            handlePadNavigation(now);
             if (s.open && dev && !menuPanelFlatRasterReady()) s.contentDirty = true;
             if (s.open && s.contentDirty) {
                 s.contentDirty = false;
@@ -4151,7 +4285,10 @@ void menuTick(ID3D11Device* dev) {
             inputGateTick();
             if (dev) menuPanelTick(dev);
         });
-        if (!g_budget.shouldRun()) inputGateSetPrivate(false);
+        if (!g_budget.shouldRun()) {
+            inputGateSetPrivate(false);
+            inputGateSetPadPrivate(false, -1);
+        }
         return;
     }
     guardedBudget(g_budget, [&] {
@@ -4553,6 +4690,7 @@ void menuTick(ID3D11Device* dev) {
 
 void menuShutdown() {
     inputGateSetPrivate(false);
+    inputGateSetPadPrivate(false, -1);
     hotkeysSuspend(false);
     setMenuVisible(0.0f);
     setMenuHeadLock(false, 0.0f, 0.0f);

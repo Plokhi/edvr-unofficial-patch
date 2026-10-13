@@ -6,6 +6,7 @@
     python tools/install_edvr.py --target frontier --openvr --tag stepped
     python tools/install_edvr.py --target steam --verify-only
     python tools/install_edvr.py --target steam --profile flat --dry-run
+    python tools/install_edvr.py --target steam --profile flat --xess --dry-run
     python tools/install_edvr.py --target frontier --native-openxr --dll \
         --native-receipt C:\\temp\\edvr-native.json
     python tools/install_edvr.py --restore-native C:\\temp\\edvr-native.json
@@ -48,6 +49,11 @@ the two profiles stop sharing one file's settings.
 --dry-run prints the plan and writes nothing at all -- no copies, no
 backups, no directories. The self-test asserts that, because a --dry-run
 that wrote files is a bug this project has already shipped once.
+
+The flat XeSS DLL and its notices are optional in this developer tool:
+--xess includes them explicitly, and --all includes them when built. A plain
+--verify-only also verifies XeSS runtime/notices when the effective flat ini
+selects xess; other modes need only the core profile.
 
 Exit 0 when everything asked for landed and verified, 1 otherwise.
 """
@@ -719,13 +725,19 @@ def _validate_v2_receipt(r):
             ini_target = legacy
     targets.update(profile=os.path.join(target, PROFILE_FILE),
                    ini=ini_target,
-                   dlss=os.path.join(target, "nvngx_dlss.dll"))
+                   dlss=os.path.join(target, "nvngx_dlss.dll"),
+                   xess=os.path.join(target, "libxess.dll"),
+                   xess_license=os.path.join(target, "INTEL-XESS-LICENSE.txt"),
+                   xess_third_party=os.path.join(target, "INTEL-XESS-THIRD-PARTY.txt"))
     keys = [e["key"] for e in files]
     if len(keys) != len(set(keys)) or not required.issubset(keys) or set(keys) - targets.keys():
         raise ValueError("incomplete or duplicate EDVR v2 components")
     if r["kind"] == FLAT_KIND:
         sources = {"graphics": paths["graphics"],
                    "dlss": os.path.join(root, "build", "nvngx_dlss.dll"),
+                   "xess": os.path.join(root, "build", "libxess.dll"),
+                   "xess_license": os.path.join(root, "build", "INTEL-XESS-LICENSE.txt"),
+                   "xess_third_party": os.path.join(root, "build", "INTEL-XESS-THIRD-PARTY.txt"),
                    "ini": _ini_source(root, "flat"), "profile": "generated"}
         for e in files:
             expected = sources[e["key"]]
@@ -1187,6 +1199,30 @@ def _ini_target(target, profile):
     return os.path.join(target, "edvr.ini" if profile == "vr" else "edvr-flat.ini")
 
 
+def _flat_selects_xess(target):
+    """Read the flat profile's effective temporal mode, including its ini fallback."""
+    ini = _ini_target(target, "flat")
+    if not os.path.isfile(ini):
+        ini = os.path.join(target, "edvr.ini")
+    if not os.path.isfile(ini):
+        return False
+    section = ""
+    mode = "off"
+    with open(ini, "r", encoding="utf-8-sig", errors="replace") as stream:
+        for line in stream:
+            line = line.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and "]" in line:
+                section = line[1:line.index("]")]
+            elif "=" in line:
+                key, value = line.split("=", 1)
+                key = (section + "." + key if section else key).strip().lower()
+                if key == "fix.temporal_aa":
+                    mode = re.split(r"\s[;#]", value, maxsplit=1)[0].strip().lower()
+    return mode == "xess"
+
+
 def _flat_vr_leftovers(target):
     """Recognized EDVR VR state needs the GUI's original-file recovery."""
     xr = os.path.join(target, "Openvr", "win64")
@@ -1206,7 +1242,7 @@ def _equivalent_startup_config(actual, expected):
 
 
 def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
-                            include_dlss=False, include_ini=False, profile="vr",
+                            include_dlss=False, include_xess=False, include_ini=False, profile="vr",
                             keep_backups=KEEP_BACKUPS):
     """Stage a profile's graphics payload and optional native components. A
     good install ends by pruning old backups (prune_backups); a dry run says
@@ -1218,6 +1254,14 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
               if not os.path.isfile(p[k])]
     if include_dlss and not os.path.isfile(os.path.join(root, "build", "nvngx_dlss.dll")):
         errors.append("missing optional DLSS source %s" % os.path.join(root, "build", "nvngx_dlss.dll"))
+    xess_names = (("xess", "libxess.dll"), ("xess_license", "INTEL-XESS-LICENSE.txt"),
+                  ("xess_third_party", "INTEL-XESS-THIRD-PARTY.txt"))
+    if include_xess and native:
+        raise SystemExit("[edvr] --xess applies only to --profile flat")
+    if include_xess:
+        for key, name in xess_names:
+            if not os.path.isfile(os.path.join(root, "build", name)):
+                errors.append("missing XeSS source %s" % os.path.join(root, "build", name))
     ini_source = _ini_source(root, profile)
     if include_ini and not os.path.isfile(ini_source):
         errors.append("missing %s INI source %s" % (profile, ini_source))
@@ -1275,6 +1319,23 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
             dst = os.path.join(target, "nvngx_dlss.dll")
             if not os.path.isfile(dst) or sha256(dst) != sha256(dlss):
                 print("[edvr] %s verify mismatch: %s" % (profile, dst)); ok = False
+        if include_xess:
+            for key, name in xess_names:
+                src = os.path.join(root, "build", name); dst = os.path.join(target, name)
+                if not os.path.isfile(dst) or sha256(dst) != sha256(src):
+                    print("[edvr] %s verify mismatch: %s" % (profile, dst)); ok = False
+        elif not native and _flat_selects_xess(target):
+            # A plain install intentionally preserves a foreign optional DLL.
+            # A selected XeSS mode must never be reported as fully verified
+            # unless the runtime and its notices match this build.
+            missing = [name for _, name in xess_names
+                       if not os.path.isfile(os.path.join(root, "build", name)) or
+                       not os.path.isfile(os.path.join(target, name)) or
+                       sha256(os.path.join(root, "build", name)) != sha256(os.path.join(target, name))]
+            if missing:
+                print("[edvr] WARNING: flat ini selects XeSS but its runtime/notices are not verified "
+                      "(%s); install with --profile flat --xess" % ", ".join(missing))
+                ok = False
         if include_ini:
             ini_target = _ini_target(target, profile)
             if (not os.path.isfile(ini_target) or not os.path.isfile(ini_source) or
@@ -1310,6 +1371,13 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
                         "backup": _native_backup_name(dst, tag, stamp) if os.path.isfile(dst) else None,
                         "before_sha256": sha256(dst) if os.path.isfile(dst) else None,
                         "installed_sha256": sha256(src)})
+    if include_xess:
+        for key, name in xess_names:
+            src = os.path.join(root, "build", name); dst = os.path.join(target, name)
+            entries.append({"key": key, "source": os.path.abspath(src), "target": os.path.abspath(dst),
+                            "backup": _native_backup_name(dst, tag, stamp) if os.path.isfile(dst) else None,
+                            "before_sha256": sha256(dst) if os.path.isfile(dst) else None,
+                            "installed_sha256": sha256(src)})
     if include_ini:
         src = ini_source; dst = _ini_target(target, profile)
         entries.append({"key": "ini", "source": os.path.abspath(src), "target": os.path.abspath(dst),
@@ -1525,12 +1593,14 @@ def main(argv=None):
                     help="compatibility alias: native runtime is always installed")
     ap.add_argument("--dlss", action="store_true",
                     help="also install build/nvngx_dlss.dll")
+    ap.add_argument("--xess", action="store_true",
+                    help="also install the XeSS runtime and notices for --profile flat")
     ap.add_argument("--ini", action="store_true",
                     help="also overwrite the selected profile's settings file "
                          "(edvr.ini for vr, edvr-flat.ini for flat) with its "
                          "template -- this discards tuned settings")
     ap.add_argument("--all", action="store_true",
-                    help="selected profile plus available DLSS (never ini)")
+                    help="selected profile plus available DLSS and, for flat, XeSS (never ini)")
     ap.add_argument("--native-openxr", action="store_true",
                      help="stage the experimental native OpenXR DLL and its "
                          "paired native graphics DLL as d3d11.dll (requires --dll, plus a receipt "
@@ -1577,7 +1647,7 @@ def main(argv=None):
 
     if args.restore_native:
         if any((args.native_openxr, args.native_receipt, args.dll, args.openvr,
-                args.dlss, args.ini, args.all, args.verify_only, args.force,
+                args.dlss, args.xess, args.ini, args.all, args.verify_only, args.force,
                 args.no_backup, args.tag)) or args.profile != "vr":
             ap.error("--restore-native cannot be combined with install options")
         if not os.path.isabs(args.restore_native):
@@ -1588,7 +1658,7 @@ def main(argv=None):
         if args.suspend and args.resume:
             ap.error("--suspend and --resume are exclusive")
         if any((args.native_openxr, args.native_receipt, args.dll, args.openvr,
-                args.dlss, args.ini, args.all, args.verify_only, args.force,
+                args.dlss, args.xess, args.ini, args.all, args.verify_only, args.force,
                 args.no_backup, args.tag)):
             ap.error("--suspend/--resume take only --target and --dry-run")
         return suspend_resume(resolve_target(args.target), resume=args.resume,
@@ -1607,9 +1677,9 @@ def main(argv=None):
         direct = args.no_backup
         if (args.native_loader or args.native_runtime) and not direct:
             ap.error("--native-loader/--native-runtime require --no-backup direct mode")
-        if any((args.openvr, args.all, args.ini, args.dlss, args.force)):
+        if any((args.openvr, args.all, args.ini, args.dlss, args.xess, args.force)):
             ap.error("--native-openxr is mutually exclusive with --openvr, "
-                     "--all, --ini, --dlss, and --force")
+                     "--all, --ini, --dlss, --xess, and --force")
         if direct:
             if not args.native_loader:
                 ap.error("direct native route requires --native-loader")
@@ -1653,11 +1723,17 @@ def main(argv=None):
         ap.error("normal native installation requires a stopped game and transactional backups")
     if args.profile == "flat" and (args.dll or args.openvr):
         ap.error("--profile flat cannot be combined with --dll or --openvr")
+    if args.xess and args.profile != "flat":
+        ap.error("--xess requires --profile flat")
     if args.dlss and not os.path.isfile(dlss_source):
         ap.error("--dlss requested but build/nvngx_dlss.dll is missing")
+    xess_source = os.path.join(root, "build", "libxess.dll")
+    if args.xess and not os.path.isfile(xess_source):
+        ap.error("--xess requested but build/libxess.dll is missing")
     return standard_native_install(root, target, tag, args.dry_run,
                                    args.verify_only,
                                    include_dlss=(args.dlss or (args.all and os.path.isfile(dlss_source))),
+                                   include_xess=(args.xess or (args.all and args.profile == "flat" and os.path.isfile(xess_source))),
                                    include_ini=args.ini, profile=args.profile,
                                    keep_backups=args.keep_backups)
 
@@ -1926,8 +2002,73 @@ def _prune_self_test():
     return not problems
 
 
+def _xess_opt_in_self_test():
+    """A plain flat install leaves a foreign XeSS DLL alone; explicit opt-in
+    backs it up, and verification checks XeSS only when requested."""
+    tmp = tempfile.mkdtemp(prefix="edvr_xess_option_test_")
+    old_profile_validate = globals()["validate_elite_game"]
+    old_probe = globals()["strict_game_running"]
+    try:
+        root = Path(tmp, "repo")
+        game = Path(tmp, "game")
+        (root / "build").mkdir(parents=True)
+        game.mkdir()
+        for name, data in (("d3d11.dll", b"FLAT-GRAPHICS"),
+                           ("libxess.dll", b"PINNED-XESS"),
+                           ("INTEL-XESS-LICENSE.txt", b"LICENSE"),
+                           ("INTEL-XESS-THIRD-PARTY.txt", b"THIRD-PARTY")):
+            (root / "build" / name).write_bytes(data)
+        (game / GAME_EXE).write_bytes(b"GAME")
+        (game / "libxess.dll").write_bytes(b"FOREIGN-XESS")
+        globals()["validate_elite_game"] = lambda path: None
+        globals()["strict_game_running"] = lambda *a: (True, False)
+        args = ["--root", str(root), "--target", str(game), "--profile", "flat"]
+        snapshot = lambda: sorted((str(p.relative_to(game)), p.read_bytes())
+                                  for p in game.rglob("*") if p.is_file())
+        before = snapshot()
+        assert main(args + ["--dry-run"]) == 0
+        assert snapshot() == before, "plain XeSS dry run wrote files"
+        assert main(args) == 0
+        assert (game / "libxess.dll").read_bytes() == b"FOREIGN-XESS", \
+            "plain flat install overwrote a foreign XeSS DLL"
+        assert main(args + ["--verify-only"]) == 0, \
+            "plain verify-only started requiring XeSS"
+        assert main(args + ["--xess", "--verify-only"]) == 1, \
+            "explicit XeSS verify accepted the foreign DLL"
+        (game / "edvr-flat.ini").write_bytes(b"[fix]\ntemporal_aa = xess ; selected\n")
+        assert main(args + ["--verify-only"]) == 1, \
+            "plain verify accepted selected XeSS with a foreign DLL"
+        (game / "edvr-flat.ini").unlink()
+        assert restore_native(str(game / "edvr_flat_receipt.json")) == 0
+        assert (game / "libxess.dll").read_bytes() == b"FOREIGN-XESS"
+        before = snapshot()
+        assert main(args + ["--xess", "--dry-run"]) == 0
+        assert snapshot() == before, "explicit XeSS dry run wrote files"
+        assert main(args + ["--xess"]) == 0
+        assert (game / "libxess.dll").read_bytes() == b"PINNED-XESS"
+        assert any(p.read_bytes() == b"FOREIGN-XESS"
+                   for p in game.glob("libxess.dll.pre-*.bak")), \
+            "explicit XeSS install did not back up the foreign DLL"
+        assert main(args + ["--xess", "--verify-only"]) == 0
+        (game / "edvr-flat.ini").write_bytes(b"[fix]\ntemporal_aa = xess\n")
+        assert main(args + ["--verify-only"]) == 0, \
+            "plain verify rejected selected XeSS with a verified runtime"
+        (game / "libxess.dll").write_bytes(b"STALE-XESS")
+        assert main(args + ["--verify-only"]) == 1, \
+            "plain verify accepted selected XeSS after the runtime went stale"
+        return True
+    except (AssertionError, OSError, ValueError, SystemExit) as exc:
+        print("XeSS opt-in self-test failed: %s" % exc)
+        return False
+    finally:
+        globals()["validate_elite_game"] = old_profile_validate
+        globals()["strict_game_running"] = old_probe
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def self_test():
     ok = True
+    if not _xess_opt_in_self_test(): ok = False
 
     # The path-aware game probe: only a game running from the install target
     # blocks staging; an unresolvable image path fails closed.
@@ -2122,6 +2263,9 @@ def self_test():
         os.makedirs(fxr)
         Path(froot, "build", "d3d11.dll").write_bytes(b"FLAT-GRAPHICS")
         Path(froot, "build", "nvngx_dlss.dll").write_bytes(b"FLAT-DLSS")
+        Path(froot, "build", "libxess.dll").write_bytes(b"FLAT-XESS")
+        Path(froot, "build", "INTEL-XESS-LICENSE.txt").write_bytes(b"INTEL-LICENSE")
+        Path(froot, "build", "INTEL-XESS-THIRD-PARTY.txt").write_bytes(b"INTEL-THIRD-PARTY")
         Path(froot, "edvr.ini").write_bytes(b"[fix]\ntemporal_aa=dlss\n")
         Path(fgame, GAME_EXE).write_bytes(b"GAME")
         Path(fgame, "edvr.ini").write_bytes(b"[user]\nkeep=1\n")
@@ -2144,6 +2288,9 @@ def self_test():
             assert xr_snapshot() == before_xr, "flat install changed Openvr"
             assert Path(fgame, "d3d11.dll").read_bytes() == b"FLAT-GRAPHICS"
             assert Path(fgame, "nvngx_dlss.dll").read_bytes() == b"FLAT-DLSS"
+            assert Path(fgame, "libxess.dll").read_bytes() == b"FLAT-XESS"
+            assert Path(fgame, "INTEL-XESS-LICENSE.txt").read_bytes() == b"INTEL-LICENSE"
+            assert Path(fgame, "INTEL-XESS-THIRD-PARTY.txt").read_bytes() == b"INTEL-THIRD-PARTY"
             assert Path(fgame, "edvr.ini").read_bytes() == b"[user]\nkeep=1\n"
             # First flat install with no edvr-flat.ini yet seeds it from the
             # existing edvr.ini; after that the two profiles' settings part.
@@ -2170,6 +2317,7 @@ def self_test():
             assert restore_native(str(receipt_path)) == 0
             assert xr_snapshot() == before_xr, "flat restore changed Openvr"
             assert not Path(fgame, "d3d11.dll").exists()
+            assert not Path(fgame, "libxess.dll").exists()
             assert not descriptor_path.exists()
             # --ini must require the generated flat template, never copy the
             # full VR INI in the repository root, and restore the user's INI.

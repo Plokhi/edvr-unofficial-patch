@@ -90,7 +90,7 @@ inline bool flatMonoReasonWarrantsWarning(FlatMonoReason reason) {
 
 // What the runtime does in the frame that starts now.
 //   Full    everything, exactly as before the stand-down existed
-//   Probe   one whole frame with the contract observation only (a stand-down probe)
+//   Probe   one whole watched frame, including CPU projection shadows for admission evidence
 //   Paused  nothing per draw or per call beyond the O(1) state trackers
 enum class FlatWork : uint8_t { Full, Probe, Paused };
 inline const char* flatWorkName(FlatWork work) {
@@ -119,7 +119,8 @@ enum class FlatStandDownEvent : uint8_t { None, Entered, Resumed };
 inline constexpr const char* kFlatStandDownPausedWork =
     "per-draw coverage classification and legacy projection readiness "
     "(shader/viewport/binding checks, jitter preparation), constant-buffer shadow "
-    "tracking on every Map/Unmap/Update, the camera-write witness, the camera "
+    "tracking except original cold certification in the bounded probe frame, "
+    "the camera-write witness, the camera "
     "refresh hook, engine-motion hooks and shader/render-target substitution, the "
     "discovery observers, the draw-capture and audit probes; kept: the O(1) state "
     "trackers (viewport, constant-buffer binds, ClearState)";

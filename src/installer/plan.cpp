@@ -14,6 +14,9 @@ const wchar_t* kProfile = L"edvr_profile.ini";
 const wchar_t* kOpenvr = L"openvr_api.dll";
 const wchar_t* kOpenvrOrig = L"openvr_api_orig.dll";
 const wchar_t* kNgx = L"nvngx_dlss.dll";   // NVIDIA's DLSS runtime, beside the game's executable
+const wchar_t* kXess = L"libxess.dll";
+const wchar_t* kXessLicense = L"INTEL-XESS-LICENSE.txt";
+const wchar_t* kXessThirdParty = L"INTEL-XESS-THIRD-PARTY.txt";
 
 // Said when the game is running and it is not this folder's copy. Nothing is
 // stopped, so it is a note rather than a problem -- but not silence either:
@@ -151,6 +154,19 @@ Survey surveyTarget(const GameInstall& game) {
     s.descriptorPresent = fileExists(joinPath(game.dir, kProfile));
     if (s.descriptorPresent) s.descriptorSha = sha256File(joinPath(game.dir, kProfile));
     s.ngx = probeDll(joinPath(game.dir, kNgx));
+    auto notice = [&](const wchar_t* leaf) {
+        DllInfo info; info.path = joinPath(game.dir, leaf);
+        if (fileExists(info.path)) {
+            info.sha256 = sha256File(info.path);
+            info.kind = info.sha256.empty() ? DllKind::Unreadable : DllKind::Foreign;
+        }
+        return info;
+    };
+    // The pinned XeSS runtime is 75 MB, above probeDll's 64 MB PE cap.
+    // Ownership here needs only a readable content hash, as for notices.
+    s.xess = notice(kXess);
+    s.xessLicense = notice(kXessLicense);
+    s.xessThirdParty = notice(kXessThirdParty);
     s.nvidiaAdapter = nvidiaAdapterPresent(&s.nvidiaAdapterName);
 
     if (!s.game.openvrDir.empty()) {
@@ -311,7 +327,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     next.installedUtc = o.nowUtc;
     next.profile = p.profile;
     next.descriptorSha = p.descriptorSha;
-    next.components = flat ? "graphics,profile,ini,ngx-optional" :
+    next.components = flat ? "graphics,profile,ini,ngx-optional,xess-optional" :
         "graphics,profile,ini,openvr,openxr-loader,openxr-license,openxr-config,ngx-optional";
     next.openvrDir = flat ? std::wstring() : relativeOpenvr(s.game.dir, nativeDir);
     next.nativeInstalled=!flat;
@@ -568,6 +584,45 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
             "is left where it is.");
     }
 
+    // XeSS-SR belongs only to the flat edition. Preserve foreign or changed
+    // files; replacement and uninstall are limited to hashes EDVR recorded.
+    if (flat && p.haveXess) {
+        if (p.xessLicenseSha.empty() || p.xessThirdPartySha.empty()) {
+            plan.blocked = true;
+            plan.problems.push_back("XeSS runtime lacks its license notices; nothing will be installed.");
+            return plan;
+        }
+        struct XessFile { const char* item; const wchar_t* leaf; const DllInfo* cur;
+                          const std::string* desired; std::string* recorded; };
+        XessFile files[] = {
+            {"xess", kXess, &s.xess, &p.xessSha, &next.xessSha},
+            {"xess_license", kXessLicense, &s.xessLicense, &p.xessLicenseSha, &next.xessLicenseSha},
+            {"xess_third_party", kXessThirdParty, &s.xessThirdParty, &p.xessThirdPartySha, &next.xessThirdPartySha},
+        };
+        const std::string previous[] = {s.state.xessSha, s.state.xessLicenseSha, s.state.xessThirdPartySha};
+        for (unsigned i=0; i<3; ++i) {
+            const auto& file = files[i];
+            const bool present = file.cur->kind != DllKind::Absent;
+            const bool ours = present && !previous[i].empty() && file.cur->sha256 == previous[i];
+            if (file.cur->kind == DllKind::Unreadable) {
+                plan.problems.push_back("The XeSS destination " + say(file.leaf) +
+                                        " cannot be read; this optional file was left untouched.");
+                continue;
+            }
+            if (present && file.cur->sha256 == *file.desired && !o.repair) {
+                *file.recorded = *file.desired;
+            } else if (present && !ours && file.cur->sha256 != *file.desired) {
+                plan.notes.push_back("A different " + say(file.leaf) + " is present; left alone.");
+                file.recorded->clear();
+            } else {
+                const std::wstring dst = joinPath(s.game.dir, file.leaf);
+                if (present) backup(dst, "the XeSS file EDVR placed, being replaced");
+                writePayload(file.item, dst, "places Intel XeSS-SR runtime or notice");
+                *file.recorded = *file.desired;
+            }
+        }
+    }
+
     if (!flat) {
     // The game-facing OpenVR ABI is always provided by native OpenXR. The
     // original DLL is retained for uninstall, never loaded by this backend.
@@ -758,7 +813,13 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         next.iniSha = sha256Bytes(merged.data(), merged.size());
     }
 
-    if (!changed && !o.repair) {
+    const bool ownershipChanged = next.xessSha != s.state.xessSha ||
+                                  next.xessLicenseSha != s.state.xessLicenseSha ||
+                                  next.xessThirdPartySha != s.state.xessThirdPartySha;
+    const bool stateOnly = !changed && body.empty() && ownershipChanged && !o.repair;
+    if (stateOnly)
+        plan.notes.push_back("Optional runtime ownership changed; only the install record will be updated.");
+    if (!changed && !ownershipChanged && !o.repair) {
         plan.nothingToDo = true;
         plan.notes.push_back("Everything is already in place. Nothing to do.");
     }
@@ -788,13 +849,15 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         mkState.why = "holds the install record";
         plan.steps.push_back(mkState);
 
-        Step base;
-        base.action = Action::WriteText;
-        base.text = p.iniText;
-        base.to = baseIniPath(s.game.dir);
-        base.why = "keeps this version's default " + toUtf8(settingsLeafFor(p.profile)) +
-                   ", so the next update can tell your changes from a changed default";
-        plan.steps.push_back(base);
+        if (!stateOnly) {
+            Step base;
+            base.action = Action::WriteText;
+            base.text = p.iniText;
+            base.to = baseIniPath(s.game.dir);
+            base.why = "keeps this version's default " + toUtf8(settingsLeafFor(p.profile)) +
+                       ", so the next update can tell your changes from a changed default";
+            plan.steps.push_back(base);
+        }
 
         Step rec;
         rec.action = Action::WriteText;
@@ -995,6 +1058,19 @@ Plan planUninstall(const Survey& s, const Options& o) {
     } else if (s.ngx.kind != DllKind::Absent) {
         plan.notes.push_back(
             "The nvngx_dlss.dll beside the game is not the copy EDVR placed -- left alone.");
+    }
+
+    const DllInfo* xessFiles[] = {&s.xess, &s.xessLicense, &s.xessThirdParty};
+    const std::string* xessOwned[] = {&s.state.xessSha, &s.state.xessLicenseSha,
+                                     &s.state.xessThirdPartySha};
+    for (unsigned i=0; i<3; ++i) {
+        const DllInfo& cur = *xessFiles[i];
+        if (cur.kind == DllKind::Absent) continue;
+        if (xessOwned[i]->empty() || cur.sha256 != *xessOwned[i]) {
+            plan.notes.push_back("Keeping a changed XeSS file: " + say(leafOf(cur.path)));
+            continue;
+        }
+        remove(cur.path, "removes Intel XeSS-SR file EDVR placed", cur.sha256);
     }
 
     // ---- settings and record ------------------------------------------
