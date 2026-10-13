@@ -122,12 +122,44 @@ int main(int argc, char** argv) {
     r.frame(300000, freq, true, false, lines);
     check(lines.count == 3, "at 5 minutes: the window line (flat active) and both session lines");
     check(startsWith(lines.text[0], "cross-profile cost: vr hooks while flat:"), "flat active names the VR hooks in the window line");
+    check(contains(lines.text[0], "over 1 frames"), "the VR window line divides by the one flat frame");
     check(startsWith(lines.text[1], "cross-profile cost session: flat hooks while vr:"), "the session names the flat hooks");
     check(contains(lines.text[1], "psConstantBuffers=130/"), "the session total keeps the 130 calls");
-    check(contains(lines.text[1], "over 4 frames"), "the session counts all four frames");
+    check(contains(lines.text[1], "over 2 frames"), "the flat session divides by the two VR frames, not all four");
     check(startsWith(lines.text[2], "cross-profile cost session: vr hooks while flat:"), "the session names the VR hooks");
     check(contains(lines.text[2], "coverDetour=0/0.00"), "a VR site with no calls reads zero");
+    check(contains(lines.text[2], "over 1 frames"), "the VR session divides by the one flat frame");
+
+    // Mixed: the review's case. 28 VR frames, then one flat frame carrying 64 cover-detour calls with 10 sampled ticks (1 MHz: 640 us
+    // over the calls it stands for). Before the fix the VR-hooks line divided by all 29 frames and read 22 us. Each owner now divides by
+    // the frames its hooks ran in: the flat hooks by the 28 VR frames, the cover detour by the one flat frame.
+    resetCounters();
+    Reporter m;
+    m.frame(0, freq, false, true, lines);
+    for (int k = 1; k <= 27; ++k) m.frame(static_cast<uint64_t>(k) * 1000, freq, false, true, lines);
+    m.frame(28000, freq, true, false, lines);
+    g_sites[static_cast<size_t>(Site::FlatPsConstantBuffers)].calls.store(28);
+    g_sites[static_cast<size_t>(Site::VrCoverDetour)].calls.store(64);
+    g_sites[static_cast<size_t>(Site::VrCoverDetour)].ticks.store(10);
+    m.frame(30000, freq, false, true, lines);
+    check(lines.count == 2, "a window spanning a switch prints a line for both owners");
+    check(startsWith(lines.text[0], "cross-profile cost: flat hooks while vr:"), "the flat hooks' line comes first");
+    check(contains(lines.text[0], "psConstantBuffers=28/0.00"), "the flat hooks divide by the 28 VR frames");
+    check(contains(lines.text[0], "over 28 frames"), "the flat window line says it covers 28 frames");
+    check(startsWith(lines.text[1], "cross-profile cost: vr hooks while flat:"), "the VR hooks' line follows");
+    check(contains(lines.text[1], "coverDetour=64/640.00"), "the cover detour reads 640 us per flat frame, not per 29");
+    check(contains(lines.text[1], "over 1 frames"), "the VR-hooks window line says it covers the one flat frame");
+    std::printf("sample: %s\n", lines.text[0]);
     std::printf("sample: %s\n", lines.text[1]);
+
+    // The mixed window's session: 30 VR frames and one flat frame in all; each owner's session line divides by its own total.
+    m.frame(300000, freq, false, true, lines);
+    check(lines.count == 3, "the mixed run's 5-minute point: a window line and both session lines");
+    check(startsWith(lines.text[1], "cross-profile cost session: flat hooks while vr:"), "the mixed session names the flat hooks");
+    check(contains(lines.text[1], "over 30 frames"), "the flat session divides by all 30 VR frames");
+    check(startsWith(lines.text[2], "cross-profile cost session: vr hooks while flat:"), "the mixed session names the VR hooks");
+    check(contains(lines.text[2], "coverDetour=64/640.00"), "the VR session divides its 10 ticks by the one flat frame");
+    check(contains(lines.text[2], "over 1 frames"), "the VR session says it covers the one flat frame");
     std::printf("sample: %s\n", lines.text[2]);
 
     std::printf("cross_profile_test: %d checks, %d failed\n", g_checks, g_fails);

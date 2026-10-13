@@ -123,7 +123,7 @@ void logEngineMotion(const emcpu::WindowReport& r) {
     Log::get().note("%s", text);
 }
 
-// What each profile pays for the other (cross_profile_cost.h): the 30 s window's line for the profile that is inactive now, and the
+// What each profile pays for the other (cross_profile_cost.h): the 30 s window's lines for the owners that ran hooks in the window, and the
 // 5-minute session lines. Read once a frame at the owned Present's boundary (perfMonitorCrossProfileFrame), because perfMonitorFrame runs
 // only while VR is active: a flat frame returns before it, and the flat profile's window line would never print.
 cross_profile::Reporter g_crossProfile;
