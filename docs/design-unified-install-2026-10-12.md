@@ -551,4 +551,6 @@ launches. The phase-1 build switches to Passthrough rather than live.
 - Offline disassembly (build 332841, Steam exe; scripts in the session scratchpad re3d): the mode is parsed into the options block at
   +0x00 (clamped 0..6) and saved from +0x30 of the saved object (fn 0x2871130); the Supersampling vtable (0x52E9000) has a per-mode
   table of 7 counters at ctx+0x3678 (acquire 0x280DED0 `lock inc`, release 0x2866480 `lock dec`, query 0x2845E10). The apply site
-  was not found. e18abf76 logs the table read-only each frame (the probe) to see whether it moves at the apply.
+  was not found. e18abf76 logs the table read-only each frame (the probe) to see whether it moves at the apply.- H, 11:18 (build d4b5006e, review fixes in): the N2 panel flew: `flat_clear,start,...,panel=1`, `panel=ready,size=1613x745,
+  format=29`, 1260 frames, `stop,reason=game_frame` at 3D on. Sean: "3d off message looked good". The frozen frame is fixed on
+  Pimax's runtime by a real projection layer (black + message).

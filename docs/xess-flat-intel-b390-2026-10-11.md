@@ -1495,4 +1495,9 @@ Units (each behind the full build; Haiku implementers, reviewed):
   the conventions match DLSS's and flat XeSS's. Frame-to-frame change after aligning each frame's head drift (6-9 px): XeSS L/R mean
   1.47/1.55, DLSS 1.66/2.15; both hot on the same fine detail (an engraved disc, grilles, thin seams), with no XeSS-only pattern
   (no eye disagreement, no whole-image swim). Residual head motion dominates the numbers, so they do not rank the engines. Reading:
-  input-limited fine detail at a 2x upscale, present for both; XH2 and XH3 hold. Check: a higher HMD Image Quality calms both.
+  input-limited fine detail at a 2x upscale, present for both; XH2 and XH3 hold. Check: a higher HMD Image Quality calms both.- CPU split (d4b5006e, edvr_gfx_20261013_111824, two 30 s windows per eye): allocator-reuse wait blocked 0 of ~2600 evals per eye.
+  ruled out: the allocator wait as the extra render-thread CPU, because it never blocked in the game (the rig's 15 of 20 came from
+  back-to-back evals). XeSS eval CPU median 0.31 / 0.26 ms per eye (submit calls 0.03 ms), about 0.57 ms per frame, matching the
+  render-thread p50 of 2.53 ms with XeSS against 2.07-2.14 ms with DLSS in the same session. The rest is XeSS's own recording inside
+  xessD3D12Execute; moving it off the render thread is a restructure for about 0.5 ms and is not proposed. Closed for Sean's rig:
+  on an RTX 5090, VR XeSS costs about 1.2 ms GPU per frame over DLSS plus about 0.5 ms render-thread CPU, nearly all XeSS itself.
