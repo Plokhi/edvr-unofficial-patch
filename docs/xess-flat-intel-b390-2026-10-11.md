@@ -48,6 +48,9 @@
 - Local input setup moved to onexplayer-elite-local-setup-2026-10-11.md. Mesa
   and MinEdLauncher setup remain in planetary-startup-intel-b390-2026-10-11.md.
   Temporary paths identify historical artifacts rather than portable evidence.
+- XeSS in VR (Sean, 2026-10-13): designed on branch
+  `claude/unified-install-feature-74bc24`, section "October 13: XeSS in VR"
+  at the end; units X1-X3, NOT BUILT.
 
 ## October 11: D3D11 capability probe
 
@@ -1440,3 +1443,32 @@ updated native Windows full build remain pending. The low-priority Legacy
 XeSS-upscale repeated refusal is still deferred; the corrected preflight guard
 is covered separately, and no new standdown behavior is inferred without
 evidence.
+
+## October 13: XeSS in VR (design)
+
+Sean asked for XeSS in the VR profile too (2026-10-13), built on the unified-install branch. Environment of the first flights:
+Sean's RTX 5090, Pimax headset on Pimax's OpenXR runtime, per-eye output about 4032x4034, XeSS SDK 3.0.2 / runtime SR 2.0.2
+through the D3D12 bridge.
+
+Facts (inventory of e177e912): the engine holds ONE feature keyed by (in, out, hdr) (xess_engine.cpp:123, :625-627) and accepts
+slot 0 only (:55, :591); every evaluation copies colour, depth and motion into shared D3D12 textures, waits on two fences and copies
+the output back (:660-751); the first evaluation pins one thread and context (:608-611). VR runs DLSS or FSR per eye through
+temporal_pass.cpp (dispatch :3979-3987) with one context per slot (eye 0, eye 1, world = 2; kUpscalerSlots = 3); xess maps to
+TemporalEngine::Own and VR refuses it (temporal_mode.h:19-23, temporal_pass.cpp:4495, native_temporal readConfig). VR's jitter is a
+fixed 8-phase cycle; XeSS needs ceil(8 x scale^2) phases (temporal_math.h:100-116). The installer and package ship libxess for flat
+only (plan.cpp:589, gen_installer_rc.py:402-405, package_native.py:74, install_edvr.py). The live profile switch never calls
+xessReleaseFeatures directly.
+
+Units (each behind the full build; Haiku implementers, reviewed):
+- X1, engine: one feature per slot (kUpscalerSlots), each keyed and rebuilt on its own; shared textures per slot; the slot check
+  widened; xessReleaseFeatures releases every slot; the profile switch's teardown calls it. Flat keeps slot 0, unchanged.
+- X2, VR route: `fix.temporal_aa = xess` enabled in VR as a third external engine (TemporalEngine::Intel) beside Nvidia and Amd:
+  availability and warm as FSR's, dispatch per eye into xessEvaluate(slot = eye), release on an engine change, a totals line with
+  ms per eye. The VR jitter cycle takes the engine's phase count (XeSS: ceil(8 x scale^2)), so the cycle matches what XeSS needs.
+  The world route (slot 2) maps xess to the same engine if its route allows a third engine without restructuring; otherwise it
+  stays on its current fallback and the report says so.
+- X3, config, menu and payload: the VR choices line gains `xess=XeSS-SR` (edvr.ini, menu schema), and libxess.dll with its two
+  licence files installs and packages for every scope (install_edvr.py --xess for vr too; installer plan; package).
+- Hypotheses for the first flight: XH1 the bridge's copies and fences cost under 1 ms per eye at about 4032x4034 on the 5090 (read
+  the totals line); XH2 the jitter sign matches (a wrong sign shows as shimmering or a half-pixel swim on static edges); XH3 two
+  slots keep independent history (a wrong sharing shows as ghosting that alternates between eyes).
