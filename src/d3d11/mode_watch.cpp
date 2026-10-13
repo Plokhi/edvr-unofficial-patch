@@ -23,6 +23,7 @@
 #include "../common/native_frame.h"           // nativeFrameLatchedFrames: the eye-submit count the watch samples
 #include "../common/native_render_settings.h"  // edvrQueryNativeRenderSizing: the runtime's live VR session
 #include "../common/runtime_profile.h"
+#include "cross_profile_cost.h"   // the live-session query's cost while flat runs, once a frame (log only)
 #include "../common/temporal_mode.h"          // temporalModeEnabled: the LOD bias default follows fix.temporal_aa
 
 #include <windows.h>
@@ -513,7 +514,10 @@ void modeWatchFrameBoundary() {
     // The runtime's live flag, sampled once a frame; a rise asks the worker for a re-read (a VR start may write no file).
     static bool lastLive = false;
     EdvrNativeRenderSizing sizing{};
+    // The VR-side query, timed while VR is not active (cross_profile_cost.h).
+    cross_profile::Probe probe = cross_profile::enterSite(cross_profile::Site::VrModeWatchFrame, !runtimeVrProfile());
     const bool live = edvrQueryNativeRenderSizing(EDVR_NATIVE_RENDER_SIZING_VERSION_1, sizeof(sizing), &sizing) && sizing.valid == 1;
+    probe.stop();
     if (live && !lastLive) modeWatchHint(ModeHint::LiveRise);
     lastLive = live;
 }

@@ -10,6 +10,7 @@
 #include "../common/code_hook.h"
 #include "../common/log.h"
 #include "../common/runtime_profile.h"  // runtimeScopeIncludesVr, runtimeProfileValue: the per-call rewrite gate
+#include "cross_profile_cost.h"         // the mode request's and the settings copy's cost while flat runs (log only)
 
 #include <windows.h>
 
@@ -109,8 +110,13 @@ void refreshUserSize() {
 // (kind 0) gets the remembered block restored before the original runs, so the apply builds the remembered mode. Nothing is changed
 // while VR is inactive.
 uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
+    // Timed while the VR profile is not active (cross_profile_cost.h): from entry to the forward call, the rewrite included.
+    cross_profile::Probe probe = cross_profile::enterSite(cross_profile::Site::VrModeRequest, !runtimeVrProfile());
     // Before any read of the saved mode. Flat and Passthrough rewrite only with VR in scope and a live session (vr_window_gate.h).
-    if (!vrWindowRewriteAllowed(runtimeProfileValue(), runtimeScopeIncludesVr(), vrSsaaHoldVrLive())) return g_requestOrig(a, b, c, d, e, f, g, h);
+    if (!vrWindowRewriteAllowed(runtimeProfileValue(), runtimeScopeIncludesVr(), vrSsaaHoldVrLive())) {
+        probe.stop();
+        return g_requestOrig(a, b, c, d, e, f, g, h);
+    }
     const uintptr_t req = reinterpret_cast<uintptr_t>(b);
     uint32_t kind = 0;
     const bool haveKind = readU32(req + kReqKindOff, &kind);
@@ -157,16 +163,22 @@ uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f
                             dw, dh);
         }
     }
+    probe.stop();
     return g_requestOrig(a, b, c, d, e, f, g, h);
 }
 
 // The settings copy (W): the original copies the settings block into the render context; then the hold (vrSsaaHoldAfterCopy) reads
 // the copied value and, while VR is live, sets the field to 1.0. ctx is the first argument's +0x1180, read before the copy.
 uint64_t copyReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
+    // Timed while the VR profile is not active (cross_profile_cost.h): the read before the copy and the hold after it, not the copy.
+    cross_profile::Probe probe = cross_profile::enterSite(cross_profile::Site::VrSettingsCopy, !runtimeVrProfile());
     uint64_t ctx = 0;
     readU64(reinterpret_cast<uintptr_t>(a) + 0x1180, &ctx);
+    probe.stop();
     const uint64_t r = g_copyOrig(a, b, c, d, e, f, g, h);
+    probe.restart();
     if (ctx) vrSsaaHoldAfterCopy(static_cast<uintptr_t>(ctx));
+    probe.stop();
     return r;
 }
 

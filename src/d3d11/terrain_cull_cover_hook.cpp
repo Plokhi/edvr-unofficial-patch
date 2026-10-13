@@ -3,6 +3,7 @@
 #include "../common/code_hook.h"
 #include "../common/log.h"
 #include "../common/runtime_profile.h"  // runtimeVrProfile: the per-call gate in coverDetour
+#include "cross_profile_cost.h"         // coverDetour's cost while the flat profile runs (log only)
 
 #include <windows.h>
 #include <atomic>
@@ -119,7 +120,11 @@ __declspec(noinline) uintptr_t __fastcall coverDetour(uintptr_t a, uintptr_t b, 
     const auto forward = reinterpret_cast<BuilderFn>(g_forward.load(std::memory_order_acquire));
     if (!forward) return 0;   // never installed; the relay is unreachable then
     // The flat profile has no stereo frustum: it gets the builder's own call, with the arguments as the game made them.
-    if (!runtimeVrProfile()) return forward(a, b, c, d, vfov, aspect);
+    if (!runtimeVrProfile()) {
+        // Inactive: timed from entry to the builder's own call (cross_profile_cost.h).
+        cross_profile::enterSite(cross_profile::Site::VrCoverDetour, true).stop();
+        return forward(a, b, c, d, vfov, aspect);
+    }
     float tanV = 0.0f, tanH = 0.0f;
     tcover::unpackTangents(g_tangents.load(std::memory_order_relaxed), &tanV, &tanH);
     const tcover::Cover r = tcover::widen(vfov, aspect, tanV, tanH);

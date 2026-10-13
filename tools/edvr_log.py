@@ -10606,7 +10606,9 @@ def self_test():
                          "2026-09-09 20:34:39 UTC\n"
                          "[00:00:12.400] Stats[40] ships 3\n"
                          "[00:00:12.400] Stats[41] ships 0\n"
-                         "[00:00:12.401] something else\n").encode("utf-8"))
+                         "[00:00:12.401] something else\n"
+                         "[00:00:12.402] cross-profile cost: flat hooks while vr: psConstantBuffers=130/0.12, resizeBuffers=0/0.00; "
+                         "captures 0 in 0.00 ms (session 0 in 0.00 ms) over 1800 frames\n").encode("utf-8"))
         with open(os.path.join(logs, "edvr_vr_20260910_060000.log"),
                   "wb") as f:
             f.write(b"[00:00:00.001] version 0.14.1-93-gf78eba4 "
@@ -10707,13 +10709,21 @@ def self_test():
             print("a missing log did not exit 1")
             ok = False
 
+        import contextlib
+        import io
+
+        # The cross-profile cost line (src\d3d11\cross_profile_cost.h's window line, from perf_monitor.cpp): --grep finds it, once.
+        grep_out = io.StringIO()
+        with contextlib.redirect_stdout(grep_out):
+            grep_rc = main(["--dir", logs, "--tag", "gfx", "--grep", "cross-profile cost"])
+        if grep_rc != 0 or "1 line(s) match" not in grep_out.getvalue():
+            print("--grep did not find the cross-profile cost line once")
+            ok = False
+
         # --tally vh: the fixture feeds the parser the way a located log
         # does, through main() on a directory the tool discovers on its
         # own. Frame 2 carries only a DC frame summary -- the shape a
         # truncated census leaves behind.
-        import contextlib
-        import io
-
         census_dir = os.path.join(tmp, "census_logs")
         os.makedirs(census_dir)
         census_lines = [

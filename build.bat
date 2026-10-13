@@ -3590,6 +3590,21 @@ if errorlevel 1 ( echo [edvr] ERROR: mode_watch_test build failed & exit /b 1 )
 "%OBJ%\modewatch\mode_watch_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_cross_profile_test
+echo [edvr] === cross_profile_test.exe ===
+REM The cross-profile cost instrument's arithmetic and sampling (src\d3d11\cross_profile_cost.h, docs\design-unified-install-2026-10-12.md section
+REM 3.3): the 1-in-64 scaling, the per-frame division, the capture scope, and the report's 30 s windows and 5-minute session totals with the
+REM profile gate. Pure: the header's only Windows call is QueryPerformanceCounter.
+if not exist "%OBJ%\crossprofile" mkdir "%OBJ%\crossprofile"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\crossprofile\\" /Fe"%OBJ%\crossprofile\cross_profile_test.exe" ^
+    "tools\cross_profile_test\cross_profile_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: cross_profile_test build failed & exit /b 1 )
+"%OBJ%\crossprofile\cross_profile_test.exe" --dry-run || exit /b 1
+"%OBJ%\crossprofile\cross_profile_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_flat_clear_test
 echo [edvr] === flat_clear_test.exe ===
 REM The headset while flat's policy (src\openxr\flat_clear_state.h, docs\design-unified-install-2026-10-12.md section 12): the 250 ms quiet

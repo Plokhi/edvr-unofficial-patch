@@ -70,6 +70,7 @@
 #include "map_wait.h"         // the game's time inside Map, for the native timing line
 #include "flat_runtime.h"
 #include "flat_temporal.h"   // bounded, flat-profile-only scene discovery
+#include "cross_profile_cost.h"   // the flat PS constant-buffer observer's cost while VR is active (log only)
 #include "../common/runtime_profile.h"
 #include "intro_panel.h"
 #include "intro_curve.h"     // the splash's recogniser: which composite draws are the game's own world-space panel
@@ -2979,7 +2980,12 @@ void STDMETHODCALLTYPE hookedVSSetConstantBuffers(ID3D11DeviceContext* self, UIN
 void STDMETHODCALLTYPE hookedPSSetConstantBuffers(ID3D11DeviceContext* self, UINT start,
                                                   UINT n, ID3D11Buffer* const* bufs) {
     // Hot: every PS constant-buffer bind. Installed for the flat scope, so a VR launch passes through here.
-    if (!runtimeFlatProfile()) { g_state->realPSSetConstantBuffers(self, start, n, bufs); return; }
+    if (!runtimeFlatProfile()) {
+        // Inactive while VR runs: timed from here to the forward call (cross_profile_cost.h).
+        cross_profile::enterSite(cross_profile::Site::FlatPsConstantBuffers, true).stop();
+        g_state->realPSSetConstantBuffers(self, start, n, bufs);
+        return;
+    }
     if (g_flatComputeInternal) { g_state->realPSSetConstantBuffers(self, start, n, bufs); return; }
     // Installed only for flat discovery. Forward exactly once, including
     // foreign contexts and every call outside the bounded capture window.

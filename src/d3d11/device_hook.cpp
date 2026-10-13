@@ -82,6 +82,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "vram_tick.h"       // vramWatchTick: the graphics memory watch, once per owned Present
 #include "vertex_resync_hook.h"   // vertexResyncInstall at startup, vertexResyncPoll once a second: the f3d vertex-buffer cache repair (both profiles)
 #include "terrain_cull_cover_hook.h"   // terrainCullCoverInstall at startup, terrainCullCoverPoll once a second: the terrain cull frustum cover (VR)
+#include "cross_profile_cost.h"   // the flat hooks' and the creation captures' cost while VR is active (log only)
 #include "frame_ticks.h"     // g_frameTicks: what the Present hook's own work cost, by name
 #include "boundary_tick.h"   // one fault budget per frame-boundary tick
 #include "vscreen.h"
@@ -688,6 +689,7 @@ HRESULT STDMETHODCALLTYPE hookedCreateLayout(ID3D11Device* self,const D3D11_INPU
     if(self==g_state->device && SUCCEEDED(hr) && bytecode && len && out && *out)
         guardedBudget(g_createBudget,[&]{
             if(runtimeScopeIncludesFlat() && elements && count<=32) {
+                cross_profile::CaptureScope capture(!runtimeFlatProfile());   // the flat layout capture, while VR runs (cross_profile_cost.h)
                 std::vector<FlatPacketInputElement> kept;bool valid=true;
                 for(UINT i=0;i<count;++i){const auto& e=elements[i];FlatPacketInputElement k{};
                     if(!e.SemanticName || std::strlen(e.SemanticName)>=sizeof(k.semantic)){valid=false;break;}
@@ -715,7 +717,7 @@ HRESULT STDMETHODCALLTYPE hookedCreateVS(ID3D11Device* self, const void* bytecod
         if (FAILED(hr) || !bytecode || len == 0 || !out || !*out) return;
         const uint64_t hash = fnv1a64(bytecode, len);
         captureFlatShader('v', hash, bytecode, len);
-        rememberFlatProbeShader('v', hash, bytecode, len);
+        { cross_profile::CaptureScope capture(!runtimeFlatProfile()); rememberFlatProbeShader('v', hash, bytecode, len); }
         registerShaderHash(*out, hash);
         engineVelocityRememberVs(static_cast<ID3D11VertexShader*>(*out),hash,bytecode,static_cast<size_t>(len),linkage!=nullptr);
         weaponMotionRememberShader(static_cast<ID3D11VertexShader*>(*out),hash,bytecode,static_cast<size_t>(len));
@@ -732,7 +734,7 @@ HRESULT STDMETHODCALLTYPE hookedCreateVS(ID3D11Device* self, const void* bytecod
 HRESULT packetCreateShader(ID3D11Device* self,const void* bytes,SIZE_T n,ID3D11ClassLinkage* link,void** out,PFN_CreateShader real,char stage) {
     const HRESULT hr=real(self,bytes,n,link,out);
     if(self==g_state->device && SUCCEEDED(hr) && bytes && n && out && *out)
-        guardedBudget(g_createBudget,[&]{const uint64_t hash=fnv1a64(bytes,n);rememberFlatProbeShader(stage,hash,bytes,n);registerShaderHash(*out,hash);
+        guardedBudget(g_createBudget,[&]{cross_profile::CaptureScope capture(!runtimeFlatProfile());const uint64_t hash=fnv1a64(bytes,n);rememberFlatProbeShader(stage,hash,bytes,n);registerShaderHash(*out,hash);
             if(stage=='g')packetGeometryCreation(static_cast<ID3D11GeometryShader*>(*out),nullptr,0,nullptr,0,0,false);});
     return hr;
 }
@@ -741,7 +743,7 @@ HRESULT STDMETHODCALLTYPE hookedCreateDS(ID3D11Device* d,const void* b,SIZE_T n,
 HRESULT STDMETHODCALLTYPE hookedCreateGS(ID3D11Device* d,const void* b,SIZE_T n,ID3D11ClassLinkage* l,void** o){return packetCreateShader(d,b,n,l,o,g_state->realCreateGS,'g');}
 HRESULT STDMETHODCALLTYPE hookedCreateGSSO(ID3D11Device* d,const void* b,SIZE_T n,const D3D11_SO_DECLARATION_ENTRY* e,UINT ec,const UINT* s,UINT sc,UINT r,ID3D11ClassLinkage* l,void** o) {
     const HRESULT hr=g_state->realCreateGSSO(d,b,n,e,ec,s,sc,r,l,o);
-    if(d==g_state->device && SUCCEEDED(hr) && b && n && o && *o)guardedBudget(g_createBudget,[&]{const uint64_t h=fnv1a64(b,n);rememberFlatProbeShader('g',h,b,n);registerShaderHash(*o,h);packetGeometryCreation(static_cast<ID3D11GeometryShader*>(*o),e,ec,s,sc,r,true);});return hr;
+    if(d==g_state->device && SUCCEEDED(hr) && b && n && o && *o)guardedBudget(g_createBudget,[&]{cross_profile::CaptureScope capture(!runtimeFlatProfile());const uint64_t h=fnv1a64(b,n);rememberFlatProbeShader('g',h,b,n);registerShaderHash(*o,h);packetGeometryCreation(static_cast<ID3D11GeometryShader*>(*o),e,ec,s,sc,r,true);});return hr;
 }
 
 HRESULT STDMETHODCALLTYPE hookedCreatePS(ID3D11Device* self, const void* bytecode,
@@ -756,11 +758,14 @@ HRESULT STDMETHODCALLTYPE hookedCreatePS(ID3D11Device* self, const void* bytecod
         if (FAILED(hr) || !bytecode || len == 0 || !out || !*out) return;
         const uint64_t hash = fnv1a64(bytecode, len);
         captureFlatShader('p', hash, bytecode, len);
-        rememberFlatProbeShader('p', hash, bytecode, len);
+        { cross_profile::CaptureScope capture(!runtimeFlatProfile()); rememberFlatProbeShader('p', hash, bytecode, len); }
         registerShaderHash(*out, hash);
         engineVelocityRememberPs(static_cast<ID3D11PixelShader*>(*out),hash,bytecode,static_cast<size_t>(len),linkage!=nullptr);
-        if (runtimeScopeIncludesFlat()) FlatOverlayLayer::rememberPixelShader(static_cast<ID3D11PixelShader*>(*out),
-            bytecode,static_cast<size_t>(len),linkage!=nullptr);
+        if (runtimeScopeIncludesFlat()) {
+            cross_profile::CaptureScope capture(!runtimeFlatProfile());
+            FlatOverlayLayer::rememberPixelShader(static_cast<ID3D11PixelShader*>(*out),
+                bytecode,static_cast<size_t>(len),linkage!=nullptr);
+        }
         uiLayerRememberHoloPs(static_cast<ID3D11PixelShader*>(*out),hash,bytecode,static_cast<size_t>(len),linkage!=nullptr);
         if(hash==EyeDrawSnapshot::kVscreenPs || hash==EyeDrawSnapshot::kSpritePs || hash==EyeDrawSnapshot::kUnknownAPs || hash==EyeDrawSnapshot::kUnknownBPs || EyeDrawSnapshot::solarPixel(hash)) EyeDrawSnapshot::rememberShader(hash,bytecode,static_cast<size_t>(len));
         EyeTonemapSnapshot::rememberShader(hash,bytecode,static_cast<size_t>(len));
@@ -1089,7 +1094,7 @@ HRESULT STDMETHODCALLTYPE hookedCreateCS(ID3D11Device* self, const void* bytecod
         const uint64_t hash = fnv1a64(bytecode, len);
         registerShaderHash(*out, hash);
         // COMPUTE shaders dump too (2026-09-07), and they had to start.
-        rememberFlatProbeShader('c', hash, bytecode, len);
+        { cross_profile::CaptureScope capture(!runtimeFlatProfile()); rememberFlatProbeShader('c', hash, bytecode, len); }
         //
         // This hook has registered their hashes since it was written, so a
         // census could NAME a dispatch -- and the dump wrote only vs_ and
@@ -1157,7 +1162,10 @@ void flatResizeNote(const char* api, UINT count, UINT width, UINT height, DXGI_F
 }
 
 HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers(IDXGISwapChain* self, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
-    if (!runtimeFlatProfile()) return g_state->realResizeBuffers(self, count, width, height, format, flags);
+    if (!runtimeFlatProfile()) {
+        cross_profile::enterSite(cross_profile::Site::FlatResizeBuffers, true).stop();   // inactive while VR runs (cross_profile_cost.h)
+        return g_state->realResizeBuffers(self, count, width, height, format, flags);
+    }
     const bool ours = self == g_state->swapChain;
     long refs = -1;
     if (ours) { menuFlatResize(); flatRuntimeResize(); refs = flatResizeBackBufferRefs(self); }
@@ -1167,7 +1175,10 @@ HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers(IDXGISwapChain* self, UINT cou
 }
 
 HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers1(IDXGISwapChain3* self, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags, const UINT* masks, IUnknown* const* queues) {
-    if (!runtimeFlatProfile()) return g_state->realResizeBuffers1(self, count, width, height, format, flags, masks, queues);
+    if (!runtimeFlatProfile()) {
+        cross_profile::enterSite(cross_profile::Site::FlatResizeBuffers, true).stop();   // inactive while VR runs (cross_profile_cost.h)
+        return g_state->realResizeBuffers1(self, count, width, height, format, flags, masks, queues);
+    }
     const bool ours = static_cast<IDXGISwapChain*>(self) == g_state->swapChain;
     long refs = -1;
     if (ours) { menuFlatResize(); flatRuntimeResize(); refs = flatResizeBackBufferRefs(self); }
@@ -1205,6 +1216,7 @@ HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers1(IDXGISwapChain3* self, UINT c
 // frame. What is not under a budget is arithmetic and flag reads that cannot
 // fault: the frame counter, the graphics-off test, whether the config poll is due.
 EDVR_BOUNDARY_TICK(tkModeWatch, "mode_watch");
+EDVR_BOUNDARY_TICK(tkCrossProfile, "cross_profile");
 EDVR_BOUNDARY_TICK(tkKinematicProbe, "kinematic_probe");
 EDVR_BOUNDARY_TICK(tkEngineVelocityClock, "engine_velocity_clock");
 EDVR_BOUNDARY_TICK(tkSchedulerProbe, "scheduler_probe");
@@ -1516,6 +1528,8 @@ void presentFrameBoundary() {
     // whether the table changed before the hang or after it, and neither
     // number could answer it. One counter, published here, printed by both.
     ++g_state->frameCounter;
+    // The cross-profile cost's window (cross_profile_cost.h): once a frame in both profiles, so the flat profile's line prints too.
+    tkCrossProfile.run([] { perfMonitorCrossProfileFrame(); });
     // The 3D mode watch's commit (mode_watch.h): a posted mode is applied here, at the one point no draw of the next frame has started.
     tkModeWatch.run([] { modeWatchFrameBoundary(); });
     // The kinematic probe's clock: exactly once per owned Present. Here,
