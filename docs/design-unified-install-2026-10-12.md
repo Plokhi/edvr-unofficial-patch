@@ -52,12 +52,12 @@
     down; 3D on came back 1280x768 windowed and the game saved it.
 - **Ruled out while designing:** section 9.
 - **Temporary keys:** none. No user-facing key is added.
-- **Phase 2 BUILT, FLOWN ONCE (F):** 190a2a12 `Config::switchProfile`;
-  113f1eca hooks for the scope; 0077832a entry points; e1262071 the live
-  switch; a6ee51a7 monitor clock; 8473c587 `profile_switch_test` (WARP:
-  mechanics only, 50 cycles, a skipped-teardown control).
-- **Next:** the leak flight on Steam: 10 toggles in one session, VRAM watch
-  read per cycle (the rig cannot see the real pipelines).
+- **Phase 2 FLOWN OK:** the live switch (e1262071 and its units), no leak
+  over 12 switches (10-13), the headset panel while flat (45c51b0f, flown
+  OK on Pimax's runtime). Review f519b1d7: three findings fixed (8f13cddf,
+  9edf70c7, d410c3dc). Main (XeSS) merged; XeSS in VR in its own doc.
+- **Next:** phase 3 (one installer with the scope prompt, section 4), then
+  Sean's approval to merge and push. Nothing is on main.
 
 ## 1. What exists today
 
