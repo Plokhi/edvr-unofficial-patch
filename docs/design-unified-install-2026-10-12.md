@@ -579,4 +579,14 @@ Units, one at a time behind the full build (Haiku implementers, reviewed):
 - P3-4 mirror, bundler, uninstall: restore offered when the scope's files are absent; editionOf reports the scope; log.dir read from
   both inis and both folders swept; --remove-settings removes both inis and both bases.
 - P3-5 docs: README.md download section, docs\installer.md (adds a Status block), docs\manual-install.md, docs\troubleshooting.md,
-  release\README.txt, AGENTS.md's edvr-flat.ini bullet and install_edvr's --scope.
+  release\README.txt, AGENTS.md's edvr-flat.ini bullet and install_edvr's --scope.- H8, cost flight (build 9b671f0d, edvr_gfx_20261013_124833, Steam, 4508x4508 per eye, DLSS): what each profile pays for the other
+  in a `both` install, from the cross-profile cost lines (465d74d9). VR for flat's hooks: PSSetConstantBuffers about 270 calls a frame,
+  0.6-7.3 us a frame in total (an upper bound: the timing reads dominate), ResizeBuffers 0; flat's creation captures 600 in 20.6 ms
+  over the session, at load. Flat for VR's hooks: mode watch 0.08-0.09 us a frame; cull cover, window and settings-copy hooks 0 calls.
+  ruled out: a lazy install of PSSetConstantBuffers or deferred flat captures as worth building, because the per-frame cost is under
+  0.01 ms of an 11 ms budget and the captures are a one-off 20 ms spread over loading. The cost lines stay as field proof.
+  Environment: this flight ran on SteamVR's OpenXR with Pimax's SteamVR driver (`runtime=SteamVR/OpenXR,system=SteamVR/OpenXR :
+  aapvr`); Sean tests both runtimes. Per the runtime logs' `headset_key` line: SteamVR for 10-12 16:05-16:39 (B, C) and this flight;
+  Pimax OpenXR (Crystal Super) for D, E, F, the leak flights, the 06:40 empty-frame refutation, the XeSS flights and the 11:21 panel
+  flight. The panel also flew OK on SteamVR in this session (`panel=ready,size=1803x832,format=29`, 6831 frames, Sean: "the panel
+  works"), so it is confirmed on both runtimes.
