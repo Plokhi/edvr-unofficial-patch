@@ -1023,6 +1023,7 @@ struct SealInputs {
     bool pickOk = false;         // the own pad is found this frame, with a pose
     bool padHeld = false;        // built v14.9: the own pad is absent this frame, held for fewer than kHeldLostFrames: the trigger keeps its state
     uint64_t bayLastMotionMs = 0;  // built v14.10: the last time a watched, non-continuous record moved (0: none); the bay's quiet time
+    uint64_t padLastMotionMs = 0;  // built v14.11: the last time the own pad moved (its own still watch)
     float rel = 0.0f;            // the pad's height above the hangar shell along its up axis now (metres; frame-independent)
     bool relOk = false;          // rel is readable this frame (an unreadable frame holds the trigger's state)
     bool sourceChanged = false;  // a centre source changed since the last reading: the still test restarts, the motion reference follows
@@ -1167,6 +1168,201 @@ inline bool poseMoved(const float prevRel[3], const float rel[3], const float pr
     return axisAngleDeg(prevA0, a0) > kBayRotDeg || axisAngleDeg(prevA2, a2) > kBayRotDeg;
 }
 
+// Built v14.11: the bay watch. The table is fixed: kBayWatchSlots records, in two regions. Ordinary records take the first
+// kBayWatchOrdinaryRoom slots; the priority names (LandingPad*, Lift*, BlastShield*, HangarGate*, TurboLift*) take the reserved room after them,
+// so a full table never loses the bay's structures. A record that does not fit is counted and not watched; the overflow is reported once.
+constexpr size_t kBayWatchSlots = 512;
+constexpr size_t kBayWatchPriorityRoom = 64;
+constexpr size_t kBayWatchOrdinaryRoom = kBayWatchSlots - kBayWatchPriorityRoom;
+
+inline bool bayWatchPriority(const char* name) noexcept {
+    return hasPrefixNoCase(name, "LandingPad") || hasPrefixNoCase(name, "Lift") || hasPrefixNoCase(name, "BlastShield") ||
+           hasPrefixNoCase(name, "HangarGate") || hasPrefixNoCase(name, "TurboLift");
+}
+
+struct BayWatchRec {
+    uintptr_t addr = 0;
+    uint32_t stamp = 0;              // the frame of the last reading
+    float rel[3] = {};               // the centre relative to the shell (a frame shift of both cancels)
+    float ax0[3] = {};
+    float ax2[3] = {};
+    uint8_t ps = 4;                  // the centre sources of that reading
+    uint8_t ss = 4;
+    uint64_t lastMovedMs = 0;
+    bool haveMotion = false;
+    bool continuous = false;
+    bool priority = false;
+    char name[48] = {};
+    MoverWindow win;
+};
+
+enum class NoteOutcome : uint8_t { kNotWatched = 0, kRead = 1, kMoved = 2, kContinuous = 3 };
+
+struct BayWatch {
+    BayWatchRec recs[kBayWatchSlots];
+    size_t ordinaryN = 0;
+    size_t priorityN = 0;
+    uint64_t lastMotionMs = 0;       // the last time a non-continuous watched record moved (0: none)
+    uint32_t dropped = 0;            // records that did not fit (the table was full)
+    bool overflowPending = false;
+    bool overflowReported = false;
+    char continuousName[48] = {};    // the record that became continuous in the last note
+
+    size_t count() const noexcept { return ordinaryN + priorityN; }
+    BayWatchRec& at(size_t i) noexcept { return i < ordinaryN ? recs[i] : recs[kBayWatchOrdinaryRoom + (i - ordinaryN)]; }
+    const BayWatchRec& at(size_t i) const noexcept { return i < ordinaryN ? recs[i] : recs[kBayWatchOrdinaryRoom + (i - ordinaryN)]; }
+
+    void reset() noexcept {
+        ordinaryN = 0;
+        priorityN = 0;
+        lastMotionMs = 0;
+        dropped = 0;
+        overflowPending = false;
+        overflowReported = false;
+        continuousName[0] = '\0';
+    }
+
+    BayWatchRec* find(uintptr_t addr) noexcept {
+        for (size_t i = 0; i < count(); ++i) {
+            if (at(i).addr == addr) return &at(i);
+        }
+        return nullptr;
+    }
+
+    // Reads one record of the frame. The first read of a record adds it (or counts it dropped). A reading one frame after the last one, from the same
+    // centre sources, is compared: moved when the centre or an axis moved (poseMoved); a missing frame or another source re-bases without counting.
+    NoteOutcome note(uintptr_t addr, const char* name, const float rel[3], const float a0[3], const float a2[3], uint8_t ps, uint8_t ss,
+                     uint32_t frame, uint64_t nowMs) noexcept {
+        continuousName[0] = '\0';
+        BayWatchRec* r = find(addr);
+        if (r == nullptr) {
+            const bool prio = bayWatchPriority(name);
+            if (prio) {
+                if (priorityN >= kBayWatchPriorityRoom) {
+                    drop();
+                    return NoteOutcome::kNotWatched;
+                }
+                r = &recs[kBayWatchOrdinaryRoom + priorityN++];
+            } else {
+                if (ordinaryN >= kBayWatchOrdinaryRoom) {
+                    drop();
+                    return NoteOutcome::kNotWatched;
+                }
+                r = &recs[ordinaryN++];
+            }
+            *r = BayWatchRec{};
+            r->addr = addr;
+            r->priority = prio;
+            std::snprintf(r->name, sizeof(r->name), "%s", name);
+        }
+        if (r->stamp == frame) return NoteOutcome::kRead;   // read this frame already
+        NoteOutcome out = NoteOutcome::kRead;
+        if (r->stamp != 0 && r->stamp + 1 == frame && r->ps == ps && r->ss == ss && !r->continuous) {
+            const bool moved = poseMoved(r->rel, rel, r->ax0, a0, r->ax2, a2);
+            if (r->win.step(moved, nowMs)) {
+                r->continuous = true;
+                std::snprintf(continuousName, sizeof(continuousName), "%s", r->name);
+                out = NoteOutcome::kContinuous;
+            } else if (moved) {
+                r->lastMovedMs = nowMs;
+                r->haveMotion = true;
+                if (nowMs > lastMotionMs) lastMotionMs = nowMs;
+                out = NoteOutcome::kMoved;
+            }
+        }
+        std::memcpy(r->rel, rel, sizeof(r->rel));
+        std::memcpy(r->ax0, a0, sizeof(r->ax0));
+        std::memcpy(r->ax2, a2, sizeof(r->ax2));
+        r->stamp = frame;
+        r->ps = ps;
+        r->ss = ss;
+        return out;
+    }
+
+    void drop() noexcept {
+        ++dropped;
+        if (!overflowReported) overflowPending = true;
+    }
+
+    // True once when the table first overflowed; *count is the records not watched so far.
+    bool takeOverflow(uint32_t* count) noexcept {
+        if (!overflowPending) return false;
+        overflowPending = false;
+        overflowReported = true;
+        *count = dropped;
+        return true;
+    }
+
+    // The names of the watched records that moved within kBayStillMs (up to maxNames), joined with ", ".
+    void movers(uint64_t now, char* out, size_t cap, size_t maxNames) const noexcept {
+        out[0] = '\0';
+        size_t used = 0;
+        size_t named = 0;
+        for (size_t i = 0; i < count() && named < maxNames; ++i) {
+            const BayWatchRec& r = at(i);
+            if (r.continuous || !r.haveMotion || now > r.lastMovedMs + kBayStillMs) continue;
+            if (used + 2 >= cap) break;
+            const int n = std::snprintf(out + used, cap - used, "%s%s", named > 0 ? ", " : "", r.name);
+            if (n < 0) break;
+            used += static_cast<size_t>(n);
+            ++named;
+        }
+    }
+
+    size_t watchedCount() const noexcept {
+        size_t n = 0;
+        for (size_t i = 0; i < count(); ++i) {
+            if (!at(i).continuous) ++n;
+        }
+        return n;
+    }
+
+    // The watched record that moved last (empty when none has moved).
+    void lastMover(char* out, size_t cap) const noexcept {
+        out[0] = '\0';
+        uint64_t latest = 0;
+        bool any = false;
+        for (size_t i = 0; i < count(); ++i) {
+            const BayWatchRec& r = at(i);
+            if (r.continuous || !r.haveMotion) continue;
+            if (!any || r.lastMovedMs >= latest) {
+                any = true;
+                latest = r.lastMovedMs;
+                std::snprintf(out, cap, "%s", r.name);
+            }
+        }
+    }
+};
+
+// Built v14.11: the own pad's own still watch: its centre relative to the shell and its orientation, read in each frame the pad is in the store.
+// A reading one frame after the last, from the same sources, is compared; a missing frame re-bases without counting.
+struct PadWatch {
+    bool have = false;
+    uint32_t stamp = 0;
+    float rel[3] = {};
+    float ax0[3] = {};
+    float ax2[3] = {};
+    uint8_t ps = 4;
+    uint8_t ss = 4;
+    uint64_t lastMovedMs = 0;
+    // Returns true when the pad moved since its last reading.
+    bool step(uint32_t frame, const float r[3], const float a0[3], const float a2[3], uint8_t p, uint8_t s, uint64_t nowMs) noexcept {
+        bool moved = false;
+        if (have && stamp + 1 == frame && ps == p && ss == s) {
+            moved = poseMoved(rel, r, ax0, a0, ax2, a2);
+            if (moved) lastMovedMs = nowMs;
+        }
+        have = true;
+        stamp = frame;
+        std::memcpy(rel, r, sizeof(rel));
+        std::memcpy(ax0, a0, sizeof(ax0));
+        std::memcpy(ax2, a2, sizeof(ax2));
+        ps = p;
+        ss = s;
+        return moved;
+    }
+};
+
 // Advances the state and returns the action. With kRelease, *why says which rule released (the order of the brief: setting off, undocked,
 // Explorer Cam, camera left, pad moved, hangar changed, launch). A pad first seen lowered with no descent observed seals on the first eligible
 // frame (the load-in rule, v14.3); after an observed descent the still delay applies. A raised pad never seals. The camera must be in the bay.
@@ -1240,7 +1436,7 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
     }
     // After a descent: the bay is settled when no watched record has moved for kBayStillMs with the pad lowered; the fallback seals
     // kBayStillTimeoutMs after the pad lowered, when the bay never settles.
-    const uint64_t quietSince = in.bayLastMotionMs > st->lowerSinceMs ? in.bayLastMotionMs : st->lowerSinceMs;
+    const uint64_t quietSince = std::max(std::max(st->lowerSinceMs, in.bayLastMotionMs), in.padLastMotionMs);   // the pad too (built v14.11)
     const bool settled = in.nowMs >= quietSince + kBayStillMs;
     const bool timedOut = in.nowMs >= st->lowerSinceMs + kBayStillTimeoutMs;
     if (!settled && !timedOut) return SealAction::kNone;
