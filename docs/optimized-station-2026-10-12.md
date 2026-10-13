@@ -2,7 +2,9 @@
 
 ## Status
 
-- **Built (`claude/optimized-station`, commit 07b49558, DLL v0.19.1-14-g07b49558; full `build.bat` green with `optimized_station_test` 55 checks, 0 failures; `build.bat --dll-only` green). Pushed. Not installed, not flown.**
+- **Built (`claude/optimized-station`, commit e580730b, DLL v0.19.1-16-ge580730b; full `build.bat` green with `optimized_station_test` 66 checks, 0 failures; `build.bat --dll-only` green). Pushed. Not installed, not flown.**
+- **Flight 07b49558 (`edvr_gfx_20261012_191925.log`): never sealed.** Docked in the hangar with the pad lowered, from 19:19:55 to 19:24:25: every 30 s "sealed for 0 of N frames", no vetoes. Cause: the store observer returned at the top of `optimizedStationAfterStore` while unsealed, so `afterStoreJudge` never ran, and no camera, pad or explicit part was ever gathered. With no pad `pickOk` stayed false and `sealStep` reset its still timer every tick. Fixed in e580730b: `sealed::storeMode` gathers (camera, pads with up axes, explicit parts, the pick) while docked and unsealed; judging and the vetoes stay sealed-only.
+- **Waiting line (new):** while docked and unsealed, `optimized station: waiting (docked=yes|no|unknown, pad=NAME|none, at lowest=yes|no, still for X of 6 s, cell=built|failed:REASON)`, once when docked, pad, at lowest or the cell changes, and at most every 10 s while docked. The next flight's log names the unmet condition. The docked input (Status.json Flags bit 0) is still unverified; this line answers it.
 - **Ships:** `fix.optimized_station = on | off`, F8 menu "Optimized station". VR default on. The flat profile is off and not on the flat allow-list (VR first).
 - **Seal:** docked (Status.json Flags bit 0), own pad found and lowered to its lowest seen height and still (within 0.2 m) for `kSealDelayMs` (6 s, a guess), and the cell builds.
 - **Effect while sealed:** records outside the held hangar box are skipped (producer-B pre-forward veto, rig early veto, post-store clear), and the sun pass (VS 7E38A6AA1269C901 / PS 7CECABDE34FFBE9E) is skipped.
