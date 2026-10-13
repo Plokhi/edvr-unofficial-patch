@@ -518,8 +518,8 @@ launches. The phase-1 build switches to Passthrough rather than live.
   vr -> flat is the flat allow-list reading VR-only keys; a flat launch prints the same lines (13 at 16:03).
 ## 12. The headset while flat (2026-10-13, Sean: "clear + message panel")
 
-- Problem (flight F and the leak flight): after 3D off the game makes no OpenVR call, the session stays up, and SteamVR keeps the
-  last submitted frame (the menu), frozen. Elite never calls ClearLastSubmittedFrame (no evidence it does).
+- Problem (flight F and the leak flight): after 3D off the game makes no OpenVR call, the session stays up, and the OpenXR runtime
+  (Pimax's, on Sean's rig; not SteamVR) keeps the last submitted frame (the menu), frozen. Elite never calls ClearLastSubmittedFrame (no evidence it does).
 - Survey facts: loading frames run from the game's Present callback with the render thread parked during a blocking xrWaitFrame
   (native_module.cpp:40-44, native_runtime_host.h:875-936); in flat that would pace the flat game by the headset. No quad layers
   exist; the runtime owns two eye swapchains and, with `separate_device=1` (the installer's default), its own device and immediate
@@ -533,8 +533,12 @@ launches. The phase-1 build switches to Passthrough rather than live.
   - N2, panel (separate device only): the same frames carry a projection layer: both eye images cleared to black with a head-locked
     message rasterised by GDI in the runtime ("Elite is in flat mode. Turn 3D on in Elite's graphics options to return to VR.").
     Borrowed-device mode keeps N1's empty frames.
-- Hypothesis N-H1: SteamVR shows its own environment, not the frozen frame, while the app submits zero-layer frames. A flight
-  decides it before N2 builds on it.
+- Hypothesis N-H1: the runtime shows its own environment, not the frozen frame, while the app submits zero-layer frames.
+  REFUTED on Pimax's runtime (2026-10-13 06:39, build caa65815): the clear ran (1638 and 742 empty frames) and the headset still
+  showed the frozen frame. ruled out: zero-layer frames as the fix, because Pimax's compositor keeps the last projection image.
+  N2 therefore submits a real image: 45c51b0f (black + message, separate device only). bdeb43cf removed the stereo-table probe:
+  ruled out: the per-mode table at ctx+0x3678 as an apply signal, because it read [0,0,0,0,0,0,8192] and never changed across
+  four toggles; the file was written 60-310 ms after each setter call, so a game hook would gain at most that.
 ### 2026-10-13, Steam, phase 2 and the headset clear (Sean)
 
 - Leak flight, 05:26 (build 72b1182f, N1 in): 12 switches, all committed, 6 off/on cycles. VRAM in VR 6582 -> 5977 -> 5967 MB, in flat
