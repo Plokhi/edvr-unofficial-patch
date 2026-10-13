@@ -41,6 +41,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "../common/hotkey.h"
 #include "fss_res.h"
 #include "journal_watch.h"
+#include "optimized_station.h"   // fix.optimized_station: the sealed-hangar station (install, the frame tick, the store and the sun skip)
 #include "explorer_cam.h"   // explorerCamFrameBoundary (the frame tick) and explorerCamShutdown (the avatar dither-fade global goes back at an unload)
 #include "ui_surfaces.h"   // the glyph atlas and sizing chain instruments
 #include "ui_panel_scale.h" // uiPanelScaleShutdown: the panel operands put back
@@ -1202,6 +1203,7 @@ EDVR_BOUNDARY_TICK(tkEngineVelocityClock, "engine_velocity_clock");
 EDVR_BOUNDARY_TICK(tkSchedulerProbe, "scheduler_probe");
 EDVR_BOUNDARY_TICK(tkVtableWatch, "vtable_watch");
 EDVR_BOUNDARY_TICK(tkVrRuntime, "vr_runtime");
+EDVR_BOUNDARY_TICK(tkOptimizedStation, "optimized_station");
 EDVR_BOUNDARY_TICK(tkToggleKey, "toggle_key");
 EDVR_BOUNDARY_TICK(tkHotkeys, "hotkeys");
 EDVR_BOUNDARY_TICK(tkEliteBinds, "elite_binds");
@@ -1543,6 +1545,8 @@ void presentFrameBoundary() {
     // it necessary -- a perfect install the game never opened, and eight
     // messages telling its owner the file was missing.
     tkVrRuntime.run([] { vrRuntimeTick(); });
+    // The optimized station's tick: the setting, the seal and release rules, the held cell in the pad's frame, the 30 s summary.
+    tkOptimizedStation.run([] { optimizedStationFrame(static_cast<uint32_t>(g_state->frameCounter)); });
     tkToggleKey.run([] {
         if (g_state->toggleKey.pressed()) toggleExposureFix();
     });
@@ -2849,6 +2853,8 @@ void hookDevice(ID3D11Device* device) {
             // The terrain cull cover (terrain_cull_cover_hook.cpp; docs/terrain-culling.md): a CodeHook on the game's cull-plane builder, always on, VR only (a flat session says
             // it is inert). A build that is not 332841 is scanned for the call site; anything short of one match is one log line and nothing patched.
             terrainCullCoverInstall(runtimeFlatProfile());
+            // The optimized station (optimized_station.cpp): reads fix.optimized_station; its hooks attach while it is on (VR by default; flat off).
+            optimizedStationInstall(runtimeFlatProfile());
 
             // AFTER BOTH INSTALLERS, and the order is the whole point. EDVR's
             // own commit writes two dozen entries of this table in the shared

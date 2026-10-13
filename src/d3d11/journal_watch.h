@@ -130,6 +130,9 @@ uint32_t journalEmbarks();
 // heuristics.
 bool journalOnFootKnown();
 bool journalOnFoot();
+// Built v14 (optimized station): the commander is docked, from Status.json Flags bit 0. Known whenever Flags is in the file.
+bool journalDockedKnown();
+bool journalDocked();
 
 // The commander is SEATED in something, by the same Status.json read: Flags bit 24 (the main ship), 25 (a fighter) or 26 (an
 // SRV), or Flags2 bit 1 (a taxi) or 2 (someone else's ship). On foot is Flags2 bit 0 and none of these; the game writes both

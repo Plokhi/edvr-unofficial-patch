@@ -106,6 +106,9 @@ struct Published {
     // shutdown states -- Status then carries only "Flags":0.
     bool     onFootKnown = false;
     bool     onFoot = false;
+    // Built v14 (optimized station): Status.json Flags bit 0 is Docked (the same field whose bit 4 is supercruise, read above).
+    bool     dockedKnown = false;
+    bool     docked = false;
     // Seated in a ship, a fighter, an SRV, a taxi or multicrew (journalSeatedFromFlags): the other half of "on foot, and
     // not in a ship or SRV". Known whenever Flags is in the file.
     bool     seatedKnown = false;
@@ -134,6 +137,8 @@ struct Visible {
     std::atomic<bool>     fsdJumpLive{false};
     std::atomic<bool>     onFootKnown{false};
     std::atomic<bool>     onFoot{false};
+    std::atomic<bool>     dockedKnown{false};
+    std::atomic<bool>     docked{false};
     std::atomic<bool>     seatedKnown{false};
     std::atomic<bool>     seated{false};
     std::atomic<bool>     fssFocusKnown{false};
@@ -160,6 +165,8 @@ void applyPublished(const Published& p) {
     g_v.fsdJumpLive.store(p.fsdJumpLive, kRelaxed);
     g_v.onFootKnown.store(p.onFootKnown, kRelaxed);
     g_v.onFoot.store(p.onFoot, kRelaxed);
+    g_v.dockedKnown.store(p.dockedKnown, kRelaxed);
+    g_v.docked.store(p.docked, kRelaxed);
     g_v.seatedKnown.store(p.seatedKnown, kRelaxed);
     g_v.seated.store(p.seated, kRelaxed);
     g_v.fssFocusKnown.store(p.fssFocusKnown, kRelaxed);
@@ -429,6 +436,8 @@ void pollStatus(Session& s) {
         ++s.pub.statusSamples;
         s.pub.onFootKnown = sawFlags2;
         s.pub.onFoot = sawFlags2 && (flags2 & 0x01u) != 0;
+        s.pub.dockedKnown = sawFlags;
+        s.pub.docked = sawFlags && (flags & 0x01u) != 0;
         // The same sample's seat: Flags bits 24-26 and Flags2 bits 1-2 (journal_watch.h). A Flags2 that is absent is read
         // as zero here; the pair is only consulted with onFootKnown too.
         s.pub.seatedKnown = sawFlags;
@@ -465,6 +474,7 @@ void pollStatus(Session& s) {
         }
     } else if (++s.statusMisses >= 3) {
         s.pub.onFootKnown = false;
+        s.pub.dockedKnown = false;
         s.pub.seatedKnown = false;
         s.pub.fsdJumpKnown = false;
         s.pub.fssFocusKnown = false;
@@ -999,6 +1009,8 @@ bool journalInJumpTunnel() {
 }
 bool journalOnFootKnown() { return journalWatchActive() && peek(g_v.onFootKnown); }
 bool journalOnFoot() { return !runtimeFlatProfile() && peek(g_v.onFoot); }
+bool journalDockedKnown() { return journalWatchActive() && peek(g_v.dockedKnown); }
+bool journalDocked() { return !runtimeFlatProfile() && peek(g_v.docked); }
 bool journalSeatedKnown() { return journalWatchActive() && peek(g_v.seatedKnown); }
 bool journalSeated() { return !runtimeFlatProfile() && peek(g_v.seated); }
 uint32_t journalStatusSamples() { return runtimeFlatProfile() ? 0u : peek(g_v.statusSamples); }
