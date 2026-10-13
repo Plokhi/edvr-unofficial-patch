@@ -810,7 +810,11 @@ std::atomic<bool> g_setting{false};        // fix.optimized_station is on (read 
 std::atomic<bool> g_sealedFlag{false};     // mirror of g_heldValid for the draw path and the hooks (atomic: read on the render thread)
 bool g_vetoesAttached = false;             // the producer and rig vetoes are attached (under g_installMutex-free single writer: the render tick)
 bool g_storeWanted = false;                // the store observer is wanted (the setting is on)
-bool g_dockedNow = false;                  // Status.json Flags bit 0 (Docked), read at each tick while known
+std::atomic<bool> g_dockedNow{false};     // Status.json Flags bit 0 (Docked), read at each tick while known (the store thread reads it)
+std::atomic<bool> g_dockedKnownNow{false};// Status.json has a Flags sample (the waiting line says unknown until then)
+sealed::WaitView g_waitLast;              // the waiting line last written (built v14.1)
+bool g_waitLastSet = false;
+uint64_t g_waitLastMs = 0;                // when the waiting line was last written (at most every 10 s while docked)
 sealed::SealState g_sealState;             // the seal trigger (optimized_station_core.h sealStep)
 bool g_flagHangarChanged = false;          // promote saw the held pad go or another own pad nearest: the tick releases on it
 bool g_flagPadMoved = false;               // promote saw the held pad move along the shaft against the shell: the tick releases on it
@@ -1126,9 +1130,10 @@ void setHeldFrame(const sealed::OwnCell& cell, uint32_t frame) {
 
 // The store observer's judgement, for one record the store has written, while sealed. Order: the centre (unreadable: kept), the named keep (the
 // pad and explicit parts, then the cell), the bay keep, the own ship (the prefix, then the live sphere), otherwise culled.
-void afterStoreJudge(uintptr_t bucket, uintptr_t record) noexcept {
+// judge: the sealed judgement (the keep and the cull); false: gathering only (the frame's camera, pads and explicit parts).
+void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
-    if (!g_heldValid) return;
+    if (judge && !g_heldValid) return;
     uintptr_t ctx = 0;
     uint32_t count = 0;
     if (!bucket || !record || !readVal(&ctx, bucket) || !ctx || !readVal(&count, ctx + kCtxCount) || count == 0) {
@@ -1159,14 +1164,18 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record) noexcept {
     std::memcpy(g_frameCam, cam, sizeof(g_frameCam));
     g_frameCamValid = true;
     const WorldRead wr = worldOfRecord(record);
-    ++g_worldSrc[wr.source];
-    if (wr.source != 4) rigNoteRecord(bucket, record, wr.world, wr.radius);
+    if (judge) {
+        ++g_worldSrc[wr.source];
+        if (wr.source != 4) rigNoteRecord(bucket, record, wr.world, wr.radius);
+    }
     const float* centre = wr.world;
     const float radius = wr.radius;
     if (wr.source == 4 || !std::isfinite(radius) || !(radius > 0.0f) || !std::isfinite(centre[0]) || !std::isfinite(centre[1]) ||
         !std::isfinite(centre[2])) {
-        g_keptUnknown.fetch_add(1, std::memory_order_relaxed);   // the centre cannot be read: kept, never judged
-        ++g_winKeptUnknown;
+        if (judge) {
+            g_keptUnknown.fetch_add(1, std::memory_order_relaxed);   // the centre cannot be read: kept, never judged
+            ++g_winKeptUnknown;
+        }
         return;
     }
     bool keep = false;
@@ -1197,6 +1206,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record) noexcept {
         if (cachedName(record, xn, sizeof(xn))) std::snprintf(x.name, sizeof(x.name), "%s", xn);
         else x.name[0] = '\0';
     }
+    if (!judge) return;   // gathering only: the pads and the explicit parts are in hand; the judgement is sealed-only
     const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, record);
     keep = v.keep;
     containing = v.containing;
@@ -1270,10 +1280,13 @@ bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps) noexcept {
     return g_sealedFlag.load(std::memory_order_acquire) && vs == kSunVs && ps == kSunPs;
 }
 
-// The store calls this after it has written a record (bucket = the collection, record = its record). Judges the record while sealed.
+// The store calls this after it has written a record (bucket = the collection, record = its record). While sealed it judges the record; while
+// docked and unsealed it only gathers the frame's pads, explicit parts and camera for the seal trigger (built v14.1).
 void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept {
-    if (!g_sealedFlag.load(std::memory_order_acquire)) return;
-    afterStoreJudge(bucket, record);
+    const sealed::StoreMode mode = sealed::storeMode(g_setting.load(std::memory_order_acquire), g_sealedFlag.load(std::memory_order_acquire),
+                                                     g_dockedNow.load(std::memory_order_acquire));
+    if (mode == sealed::StoreMode::kNone) return;
+    afterStoreJudge(bucket, record, mode == sealed::StoreMode::kJudge);
 }
 
 // The render thread's frame tick: the setting, the held cell in the pad's frame, the seal and release rules, the rig verdicts, the summary.
@@ -1296,7 +1309,8 @@ void optimizedStationFrame(uint32_t frame) {
     std::lock_guard<std::recursive_mutex> lock(g_sealedMutex);
     ++g_winFrames;
     if (g_heldValid) ++g_winSealedFrames;
-    g_dockedNow = journalDockedKnown() && journalDocked();
+    g_dockedKnownNow.store(journalDockedKnown(), std::memory_order_release);
+    g_dockedNow.store(journalDockedKnown() && journalDocked(), std::memory_order_release);
     refreshHeldWorld();
     // The camera against the held box: outside it by more than kCameraLeaveM releases the seal.
     bool cameraOutside = false;
@@ -1333,6 +1347,31 @@ void optimizedStationFrame(uint32_t frame) {
     } else if (act == sealed::SealAction::kRequestEngage) {
         g_engagePending = true;
         g_engageTries = 0;
+    }
+    // Built v14.1: while docked and unsealed, one line when the seal's inputs change, and at most every 10 s while docked: the unmet condition.
+    if (!g_heldValid) {
+        sealed::WaitView w;
+        w.dockedKnown = g_dockedKnownNow.load(std::memory_order_acquire);
+        w.docked = g_dockedNow.load(std::memory_order_acquire);
+        w.havePad = g_pickCell.has;
+        if (g_pickCell.has) std::snprintf(w.padName, sizeof(w.padName), "%s", g_pickCell.padName);
+        w.atLowest = g_padAlongValid && (g_padAlong - g_padLowest) <= sealed::kSealStillM;
+        w.stillS = g_sealState.stillValid ? static_cast<float>(now - g_sealState.stillSinceMs) / 1000.0f : 0.0f;
+        w.cellBuilt = g_pickCell.has && g_pickCell.radius > 0.0f && g_padAlongValid;
+        if (!w.cellBuilt) {
+            if (!g_pickCell.has) std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", g_pickCell.reason);
+            else std::snprintf(w.cellReason, sizeof(w.cellReason), "%s", "no pad height (the pad's pose is unreadable)");
+        }
+        const bool changed = !g_waitLastSet || sealed::waitingKeyChanged(g_waitLast, w);
+        const bool periodic = w.docked && g_waitLastSet && now - g_waitLastMs >= 10000;
+        if (changed || periodic) {
+            char line[320] = {};
+            sealed::waitingLine(w, static_cast<float>(sealed::kSealDelayMs) / 1000.0f, line, sizeof(line));
+            Log::get().note("%s", line);
+            g_waitLast = w;
+            g_waitLastSet = true;
+            g_waitLastMs = now;
+        }
     }
     refreshRigVerdicts();
     if (now - g_summaryStartMs >= kSummaryMs) summaryLine(now);

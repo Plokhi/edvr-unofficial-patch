@@ -1093,6 +1093,45 @@ inline size_t pickShell(const ExplicitObs* obs, size_t n, const float centre[3],
     return best;
 }
 
+// Built v14.1: what the store observer does with a record. Judging (the keep and the cull) is sealed-only. Gathering (the camera, the frame's
+// pads, the explicit parts and so the own-pad pick the seal trigger needs) runs while docked and unsealed, so a pad is in hand before the seal.
+// Setting off: nothing. The v14 flight never sealed because the gathering was inside the sealed-only judge (no pad, so no seal, ever).
+enum class StoreMode : uint8_t { kNone = 0, kGather = 1, kJudge = 2 };
+
+inline StoreMode storeMode(bool setting, bool isSealed, bool docked) noexcept {
+    if (!setting) return StoreMode::kNone;
+    if (isSealed) return StoreMode::kJudge;
+    return docked ? StoreMode::kGather : StoreMode::kNone;
+}
+
+// Built v14.1: the waiting line's inputs, as they stand this frame. The still time is not a state change (it runs every frame).
+struct WaitView {
+    bool dockedKnown = false;   // Status.json has a Flags sample
+    bool docked = false;        // Flags bit 0
+    bool havePad = false;       // the own pad is picked this frame
+    char padName[64] = {};      // when havePad
+    bool atLowest = false;      // the pad is at its lowest seen height (within kSealStillM)
+    float stillS = 0.0f;        // seconds the stillness timer has run
+    bool cellBuilt = false;     // the pad's cell can be built (a pad with a radius and a readable height)
+    char cellReason[96] = {};   // when not built: why
+};
+
+// True when the seal's state changed: docked, the pad, at lowest, the cell.
+inline bool waitingKeyChanged(const WaitView& a, const WaitView& b) noexcept {
+    return a.dockedKnown != b.dockedKnown || a.docked != b.docked || a.havePad != b.havePad || std::strcmp(a.padName, b.padName) != 0 ||
+           a.atLowest != b.atLowest || a.cellBuilt != b.cellBuilt || std::strcmp(a.cellReason, b.cellReason) != 0;
+}
+
+// The waiting line, with the unmet condition in its words: docked, pad, at lowest, still for X of the delay, cell.
+inline void waitingLine(const WaitView& w, float delayS, char* out, size_t cap) noexcept {
+    const char* docked = !w.dockedKnown ? "unknown" : (w.docked ? "yes" : "no");
+    char cell[128];
+    if (w.cellBuilt) std::snprintf(cell, sizeof(cell), "built");
+    else std::snprintf(cell, sizeof(cell), "failed:%s", w.cellReason[0] != '\0' ? w.cellReason : "no cell");
+    std::snprintf(out, cap, "optimized station: waiting (docked=%s, pad=%s, at lowest=%s, still for %.1f of %.0f s, cell=%s)", docked,
+                  w.havePad ? w.padName : "none", w.atLowest ? "yes" : "no", static_cast<double>(w.stillS), static_cast<double>(delayS), cell);
+}
+
 // The position of p along the cell box's own axes (u, v, w), when the cell is a box. False otherwise.
 inline bool boxCoordsOf(const OwnCell& c, const float p[3], float coords[3]) noexcept {
     if (!c.box) return false;

@@ -281,6 +281,58 @@ int main(int argc, char** argv) {
         check(se::pickShell(ex, 2, padC, se::PadSize::kMedium, 150.0f) == 2, "fix 2: with only the skirt and the gate there is no shell (n)");
     }
 
+    // ---- Built v14.1: the unsealed gathering path (the store observer while docked) and the waiting line ----------------------------------
+    {
+        check(se::storeMode(false, false, true) == se::StoreMode::kNone && se::storeMode(true, false, false) == se::StoreMode::kNone,
+              "v14.1: setting off, or undocked and unsealed, the store observer does nothing");
+        check(se::storeMode(true, false, true) == se::StoreMode::kGather, "v14.1: docked and unsealed, the store observer gathers (no judgement)");
+        check(se::storeMode(true, true, false) == se::StoreMode::kJudge && se::storeMode(true, true, true) == se::StoreMode::kJudge,
+              "v14.1: sealed, the store observer judges, docked or not");
+
+        // The v14 flight's chicken and egg: with no pad gathered, pickOk stays false and the seal is never requested.
+        se::SealState stNoPad;
+        se::SealInputs noPad = quiet(0);
+        noPad.pickOk = false;
+        check(firstEngage(&stNoPad, noPad, 0, 20000) == 0, "v14.1: no pad gathered (pickOk false): the seal is never requested");
+        se::SealState stGathered;
+        check(firstEngage(&stGathered, quiet(0), 0, 20000) == se::kSealDelayMs,
+              "v14.1: with the pad gathered while docked, the still pad requests the seal after the delay");
+
+        char line[320] = {};
+        se::WaitView unknownNoPad;
+        se::waitingLine(unknownNoPad, 6.0f, line, sizeof(line));
+        check(std::strstr(line, "docked=unknown") != nullptr && std::strstr(line, "pad=none") != nullptr && std::strstr(line, "cell=failed:") != nullptr,
+              "v14.1: the waiting line names an unknown docked state, no pad, and a failed cell");
+        se::WaitView v;
+        v.dockedKnown = true;
+        v.docked = true;
+        v.havePad = true;
+        std::snprintf(v.padName, sizeof(v.padName), "%s", "LandingPadMediumA");
+        v.atLowest = true;
+        v.stillS = 2.5f;
+        v.cellBuilt = true;
+        se::waitingLine(v, 6.0f, line, sizeof(line));
+        check(std::strstr(line, "docked=yes") != nullptr && std::strstr(line, "pad=LandingPadMediumA") != nullptr &&
+                  std::strstr(line, "at lowest=yes") != nullptr && std::strstr(line, "still for 2.5 of 6 s") != nullptr &&
+                  std::strstr(line, "cell=built") != nullptr,
+              "v14.1: the waiting line names docked, the pad, at lowest, the still time of the delay, and the cell");
+        se::WaitView v2 = v;
+        v2.stillS = 3.0f;
+        check(!se::waitingKeyChanged(v, v2), "v14.1: the still time alone is not a state change (no line per frame)");
+        v2 = v;
+        v2.atLowest = false;
+        check(se::waitingKeyChanged(v, v2), "v14.1: at lowest changing is a state change");
+        v2 = v;
+        v2.docked = false;
+        check(se::waitingKeyChanged(v, v2), "v14.1: docked changing is a state change");
+        v2 = v;
+        v2.cellBuilt = false;
+        std::snprintf(v2.cellReason, sizeof(v2.cellReason), "%s", "no pad height");
+        se::waitingLine(v2, 6.0f, line, sizeof(line));
+        check(se::waitingKeyChanged(v, v2) && std::strstr(line, "cell=failed:no pad height") != nullptr,
+              "v14.1: a cell that fails names its reason, and is a state change");
+    }
+
     // ---- The rules the seal relies on -------------------------------------------------------------------------------------------------------------
     check(se::kPadMoveReleaseM == 2.0f && se::kCameraLeaveM == 2.0f && se::kSealStillM == 0.2f && se::kSealDelayMs == 6000,
           "the constants: the pad-move release 2 m, the camera 2 m, the still 0.2 m, the seal delay 6 s");
