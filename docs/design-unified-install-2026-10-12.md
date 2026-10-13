@@ -2,9 +2,9 @@
 
 ## Status
 
-- **State (2026-10-13):** phases 1-3 built on branch
-  `claude/unified-install-feature-74bc24`; 1 and 2 flown OK; not on main
-  (Sean approves before it ships). The watch keeps the file's last confirmed
+- **State (2026-10-13):** phases 1-3 MERGED to main 2769e3e5 (Sean
+  approved after the Steam sessions of 14:31-15:22: flat, vr and both
+  scopes, live switches, the headset panel, flat XeSS); not yet released. The watch keeps the file's last confirmed
   class apart from the class EDVR runs (a read posts only when the FILE
   changes); rigs run under a pinned LOCALAPPDATA (549e8d91).
 - **Goal (Sean, 2026-10-12):**
@@ -48,9 +48,9 @@
   9edf70c7, d410c3dc). Main (XeSS) merged; XeSS in VR in its own doc.
 - **Phase 3 BUILT, the installer NOT YET RUN for real** (section 13):
   a7a2c916, 756fb251, 9b642c02, f30817fa, 31b96980, 7ce8a77d, af948bcb.
-- **Next:** a real Update through the installer GUI on Epic plus a flat
-  flight; a Frontier VR launch; then Sean's approval, merge, CI and the
-  release notes. Nothing is on main.
+- **Next:** the release (notes via reflow_notes.py, credits via
+  release_credits.py; the Release build workflow is the CI pass). Not yet
+  flown: an Epic install through the GUI, a Frontier launcher launch.
 
 ## 1. What exists today
 
