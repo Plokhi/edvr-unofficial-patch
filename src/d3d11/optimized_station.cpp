@@ -968,7 +968,7 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
     g_engagePending = false;
     sealed::clearTrigger(&g_sealState);   // the pad's motion memory stays: a release by motion makes the next seal wait its delay (built v14.4)
     g_sealedFlag.store(false, std::memory_order_release);
-    g_latch.reset();   // the next seal latches the bay again (built v14.14)
+    // the latch is kept across a release (built v14.16): undock, a hangar change and a ship change clear it
 }
 
 // Built v14.12: the latch is kept while docked, unsealed, after a descent; it is cleared on a hangar change, a ship change, an undock or a seal.

@@ -1151,9 +1151,20 @@ struct LatchCand {
     float centre[3] = {};
 };
 
+// The latch's class of a candidate name (built v14.16): 1 the pads of the own size (checked as pads), 2 BlastShield* and Lift / Lift_*, 3 HangarGate*.
+// -1: not a mechanism. TurboLift* (the elevator doors, open whenever the lift is used), doors and decals are never mechanism records.
+inline int latchClass(const char* name) noexcept {
+    if (containsNoCase(name, "Door") || containsNoCase(name, "Decal") || hasPrefixNoCase(name, "TurboLift")) return -1;
+    if (isPadName(name)) return 1;
+    if (hasPrefixNoCase(name, "BlastShield")) return 2;
+    if (std::strcmp(name, "Lift") == 0 || hasPrefixNoCase(name, "Lift_")) return 2;
+    if (hasPrefixNoCase(name, "HangarGate")) return 3;
+    return -1;
+}
+
 inline bool mechanismName(const char* name) noexcept {
-    return hasPrefixNoCase(name, "Lift") || hasPrefixNoCase(name, "TurboLift") || hasPrefixNoCase(name, "BlastShield") ||
-           hasPrefixNoCase(name, "HangarGate");
+    const int cls = latchClass(name);
+    return cls == 2 || cls == 3;
 }
 
 // The distance of c from the shaft line through o along the unit up axis, and the position of c along that axis.
@@ -1277,17 +1288,19 @@ struct LatchReject {
 // The latch: the own pad first (ownAddr, ownName, ownSize, at origin along up), then the candidates that qualify. A pad qualifies with the own size
 // within kLatchLateralM laterally; a mechanism record within kLatchLateralM laterally and with its along position in [alongMin, alongMax]. Returns
 // the count written to out (at most kLatchCap). Refused candidates are written to rej (up to rejCap), with their reason, when rej is given.
+// The latch: the own pad first (ownAddr, ownName, ownSize, at origin along up), then, in priority order, the pads of the own size within kLatchLateralM
+// laterally, then BlastShield* and Lift records, then HangarGate* records; the mechanism records within kLatchLateralM laterally and with their along
+// position in [alongMin, alongMax]. At most kLatchCap records: a candidate that qualifies beyond the cap is refused with "over the latch cap" (built
+// v14.16). Refused candidates are written to rej (up to rejCap), with their reason, when rej is given.
 inline size_t selectMechanism(const LatchCand* cands, size_t n, uintptr_t ownAddr, const char* ownName, PadSize ownSize, const float origin[3],
                               const float up[3], float alongMin, float alongMax, LatchRec* out, LatchReject* rej = nullptr, size_t rejCap = 0,
                               size_t* rejN = nullptr) noexcept {
     size_t k = 0;
-    size_t refused = 0;
     auto refuse = [&](const LatchCand& cand, const char* why) noexcept {
         if (rej == nullptr || rejN == nullptr || *rejN >= rejCap) return;
         std::snprintf(rej[*rejN].name, sizeof(rej[*rejN].name), "%s", cand.name);
         std::snprintf(rej[*rejN].why, sizeof(rej[*rejN].why), "%s", why);
         ++*rejN;
-        ++refused;
     };
     if (ownAddr != 0) {
         out[k] = LatchRec{};
@@ -1295,27 +1308,31 @@ inline size_t selectMechanism(const LatchCand* cands, size_t n, uintptr_t ownAdd
         std::snprintf(out[k].name, sizeof(out[k].name), "%s", ownName);
         ++k;
     }
-    for (size_t i = 0; i < n && k < kLatchCap; ++i) {
-        const LatchCand& cand = cands[i];
-        if (cand.addr == 0 || cand.addr == ownAddr) continue;
-        bool take = false;
-        if (isPadName(cand.name)) {
-            if (padSizeOf(cand.name) != ownSize || ownSize == PadSize::kNone) {
-                refuse(cand, "a pad of another size");
-            } else {
-                const float lat = shaftLateralM(cand.centre, origin, up);
-                if (lat > kLatchLateralM) {
+    for (int pass = 1; pass <= 3; ++pass) {
+        for (size_t i = 0; i < n; ++i) {
+            const LatchCand& cand = cands[i];
+            if (cand.addr == 0 || cand.addr == ownAddr) continue;
+            const int cls = latchClass(cand.name);
+            if (cls < 0) {
+                if (pass == 1) refuse(cand, "not a mechanism record (or excluded: a door, a decal, a turbo lift)");
+                continue;
+            }
+            const int want = cls == 1 ? 1 : (cls == 2 ? 2 : 3);
+            if (want != pass) continue;
+            const float lat = shaftLateralM(cand.centre, origin, up);
+            const float along = shaftAlongM(cand.centre, origin, up);
+            bool ok = false;
+            if (cls == 1) {
+                if (ownSize == PadSize::kNone || padSizeOf(cand.name) != ownSize) {
+                    refuse(cand, "a pad of another size");
+                } else if (lat > kLatchLateralM) {
                     char why[80];
                     std::snprintf(why, sizeof(why), "%.0f m lateral (limit %.0f)", static_cast<double>(lat), static_cast<double>(kLatchLateralM));
                     refuse(cand, why);
                 } else {
-                    take = true;
+                    ok = true;
                 }
-            }
-        } else if (mechanismName(cand.name)) {
-            const float lat = shaftLateralM(cand.centre, origin, up);
-            const float along = shaftAlongM(cand.centre, origin, up);
-            if (lat > kLatchLateralM) {
+            } else if (lat > kLatchLateralM) {
                 char why[80];
                 std::snprintf(why, sizeof(why), "%.0f m lateral (limit %.0f)", static_cast<double>(lat), static_cast<double>(kLatchLateralM));
                 refuse(cand, why);
@@ -1325,18 +1342,19 @@ inline size_t selectMechanism(const LatchCand* cands, size_t n, uintptr_t ownAdd
                               static_cast<double>(alongMax));
                 refuse(cand, why);
             } else {
-                take = true;
+                ok = true;
             }
-        } else {
-            refuse(cand, "not a mechanism name");
+            if (!ok) continue;
+            if (k >= kLatchCap) {
+                refuse(cand, "over the latch cap (16): dropped");
+                continue;
+            }
+            out[k] = LatchRec{};
+            out[k].addr = cand.addr;
+            std::snprintf(out[k].name, sizeof(out[k].name), "%s", cand.name);
+            ++k;
         }
-        if (!take) continue;
-        out[k] = LatchRec{};
-        out[k].addr = cand.addr;
-        std::snprintf(out[k].name, sizeof(out[k].name), "%s", cand.name);
-        ++k;
     }
-    (void)refused;
     return k;
 }
 
@@ -1465,7 +1483,7 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         else if (in.hangarChanged) w = ReleaseWhy::kHangarChanged;
         else if (in.launched) w = ReleaseWhy::kLaunch;
         if (w != ReleaseWhy::kNone) {
-            if (in.padMoved || in.launched) st->moved = true;   // a release by motion is a descent
+            if (in.padMoved || in.launched || in.mechanismMoved) st->moved = true;   // a release by motion is a descent (built v14.16)
             clearTrigger(st);
             st->camOutRun = 0;
             if (w == ReleaseWhy::kCameraLeft) st->camInRun = 0;   // the re-seal waits kCameraFrames inside the bay

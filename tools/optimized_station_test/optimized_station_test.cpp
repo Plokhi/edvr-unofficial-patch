@@ -669,6 +669,80 @@ int main(int argc, char** argv) {
         check(req == 4000 + se::kBayStillMs, "v14.12: the own pad must be still for 2 s too: sealed 2 s after the pad's last move");
     }
 
+    // ---- Built v14.16: a release by motion waits the lowered pad and the stillness; the mechanism set (no TurboLift, doors or decals; the cap) ----
+    {
+        // Load-in seal, then the pad slides sideways (a mechanism release: the pad's own move), then the pad keeps moving: no seal for the next 3 s.
+        const float a0[3] = {1.0f, 0.0f, 0.0f};
+        const float a2[3] = {0.0f, 0.0f, 1.0f};
+        se::LatchSet set;
+        set.latched = true;
+        set.n = 2;
+        std::snprintf(set.recs[0].name, sizeof(set.recs[0].name), "%s", "LandingPadMediumA");
+        set.recs[0].addr = 0x1;
+        std::snprintf(set.recs[1].name, sizeof(set.recs[1].name), "%s", "BlastShieldBase");
+        set.recs[1].addr = 0x7;
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::sealStep(quiet(100), &st, &w);
+        uint64_t relAt = 0;
+        for (uint32_t f = 1; f <= 100 && relAt == 0; ++f) {
+            float padRel[3] = {0.0f, 0.0f, -45.0f};
+            if (f >= 50) padRel[0] = (f % 2 == 0) ? 0.1f : 0.0f;   // the pad slides sideways
+            const float hatchStill[3] = {5.0f, 0.0f, -45.0f};
+            set.recs[0].step(f, padRel, a0, a2, 1, 1, f * 100ull);
+            set.recs[1].step(f, hatchStill, a0, a2, 1, 1, f * 100ull);
+            set.recomputeMotion();
+            se::SealInputs h = quiet(f * 100ull);
+            h.held = true;
+            h.mechanismMoved = set.movedIndex() >= 0;
+            if (se::sealStep(h, &st, &w) == se::SealAction::kRelease) relAt = f;
+        }
+        check(relAt == 51 && st.moved, "v14.16: the pad's own move releases the seal, and the release is a descent (the motion memory is set)");
+        bool resealed = false;
+        for (uint32_t f = 52; f <= 80; ++f) {   // the pad keeps moving for 3 s (frames 52-80): no seal
+            float padRel[3] = {0.0f, 0.0f, -45.0f};
+            padRel[0] = (f % 2 == 0) ? 0.1f : 0.0f;
+            set.recs[0].step(f, padRel, a0, a2, 1, 1, f * 100ull);
+            set.recomputeMotion();
+            se::SealInputs in = quiet(f * 100ull);
+            in.bayLastMotionMs = set.lastMotionMs;
+            in.padLastMotionMs = set.padLastMotionMs();
+            resealed = resealed || se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage;
+        }
+        check(!resealed, "v14.16: after the mechanism release the next seal is not immediate: no seal while the pad keeps moving (3 s)");
+    }
+    {
+        // The mechanism set: no TurboLift*, doors or decals; Lift and Lift_* yes, LiftDoor no; the cap of 16 with the refusals logged.
+        check(se::latchClass("TurboLiftDoorLeft") < 0 && se::latchClass("TurboLift_Blocker") < 0 && se::latchClass("DecalB") < 0 &&
+                  se::latchClass("LiftDoor") < 0 && se::latchClass("Lift") == 2 && se::latchClass("Lift_3") == 2 && se::latchClass("BlastShieldBase") == 2 &&
+                  se::latchClass("HangarGate_Ramp1_0") == 3 && se::latchClass("LandingPadMediumB") == 1,
+              "v14.16 set: TurboLift, doors and decals are never mechanism records; Lift and Lift_* are; the pads are the first class");
+        se::LatchCand many[40] = {};
+        for (int i = 0; i < 30; ++i) {
+            char nm[48] = {};
+            std::snprintf(nm, sizeof(nm), "Lift_%d", i);
+            many[i].addr = static_cast<uintptr_t>(0x300 + i);
+            std::snprintf(many[i].name, sizeof(many[i].name), "%s", nm);
+            many[i].centre[0] = 5.0f;
+        }
+        const float origin[3] = {0.0f, 0.0f, 0.0f};
+        const float up[3] = {0.0f, 0.0f, 1.0f};
+        se::LatchRec out[se::kLatchCap];
+        se::LatchReject rej[10];
+        size_t rejN = 0;
+        const size_t kc = se::selectMechanism(many, 30, 0x1, "LandingPadMediumA", se::PadSize::kMedium, origin, up, -85.0f, 300.0f, out, rej, 10, &rejN);
+        check(kc == se::kLatchCap && rejN == 10 && std::strstr(rej[0].why, "cap") != nullptr,
+              "v14.16 set: at the cap (16) the rest are refused with 'over the latch cap' (the first ten logged)");
+        se::LatchCand door[2] = {};
+        std::snprintf(door[0].name, sizeof(door[0].name), "%s", "TurboLiftDoorLeft");
+        door[0].addr = 0x401;
+        std::snprintf(door[1].name, sizeof(door[1].name), "%s", "DecalB");
+        door[1].addr = 0x402;
+        size_t rejN2 = 0;
+        const size_t kd = se::selectMechanism(door, 2, 0x1, "LandingPadMediumA", se::PadSize::kMedium, origin, up, -85.0f, 300.0f, out, rej, 10, &rejN2);
+        check(kd == 1 && rejN2 == 2, "v14.16 set: the elevator doors and decals are refused, the set is the own pad only");
+    }
+
     // ---- Built v14.15: the load-in latch, the reject log, the bay's span, and the own pad's 3D move while sealed ----------------------------
     {
         // A load-in seal (immediate) then the pad slides sideways (x, 10 cm each frame from frame 50): released within 2 frames (at 51).
