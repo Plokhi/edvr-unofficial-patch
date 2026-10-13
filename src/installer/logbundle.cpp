@@ -614,6 +614,20 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir,
         std::wstring name;
         const char*  missing;  // note when it is not there, or nullptr to stay quiet
     };
+    // The native OpenXR runtime's startup file, beside its openvr_api.dll: the
+    // folder the installer itself resolves (detect.cpp). It carries keys that
+    // change what the runtime does -- frame_end_overlap, pose_cache, the runtime
+    // manifest -- and none of them are in edvr.ini, so a log can only say what
+    // the runtime did with the file, never what the file said. A flat install has
+    // no such runtime, so it contributes nothing. A VR install without the file
+    // is a valid one (the runtime then starts from its packaged defaults and its
+    // log says source=packaged-default), so a missing file is not noted.
+    std::wstring nativeIniPath;
+    if (scope != "flat") {  // the runtime is installed for both and vr scopes
+        const std::wstring openvrDir = findOpenvrDir(gameDir);
+        nativeIniPath = joinPath(openvrDir.empty() ? joinPath(gameDir, L"Openvr\\win64") : openvrDir,
+                                 L"edvr_openxr.ini");
+    }
     const Extra extras[] = {
         {joinPath(gameDir, L"edvr_breadcrumbs.txt"), L"edvr_breadcrumbs.txt", nullptr},
         {joinPath(gameDir, L"edvr_FATAL.txt"), L"edvr_FATAL.txt", nullptr},
@@ -625,6 +639,7 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir,
          scopeHasFlatIni(scope) && (scope != "flat" || !fileExists(sharedIniPath)) ? "edvr-flat.ini is not there"
                                                                                     : nullptr},
         {statePath(gameDir), L"edvr_install_state.ini", nullptr},
+        {nativeIniPath, L"edvr_openxr.ini", nullptr},
     };
     for (const Extra& extra : extras) {
         if (fileExists(extra.path)) {
