@@ -169,7 +169,7 @@ static DllInfo fakeDll(DllKind kind, const std::wstring& path, const std::string
 static PayloadInfo testPayload(const std::string& iniText) {
     PayloadInfo p;
     p.version = "v9.9.9-test";
-    p.descriptorText = "[install]\r\nschema = 1\r\nprofile = vr\r\n";
+    p.descriptorText = "[install]\r\nschema = 2\r\nscope = both\r\n";
     p.descriptorSha = sha256Bytes(p.descriptorText.data(), p.descriptorText.size());
     p.haveD3d11 = true;
     p.d3d11Sha = "aaaa-new-d3d11";
@@ -1770,7 +1770,7 @@ static void testNativePlanner() {
     const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
     Options o = testOptions();
     PayloadInfo p; p.version="native-test"; p.iniText="[fix]\r\nblack_void = 1\r\n";
-    p.descriptorText = "[install]\r\nschema = 1\r\nprofile = vr\r\n";
+    p.descriptorText = "[install]\r\nschema = 2\r\nscope = both\r\n";
     p.descriptorSha = sha256Bytes(p.descriptorText.data(), p.descriptorText.size());
     p.nativePairValid=true; p.haveD3d11=true; p.haveOpenvr=true; p.haveOpenxrLoader=true; p.d3d11Sha="graphics";
     p.openvrSha="runtime"; p.openxrLoaderSha="loader";
@@ -1806,7 +1806,7 @@ static void testFlatPlanner() {
     const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
     PayloadInfo flat = testPayload("[fix]\r\ntemporal_aa = off\r\n[advanced]\r\nreal_dll =\r\n");
     flat.profile = "flat";
-    flat.descriptorText = "[install]\r\nschema = 1\r\nprofile = flat\r\n";
+    flat.descriptorText = "[install]\r\nschema = 2\r\nscope = flat\r\n";
     flat.descriptorSha = sha256Bytes(flat.descriptorText.data(), flat.descriptorText.size());
     flat.nativeGraphicsValid = true;
     flat.haveOpenvr = false; flat.haveOpenxrLoader = false; flat.haveOpenxrLicense = false;
@@ -1929,7 +1929,7 @@ static const char kFlatGraphicsBytes[] = "TEST-FLAT-D3D11-PAYLOAD";
 static PayloadInfo flatPayloadFor(const std::string& iniText) {
     PayloadInfo p = testPayload(iniText);
     p.profile = "flat";
-    p.descriptorText = "[install]\r\nschema = 1\r\nprofile = flat\r\n";
+    p.descriptorText = "[install]\r\nschema = 2\r\nscope = flat\r\n";
     p.descriptorSha = sha256Bytes(p.descriptorText.data(), p.descriptorText.size());
     p.nativeGraphicsValid = true;
     p.haveOpenvr = false;
@@ -1943,7 +1943,7 @@ static PayloadInfo flatPayloadFor(const std::string& iniText) {
 // The payload the flat installer carries, for an apply on real files.
 static PayloadProvider flatProvider() {
     return [](const std::string& item, const void** data, size_t* size) {
-        static const char kProfile[] = "[install]\r\nschema = 1\r\nprofile = flat\r\n";
+        static const char kProfile[] = "[install]\r\nschema = 2\r\nscope = flat\r\n";
         if (item == "d3d11") {
             *data = kFlatGraphicsBytes;
             *size = sizeof(kFlatGraphicsBytes) - 1;
@@ -1996,6 +1996,169 @@ static Survey installedFlatSurvey(const std::wstring& dir, const PayloadInfo& in
     s.state.d3d11Sha = "an-older-flat-d3d11";
     s.baseIniText = installedWith.iniText;
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// the unified descriptor (schema 2) against the planner
+//
+// install_edvr.py writes `scope = both` with no installer record. The installer
+// must take that folder as the VR edition it is: update it, keep its descriptor
+// when it already says that, upgrade a schema-1 or record-less copy in place,
+// and convert it to flat only through the runtime ownership proofs. A modified
+// or unknown descriptor is still refused.
+// ---------------------------------------------------------------------------
+
+static std::string unifiedProblems(const Plan& plan) {
+    std::string out;
+    for (const std::string& problem : plan.problems) out += problem + " ";
+    return out;
+}
+
+// A `both` folder install_edvr.py wrote: EDVR's runtime and graphics in place,
+// the game's original runtime kept in a backup, its descriptor, and no record.
+static Survey toolBothSurvey(const std::wstring& dir, const PayloadInfo& vr) {
+    Survey s = baseSurvey(dir);
+    s.d3d11 = fakeDll(DllKind::Edvr, joinPath(dir, L"d3d11.dll"), vr.d3d11Sha);
+    s.openvrCurrent = fakeDll(DllKind::Edvr, joinPath(s.game.openvrDir, L"openvr_api.dll"), vr.openvrSha);
+    s.openvrOrig = fakeDll(DllKind::Absent, joinPath(s.game.openvrDir, L"openvr_api_orig.dll"), "");
+    s.openvrOrigInBackups.push_back(L"C:\\Games\\ED\\backup\\openvr_api_stock.dll");
+    s.openxrLoader = fakeDll(DllKind::Edvr, joinPath(s.game.openvrDir, L"openxr_loader.dll"), vr.openxrLoaderSha);
+    s.openxrLicense = fakeDll(DllKind::Edvr, joinPath(s.game.openvrDir, L"OPENXR-LOADER-LICENSE.txt"), vr.openxrLicenseSha);
+    s.descriptorPresent = true;
+    s.descriptorSha = sha256Bytes(vr.descriptorText.data(), vr.descriptorText.size());
+    return s;
+}
+
+static void testUnifiedDescriptor() {
+    printf("\nunified descriptor (schema 2)\n");
+    const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+    const std::string both2 = "[install]\r\nschema = 2\r\nscope = both\r\n";
+    const std::string vr2 = "[install]\r\nschema = 2\r\nscope = vr\r\n";
+    const std::string flat2 = "[install]\r\nschema = 2\r\nscope = flat\r\n";
+    const std::string vr1 = "[install]\r\nschema = 1\r\nprofile = vr\r\n";
+    const std::string flat1 = "[install]\r\nschema = 1\r\nprofile = flat\r\n";
+    auto shaOf = [](const std::string& text) { return sha256Bytes(text.data(), text.size()); };
+    const Options o = testOptions();
+    Options convert = o;
+    convert.convertProfile = true;
+    const PayloadInfo vr = testPayload("[fix]\r\ntemporal_aa = off\r\n");
+    const PayloadInfo flat = flatPayloadFor("[fix]\r\ntemporal_aa = off\r\n");
+    check(vr.descriptorSha == shaOf(both2), "the VR payload declares scope = both");
+    check(flat.descriptorSha == shaOf(flat2), "the flat payload declares scope = flat");
+
+    {   // The review's repro: a folder with no descriptor, given the tool's bytes.
+        Survey clean = baseSurvey(dir);
+        check(!planInstall(clean, o, vr).blocked, "baseline: a fresh folder plans");
+        clean.descriptorPresent = true;
+        clean.descriptorSha = shaOf(both2);
+        const Plan migrated = planInstall(clean, o, vr);
+        check(!migrated.blocked, "a tool-written scope = both descriptor is not refused", unifiedProblems(migrated));
+    }
+    {   // (a) A tool-written both install, no installer record: the update proceeds and keeps the descriptor.
+        const Survey s = toolBothSurvey(dir, vr);
+        check(installedProfile(s) == "vr", "a scope = both descriptor identifies the VR edition");
+        const Plan plan = planInstall(s, o, vr);
+        check(!plan.blocked, "a tool-written both install updates without an installer record", unifiedProblems(plan));
+        check(plan.nextState.descriptorSha == shaOf(both2), "the update leaves scope = both");
+        check(!hasStep(plan, Action::WritePayload, nullptr, L"edvr_profile.ini"),
+              "and does not rewrite a descriptor that already says both");
+    }
+    {   // (b) The same folder with an older record holding the schema-1 hash: still proceeds.
+        Survey s = toolBothSurvey(dir, vr);
+        s.state.present = true;
+        s.state.profile = "vr";
+        s.state.descriptorSha = shaOf(vr1);
+        s.state.openvrInstalled = true;
+        s.state.openvrSha = vr.openvrSha;
+        const Plan plan = planInstall(s, o, vr);
+        check(!plan.blocked, "an older schema-1 record does not block a tool-written both install",
+              unifiedProblems(plan));
+        check(plan.nextState.descriptorSha == shaOf(both2), "that update records scope = both");
+    }
+    {   // (b') A schema-1 descriptor the record names is upgraded in place to scope = both.
+        Survey s = toolBothSurvey(dir, vr);
+        s.descriptorSha = shaOf(vr1);
+        s.state.present = true;
+        s.state.profile = "vr";
+        s.state.descriptorSha = shaOf(vr1);
+        const Plan plan = planInstall(s, o, vr);
+        check(!plan.blocked, "a schema-1 vr descriptor the record names is upgraded in place", unifiedProblems(plan));
+        check(hasStep(plan, Action::WritePayload, nullptr, L"edvr_profile.ini"),
+              "the upgrade rewrites the descriptor");
+        check(plan.nextState.descriptorSha == shaOf(both2), "and records scope = both");
+    }
+    {   // (b'') A schema-1 vr descriptor with no record at all is upgraded in place too.
+        Survey s = toolBothSurvey(dir, vr);
+        s.descriptorSha = shaOf(vr1);
+        const Plan plan = planInstall(s, o, vr);
+        check(!plan.blocked, "a schema-1 vr descriptor with no record is upgraded, not refused", unifiedProblems(plan));
+    }
+    {   // (c) Conversion of a tool-written both install to flat.
+        // Without any record nothing proves the runtime is EDVR's, so the conversion stays refused.
+        const Plan refused = planInstall(toolBothSurvey(dir, vr), convert, flat);
+        check(refused.blocked, "a both install with no record cannot convert: the runtime is unproven");
+        // After the GUI update has recorded the install, the conversion goes through the proofs.
+        Survey after = toolBothSurvey(dir, vr);
+        const Plan update = planInstall(after, o, vr);
+        check(!update.blocked, "the GUI update of a tool-written both install plans", unifiedProblems(update));
+        after.state = update.nextState;
+        after.openxrLoader = fakeDll(DllKind::Edvr, joinPath(after.game.openvrDir, L"openxr_loader.dll"), vr.openxrLoaderSha);
+        after.openxrLicense = fakeDll(DllKind::Edvr, joinPath(after.game.openvrDir, L"OPENXR-LOADER-LICENSE.txt"), vr.openxrLicenseSha);
+        after.nativeConfig = fakeDll(DllKind::Edvr, joinPath(after.game.openvrDir, L"edvr_openxr.ini"), update.nextState.nativeConfigSha);
+        const Plan conversion = planInstall(after, convert, flat);
+        check(!conversion.blocked, "a recorded both install converts to flat through the runtime proofs", unifiedProblems(conversion));
+        check(hasStep(conversion, Action::Delete, L"openvr_api.dll", nullptr), "the conversion retires EDVR's runtime");
+        check(hasStep(conversion, Action::Backup, L"openvr_api_stock.dll", L"openvr_api.dll"),
+              "the conversion restores the game's original runtime");
+        check(conversion.nextState.profile == "flat", "the conversion records the flat edition");
+        check(conversion.nextState.descriptorSha == shaOf(flat2), "and ends with scope = flat");
+    }
+    {   // (d) A modified descriptor is still refused, whatever it nearly says.
+        const std::string modified[] = {
+            "[install]\r\nschema = 2\r\nscope = bot\r\n",              // one byte changed
+            both2 + "note = edited\r\n",                               // an unknown key
+            "[install]\nschema = 2\nscope = both\n",                   // LF endings, which no writer produces
+        };
+        for (const std::string& text : modified) {
+            Survey s = toolBothSurvey(dir, vr);
+            s.descriptorSha = shaOf(text);
+            const Plan plan = planInstall(s, o, vr);
+            bool named = false;
+            for (const std::string& problem : plan.problems)
+                if (problem.find("differs from the recorded file") != std::string::npos) named = true;
+            check(plan.blocked && named, "a modified descriptor is refused with the existing message");
+        }
+    }
+    {   // (e) schema-2 vr and flat are recognised; a payload declaring the retired schema 1 is refused.
+        Survey markerVr = baseSurvey(dir);
+        markerVr.descriptorPresent = true;
+        markerVr.descriptorSha = shaOf(vr2);
+        check(installedProfile(markerVr) == "vr", "a scope = vr descriptor identifies the VR edition");
+        check(!planInstall(markerVr, o, vr).blocked, "a scope = vr install takes the VR payload as an update");
+
+        Survey markerFlat = baseSurvey(dir);
+        markerFlat.haveOpenvrDir = false;
+        markerFlat.descriptorPresent = true;
+        markerFlat.descriptorSha = shaOf(flat2);
+        check(installedProfile(markerFlat) == "flat", "a scope = flat descriptor identifies the flat edition");
+        check(planInstall(markerFlat, o, vr).blocked, "the VR payload does not widen a scope = flat install");
+        check(!planInstall(markerFlat, convert, vr).blocked, "an explicit conversion from scope = flat installs VR");
+        check(!planInstall(markerFlat, o, flat).blocked, "the flat payload updates a scope = flat install");
+
+        PayloadInfo retired = vr;
+        retired.descriptorText = vr1;
+        retired.descriptorSha = shaOf(vr1);
+        check(planInstall(baseSurvey(dir), o, retired).blocked,
+              "a payload carrying the retired schema-1 descriptor is refused");
+    }
+    {   // A schema-1 flat install with an older record: the flat update upgrades it to scope = flat.
+        Survey fs = installedFlatSurvey(dir, flat);
+        fs.descriptorSha = shaOf(flat1);
+        fs.state.descriptorSha = shaOf(flat1);
+        const Plan plan = planInstall(fs, o, flat);
+        check(!plan.blocked, "a schema-1 flat descriptor is upgraded by the flat update", unifiedProblems(plan));
+        check(plan.nextState.descriptorSha == shaOf(flat2), "and the flat update records scope = flat");
+    }
 }
 
 static void testXessPlanner() {
@@ -2434,7 +2597,7 @@ static PayloadProvider provider(bool failOpenvr) {
         static const char kOpenvr[] = "TEST-OPENVR-PAYLOAD";
         static const char kLoader[] = "TEST-OPENXR-LOADER";
         static const char kLicense[] = "Khronos OpenXR Loader license";
-        static const char kProfile[] = "[install]\r\nschema = 1\r\nprofile = vr\r\n";
+        static const char kProfile[] = "[install]\r\nschema = 2\r\nscope = both\r\n";
         if (item == "d3d11") {
             *data = kD3d11;
             *size = sizeof(kD3d11) - 1;
@@ -5110,7 +5273,7 @@ static void testLogBundle(const std::wstring& scratch) {
         removeTree(flat);
         makeTree(flatLogs);
         writeAll(joinPath(flat, L"EliteDangerous64.exe"), "not really the game");
-        writeAll(joinPath(flat, L"edvr_profile.ini"), "[install]\r\nschema = 1\r\nprofile = flat\r\n");
+        writeAll(joinPath(flat, L"edvr_profile.ini"), "[install]\r\nschema = 2\r\nscope = flat\r\n");
         writeAll(joinPath(flat, L"edvr.ini"), "[log]\r\ndir = " + toUtf8(joinPath(flat, L"vr_logs_nowhere")) + "\r\n");
         writeAll(joinPath(flat, L"edvr-flat.ini"), "[log]\r\ndir = " + toUtf8(flatLogs) + "\r\n");
         writeAll(joinPath(flatLogs, L"edvr_gfx_20260827_140000.log"), "the flat session");
@@ -5192,6 +5355,7 @@ int wmain(int argc, wchar_t** argv) {
     testPlanner();
     testNativePlanner();
     testFlatPlanner();
+    testUnifiedDescriptor();
     testXessPlanner();
     testFlatSettingsPlanner();
     testApply(scratch);

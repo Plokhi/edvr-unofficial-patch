@@ -23,6 +23,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from gen_installer_rc import descriptor_bytes
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # What a release carries under these archive names is stamped with EDVR's own
@@ -235,7 +237,7 @@ def _validate_installer_resources(executable, files, profile="vr"):
         actual = _embedded_resource(executable, resource_id)
         if hashlib.sha256(actual).digest() != hashlib.sha256(by_name[name].read_bytes()).digest():
             raise ValueError("installer resource %d differs from %s" % (resource_id, name))
-    expected_descriptor = ("[install]\r\nschema = 1\r\nprofile = %s\r\n" % profile).encode("ascii")
+    expected_descriptor = descriptor_bytes(profile)
     if by_name["edvr_profile.ini"].read_bytes() != expected_descriptor:
         raise ValueError("loose descriptor does not declare the packaged profile")
     if profile == "flat":
@@ -373,7 +375,7 @@ def self_test():
         root = Path(temp); (root / "build").mkdir(); (root / "release").mkdir()
         for source, _ in _files(root, True):
             source.parent.mkdir(parents=True, exist_ok=True); source.write_bytes(b"payload")
-        vr_descriptor = b"[install]\r\nschema = 1\r\nprofile = vr\r\n"
+        vr_descriptor = b"[install]\r\nschema = 2\r\nscope = both\r\n"
         (root / "build" / "edvr_profile_vr.ini").write_bytes(vr_descriptor)
         (root / "build" / "OPENXR-LOADER-LICENSE.txt").write_bytes(b"notice")
         import openxr_pe
@@ -511,7 +513,7 @@ def self_test():
             assert not (root / "dist" / "edvr-3.0.0.zip").exists()
             assert package(root, "3.0.0", no_dlss=True) == 0 and (root / "dist" / "edvr-3.0.0.zip").is_file()
 
-            flat_descriptor = b"[install]\r\nschema = 1\r\nprofile = flat\r\n"
+            flat_descriptor = b"[install]\r\nschema = 2\r\nscope = flat\r\n"
             (root / "build" / "edvr_profile_flat.ini").write_bytes(flat_descriptor)
             (root / "build" / "edvr-flat.ini").write_bytes(b"[fix]\r\ntemporal_aa = off\r\n")
             (root / "build" / "edvr-flat-README.txt").write_bytes(b"Flat qualification build")

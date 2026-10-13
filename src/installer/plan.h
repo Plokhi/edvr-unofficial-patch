@@ -118,8 +118,9 @@ struct Survey {
 
 Survey surveyTarget(const GameInstall& game);
 
-// The state record is optional; a canonical runtime descriptor still identifies
-// the installed edition after a developer install or lost installer record.
+// The state record is optional; a canonical descriptor (schema 1 or 2, by its exact
+// bytes) still identifies the installed edition after a tool install or a lost
+// installer record. Its scope names the edition: both and vr are "vr", flat is "flat".
 std::string installedProfile(const Survey& survey);
 
 // Whether the folder holds a settings file `profile` would read: its own, or, for

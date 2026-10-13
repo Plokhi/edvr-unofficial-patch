@@ -11,6 +11,7 @@
 #include "detect.h"
 #include "../common/elite_graphics_folder.h"
 #include "../common/iniedit.h"
+#include "../common/install_scope.h"
 #include "state.h"
 
 namespace edvr::installer {
@@ -22,13 +23,13 @@ namespace {
 const long long kSessionWindowSeconds = 180;
 
 // The edition installed in this folder, as far as it can be told without a
-// survey: the record when there is one, else the descriptor the flat edition
-// always writes. Everything else is VR.
+// survey: the record when there is one, else the descriptor's scope (schema 2
+// `scope = flat`, or schema 1 `profile = flat`). Everything else is VR.
 std::string editionOf(const std::wstring& gameDir) {
     const InstallState state = readState(gameDir);
     if (state.present) return state.profile;
     const std::string descriptor = readTextFile(joinPath(gameDir, L"edvr_profile.ini"));
-    return iniValue(descriptor, "install.profile") == "flat" ? "flat" : "vr";
+    return edvr::parseInstallDescriptor(descriptor).scope == edvr::InstallScope::Flat ? "flat" : "vr";
 }
 
 unsigned long crc32Of(const unsigned char* data, size_t size, unsigned long running) {

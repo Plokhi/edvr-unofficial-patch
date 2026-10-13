@@ -6,8 +6,48 @@
 #include <cwctype>
 #include <utility>
 
+#include "../common/install_scope.h"
+
 namespace edvr::installer {
 namespace {
+
+// The descriptors EDVR writes, by their exact bytes (CRLF, as every writer produces them). Schema 1 is what the installer and the
+// flat edition wrote before the unified install; schema 2 is what install_edvr.py and the unified installer write. A file is EDVR's
+// only as one of these bytes: a modified or unknown descriptor matches none of them, whatever it says.
+const char* const kDescriptorTexts[] = {
+    "[install]\r\nschema = 1\r\nprofile = vr\r\n",
+    "[install]\r\nschema = 1\r\nprofile = flat\r\n",
+    "[install]\r\nschema = 2\r\nscope = both\r\n",
+    "[install]\r\nschema = 2\r\nscope = vr\r\n",
+    "[install]\r\nschema = 2\r\nscope = flat\r\n",
+};
+
+// The scope a canonical descriptor declares, read through the same parser the DLL uses. False when the hash is none of EDVR's texts.
+bool ownDescriptorScope(const std::string& sha, edvr::InstallScope* scope) {
+    for (const char* text : kDescriptorTexts) {
+        const std::string bytes(text);
+        if (sha != sha256Bytes(bytes.data(), bytes.size())) continue;
+        *scope = edvr::parseInstallDescriptor(bytes).scope;
+        return true;
+    }
+    return false;
+}
+
+// The edition a scope installs: both and vr carry the VR runtime, so they are the VR edition; flat is the flat edition.
+std::string editionOfScope(edvr::InstallScope scope) {
+    return scope == edvr::InstallScope::Flat ? "flat" : "vr";
+}
+
+// Whether `sha` is one of EDVR's own descriptor texts for `edition`.
+bool isOwnDescriptor(const std::string& sha, const std::string& edition) {
+    edvr::InstallScope scope = edvr::InstallScope::Invalid;
+    return ownDescriptorScope(sha, &scope) && editionOfScope(scope) == edition;
+}
+
+// The descriptor a payload carries: the VR edition declares both scopes, the flat edition declares flat.
+std::string payloadDescriptorFor(bool flat) {
+    return flat ? "[install]\r\nschema = 2\r\nscope = flat\r\n" : "[install]\r\nschema = 2\r\nscope = both\r\n";
+}
 
 const wchar_t* kD3d11 = L"d3d11.dll";
 const wchar_t* kProfile = L"edvr_profile.ini";
@@ -109,11 +149,10 @@ std::wstring relativeOpenvr(const std::wstring& gameDir, const std::wstring& ope
 std::string installedProfile(const Survey& s) {
     if (s.state.present) return s.state.profile;
     if (!s.descriptorPresent || s.descriptorSha.empty()) return std::string();
-    for (const char* profile : {"flat", "vr"}) {
-        const std::string text = std::string("[install]\r\nschema = 1\r\nprofile = ") + profile + "\r\n";
-        if (s.descriptorSha == sha256Bytes(text.data(), text.size())) return profile;
-    }
-    return std::string();
+    // The scope enters here: a recognised descriptor's scope names the edition it installed.
+    edvr::InstallScope scope = edvr::InstallScope::Invalid;
+    if (!ownDescriptorScope(s.descriptorSha, &scope)) return std::string();
+    return editionOfScope(scope);
 }
 
 bool hasSettingsFor(const Survey& s, const std::string& profile) {
@@ -234,7 +273,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         return plan;
     }
     const bool flat = p.profile == "flat";
-    const std::string expectedDescriptor = "[install]\r\nschema = 1\r\nprofile = " + p.profile + "\r\n";
+    const std::string expectedDescriptor = payloadDescriptorFor(flat);
     if ((p.profile != "flat" && p.profile != "vr") || !p.haveD3d11 ||
         (flat ? !p.nativeGraphicsValid
               : (!p.haveOpenvr || !p.haveOpenxrLoader || !p.haveOpenxrLicense || !p.nativePairValid)) ||
@@ -254,12 +293,13 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         plan.problems.push_back("This folder has the " + existingProfile + " edition. Use --convert-profile or confirm edition conversion in the window.");
         return plan;
     }
-    const std::string oldDescriptor = "[install]\r\nschema = 1\r\nprofile = " +
-                                      existingProfile + "\r\n";
-    if (s.descriptorPresent && (s.descriptorSha.empty() ||
-        (!s.state.descriptorSha.empty() && s.descriptorSha != s.state.descriptorSha) ||
-        (s.state.descriptorSha.empty() && s.descriptorSha != p.descriptorSha &&
-         s.descriptorSha != sha256Bytes(oldDescriptor.data(), oldDescriptor.size())))) {
+    // The file on disk is the one the record names, or the payload's own text, or any of EDVR's texts for the edition this folder
+    // already has (schema 1 or 2, whichever an earlier install or the tool wrote). That last clause upgrades such a file in place;
+    // a modified or unknown file matches none of them and is refused.
+    const bool ownEdition = !existingProfile.empty() && isOwnDescriptor(s.descriptorSha, existingProfile);
+    const bool recordAgrees = s.state.descriptorSha.empty() ? s.descriptorSha == p.descriptorSha
+                                                            : s.descriptorSha == s.state.descriptorSha;
+    if (s.descriptorPresent && (s.descriptorSha.empty() || (!recordAgrees && !ownEdition))) {
         plan.blocked = true; plan.problems.push_back("edvr_profile.ini differs from the recorded file; it was left untouched."); return plan;
     }
     if (flat && (conversion || (!s.state.present && s.openvrCurrent.nativeRuntimeExports))) {
