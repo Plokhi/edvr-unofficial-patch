@@ -52,7 +52,13 @@ struct XessBridgeTiming {
     double copyInMedian = 0.0, copyInP95 = 0.0, waitMedian = 0.0, waitP95 = 0.0;
     double executeMedian = 0.0, executeP95 = 0.0, copyOutMedian = 0.0, copyOutP95 = 0.0;
     double totalMedian = 0.0, totalP95 = 0.0;
-    char line[512] = "";   // the text logged by the report
+    // CPU spans per executed evaluation (QueryPerformanceCounter): entry to return, the allocator-reuse wait, and the
+    // queue Wait plus ExecuteCommandLists through Signal. `blocked` counts evaluations whose allocator fence had not passed.
+    unsigned cpuEvals = 0, blocked = 0;
+    double evalMedian = 0.0, evalP95 = 0.0, allocMedian = 0.0, allocP95 = 0.0;
+    double submitMedian = 0.0, submitP95 = 0.0;
+    bool submitTimed = false;
+    char line[768] = "";   // the text logged by the report
 };
 // Reads back whatever the GPU has finished, for every slot. Never waits. Returns the evaluations still unread.
 unsigned xessBridgeTimingSweep(ID3D11DeviceContext* context);

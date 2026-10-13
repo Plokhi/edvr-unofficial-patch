@@ -431,6 +431,9 @@ bool bridgeTiming(ID3D11Device* device, ID3D11DeviceContext* context) {
         if (!check(timing.d11Samples > 0 && timing.d12Samples > 0 &&
                    timing.executeMedian > 0.0 && timing.waitMedian > 0.0,
                    "bridge timing reads D3D11 and D3D12 with nonzero execute and wait")) return false;
+        if (!check(timing.cpuEvals > 0 && timing.evalMedian > 0.0 && timing.allocMedian >= 0.0 &&
+                   timing.blocked <= timing.cpuEvals && timing.submitTimed,
+                   "bridge timing carries CPU spans with nonzero eval time")) return false;
     }
     std::fprintf(stderr, "xess_engine_test: PASS bridge timing, 40 evals on slots 0,1\n");
     return true;

@@ -124,6 +124,11 @@ struct BridgeWindow {
     unsigned executed = 0;
     unsigned untimed = 0;                      // evaluations whose D3D11 set could not begin
     unsigned invalid = 0;                      // timings read back invalid
+    // CPU spans per executed evaluation, milliseconds (QueryPerformanceCounter, no GPU queries).
+    std::vector<double> cpuEval;               // entry to return
+    std::vector<double> cpuAlloc;              // the allocator-reuse wait
+    std::vector<double> cpuSubmit;             // the queue Wait, then ExecuteCommandLists through Signal
+    unsigned allocBlocked = 0;                 // evaluations whose allocator fence had not passed when reused
 };
 
 struct Feature {
@@ -259,6 +264,15 @@ void noteSample(std::vector<double>& samples, double ms) {
     if (samples.size() < kBridgeCap) samples.push_back(ms);
 }
 
+// Milliseconds between two QueryPerformanceCounter readings.
+double qpcSpanMs(const LARGE_INTEGER& from, const LARGE_INTEGER& to) {
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    return frequency.QuadPart > 0
+        ? static_cast<double>(to.QuadPart - from.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart)
+        : 0.0;
+}
+
 // One allocator's execute timestamps, read once the fence has passed the submission that wrote them.
 void collectExecute(State& state, BridgeWindow& window, CommandSlot& command) {
     if (!command.timingPending) return;
@@ -342,8 +356,23 @@ void reportSlot(State& state, unsigned slot, XessBridgeTiming& out) {
     out.executeMedian = executeMedian;        out.executeP95 = executeP95;
     out.copyOutMedian = median[kBridgeCopyOut]; out.copyOutP95 = p95[kBridgeCopyOut];
     out.totalMedian = median[kBridgeTotal];   out.totalP95 = p95[kBridgeTotal];
+    double evalMedian = 0.0, evalP95 = 0.0, allocMedian = 0.0, allocP95 = 0.0, submitMedian = 0.0, submitP95 = 0.0;
+    const bool hasEval = summarize(window.cpuEval, evalMedian, evalP95);
+    const bool hasAlloc = summarize(window.cpuAlloc, allocMedian, allocP95);
+    const bool hasSubmit = summarize(window.cpuSubmit, submitMedian, submitP95);
+    out.cpuEvals = unsigned(window.cpuEval.size());
+    out.blocked = window.allocBlocked;
+    out.evalMedian = evalMedian; out.evalP95 = evalP95;
+    out.allocMedian = allocMedian; out.allocP95 = allocP95;
+    out.submitMedian = submitMedian; out.submitP95 = submitP95;
+    out.submitTimed = hasSubmit;
 
     char copyIn[32], wait[32], execute[32], copyOut[32], total[32];
+    char evalText[32], allocText[32], submitText[32];
+    pairText(evalText, sizeof evalText, hasEval, evalMedian, evalP95);
+    pairText(allocText, sizeof allocText, hasAlloc, allocMedian, allocP95);
+    pairText(submitText, sizeof submitText, hasSubmit, submitMedian, submitP95);
+    const std::string submitPart = hasSubmit ? std::string(", submit ") + submitText : std::string();
     pairText(copyIn, sizeof copyIn, has[kBridgeCopyIn], median[kBridgeCopyIn], p95[kBridgeCopyIn]);
     pairText(wait, sizeof wait, has[kBridgeWait], median[kBridgeWait], p95[kBridgeWait]);
     pairText(execute, sizeof execute, hasExecute, executeMedian, executeP95);
@@ -355,16 +384,22 @@ void reportSlot(State& state, unsigned slot, XessBridgeTiming& out) {
     if (!hasExecute && holder.d12Note[0]) reasons += std::string(", d3d12 ") + holder.d12Note;
     std::snprintf(out.line, sizeof out.line,
                   "xess: slot=%u bridge timing over %u evals, ms median/p95: copy-in %s, wait %s, "
-                  "d3d12 execute %s, copy-out %s, d3d11 total %s (unread %u%s)",
-                  slot, out.evals, copyIn, wait, execute, copyOut, total, out.unread, reasons.c_str());
+                  "d3d12 execute %s, copy-out %s, d3d11 total %s (unread %u%s); "
+                  "cpu ms median/p95: eval %s, alloc-wait %s (blocked %u of %u)%s",
+                  slot, out.evals, copyIn, wait, execute, copyOut, total, out.unread, reasons.c_str(),
+                  evalText, allocText, window.allocBlocked, window.executed, submitPart.c_str());
     Log::get().note("%s", out.line);
 
     for (std::vector<double>& samples : window.parts) samples.clear();
     window.execute.clear();
+    window.cpuEval.clear();
+    window.cpuAlloc.clear();
+    window.cpuSubmit.clear();
     window.startedAt = 0;
     window.executed = 0;
     window.untimed = 0;
     window.invalid = 0;
+    window.allocBlocked = 0;
 }
 
 // Starts an evaluation's D3D11 intervals: the whole bridge, then copy-in. A set that cannot begin counts as untimed and the
@@ -929,7 +964,14 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     CommandSlot& command = feature.commands[feature.nextCommand++ % kCommandRing];
     // The wait happens only when a command allocator is about to be reused;
     // normal producer/consumer ordering is entirely GPU-fence based.
+    // CPU spans for the bridge line. The fence is read before the wait, so "blocked" means the wait really had to wait.
+    const bool allocBlocked = command.doneValue > state.fence12->GetCompletedValue();
+    LARGE_INTEGER allocBegan{}, allocEnded{};
+    QueryPerformanceCounter(&allocBegan);
     if (!waitFor(state, command.doneValue, why, "allocator reuse")) return false;
+    QueryPerformanceCounter(&allocEnded);
+    const double allocMs = qpcSpanMs(allocBegan, allocEnded);
+    double submitMs = 0.0;
     // The wait above has passed this allocator's last submission, so its timestamps are final before the reset reuses them.
     collectExecute(state, holder.window, command);
     hr = command.allocator->Reset();
@@ -966,7 +1008,11 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     }
     context->Flush();
     feature.lastUseValue = producer;
+    LARGE_INTEGER queueWaitBegan{}, queueWaitEnded{};
+    QueryPerformanceCounter(&queueWaitBegan);
     hr = state.queue->Wait(state.fence12.Get(), producer);
+    QueryPerformanceCounter(&queueWaitEnded);
+    submitMs += qpcSpanMs(queueWaitBegan, queueWaitEnded);
     if (FAILED(hr)) {
         command.list->Close(); // No command list was submitted.
         return fail(why, "D3D12 producer Wait(%llu) failed 0x%08X",
@@ -1025,10 +1071,14 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     hr = list->Close();
     if (FAILED(hr)) return fail(why, "D3D12 XeSS command close failed 0x%08X", unsigned(hr));
     ID3D12CommandList* lists[] = {list};
+    LARGE_INTEGER submitBegan{}, submitEnded{};
+    QueryPerformanceCounter(&submitBegan);
     state.queue->ExecuteCommandLists(1, lists);
     command.timingPending = command.timingHeap.Get() != nullptr;
     const uint64_t done = ++state.nextFenceValue;
     hr = state.queue->Signal(state.fence12.Get(), done);
+    QueryPerformanceCounter(&submitEnded);
+    submitMs += qpcSpanMs(submitBegan, submitEnded);
     if (FAILED(hr)) {
         state.untrackedSubmission = true;
         return fail(why, "D3D12 execute Signal(%llu) failed 0x%08X; submitted work retained",
@@ -1084,6 +1134,11 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     if (ms > holder.timeMaxMs) holder.timeMaxMs = ms;
     if (!holder.window.executed) holder.window.startedAt = GetTickCount64();
     ++holder.window.executed;
+    // Stored only for evaluations that executed, so every CPU sample and the blocked count describe the same set.
+    noteSample(holder.window.cpuEval, ms);
+    noteSample(holder.window.cpuAlloc, allocMs);
+    noteSample(holder.window.cpuSubmit, submitMs);
+    if (allocBlocked) ++holder.window.allocBlocked;
     ++state.evaluations;
     if (reset) ++state.resets;
     if (state.evaluations <= 3 || state.evaluations % 300 == 0)
