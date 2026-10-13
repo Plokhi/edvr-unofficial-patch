@@ -8,9 +8,10 @@ struct ID3D11Texture2D;
 
 namespace edvr {
 
-// XeSS-SR is available only to the flat resolver's slot 0. This backend uses
-// Intel's D3D12 SDK over a shared D3D11/D3D12 device pair; it does not provide
-// frame generation or a VR per-eye context.
+// XeSS-SR keeps one feature per upscaler slot (dlaa.h, kUpscalerSlots); each
+// slot is keyed and rebuilt on its own. The flat resolver uses slot 0. This
+// backend uses Intel's D3D12 SDK over a shared D3D11/D3D12 device pair; it does
+// not provide frame generation.
 bool xessBuiltIn();
 bool xessAvailable(ID3D11Device* device, const char** why);
 
@@ -27,7 +28,14 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
                   uint32_t outputHeight, float jitterX, float jitterY,
                   bool reset, bool hdr, const char** why);
 
+// Releases every slot's feature (each with its bounded GPU wait); the library
+// and the D3D12 device stay loaded. Safe when XeSS never started.
 void xessReleaseFeatures();
 void xessShutdown();
+
+// Rig seams (fsr3_engine.h's fsr3TestContextCreations pattern): features a slot
+// has built since the backend started, and whether a slot holds one now.
+uint32_t xessTestFeatureCreations(unsigned slot);
+bool xessTestFeatureLive(unsigned slot);
 
 }  // namespace edvr

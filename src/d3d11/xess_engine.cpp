@@ -8,6 +8,7 @@
 #include <cwchar>
 
 #include "../common/log.h"
+#include "dlaa.h"  // kUpscalerSlots: one XeSS feature per upscaler slot
 
 #ifndef EDVR_HAVE_XESS
 #define EDVR_HAVE_XESS 0
@@ -52,7 +53,6 @@ bool fail(const char** why, const char* format, ...) {
 }
 
 #if EDVR_HAVE_XESS
-constexpr unsigned kFlatSlot = 0;
 constexpr unsigned kCommandRing = 3;
 constexpr DWORD kGpuWaitMs = 5000;
 // Only this device ever takes a shared texture's key, always key 0, so an
@@ -89,6 +89,7 @@ struct CommandSlot {
 };
 
 struct Feature {
+    unsigned slot = 0;
     uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
     bool hdr = false;
     xess_quality_settings_t quality = XESS_QUALITY_SETTING_PERFORMANCE;
@@ -99,6 +100,14 @@ struct Feature {
     std::array<CommandSlot, kCommandRing> commands;
     unsigned nextCommand = 0;
     uint64_t lastUseValue = 0;
+};
+
+// One per upscaler slot (dlaa.h, kUpscalerSlots), as fsr3_engine.cpp keeps one context per slot. Each slot keys,
+// builds, releases and latches its own feature; the shared textures hang off the feature, so they are per slot too.
+struct FeatureSlot {
+    XessFeatureFailureLatch failedFeature;
+    std::unique_ptr<Feature> feature;
+    uint32_t creations = 0;  // test seam: features this slot has built since the backend started
 };
 
 struct State {
@@ -115,17 +124,18 @@ struct State {
     HANDLE sharedFenceHandle = nullptr;
     HANDLE cpuEvent = nullptr;
     XessApi api;
+    // One counter for every slot: all slots signal the one shared fence in this order, so a wait on a slot's own
+    // value also covers the other slots' earlier work, and the value never goes backwards.
     uint64_t nextFenceValue = 0;
     uint32_t evaluations = 0, resets = 0, failures = 0;
     bool untrackedSubmission = false;
     bool untrackedRefusalLogged = false;
-    XessFeatureFailureLatch failedFeature;
-    std::unique_ptr<Feature> feature;
+    std::array<FeatureSlot, kUpscalerSlots> slots;
     ~State() {
         // Normal shutdown has already destroyed the XeSS context after the
         // consumer fence. Release COM objects before unloading the modules
         // that supply their vtables, including on an availability failure.
-        feature.reset();
+        for (FeatureSlot& slot : slots) slot.feature.reset();
         fence11.Reset();
         fence12.Reset();
         queue.Reset();
@@ -187,21 +197,22 @@ bool waitFor(State& state, uint64_t value, const char** why, const char* stage) 
     return true;
 }
 
-bool releaseFeature(State& state, const char** why) {
-    if (!state.feature) return true;
+bool releaseSlot(State& state, unsigned slot, const char** why) {
+    std::unique_ptr<Feature>& feature = state.slots[slot].feature;
+    if (!feature) return true;
     if (state.untrackedSubmission)
         return fail(why, "a submitted D3D12 command list has no completed fence; retaining its resources");
-    if (!waitFor(state, state.feature->lastUseValue, why, "release")) return false;
-    if (state.feature->context) {
-        const xess_result_t rc = state.api.destroyContext(state.feature->context);
-        Log::get().note("xess: destroy context rc=%d after %u evaluations", int(rc), state.evaluations);
-        state.feature->context = nullptr;
+    if (!waitFor(state, feature->lastUseValue, why, "release")) return false;
+    if (feature->context) {
+        const xess_result_t rc = state.api.destroyContext(feature->context);
+        Log::get().note("xess: slot=%u destroy context rc=%d after %u evaluations", slot, int(rc), state.evaluations);
+        feature->context = nullptr;
     }
-    state.feature.reset();
+    feature.reset();
     return true;
 }
 
-bool makeShared(State& state, SharedTexture& target, const char* role,
+bool makeShared(State& state, unsigned slot, SharedTexture& target, const char* role,
                 uint32_t width, uint32_t height, DXGI_FORMAT format,
                 bool writable, const char** why) {
     D3D11_TEXTURE2D_DESC desc{};
@@ -232,8 +243,8 @@ bool makeShared(State& state, SharedTexture& target, const char* role,
         return fail(why, "shared %s NT handle failed 0x%08X", role, unsigned(hr));
     hr = state.d12->OpenSharedHandle(target.handle, IID_PPV_ARGS(target.d12.GetAddressOf()));
     if (FAILED(hr)) return fail(why, "shared %s D3D12 open failed 0x%08X", role, unsigned(hr));
-    Log::get().note("xess: shared %s %ux%u format=%u D3D11->D3D12 open ok",
-                    role, width, height, unsigned(format));
+    Log::get().note("xess: slot=%u shared %s %ux%u format=%u D3D11->D3D12 open ok",
+                    slot, role, width, height, unsigned(format));
     return true;
 }
 
@@ -295,22 +306,23 @@ bool qualityFor(State& state, Feature& feature, const char** why) {
     if (!selected) return fail(why, "no XeSS quality accepts input %ux%u for output %ux%u",
                                feature.inW, feature.inH, feature.outW, feature.outH);
     feature.quality = selected->setting;
-    Log::get().note("xess: quality=%s input=%ux%u output=%ux%u optimal=%ux%u bounds=%ux%u..%ux%u",
-                    selected->name, feature.inW, feature.inH, feature.outW, feature.outH,
+    Log::get().note("xess: slot=%u quality=%s input=%ux%u output=%ux%u optimal=%ux%u bounds=%ux%u..%ux%u",
+                    feature.slot, selected->name, feature.inW, feature.inH, feature.outW, feature.outH,
                     selectedOptimal.x, selectedOptimal.y, selectedMin.x, selectedMin.y,
                     selectedMax.x, selectedMax.y);
     return true;
 }
 
-bool makeFeature(State& state, uint32_t w, uint32_t h, uint32_t outW,
+bool makeFeature(State& state, unsigned slot, uint32_t w, uint32_t h, uint32_t outW,
                  uint32_t outH, bool hdr, const char** why) {
     auto feature = std::make_unique<Feature>();
+    feature->slot = slot;
     feature->inW = w; feature->inH = h; feature->outW = outW;
     feature->outH = outH; feature->hdr = hdr;
     const xess_result_t created = state.api.createContext(state.d12.Get(), &feature->context);
     if (created != XESS_RESULT_SUCCESS || !feature->context)
         return fail(why, "xessD3D12CreateContext returned %d", int(created));
-    Log::get().note("xess: D3D12 context create rc=%d ptr=%p", int(created), feature->context);
+    Log::get().note("xess: slot=%u D3D12 context create rc=%d ptr=%p", slot, int(created), feature->context);
     // From this point every failure destroys the XeSS context before the
     // temporary shared textures and D3D12 objects leave scope.
     auto abandon = [&]() -> bool {
@@ -332,17 +344,17 @@ bool makeFeature(State& state, uint32_t w, uint32_t h, uint32_t outW,
         fail(why, "xessD3D12Init returned %d", int(initialized));
         return abandon();
     }
-    Log::get().note("xess: D3D12 init rc=%d flags=0x%X quality=%u output=%ux%u",
-                    int(initialized), init.initFlags, unsigned(feature->quality), outW, outH);
+    Log::get().note("xess: slot=%u D3D12 init rc=%d flags=0x%X quality=%u output=%ux%u",
+                    slot, int(initialized), init.initFlags, unsigned(feature->quality), outW, outH);
     xess_version_t intel{};
     const xess_result_t intelRc = state.api.getIntelVersion(feature->context, &intel);
-    Log::get().note("xess: Intel XeFX query rc=%d version=%u.%u.%u.%u (diagnostic only)",
-                    int(intelRc), intel.major, intel.minor, intel.patch, intel.reserved);
+    Log::get().note("xess: slot=%u Intel XeFX query rc=%d version=%u.%u.%u.%u (diagnostic only)",
+                    slot, int(intelRc), intel.major, intel.minor, intel.patch, intel.reserved);
     const DXGI_FORMAT colorFormat = hdr ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
-    if (!makeShared(state, feature->color, "color", w, h, colorFormat, false, why) ||
-        !makeShared(state, feature->motion, "motion", w, h, DXGI_FORMAT_R16G16_FLOAT, false, why) ||
-        !makeShared(state, feature->depth, "depth", w, h, DXGI_FORMAT_R32_FLOAT, false, why) ||
-        !makeShared(state, feature->output, "output", outW, outH, colorFormat, true, why))
+    if (!makeShared(state, slot, feature->color, "color", w, h, colorFormat, false, why) ||
+        !makeShared(state, slot, feature->motion, "motion", w, h, DXGI_FORMAT_R16G16_FLOAT, false, why) ||
+        !makeShared(state, slot, feature->depth, "depth", w, h, DXGI_FORMAT_R32_FLOAT, false, why) ||
+        !makeShared(state, slot, feature->output, "output", outW, outH, colorFormat, true, why))
         return abandon();
     if (hdr) {
         HRESULT hr = state.d11->CreateShaderResourceView(feature->output.d11.Get(), nullptr,
@@ -358,7 +370,7 @@ bool makeFeature(State& state, uint32_t w, uint32_t h, uint32_t outW,
             fail(why, "precompiled R11->FP16 copy shader failed 0x%08X", unsigned(hr));
             return abandon();
         }
-        Log::get().note("xess: HDR R11 matched SDK output -> FP16 flat target via precompiled copy shader");
+        Log::get().note("xess: slot=%u HDR R11 matched SDK output -> FP16 target via precompiled copy shader", slot);
     }
     for (CommandSlot& command : feature->commands) {
         HRESULT hr = state.d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -380,8 +392,9 @@ bool makeFeature(State& state, uint32_t w, uint32_t h, uint32_t outW,
             return abandon();
         }
     }
-    Log::get().note("xess: three command allocators ready; backend feature established");
-    state.feature = std::move(feature);
+    Log::get().note("xess: slot=%u three command allocators ready; backend feature established", slot);
+    state.slots[slot].feature = std::move(feature);
+    ++state.slots[slot].creations;
     return true;
 }
 
@@ -588,14 +601,16 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     (void)jitterX; (void)jitterY; (void)reset; (void)hdr;
     return fail(why, "this build has no XeSS SDK (EDVR_HAVE_XESS=0)");
 #else
-    if (slot != kFlatSlot) return fail(why, "XeSS-SR is flat slot 0 only (got %u)", slot);
+    if (slot >= kUpscalerSlots)
+        return fail(why, "XeSS-SR upscaler slot %u is outside 0..%u", slot, kUpscalerSlots - 1);
     if (!context || !width || !height || !outputWidth || !outputHeight ||
         !std::isfinite(jitterX) || !std::isfinite(jitterY))
-        return fail(why, "invalid XeSS flat context, dimensions, or jitter");
+        return fail(why, "invalid XeSS context, dimensions, or jitter");
     ComPtr<ID3D11Device> device;
     context->GetDevice(device.GetAddressOf());
     if (!xessAvailable(device.Get(), why)) return false;
     State& state = *g_state;
+    FeatureSlot& holder = state.slots[slot];
     if (state.untrackedSubmission) {
         constexpr const char* reason = "an unfenced GPU submission is still in flight; XeSS resources are retained until process exit";
         if (!state.untrackedRefusalLogged) {
@@ -607,7 +622,7 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     }
     const DWORD thread = GetCurrentThreadId();
     if (state.ownerThread && (state.ownerThread != thread || state.ownerContext.Get() != context))
-        return fail(why, "XeSS flat backend must use its original D3D11 immediate context/render thread");
+        return fail(why, "XeSS backend must use its original D3D11 immediate context/render thread");
     if (!state.ownerThread) { state.ownerThread = thread; state.ownerContext = context; }
     ComPtr<ID3D11DeviceContext4> ctx4;
     HRESULT hr = context->QueryInterface(IID_PPV_ARGS(ctx4.GetAddressOf()));
@@ -620,28 +635,28 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
                          hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : colorFormat, "output", why))
         return false;
     const XessFeatureKey key{width, height, outputWidth, outputHeight, hdr};
-    state.failedFeature.clearIfDifferent(key);
-    if (state.failedFeature.matches(key)) return returnLatchedFailure(state.failedFeature, why);
-    if (!state.feature || state.feature->inW != width || state.feature->inH != height ||
-        state.feature->outW != outputWidth || state.feature->outH != outputHeight ||
-        state.feature->hdr != hdr) {
+    holder.failedFeature.clearIfDifferent(key);
+    if (holder.failedFeature.matches(key)) return returnLatchedFailure(holder.failedFeature, why);
+    if (!holder.feature || holder.feature->inW != width || holder.feature->inH != height ||
+        holder.feature->outW != outputWidth || holder.feature->outH != outputHeight ||
+        holder.feature->hdr != hdr) {
         // A fence-drain refusal is transient; only a failed create is latched.
-        if (!releaseFeature(state, why)) return false;
+        if (!releaseSlot(state, slot, why)) return false;
         const char* createWhy = nullptr;
         bool created = false;
         {
             QuietFeatureFailure quiet;
-            created = makeFeature(state, width, height, outputWidth, outputHeight, hdr, &createWhy);
+            created = makeFeature(state, slot, width, height, outputWidth, outputHeight, hdr, &createWhy);
         }
         if (!created) {
-            state.failedFeature.record(key, createWhy);
-            Log::get().note("xess: feature create failed in=%ux%u out=%ux%u hdr=%u: %s; this key will not retry until the key or mode changes",
-                            width, height, outputWidth, outputHeight, hdr ? 1u : 0u,
-                            state.failedFeature.reason());
-            return returnLatchedFailure(state.failedFeature, why);
+            holder.failedFeature.record(key, createWhy);
+            Log::get().note("xess: slot=%u feature create failed in=%ux%u out=%ux%u hdr=%u: %s; this key will not retry until the key or mode changes",
+                            slot, width, height, outputWidth, outputHeight, hdr ? 1u : 0u,
+                            holder.failedFeature.reason());
+            return returnLatchedFailure(holder.failedFeature, why);
         }
     }
-    Feature& feature = *state.feature;
+    Feature& feature = *holder.feature;
     CommandSlot& command = feature.commands[feature.nextCommand++ % kCommandRing];
     // The wait happens only when a command allocator is about to be reused;
     // normal producer/consumer ordering is entirely GPU-fence based.
@@ -654,8 +669,8 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     const char* keyWhy = nullptr;
     if (!takeKeys(inputs, &keyWhy, "D3D11 input copy")) {
         command.list->Close(); // Reset opened it; no D3D12 work was submitted.
-        state.failedFeature.record(key, keyWhy);
-        return returnLatchedFailure(state.failedFeature, why);
+        holder.failedFeature.record(key, keyWhy);
+        return returnLatchedFailure(holder.failedFeature, why);
     }
     context->CopyResource(feature.color.d11.Get(), colour);
     context->CopyResource(feature.motion.d11.Get(), motion);
@@ -740,8 +755,8 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
                                 static_cast<unsigned long long>(done), unsigned(hr));
     SharedTexture* const result[] = {&feature.output};
     if (!takeKeys(result, &keyWhy, "D3D11 output copy")) {
-        state.failedFeature.record(key, keyWhy);
-        return returnLatchedFailure(state.failedFeature, why);
+        holder.failedFeature.record(key, keyWhy);
+        return returnLatchedFailure(holder.failedFeature, why);
     }
     if (hdr) {
         const bool widened = widenHdr(context, feature, output, why);
@@ -765,8 +780,8 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     ++state.evaluations;
     if (reset) ++state.resets;
     if (state.evaluations <= 3 || state.evaluations % 300 == 0)
-        Log::get().note("xess: execute #%u rc=0 in=%ux%u out=%ux%u hdr=%u jitter=(%.3f,%.3f) reset=%u fences=%llu/%llu/%llu copy=%s",
-                        state.evaluations, width, height, outputWidth, outputHeight,
+        Log::get().note("xess: slot=%u execute #%u rc=0 in=%ux%u out=%ux%u hdr=%u jitter=(%.3f,%.3f) reset=%u fences=%llu/%llu/%llu copy=%s",
+                        slot, state.evaluations, width, height, outputWidth, outputHeight,
                         hdr ? 1u : 0u, jitterX, jitterY, reset ? 1u : 0u,
                         static_cast<unsigned long long>(producer),
                         static_cast<unsigned long long>(done),
@@ -778,9 +793,14 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
 
 void xessReleaseFeatures() {
 #if EDVR_HAVE_XESS
-    if (g_state) g_state->failedFeature.clear();
-    if (g_state && !releaseFeature(*g_state, nullptr))
-        Log::get().note("xess: retained feature after bounded GPU wait refusal; it cannot be freed in flight");
+    if (!g_state) return;
+    // The profile switch releases every slot. Each release has its own bounded GPU
+    // wait, so one slot's refusal does not keep the others from being freed.
+    for (unsigned slot = 0; slot < kUpscalerSlots; ++slot) {
+        g_state->slots[slot].failedFeature.clear();
+        if (!releaseSlot(*g_state, slot, nullptr))
+            Log::get().note("xess: slot=%u retained feature after bounded GPU wait refusal; it cannot be freed in flight", slot);
+    }
 #endif
 }
 
@@ -789,7 +809,10 @@ void xessShutdown() {
     if (g_state) {
         Log::get().note("xess: session evaluations=%u resets=%u failures=%u",
                         g_state->evaluations, g_state->resets, g_state->failures);
-        if (!releaseFeature(*g_state, nullptr)) {
+        bool drained = true;
+        for (unsigned slot = 0; slot < kUpscalerSlots; ++slot)
+            if (!releaseSlot(*g_state, slot, nullptr)) drained = false;
+        if (!drained) {
             // The GPU still refers to the feature's command allocators or
             // shared textures. Process teardown will reclaim them; releasing
             // them here would be a use-after-free on a hung device.
@@ -801,6 +824,26 @@ void xessShutdown() {
     }
     g_tried = false;
     g_available = false;
+#endif
+}
+
+// Rig seams, as fsr3TestContextCreations is for FSR: the features a slot has built since the backend started, and whether
+// the slot holds one now. Both are zero or false in a build without the XeSS SDK.
+uint32_t xessTestFeatureCreations(unsigned slot) {
+#if EDVR_HAVE_XESS
+    return g_state && slot < kUpscalerSlots ? g_state->slots[slot].creations : 0u;
+#else
+    (void)slot;
+    return 0u;
+#endif
+}
+
+bool xessTestFeatureLive(unsigned slot) {
+#if EDVR_HAVE_XESS
+    return g_state && slot < kUpscalerSlots && g_state->slots[slot].feature != nullptr;
+#else
+    (void)slot;
+    return false;
 #endif
 }
 

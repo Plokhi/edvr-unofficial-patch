@@ -12,6 +12,7 @@
 #include "mode_watch_logic.h"
 #include "perf_monitor.h"       // perfMonitorProfileSwitch: the frame interval restarts at a switch
 #include "ui_layer.h"           // uiLayerProfileSwitch: the VR UI layers, torn down before a commit leaves VR
+#include "xess_engine.h"        // xessReleaseFeatures: XeSS's features, released at every switch
 #include "vr_ssaa_hold.h"       // vrSsaaHoldProfileChanged: the Supersampling hold follows the profile
 
 #include "../common/config.h"
@@ -391,6 +392,7 @@ void commitPosted(uint64_t packed) {
         }
         dlaaReleaseForSwitch();
         fsr3ReleaseFeatures();
+        xessReleaseFeatures();
         menuProfileSwitch();
         g_teardowns.fetch_add(1, std::memory_order_relaxed);
     }

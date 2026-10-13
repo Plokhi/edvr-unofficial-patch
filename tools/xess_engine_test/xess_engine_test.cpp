@@ -90,6 +90,22 @@ bool gateSelfTest() {
                  "GPU gate fails real bridge and runtime errors");
 }
 
+// The slot check runs before any device use, so a null context proves the
+// range without a GPU: slot 3 is refused by range, and slot 2 (the last of
+// kUpscalerSlots = 3) passes it and stops at the context check.
+bool slotRangeSelfTest() {
+    const char* why = nullptr;
+    const bool refusedFourth = !edvr::xessEvaluate(nullptr, 3, nullptr, nullptr, nullptr, nullptr,
+                                                   1, 1, 1, 1, 0.0f, 0.0f, false, false, &why);
+    if (!check(refusedFourth && why && std::strstr(why, "slot 3") != nullptr,
+               "upscaler slot 3 is refused by range")) return false;
+    why = nullptr;
+    const bool acceptedLast = !edvr::xessEvaluate(nullptr, 2, nullptr, nullptr, nullptr, nullptr,
+                                                  1, 1, 1, 1, 0.0f, 0.0f, false, false, &why);
+    return check(acceptedLast && why && std::strstr(why, "invalid XeSS") != nullptr,
+                 "upscaler slot 2 passes the range check");
+}
+
 enum class Probe { Ready, Skip, Fail };
 
 Probe hardwareAdapterPresent() {
@@ -222,7 +238,7 @@ bool hasPixel(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2
 
 bool flight(ID3D11Device* device, ID3D11DeviceContext* context,
             UINT width, UINT height, UINT outW, UINT outH, bool hdr,
-            const char** failureReason = nullptr) {
+            const char** failureReason = nullptr, unsigned slot = 0) {
     if (failureReason) *failureReason = nullptr;
     const DXGI_FORMAT colorFormat = hdr ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     const DXGI_FORMAT outFormat = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : colorFormat;
@@ -240,7 +256,7 @@ bool flight(ID3D11Device* device, ID3D11DeviceContext* context,
                clear(device, context, motion.Get(), farDepth), "clear render-grid inputs")) return false;
     for (unsigned frame = 0; frame < 5; ++frame) {
         const char* why = nullptr;
-        if (!edvr::xessEvaluate(context, 0, color.Get(), depth.Get(), motion.Get(),
+        if (!edvr::xessEvaluate(context, slot, color.Get(), depth.Get(), motion.Get(),
                                 output.Get(), width, height, outW, outH,
                                 0.0f, 0.0f, frame == 0, hdr, &why)) {
             if (failureReason) *failureReason = why;
@@ -250,8 +266,8 @@ bool flight(ID3D11Device* device, ID3D11DeviceContext* context,
         }
     }
     if (!check(hasPixel(device, context, output.Get()), "D3D11 readback nonzero center pixel")) return false;
-    std::fprintf(stderr, "xess_engine_test: PASS %s %ux%u -> %ux%u, 5 frames\n",
-                 hdr ? "HDR" : "LDR", width, height, outW, outH);
+    std::fprintf(stderr, "xess_engine_test: PASS %s %ux%u -> %ux%u, 5 frames slot=%u\n",
+                 hdr ? "HDR" : "LDR", width, height, outW, outH, slot);
     return true;
 }
 
@@ -292,6 +308,41 @@ bool rebindAfterFailedFeature(ID3D11Device* device, ID3D11DeviceContext* context
                "failure reason remains readable after old State is destroyed")) return false;
     return flight(replacement.Get(), replacementContext.Get(), 640, 360, 640, 360, false);
 }
+
+// Upscaler slots keep separate features. Slot 1 changing size builds slot 1
+// alone and leaves slot 0 unbuilt; slot 0 keeps its feature while slot 1 runs;
+// slot 3 is refused; the profile switch's release frees every slot, and a freed
+// slot rebuilds on its next use. Builds are counted from the backend's start,
+// so every check is against a baseline taken after the release.
+bool slotIsolation(ID3D11Device* device, ID3D11DeviceContext* context) {
+    edvr::xessReleaseFeatures();
+    const uint32_t base0 = edvr::xessTestFeatureCreations(0);
+    const uint32_t base1 = edvr::xessTestFeatureCreations(1);
+    if (!check(!edvr::xessTestFeatureLive(0) && !edvr::xessTestFeatureLive(1),
+               "release leaves no slot live")) return false;
+    if (!flight(device, context, 640, 360, 1280, 720, false, nullptr, 0)) return false;
+    if (!check(edvr::xessTestFeatureLive(0) && !edvr::xessTestFeatureLive(1) &&
+               edvr::xessTestFeatureCreations(0) == base0 + 1 && edvr::xessTestFeatureCreations(1) == base1,
+               "slot 0 builds alone")) return false;
+    if (!flight(device, context, 800, 450, 1600, 900, false, nullptr, 1)) return false;
+    if (!check(edvr::xessTestFeatureLive(0) && edvr::xessTestFeatureLive(1) &&
+               edvr::xessTestFeatureCreations(0) == base0 + 1 && edvr::xessTestFeatureCreations(1) == base1 + 1,
+               "slot 1 at another size builds without rebuilding slot 0")) return false;
+    if (!flight(device, context, 640, 360, 1280, 720, false, nullptr, 0)) return false;
+    if (!check(edvr::xessTestFeatureCreations(0) == base0 + 1,
+               "slot 0 keeps its feature while slot 1 runs")) return false;
+    const char* refusal = nullptr;
+    if (!check(!flight(device, context, 640, 360, 1280, 720, false, &refusal, 3) &&
+               refusal && std::strstr(refusal, "slot 3") != nullptr,
+               "upscaler slot 3 is refused on the GPU path")) return false;
+    edvr::xessReleaseFeatures();
+    if (!check(!edvr::xessTestFeatureLive(0) && !edvr::xessTestFeatureLive(1) &&
+               edvr::xessTestFeatureCreations(0) == base0 + 1 && edvr::xessTestFeatureCreations(1) == base1 + 1,
+               "release frees every slot without counting a rebuild")) return false;
+    if (!flight(device, context, 800, 450, 1600, 900, false, nullptr, 1)) return false;
+    return check(edvr::xessTestFeatureLive(1) && edvr::xessTestFeatureCreations(1) == base1 + 2,
+                 "a released slot rebuilds on its next use");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -302,7 +353,7 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(argv[1], "--self-test") == 0)
         return check(edvr::xessBuiltIn(), "backend compiled into rig") &&
-               latchSelfTest() && gateSelfTest() ? 0 : 1;
+               latchSelfTest() && gateSelfTest() && slotRangeSelfTest() ? 0 : 1;
     const bool optional = std::strcmp(argv[1], "--gpu-test-if-available") == 0;
     if (!optional && std::strcmp(argv[1], "--gpu-test") != 0) return 2;
     if (optional) {
@@ -346,7 +397,8 @@ int main(int argc, char** argv) {
                       flight(device.Get(), context.Get(), 640, 360, 1280, 720, true);
     edvr::xessReleaseFeatures();
     const bool recreated = good && flight(device.Get(), context.Get(), 640, 360, 1280, 720, true);
-    const bool rebound = recreated && rebindAfterFailedFeature(device.Get(), context.Get());
+    const bool slots = recreated && slotIsolation(device.Get(), context.Get());
+    const bool rebound = slots && rebindAfterFailedFeature(device.Get(), context.Get());
     edvr::xessShutdown();
     return rebound ? 0 : 1;
 }
