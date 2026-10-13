@@ -108,6 +108,9 @@ struct FeatureSlot {
     XessFeatureFailureLatch failedFeature;
     std::unique_ptr<Feature> feature;
     uint32_t creations = 0;  // test seam: features this slot has built since the backend started
+    // The slot's price, as CPU time for each successful evaluate call (submission and its copies; the GPU is not timed).
+    uint32_t evaluations = 0, resets = 0;
+    double timeSumMs = 0.0, timeMaxMs = 0.0;
 };
 
 struct State {
@@ -606,6 +609,8 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     if (!context || !width || !height || !outputWidth || !outputHeight ||
         !std::isfinite(jitterX) || !std::isfinite(jitterY))
         return fail(why, "invalid XeSS context, dimensions, or jitter");
+    LARGE_INTEGER began{};
+    QueryPerformanceCounter(&began);
     ComPtr<ID3D11Device> device;
     context->GetDevice(device.GetAddressOf());
     if (!xessAvailable(device.Get(), why)) return false;
@@ -777,6 +782,16 @@ bool xessEvaluate(ID3D11DeviceContext* context, unsigned slot,
     }
     context->Flush();
     feature.lastUseValue = consumer;
+    LARGE_INTEGER ended{}, frequency{};
+    QueryPerformanceCounter(&ended);
+    QueryPerformanceFrequency(&frequency);
+    const double ms = frequency.QuadPart > 0
+        ? static_cast<double>(ended.QuadPart - began.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart)
+        : 0.0;
+    ++holder.evaluations;
+    if (reset) ++holder.resets;
+    holder.timeSumMs += ms;
+    if (ms > holder.timeMaxMs) holder.timeMaxMs = ms;
     ++state.evaluations;
     if (reset) ++state.resets;
     if (state.evaluations <= 3 || state.evaluations % 300 == 0)
@@ -843,6 +858,22 @@ bool xessTestFeatureLive(unsigned slot) {
     return g_state && slot < kUpscalerSlots && g_state->slots[slot].feature != nullptr;
 #else
     (void)slot;
+    return false;
+#endif
+}
+
+bool xessSlotTotals(unsigned slot, uint32_t* evaluations, uint32_t* resets, double* avgMs, double* maxMs) {
+#if EDVR_HAVE_XESS
+    if (!g_state || slot >= kUpscalerSlots) return false;
+    const FeatureSlot& holder = g_state->slots[slot];
+    if (holder.evaluations == 0) return false;
+    if (evaluations) *evaluations = holder.evaluations;
+    if (resets) *resets = holder.resets;
+    if (avgMs) *avgMs = holder.timeSumMs / holder.evaluations;
+    if (maxMs) *maxMs = holder.timeMaxMs;
+    return true;
+#else
+    (void)slot; (void)evaluations; (void)resets; (void)avgMs; (void)maxMs;
     return false;
 #endif
 }

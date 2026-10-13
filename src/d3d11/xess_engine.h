@@ -38,4 +38,8 @@ void xessShutdown();
 uint32_t xessTestFeatureCreations(unsigned slot);
 bool xessTestFeatureLive(unsigned slot);
 
+// The slot's measured price, as the temporal pass's totals line reads it: evaluations, resets, and the mean and
+// maximum CPU milliseconds per successful evaluate. False until the slot has evaluated, and in a build without the SDK.
+bool xessSlotTotals(unsigned slot, uint32_t* evaluations, uint32_t* resets, double* avgMs, double* maxMs);
+
 }  // namespace edvr
