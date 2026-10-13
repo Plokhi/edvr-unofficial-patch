@@ -769,9 +769,10 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
             "is left where it is.");
     }
 
-    // XeSS-SR ships with both editions, and is present only when the build
+    // XeSS-SR ships with every scope, and is present only when the build
     // carried it. Preserve foreign or changed files; replacement and uninstall
-    // are limited to hashes EDVR recorded.
+    // are limited to hashes EDVR recorded. Like the DLSS runtime above, the
+    // report says what happened to it in one line, whatever the outcome.
     if (p.haveXess) {
         if (p.xessLicenseSha.empty() || p.xessThirdPartySha.empty()) {
             plan.blocked = true;
@@ -786,6 +787,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
             {"xess_third_party", kXessThirdParty, &s.xessThirdParty, &p.xessThirdPartySha, &next.xessThirdPartySha},
         };
         const std::string previous[] = {s.state.xessSha, s.state.xessLicenseSha, s.state.xessThirdPartySha};
+        unsigned placed = 0, updated = 0, current = 0;
         for (unsigned i=0; i<3; ++i) {
             const auto& file = files[i];
             const bool present = file.cur->kind != DllKind::Absent;
@@ -797,6 +799,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
             }
             if (present && file.cur->sha256 == *file.desired && !o.repair) {
                 *file.recorded = *file.desired;
+                ++current;
             } else if (present && !ours && file.cur->sha256 != *file.desired) {
                 plan.notes.push_back("A different " + say(file.leaf) + " is present; left alone.");
                 file.recorded->clear();
@@ -805,8 +808,15 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
                 if (present) backup(dst, "the XeSS file EDVR placed, being replaced");
                 writePayload(file.item, dst, "places Intel XeSS-SR runtime or notice");
                 *file.recorded = *file.desired;
+                ++(present ? updated : placed);
             }
         }
+        if (placed || updated)
+            plan.notes.push_back(placed && !updated
+                ? "Placing libxess.dll (Intel's XeSS-SR runtime, for temporal_aa = xess) and its licence notices."
+                : "Updating libxess.dll (Intel's XeSS-SR runtime) and its licence notices.");
+        else if (current == 3)
+            plan.notes.push_back("libxess.dll (Intel's XeSS-SR runtime) is already this build's -- left alone.");
     }
 
     if (!flat) {

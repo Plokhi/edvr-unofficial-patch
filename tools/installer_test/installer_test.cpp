@@ -2230,6 +2230,8 @@ static void testXessPlanner() {
               !hasStep(plan, Action::WriteText, nullptr, L"edvr-flat.ini") &&
               !hasStep(plan, Action::WritePayload, nullptr, L"libxess.dll"),
               "adoption writes only the ownership record, not existing files");
+        check(notesMention(plan, "libxess.dll (Intel's XeSS-SR runtime) is already this build's"),
+              "the report says the XeSS runtime is already this build's");
         const InstallState adopted = parseState(plannedText(plan, L"state.ini"));
         check(adopted.xessSha == p.xessSha && adopted.xessLicenseSha == p.xessLicenseSha &&
               adopted.xessThirdPartySha == p.xessThirdPartySha,
@@ -2264,6 +2266,7 @@ static void testXessPlanner() {
               hasStep(plan, Action::WritePayload, nullptr, L"libxess.dll") &&
               plan.nextState.xessSha == p.xessSha,
               "stale XeSS file that EDVR placed is backed up and updated");
+        check(notesMention(plan, "Updating libxess.dll"), "the report says the XeSS runtime is being updated");
     }
     {   // A scanner may make only the optional runtime unreadable. Core
         // graphics and other XeSS files must still proceed.
@@ -2298,6 +2301,7 @@ static void testXessPlanner() {
               hasStep(plan, Action::WritePayload, nullptr, L"INTEL-XESS-LICENSE.txt") &&
               hasStep(plan, Action::WritePayload, nullptr, L"INTEL-XESS-THIRD-PARTY.txt"),
               "a VR install carries libxess.dll and both license notices");
+        check(notesMention(plan, "Placing libxess.dll"), "the report says the XeSS runtime is being placed");
         check(plan.nextState.xessSha == vr.xessSha && plan.nextState.xessLicenseSha == vr.xessLicenseSha &&
               plan.nextState.xessThirdPartySha == vr.xessThirdPartySha,
               "a VR install records the XeSS files it placed");
