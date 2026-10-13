@@ -554,3 +554,29 @@ launches. The phase-1 build switches to Passthrough rather than live.
   was not found. e18abf76 logs the table read-only each frame (the probe) to see whether it moves at the apply.- H, 11:18 (build d4b5006e, review fixes in): the N2 panel flew: `flat_clear,start,...,panel=1`, `panel=ready,size=1613x745,
   format=29`, 1260 frames, `stop,reason=game_frame` at 3D on. Sean: "3d off message looked good". The frozen frame is fixed on
   Pimax's runtime by a real projection layer (black + message).
+## 13. Phase 3 build plan (2026-10-13)
+
+From an inventory of the installer at 11ed0560. Corrected references (section 4's numbers predate the branch): installedProfile
+plan.cpp:149-156; the edition-mismatch block 289-295 (GUI dialog gui.cpp:750-758); conversion proofs 305-324 and the runtime
+retirement 725-758; flat->VR installs the runtime with no proof gate (667-724); the merge base is one file,
+`edvr_install\edvr.ini.base` (state.cpp:19-20), rewritten every install from the payload ini (plan.cpp:894-900), so a flat install
+overwrites the VR default; base choice 805-807. EDVR_INSTALLER_FLAT is used only at payload.cpp:55-57 (profile), settings.cpp:186-192
+(the flat 3-row filter) and build.bat:2690; everything else branches on payloadInfo().profile at run time. No `--scope`, no scope in
+InstallState (state.h:21-61) or Options (plan.h:131-143). The GUI Uninstall never removes settings (gui.cpp:704).
+
+Units, one at a time behind the full build (Haiku implementers, reviewed):
+- P3-1 payload: both inis embedded (new id 111 = edvr-flat.ini; gen_installer_rc.py, payload.h/.cpp), the descriptor text chosen by
+  the planner for the scope from plan.cpp's canonical texts, not taken from a fixed payload resource.
+- P3-2 planner: `scope` in Options and InstallState (old records: profile vr -> both, flat -> flat); install per scope (both = runtime
+  + both inis, vr = runtime + edvr.ini, flat = no runtime + edvr-flat.ini); scope changes through the existing conversion proofs
+  (to flat) and the runtime install (from flat); no settings file deleted by a scope change; two merge bases (edvr.ini.base,
+  edvr-flat.ini.base), each from its own payload ini; the edition-mismatch block and --convert-profile retired. installer_test: each
+  scope fresh, each old state upgrading, each scope change incl. the runtime proofs, the two bases, dry-run writes nothing.
+- P3-3 GUI and CLI: "Install EDVR for:" (VR and flat (recommended) / VR only / Flat only), default the installed scope or both;
+  `--scope both|vr|flat`; a status line from the 3D mode through the shared parser; the settings screen's VR/Flat selector limited to
+  the scope, defaulting to the current 3D mode's file, with the flat 3-row filter at run time; the flat edition retired (payload.cpp
+  ifdef, build.bat rig_flat_installer, package_native --profile flat, package.bat, the flat README folded into release\README.txt).
+- P3-4 mirror, bundler, uninstall: restore offered when the scope's files are absent; editionOf reports the scope; log.dir read from
+  both inis and both folders swept; --remove-settings removes both inis and both bases.
+- P3-5 docs: README.md download section, docs\installer.md (adds a Status block), docs\manual-install.md, docs\troubleshooting.md,
+  release\README.txt, AGENTS.md's edvr-flat.ini bullet and install_edvr's --scope.
