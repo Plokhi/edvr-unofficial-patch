@@ -27,6 +27,17 @@ inline Decision decide(bool holdAllowed, bool modeKnown, int mode, float request
     return Decision{hold, hold ? kHeldValue : requested};
 }
 
+// What a profile change does to the hold (vrSsaaHoldProfileChanged): release a held field, engage a field that should be held
+// while VR is live, or nothing. The hold is held only while the profile allows it AND VR is live, so a switch to flat (or out of
+// VR) must not leave the game's Supersampling at 1.0.
+enum class ProfileAction { None, Release, Engage };
+inline ProfileAction profileChangeAction(bool holdAllowed, bool vrLive, bool held) {
+    const bool want = holdAllowed && vrLive;
+    if (held && !want) return ProfileAction::Release;
+    if (!held && want) return ProfileAction::Engage;
+    return ProfileAction::None;
+}
+
 // The menu's toast, once per change of the requested value (one line; the toast card holds one).
 inline int formatHoldToast(char* out, size_t size, float requested) {
     return std::snprintf(out, size, "Supersampling %.2f is held at 1.0 in VR: use HMD Image Quality to set resolution", static_cast<double>(requested));

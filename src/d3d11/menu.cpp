@@ -3782,6 +3782,21 @@ void closeMenu(const char* why) {
 
 }  // namespace
 
+// Called at a profile switch, render thread, frame boundary. The menu closes; the flat panel's raster and its device objects
+// are let go by calling menuPanelFlatResize directly (menuFlatResize returns early unless the flat profile is active, and the
+// profile now active may be VR); and the first-time block of menuConfigure runs again under the new profile. Safe when the menu
+// never configured: menuPanelFlatResize tests each pointer, and inputGateSetPrivate(false) is a no-op while the flag is clear.
+void menuProfileSwitch() {
+    State& s = g_s;
+    if (s.open) closeMenu("profile switch");
+    inputGateSetPrivate(false);
+    menuPanelFlatResize();
+    s.lastDrawn = menuDrawnValue();
+    s.lastDrawnMs = 0;
+    s.contentDirty = true;
+    s.configured = false;
+}
+
 // ---------------------------------------------------------------------------
 
 void menuAdoptGameBindings(bool enabled, const char* why) {

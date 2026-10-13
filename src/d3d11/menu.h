@@ -57,6 +57,9 @@ void menuTick(ID3D11Device* dev);
 // before Present. The model/raster still advances from menuTick after Present.
 void menuFlatBeforePresent(IDXGISwapChain* swap, unsigned flags);
 void menuFlatResize();
+// Called at a profile switch, render thread, frame boundary: closes the menu, releases the flat panel's raster, and makes the
+// next menuConfigure run the first-time block of the profile now active.
+void menuProfileSwitch();
 
 // The reload poll re-read edvr.ini: refresh every row's value, diff the
 // restart snapshot, and toast what changed from outside the menu.

@@ -101,6 +101,15 @@ void decideCases() {
     check(!d.hold && same(d.value, 0.5f), "VR, mode unknown: not held, the requested 0.5 passes");
     d = decide(true, false, 3, 0.5f);
     check(!d.hold && same(d.value, 0.5f), "VR, mode unknown even with a stale 3: not held");
+    // A profile change: to flat while held releases, to VR while live holds, and nothing else acts.
+    using edvr::ssaahold::ProfileAction;
+    using edvr::ssaahold::profileChangeAction;
+    check(profileChangeAction(false, true, true) == ProfileAction::Release, "held, profile to flat (not allowed), VR live: released");
+    check(profileChangeAction(true, false, true) == ProfileAction::Release, "held, VR not live: released");
+    check(profileChangeAction(true, true, false) == ProfileAction::Engage, "not held, profile to VR while VR live: held");
+    check(profileChangeAction(false, true, false) == ProfileAction::None, "not held, flat profile: nothing to do");
+    check(profileChangeAction(true, true, true) == ProfileAction::None, "held and allowed while live: nothing to do");
+    check(profileChangeAction(false, false, false) == ProfileAction::None, "flat and not live, not held: nothing to do");
 }
 
 void toastCases() {

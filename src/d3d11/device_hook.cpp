@@ -447,6 +447,10 @@ constexpr uint64_t kBindsCheckMs = 5000;
 // How often edvr.ini is re-read so live tuning takes effect. Once a second.
 constexpr uint64_t kConfigPollMs = 1000;
 
+// Set by deviceHookRequestConfigRefresh (a profile switch); the config-poll block takes it at the next frame boundary, runs the
+// sweep whatever its timer says, and clears it there.
+std::atomic<bool> g_configRefreshRequested{false};
+
 // How many times a session to point out that a history-key press was ignored
 // because another window had focus. Three is enough to be noticed and few
 // enough that a player who works with a browser focused is not papered with it.
@@ -1618,12 +1622,16 @@ void presentFrameBoundary() {
     // The menu asks for the poll NOW after each write it made, so the
     // change lands this frame through the same configure path a hand
     // edit takes -- nothing applies a value except the reload.
-    if (menuTakeConfigPollRequest() || dueMs(g_state->configPollMs, kConfigPollMs)) {
+    if (menuTakeConfigPollRequest() || dueMs(g_state->configPollMs, kConfigPollMs) ||
+        g_configRefreshRequested.load(std::memory_order_acquire)) {
         g_state->configPollMs = stampMs();
         // The reload and what is derived from it are one group: with the reload
         // stood down there is nothing new to derive from.
         tkConfigRefresh.run([] {
-            vScreenRefreshConfig();
+            // A profile switch asked for the sweep without the reload's gate. The flag is taken inside the tick, so a
+            // stood-down tick leaves it set rather than losing the request.
+            if (g_configRefreshRequested.exchange(false, std::memory_order_acq_rel)) vScreenForceRefreshConfig();
+            else vScreenRefreshConfig();
             // The vertex-buffer resync's 60 s count and its ten-minute heartbeat: it needs no vScreen State, so it is asked here, after the reload, in both profiles.
             vertexResyncPoll(stampMs());
             // The terrain cull cover's ten-minute heartbeat (written while its hook is live, zero counts included).
@@ -3067,6 +3075,10 @@ bool deviceHookTakeFssZoomPress() {
     if (!g_state || !g_state->fssZoomPressPending) return false;
     g_state->fssZoomPressPending = false;
     return true;
+}
+
+void deviceHookRequestConfigRefresh() {
+    g_configRefreshRequested.store(true, std::memory_order_release);
 }
 
 bool deviceHookHmdQuality(float* multiplier) {

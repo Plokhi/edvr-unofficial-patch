@@ -137,6 +137,10 @@ bool deviceHookFssModeLatch();
 // earliest marker. Consumed on read.
 bool deviceHookTakeFssZoomPress();
 
+// Called at a profile switch, render thread, frame boundary: the config-poll block runs its sweep on the next frame boundary
+// whatever its timer says (vScreenForceRefreshConfig), then clears the request. Safe before any state exists: it sets a flag.
+void deviceHookRequestConfigRefresh();
+
 // The game's own resource creations since the last take (the monitor takes
 // them once a frame for its long-frame line): counts, and the textures' and
 // buffers' bytes about.

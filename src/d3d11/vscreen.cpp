@@ -5525,7 +5525,9 @@ uint32_t vScreenEyeDrawsThisFrame() {
     return s ? s->eyeDrawsThisFrame : 0;
 }
 
-void vScreenRefreshConfig() {
+// The one refresh. vScreenRefreshConfig runs it behind the reload's gate; vScreenForceRefreshConfig runs it with the gate taken away.
+// The configure calls stay in this one body: the reload gate is the only difference between the two.
+static void vScreenRefreshConfigBody(bool forced) {
     State* s = g_state;
     Config& cfg = Config::get();
     // Cheap: one GetFileAttributesEx, and only when the write time moved.
@@ -5533,8 +5535,12 @@ void vScreenRefreshConfig() {
     // THE RELOAD COMES BEFORE THE STATE CHECK. This is the only place the ini is re-read, and its readers outside vScreen (hotkey.explorer_cam, the diagnostic keys,
     // each read live from Config) need no vScreen State: with vScreen installed transport-only (no State) a reload that waited for one never happened, and a key
     // bound or cleared while the game runs never applied (review 2026-10-08, finding 3; tools\gate_test pins the order, the transport fixture binds a key live).
-    if (!cfg.reloadIfChanged()) return;
+    if (!forced && !cfg.reloadIfChanged()) return;
     if (!s) return;   // nothing of vScreen's to re-derive
+    if (forced) {
+        // The quiet-pass counters go back to zero with the sweep: the vouch list is rebuilt from silence the new profile earns.
+        for (uint8_t& q : s->quietPasses) q = 0;
+    }
     const bool gpuTimingEnabled = cfg.getBool("advanced.app_gpu_timing", true);
     gpuFrameConfigure(gpuTimingEnabled);
     // A reload -- the parse of a 124 KB ini and every module's reconfigure,
@@ -5624,9 +5630,19 @@ void vScreenRefreshConfig() {
     // is where every one of them learns its new value. Re-sample the real
     // condition here rather than merely raising the gate: the answer is
     // knowable now, and waiting for the next frame boundary would cost the
-    // newly enabled fix its first frame of draws. This runs only on a change
-    // -- the reloadIfChanged early return above sees to that.
+    // newly enabled fix its first frame of draws. A refresh runs this only on a change -- the reloadIfChanged early return in
+    // vScreenRefreshConfig sees to that. A forced refresh (a profile switch) runs it with no change to wait for.
     drawGateSet(drawGateSubscribed(s));
+}
+
+void vScreenRefreshConfig() {
+    vScreenRefreshConfigBody(false);
+}
+
+// Called at a profile switch, render thread, frame boundary: the same refresh without its reloadIfChanged gate, so every *Configure
+// runs again whether or not the file's write time moved (a profile switch changes which settings are live, not the file).
+void vScreenForceRefreshConfig() {
+    vScreenRefreshConfigBody(true);
 }
 
 bool vScreenReclaimHooks() {
