@@ -1483,4 +1483,9 @@ Units (each behind the full build; Haiku implementers, reviewed):
   2.3-2.5 ms, others about 1.9 ms. Sean: "more expensive than FSR or DLSS even".
 - XH1 (bridge under 1 ms per eye): not decidable from the bracket alone (it holds XeSS's own compute, DP4a on NVIDIA, plus four copies
   and two fence waits per eye). Next: an instrument splitting execute (D3D12 timestamps) from copy-in, wait and copy-out (D3D11
-  timestamps). XH2 (jitter sign) and XH3 (per-eye history): Sean's visual report pending.
+  timestamps). XH2 (jitter sign) and XH3 (per-eye history): Sean's visual report pending.- Bridge split (f76a9fef, edvr_gfx_20261013_101700, four 30 s windows agree), per eye, ms median: slot 0 copy-in 0.04, wait 2.36,
+  execute 2.05, copy-out 0.04, total 2.45; slot 1 0.04 / 2.13 / 1.73 / 0.05 / 2.21. Per pair: execute ~3.8 ms (81%), queue handoff
+  (wait - execute) ~0.7 ms (15%), copies ~0.16 ms (3%); the sum matches the 4.7 ms bracket. XH1 holds for the copies; the handoff is
+  the bridge's real cost. ruled out: removing the copies (shared pass textures) as worth building, because they are 0.16 ms per pair.
+  The rest is XeSS's own DP4a compute on NVIDIA. Render-thread CPU p50 rose from ~1.9 to 2.4-2.9 ms with XeSS: leading suspect the
+  allocator-reuse wait (xess_engine.cpp:932, three allocators per slot, two evals a frame); unmeasured.
