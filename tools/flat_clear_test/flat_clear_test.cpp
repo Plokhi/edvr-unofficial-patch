@@ -4,8 +4,10 @@
 // runtime's trace prints them. The word reads VR when nobody has written it. Built from the repo root by build.bat's
 // :rig_flat_clear_test. Windows-free: it includes only the pure headers. --dry-run writes nothing; --self-test runs the checks.
 #include "../../src/openxr/flat_clear_state.h"
+#include "../../src/openxr/flat_notice_placement.h"
 #include "../../src/common/frame_flag.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -162,6 +164,29 @@ void failureLatch() {
     check(again.run && again.started, "VR then flat again re-arms clearing and runs");
 }
 
+// The notice's placement (flat_notice_placement.h): the panel's centre is the eye's optical centre from its own tangents.
+void noticeGeometry() {
+    using namespace edvr::openxr;
+    check(noticePanelWidth(512) == 205, "the notice panel is 40% of a 512 px eye image");
+    check(noticeHeadlineHeight(512) == 18 && noticeDetailHeight(512) == 14, "the font cells are the eye height over 28 and over 36");
+    const double t = std::tan(0.785398163);
+    NoticeRect r{};
+    check(flatNoticeRect(512, 512, 205, 60, -t, t, t, -t, r) && r.x == 154 && r.y == 226 && r.width == 205 && r.height == 60,
+          "a symmetric fov centres the panel on the image (x 154, y 226)");
+    // A canted fov: the left edge reaches less far than the right, so the straight-ahead point sits left of the image middle; the top
+    // edge reaches further than the bottom, so it sits below the middle (image y grows downward).
+    const double tanL = std::tan(-0.6), tanR = std::tan(0.9), tanU = std::tan(0.7), tanD = std::tan(-0.5);
+    check(flatNoticeRect(512, 512, 205, 60, tanL, tanR, tanU, tanD, r) && std::abs(r.x + 102 - 180) <= 1,
+          "a canted fov moves the centre to its own optical centre (x about 180, not 256)");
+    check(r.y + 30 > 256, "a top edge that reaches further than the bottom puts the centre below the image middle");
+    check(flatNoticeRect(512, 512, 205, 60, -2.0, 0.1, 0.5, -0.5, r) && r.x == 512 - 205 && r.y == 256 - 30,
+          "a centre past the right edge clamps the panel inside the image");
+    check(flatNoticeRect(512, 512, 205, 60, 0.0, 0.0, 0.5, -0.5, r) == false, "a zero horizontal span is refused");
+    check(flatNoticeRect(512, 512, 205, 60, -0.5, 0.5, 0.5, 0.5, r) == false, "a zero vertical span is refused");
+    check(flatNoticeRect(512, 512, 205, 60, std::nan(""), 0.5, 0.5, -0.5, r) == false, "a non-finite tangent is refused");
+    check(flatNoticeRect(0, 512, 205, 60, -0.5, 0.5, 0.5, -0.5, r) == false, "an empty image is refused");
+}
+
 void defaultWordReadsVr() {
     check(edvr::kVrProfileWordVr == 1 && edvr::kVrProfileWordNotVr == 2, "the word's values are 1 for VR and 2 for not VR");
     check(edvr::vrProfileWordIsVr(0), "a fresh word (nobody wrote) reads as VR, so an absent graphics half changes nothing");
@@ -192,6 +217,7 @@ int main(int argc, char** argv) {
     vrFromTheStart();
     staleEdges();
     failureLatch();
+    noticeGeometry();
     defaultWordReadsVr();
     if (g_fails) {
         std::printf("FAIL: flat_clear_test %d of %d checks failed\n", g_fails, g_checks);

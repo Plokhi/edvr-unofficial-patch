@@ -307,6 +307,14 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   // is for that frame and is dropped (submitEyeAdmitted). Cleared by the next WaitGetPoses.
   bool staleFrameEnded=false;
   uint64_t lateSubmitsDropped=0;
+  // The flat notice (N2): the layer flatClearFrame rendered before it ends the frame, which composeBackground hands over instead of
+  // drawing the skybox; the trace's last texture generation; and the once-only unavailable reason.
+  XrCompositionLayerProjection flatNoticeLayer{};
+  bool flatNoticeReady=false,flatPanelNoted=false;
+  uint32_t flatNoticeGeneration=0;
+  // The panel needs the runtime's own device (separate_device=1), where the owner's context can draw the eye images, and a text
+  // format the renderer converts to. Otherwise the clear frames stay black.
+  bool flatPanelAvailable() const {return separateGraphics()&&stereo.noticeFormatSupported();}
   SeatedSpace seated;ReferenceChanges changes;ResetEvents resetEvents;
   XrSpace frameSpace=XR_NULL_HANDLE;
   uint64_t recenters=0,resetPolls=0,referenceChanges=0;
@@ -968,7 +976,15 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       return;
     }
     const auto step=flatClear.decide(vrProfile,state.frameOpen(),running,quiet);
-    if(step.started){flatClearStretchFrames=0;nativeTracePrintf("flat_clear,start,quiet_ms=%llu\n",(unsigned long long)quiet);}
+    if(step.started){
+      flatClearStretchFrames=0;
+      if(!flatPanelNoted&&!flatPanelAvailable()){
+        flatPanelNoted=true;
+        if(!separateGraphics())nativeTracePrintf("flat_clear,panel=unavailable,reason=borrowed_device\n");
+        else nativeTracePrintf("flat_clear,panel=unavailable,reason=format_%d\n",int(stereo.format()));
+      }
+      nativeTracePrintf("flat_clear,start,quiet_ms=%llu,panel=%u\n",(unsigned long long)quiet,unsigned(flatPanelAvailable()));
+    }
     if(step.run){
       const XrResult r=flatClearFrame();
       if(r!=XR_SUCCESS){
@@ -980,25 +996,54 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       }
       ++flatClearFrames;++flatClearStretchFrames;
     }
-    if(step.stopped)nativeTracePrintf("flat_clear,stop,reason=%s,frames=%llu\n",
+    if(step.stopped)nativeTracePrintf("flat_clear,stop,reason=%s,frames=%llu,panel=%u\n",
       step.reason==FlatClearState::Stop::VrProfile?"vr_profile":step.reason==FlatClearState::Stop::Session?"session":"game_frame",
-      (unsigned long long)flatClearStretchFrames);
+      (unsigned long long)flatClearStretchFrames,unsigned(flatPanelAvailable()));
     // Every 30 s while the graphics half says flat, whether or not the owner is clearing, so a flat stretch with no clear frames shows
     // why: frames stays 0 and game_frame_open or quiet_ms names the blocker.
     if(!vrProfile&&now-flatClearSummaryMs>=30000){
       flatClearSummaryMs=now;
-      nativeTracePrintf("flat_clear,summary,frames=%llu,clearing=%u,game_frame_open=%u,quiet_ms=%llu,running=%u\n",
-        (unsigned long long)flatClearFrames,unsigned(flatClear.active()),unsigned(state.frameOpen()),(unsigned long long)quiet,unsigned(running));
+      nativeTracePrintf("flat_clear,summary,frames=%llu,clearing=%u,game_frame_open=%u,quiet_ms=%llu,running=%u,panel=%u\n",
+        (unsigned long long)flatClearFrames,unsigned(flatClear.active()),unsigned(state.frameOpen()),(unsigned long long)quiet,unsigned(running),
+        unsigned(flatPanelAvailable()));
     }
   }
-  // One empty frame, begun and ended with zero layers: the shape of loadingStep's empty work. clear() ends whatever begin opened on
-  // every path, so no frame is left open on return.
+  // One frame of the headset while flat: the notice when the runtime's own device can draw it and the frame should render, otherwise
+  // an empty frame. The notice is rendered here, before the frame ends, so a failure in it can end the frame empty without the
+  // boundary failing (composeBackground hands over the rendered layer). clear() ends whatever begin opened on every path, so no frame
+  // is left open on return.
   XrResult flatClearFrame() {
     auto r=boundary.waitAndBegin();
     if(r!=XR_SUCCESS&&r!=XR_FRAME_DISCARDED&&r!=XR_SESSION_LOSS_PENDING)return r;
     auto frame=boundary.frame();
     if(!applyFrameSequence(frame)){boundary.clear();return XR_ERROR_LIMIT_REACHED;}
-    return boundary.clear();
+    if(!flatPanelAvailable()||!frame.shouldRender)return boundary.clear();
+    // The views, located as loadingStep locates its skybox frame.
+    uint64_t applied=0;
+    if(!changes.advance(frame.predictedDisplayTime,applied)){boundary.clear();return XR_ERROR_TIME_INVALID;}
+    if(applied){referenceChanges+=applied;if(!invalidateOrigin()){boundary.clear();return XR_ERROR_LIMIT_REACHED;}}
+    frameSpace=seated.space();
+    GeometryInput located{};
+    r=locateGeometry({api.locateViews,api.locateSpace},binding,frame,geometryGeneration,sizes,located,nullptr,frameSpace);
+    if(r!=XR_SUCCESS){boundary.clear();return r;}
+    GeometrySnapshot snapshot{};
+    // No noteProjectionMode here: the parallel-projection verdict is decided on the loading and game frames only.
+    const bool valid=makeGeometrySnapshot(located,snapshot);
+    frameViews[0]=located.views[0];frameViews[1]=located.views[1];
+    boundary.setGeometryReady(valid);
+    if(!valid)return boundary.clear();
+    XrCompositionLayerProjection layer{};
+    r=stereo.renderNotice(frameViews,frameSpace,layer);
+    if(r!=XR_SUCCESS){boundary.clear();return r;}
+    if(stereo.noticeGeneration()!=flatNoticeGeneration){
+      flatNoticeGeneration=stereo.noticeGeneration();
+      uint32_t lw=0,lh=0,rw=0,rh=0;stereo.noticeSize(0,&lw,&lh);stereo.noticeSize(1,&rw,&rh);
+      nativeTracePrintf("flat_clear,panel=ready,size=%ux%u,size_right=%ux%u,format=%d\n",lw,lh,rw,rh,int(stereo.format()));
+    }
+    flatNoticeLayer=layer;flatNoticeReady=true;
+    r=boundary.background();
+    flatNoticeReady=false;
+    return r;
   }
   static void referenceEvent(const XrEventDataBuffer& buffer,void* context) noexcept {
     auto& host=*static_cast<NativeRuntimeHost*>(context);
@@ -2323,6 +2368,8 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     } else previousPairValid=false;
   }
   XrResult composeBackground(XrCompositionLayerProjection& layer) override {
+    // The flat notice was drawn before its frame ended (flatClearFrame); the layer it made is handed over, not drawn again.
+    if(flatNoticeReady){layer=flatNoticeLayer;return XR_SUCCESS;}
     return stereo.renderSkybox(frameViews,frameSpace,skybox,layer,comfortFade());
   }
   // The level the provider gave this frame, or 0: no provider, no frame read yet, or an answer that carried none.

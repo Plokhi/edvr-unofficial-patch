@@ -646,7 +646,7 @@ cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /LD /D_CRT_SECURE_NO_WARNINGS %EDVR_
     "src\openxr\device_gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
     "src\openxr\openvr_compositor.cpp" "src\openxr\openvr_auxiliary.cpp" ^
     "src\common\frame_flag.cpp" ^
-    /link /INCREMENTAL:NO %EDVR_CPU_LINK% /PDB:"%BUILD%\edvr_openxr_runtime.pdb" /DEF:"src\openxr\native_module.def" "%OBJ%\openxr_module\version.res" d3d11.lib dxgi.lib user32.lib
+    /link /INCREMENTAL:NO %EDVR_CPU_LINK% /PDB:"%BUILD%\edvr_openxr_runtime.pdb" /DEF:"src\openxr\native_module.def" "%OBJ%\openxr_module\version.res" d3d11.lib dxgi.lib user32.lib gdi32.lib
 if errorlevel 1 ( echo [edvr] ERROR: native runtime module build failed & exit /b 1 )
 
 REM Shared by the installer and installer_test rigs below.
@@ -1440,7 +1440,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     "src\d3d11\vr_world_route.cpp" "src\d3d11\binding_shadow.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\map_easu.cpp" "src\d3d11\map_smaa.cpp" ^
     "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
     "src\common\config.cpp" "src\common\proxy.cpp" "src\common\guard.cpp" ^
-    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib version.lib
+    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib gdi32.lib version.lib
 if errorlevel 1 ( echo [edvr] ERROR: vr world route GPU test build failed & exit /b 1 )
 "%BUILD%\vr_world_route_gpu_test.exe" --dry-run || exit /b 1
 "%BUILD%\vr_world_route_gpu_test.exe" --self-test || exit /b 1
@@ -1452,7 +1452,7 @@ if not exist "%OBJ%\flat_sdk_integration_test" mkdir "%OBJ%\flat_sdk_integration
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /Fo"%OBJ%\flat_sdk_integration_test\\" /Fe"%BUILD%\flat_sdk_integration_test.exe" ^
     "tools\flat_sdk_integration_test\flat_sdk_integration_test.cpp" ^
-    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib
+    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib gdi32.lib
 if errorlevel 1 ( echo [edvr] ERROR: flat SDK integration bench compile failed & exit /b 1 )
 "%BUILD%\flat_sdk_integration_test.exe" --dry-run || exit /b 1
 "%BUILD%\flat_sdk_integration_test.exe" --self-test || exit /b 1
@@ -2329,7 +2329,7 @@ for %%T in (native stereo) do (
         "src\openxr\openvr_compositor.cpp" "tools\openxr_native_test\compositor_caller.cpp" ^
         "src\openxr\openvr_auxiliary.cpp" "src\openxr\runtime_exports.cpp" ^
         "src\common\frame_flag.cpp" ^
-        /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib
+        /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib gdi32.lib
     if errorlevel 1 ( echo [edvr] ERROR: OpenXR %%T test build failed & exit /b 1 )
 )
 for %%T in (native stereo) do (
@@ -2432,7 +2432,7 @@ cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /I"third_party\openxr\include" /I"%G
     "tools\openxr_proxy_state_test\openxr_proxy_state_test.cpp" ^
     "src\openxr\d3d11_stereo.cpp" "src\openxr\eye_capture.cpp" "src\openxr\skybox_capture.cpp" ^
     "src\openxr\shared_texture_transfer.cpp" "src\openxr\producer_gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
-    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib
+    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib gdi32.lib
 if errorlevel 1 ( echo [edvr] ERROR: OpenXR proxy state test build failed & exit /b 1 )
 "%BUILD%\openxr_proxy_state_test.exe" --dry-run || exit /b 1
 "%BUILD%\openxr_proxy_state_test.exe" --self-test || exit /b 1
@@ -2574,7 +2574,7 @@ if not exist "%OBJ%\openxr_module_test" mkdir "%OBJ%\openxr_module_test"
 cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\openxr_module_test\\" /Fe"%BUILD%\openxr_module_test.exe" ^
     "tools\openxr_module_test\openxr_module_test.cpp" ^
-    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib
+    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib gdi32.lib
 if errorlevel 1 ( echo [edvr] ERROR: native runtime module test build failed & exit /b 1 )
 "%BUILD%\openxr_module_test.exe" --dry-run || exit /b 1
 "%BUILD%\openxr_module_test.exe" --self-test || exit /b 1
