@@ -2,21 +2,11 @@
 
 ## Status
 
-- **State (2026-10-12):** phase 1 BUILT on branch
-  `claude/unified-install-feature-74bc24`, NOT FLOWN, not on main (Sean
-  approves before it ships). Installed to Steam (`--scope both`).
-  - The launch decision (`src/common/install_scope.h`, rig
-    `runtime_profile_test`); the Settings.xml watch, log-only
-    (`src/d3d11/mode_watch*`, rig `mode_watch_test`); Passthrough plus a
-    restart toast at a confirmed switch; the H7 swap-chain line;
-    `install_edvr.py --scope`; `edvr_log.py --switches`.
-  - Built differently from 3.2: the watch keeps the file's last confirmed
-    class apart from the class EDVR runs, and starts from the launch's
-    effective mode. A read posts only when the FILE changes, so neither a
-    live rise nor a `/vr` launch over a file at 0 is undone by the file.
-  - Rigs run under a pinned LOCALAPPDATA (Settings.xml mode 4), so the gate
-    does not follow the 3D mode the maintainer last flew (549e8d91).
-  - Not built yet: the switch rig (phase 2, with its leak count).
+- **State (2026-10-13):** phases 1-3 built on branch
+  `claude/unified-install-feature-74bc24`; 1 and 2 flown OK; not on main
+  (Sean approves before it ships). The watch keeps the file's last confirmed
+  class apart from the class EDVR runs (a read posts only when the FILE
+  changes); rigs run under a pinned LOCALAPPDATA (549e8d91).
 - **Goal (Sean, 2026-10-12):**
   - one installer;
   - EDVR runs its flat profile when Elite's 3D mode is off (or anaglyph), and
@@ -45,7 +35,7 @@
   - H5 open: the Settings.xml path on every store and on Proton.
   - H6 HOLDS: a 3D apply rewrites the file and the watch sees it.
   - H7 holds so far: no new swap chain at a toggle in B or D.
-  - H8 open: the always-installed hooks cost VR nothing measurable.
+  - H8 HOLDS: each profile pays under 0.01 ms a frame for the other's hooks.
   - H10 SETTLED: a launch the file did not decide leaves it stale until
     the game's first write, which holds the live mode (f11b7a3e).
   - Regression fixed (7b0358b4): Passthrough stood the window rewrite
