@@ -136,6 +136,21 @@ inline RuntimeProfile runtimeProfileValue() { return g_runtimeProfile.load(std::
 // The profile the launch decision chose (before any mid-session commit), for gates that must still know a VR launch after a drop.
 inline RuntimeProfile runtimeLaunchProfile() { return g_launchDecision.active; }
 
+// Scope gates for the hooks. An install hooks what its scope includes, and a hook acts per call on the active profile, so a switch
+// mid-session finds its hooks in place. decideLaunch never yields LegacyVr, so LegacyVr marks the time before the decision: then the
+// answer is the VR-only install that predates the unified one (VR yes, flat no).
+inline bool runtimeLaunchDecided() { return g_launchDecision.active != RuntimeProfile::LegacyVr; }
+inline bool runtimeScopeIncludesFlat() {
+    if (!runtimeLaunchDecided()) return false;
+    const InstallScope scope = runtimeInstallScope();
+    return scope == InstallScope::Both || scope == InstallScope::Flat;
+}
+inline bool runtimeScopeIncludesVr() {
+    if (!runtimeLaunchDecided()) return true;
+    const InstallScope scope = runtimeInstallScope();
+    return scope == InstallScope::Both || scope == InstallScope::Vr;
+}
+
 // Flat owns a separate mono adapter. Generic setting reads cannot activate the
 // stereo pipeline or unrelated fixes; the mono adapter explicitly reads the
 // desired mode through requestedTemporalMode().

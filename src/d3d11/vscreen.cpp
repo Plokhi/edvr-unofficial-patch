@@ -2978,6 +2978,8 @@ void STDMETHODCALLTYPE hookedVSSetConstantBuffers(ID3D11DeviceContext* self, UIN
 
 void STDMETHODCALLTYPE hookedPSSetConstantBuffers(ID3D11DeviceContext* self, UINT start,
                                                   UINT n, ID3D11Buffer* const* bufs) {
+    // Hot: every PS constant-buffer bind. Installed for the flat scope, so a VR launch passes through here.
+    if (!runtimeFlatProfile()) { g_state->realPSSetConstantBuffers(self, start, n, bufs); return; }
     if (g_flatComputeInternal) { g_state->realPSSetConstantBuffers(self, start, n, bufs); return; }
     // Installed only for flat discovery. Forward exactly once, including
     // foreign contexts and every call outside the bounded capture window.
@@ -6905,10 +6907,10 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
                    reinterpret_cast<void**>(&s.realPSSetShader));
     s.hook.replace(kSlotVSSetConstantBuffers, &hookedVSSetConstantBuffers,
                    reinterpret_cast<void**>(&s.realVSSetConstantBuffers));
-    if (runtimeFlatProfile()) {
+    if (runtimeScopeIncludesFlat()) {
         const bool installed = s.hook.replace(kSlotPSSetConstantBuffers, &hookedPSSetConstantBuffers,
             reinterpret_cast<void**>(&s.realPSSetConstantBuffers));
-        Log::get().note("flat discover PS constant-buffer observer: slot=%zu installed=%u; active only during owned capture",
+        Log::get().note("flat discover PS constant-buffer observer: slot=%zu installed=%u for flat; active only in flat during owned capture",
                        kSlotPSSetConstantBuffers, installed && s.realPSSetConstantBuffers ? 1u : 0u);
     }
     s.hook.replace(kSlotVSSetShaderResources, &hookedVSSetShaderResources,

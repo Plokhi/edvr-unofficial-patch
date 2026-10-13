@@ -2,6 +2,7 @@
 #include "terrain_cull_cover_core.h"
 #include "../common/code_hook.h"
 #include "../common/log.h"
+#include "../common/runtime_profile.h"  // runtimeVrProfile: the per-call gate in coverDetour
 
 #include <windows.h>
 #include <atomic>
@@ -117,6 +118,8 @@ using BuilderFn = uintptr_t (__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uintp
 __declspec(noinline) uintptr_t __fastcall coverDetour(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, float vfov, float aspect) noexcept {
     const auto forward = reinterpret_cast<BuilderFn>(g_forward.load(std::memory_order_acquire));
     if (!forward) return 0;   // never installed; the relay is unreachable then
+    // The flat profile has no stereo frustum: it gets the builder's own call, with the arguments as the game made them.
+    if (!runtimeVrProfile()) return forward(a, b, c, d, vfov, aspect);
     float tanV = 0.0f, tanH = 0.0f;
     tcover::unpackTangents(g_tangents.load(std::memory_order_relaxed), &tanV, &tanH);
     const tcover::Cover r = tcover::widen(vfov, aspect, tanV, tanH);
@@ -154,11 +157,11 @@ void sayInert(const char* why) {
 
 }  // namespace
 
-void terrainCullCoverInstall(bool flatProfile) {
+void terrainCullCoverInstall(bool noVrScope) {
     bool expected = false;
     if (!g_attempted.compare_exchange_strong(expected, true)) return;   // once, ever: a refusal is final
-    if (flatProfile) {
-        sayInert("the flat profile has no stereo frustum to cover; nothing was patched");
+    if (noVrScope) {
+        sayInert("the install scope has no VR, so there is no stereo frustum to cover; nothing was patched");
         return;
     }
     const uint8_t* base = nullptr;

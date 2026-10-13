@@ -86,6 +86,8 @@ bool flatPacketInputLayout(ID3D11InputLayout* layout,std::vector<FlatPacketInput
 struct FlatPacketGeometryCreate {UINT streamOutput=0,declarations=0,strides=0,rasterizedStream=0;};
 struct FlatPacketSOElement {char semantic[64]{};UINT stream=0,semanticIndex=0,startComponent=0,componentCount=0,outputSlot=0;};
 bool flatPacketGeometryShaderData(ID3D11GeometryShader* shader,std::vector<uint8_t>& bytes);
+// True unless a VR launch failed to hook ResizeBuffers, which leaves a later switch into flat without its resize hooks.
+bool flatSwitchAvailable();
 // Sticky for the process, including later devices and submit-side passes.
 // True for either sentinel recovery or advanced.d3d11_fixes=0.
 bool deviceHookRecoveryDisabled();

@@ -264,23 +264,32 @@ void redactCases() {
         "redact: no output carries a server token, a password, an account name or a user id");
 }
 
-// The mode request's rewrite gate (vr_window_gate.h) over the eight combinations of the current profile and the launch's: true only for
-// a VR current profile, and for Passthrough after a VR launch. A flat launch never rewrites.
+// The mode request's rewrite gate (vr_window_gate.h) over the four profiles, each with the install scope's VR flag and the runtime's live
+// flag (16 rows). A VR profile always rewrites. Flat and Passthrough rewrite only with VR in scope and a live session. Invalid never does.
 void windowGateCases() {
-    struct Row { RuntimeProfile current; const char* name; RuntimeProfile launch; const char* launchName; bool want; };
+    struct Row { RuntimeProfile current; const char* name; bool scopeVr; bool live; bool want; };
     const Row rows[] = {
-        {RuntimeProfile::Vr, "vr", RuntimeProfile::Vr, "vr", true},
-        {RuntimeProfile::Vr, "vr", RuntimeProfile::Flat, "flat", true},
-        {RuntimeProfile::Flat, "flat", RuntimeProfile::Vr, "vr", false},
-        {RuntimeProfile::Flat, "flat", RuntimeProfile::Flat, "flat", false},
-        {RuntimeProfile::Passthrough, "passthrough", RuntimeProfile::Vr, "vr", true},
-        {RuntimeProfile::Passthrough, "passthrough", RuntimeProfile::Flat, "flat", false},
-        {RuntimeProfile::Invalid, "invalid", RuntimeProfile::Vr, "vr", false},
-        {RuntimeProfile::Invalid, "invalid", RuntimeProfile::Flat, "flat", false},
+        {RuntimeProfile::Vr, "vr", true, true, true},
+        {RuntimeProfile::Vr, "vr", true, false, true},
+        {RuntimeProfile::Vr, "vr", false, true, true},
+        {RuntimeProfile::Vr, "vr", false, false, true},
+        {RuntimeProfile::Flat, "flat", true, true, true},
+        {RuntimeProfile::Flat, "flat", true, false, false},
+        {RuntimeProfile::Flat, "flat", false, true, false},
+        {RuntimeProfile::Flat, "flat", false, false, false},
+        {RuntimeProfile::Passthrough, "passthrough", true, true, true},
+        {RuntimeProfile::Passthrough, "passthrough", true, false, false},
+        {RuntimeProfile::Passthrough, "passthrough", false, true, false},
+        {RuntimeProfile::Passthrough, "passthrough", false, false, false},
+        {RuntimeProfile::Invalid, "invalid", true, true, false},
+        {RuntimeProfile::Invalid, "invalid", true, false, false},
+        {RuntimeProfile::Invalid, "invalid", false, true, false},
+        {RuntimeProfile::Invalid, "invalid", false, false, false},
     };
     for (const Row& row : rows) {
-        const std::string name = std::string("window gate: current ") + row.name + ", launch " + row.launchName;
-        check(vrWindowRewriteAllowed(row.current, row.launch) == row.want, name.c_str());
+        const std::string name = std::string("window gate: current ") + row.name + ", scope vr " + (row.scopeVr ? "yes" : "no") +
+            ", vr live " + (row.live ? "yes" : "no");
+        check(vrWindowRewriteAllowed(row.current, row.scopeVr, row.live) == row.want, name.c_str());
     }
 }
 

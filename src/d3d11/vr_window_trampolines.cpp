@@ -9,7 +9,7 @@
 
 #include "../common/code_hook.h"
 #include "../common/log.h"
-#include "../common/runtime_profile.h"  // runtimeVrProfile: the flat profile's requests pass unchanged
+#include "../common/runtime_profile.h"  // runtimeScopeIncludesVr, runtimeProfileValue: the per-call rewrite gate
 
 #include <windows.h>
 
@@ -103,14 +103,14 @@ void refreshUserSize() {
     g_userH.store(h, std::memory_order_release);
 }
 
-// The mode request's window rewrite (H6; the maintainer's decision: keep the user's display mode when 3D is on). VR profile only: the
-// flat profile's requests pass byte for byte, and the saved mode is not read for them. VR inactive: a non-windowed request is remembered
+// The mode request's window rewrite (H6; the maintainer's decision: keep the user's display mode when 3D is on). VR profile, or flat and
+// passthrough with VR in scope and live (vr_window_gate.h): otherwise the request passes byte for byte, and the saved mode is not read. VR inactive: a non-windowed request is remembered
 // whole (its block) and passes unchanged. VR active (or the settings file's mode is on at a windowed request): a windowed request
 // (kind 0) gets the remembered block restored before the original runs, so the apply builds the remembered mode. Nothing is changed
 // while VR is inactive.
 uint64_t requestReplacement(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
-    // Before any read of the saved mode. A VR launch keeps the rewrite in Passthrough (vr_window_gate.h).
-    if (!vrWindowRewriteAllowed(runtimeProfileValue(), runtimeLaunchProfile())) return g_requestOrig(a, b, c, d, e, f, g, h);
+    // Before any read of the saved mode. Flat and Passthrough rewrite only with VR in scope and a live session (vr_window_gate.h).
+    if (!vrWindowRewriteAllowed(runtimeProfileValue(), runtimeScopeIncludesVr(), vrSsaaHoldVrLive())) return g_requestOrig(a, b, c, d, e, f, g, h);
     const uintptr_t req = reinterpret_cast<uintptr_t>(b);
     uint32_t kind = 0;
     const bool haveKind = readU32(req + kReqKindOff, &kind);
