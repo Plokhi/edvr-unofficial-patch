@@ -96,8 +96,8 @@ int main(int argc, char** argv) {
     {
         se::SealState st;
         se::SealInputs in = quiet(0);
-        in.explorerOn = true;
-        check(firstEngage(&st, in, 0, 10000) == 0, "Explorer Cam on: no seal");
+        // Built v14.7: Explorer Cam is no seal condition; the camera rule alone decides.
+        check(firstEngage(&st, in, 100, 10000) == 100, "Explorer Cam is not a seal condition: a lowered pad with the camera in the bay seals");
     }
     {
         se::SealState st;
@@ -154,16 +154,6 @@ int main(int argc, char** argv) {
     {
         Case c{"undocked", base, se::ReleaseWhy::kUndocked};
         c.inputs.docked = false;
-        cases.push_back(c);
-    }
-    {
-        Case c{"Explorer Cam on", base, se::ReleaseWhy::kExplorerCam};
-        c.inputs.explorerOn = true;
-        cases.push_back(c);
-    }
-    {
-        Case c{"the camera left the bay", base, se::ReleaseWhy::kCameraLeft};
-        c.inputs.cameraOutside = true;
         cases.push_back(c);
     }
     {
@@ -475,20 +465,58 @@ int main(int argc, char** argv) {
         check(firstEngage(&st, in, 100, 60000) == 0, "v14.5: a pad 9.9 m above the lowered line (-10 m) does not seal");
     }
     {
-        // The Explorer Cam release and the re-seal: no pad motion, the camera back in the bay: the seal is immediate.
+        // Built v14.7: the camera rule alone. Outside the held box for kCameraFrames frames releases; inside the bay for kCameraFrames re-seals.
+        // Explorer Cam is no condition.
         se::SealState st;
         se::ReleaseWhy w = se::ReleaseWhy::kNone;
-        check(se::sealStep(quiet(100), &st, &w) == se::SealAction::kRequestEngage && st.immediate, "v14.5 explorer: the load-in seal");
-        se::SealInputs ex = quiet(150);
-        ex.held = true;
-        ex.explorerOn = true;
-        check(se::sealStep(ex, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kExplorerCam, "v14.5 explorer: Explorer Cam releases");
-        se::clearTrigger(&st);
-        se::SealInputs away = quiet(200);
-        away.cameraInBox = false;
-        check(se::sealStep(away, &st, &w) == se::SealAction::kNone, "v14.5 explorer: the camera still outside the bay: no seal yet");
-        check(se::sealStep(quiet(300), &st, &w) == se::SealAction::kRequestEngage && st.immediate,
-              "v14.5 explorer: the camera back in the bay, no pad motion: the re-seal is immediate");
+        check(se::sealStep(quiet(100), &st, &w) == se::SealAction::kRequestEngage && st.immediate, "v14.7: the load-in seal, camera in the bay");
+        bool released = false;
+        for (uint64_t k = 0; k < 30; ++k) {   // held, the camera inside the bay, Explorer Cam or not: the seal stays
+            se::SealInputs h = quiet(200 + k * 100);
+            h.held = true;
+            released = released || se::sealStep(h, &st, &w) == se::SealAction::kRelease;
+        }
+        check(!released, "v14.7: held with the camera inside the bay for 30 frames: the seal stays");
+        released = false;
+        for (uint64_t k = 0; k < 9; ++k) {   // a wall skimmed: outside for nine frames, then inside again
+            se::SealInputs h = quiet(5000 + k * 100);
+            h.held = true;
+            h.cameraOutside = true;
+            released = released || se::sealStep(h, &st, &w) == se::SealAction::kRelease;
+        }
+        se::SealInputs back = quiet(5900);
+        back.held = true;
+        released = released || se::sealStep(back, &st, &w) == se::SealAction::kRelease;
+        check(!released && st.camOutRun == 0, "v14.7: outside for nine frames (a wall skimmed) does not release");
+        released = false;
+        se::ReleaseWhy wy = se::ReleaseWhy::kNone;
+        for (uint64_t k = 0; k < 10 && !released; ++k) {   // the camera leaves: outside for ten consecutive frames
+            se::SealInputs h = quiet(6000 + k * 100);
+            h.held = true;
+            h.cameraOutside = true;
+            released = se::sealStep(h, &st, &wy) == se::SealAction::kRelease;
+        }
+        check(released && wy == se::ReleaseWhy::kCameraLeft, "v14.7: outside for ten consecutive frames: released (the camera left)");
+        bool sealedEarly = false;
+        for (uint64_t k = 0; k < 9; ++k) {   // back inside: nine frames are not enough
+            sealedEarly = sealedEarly || se::sealStep(quiet(7000 + k * 100), &st, &w) == se::SealAction::kRequestEngage;
+        }
+        check(!sealedEarly, "v14.7: back in the bay for nine frames: no re-seal yet");
+        check(se::sealStep(quiet(7900), &st, &w) == se::SealAction::kRequestEngage && st.immediate,
+              "v14.7: back in the bay for ten frames, no pad motion: the re-seal is immediate");
+    }
+    {
+        // Explorer Cam's own state never releases: the camera is inside the bay and the pad is still, so the held seal carries on.
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::sealStep(quiet(100), &st, &w);
+        bool any = false;
+        for (uint64_t k = 0; k < 20; ++k) {
+            se::SealInputs h = quiet(200 + k * 100);
+            h.held = true;
+            any = any || se::sealStep(h, &st, &w) != se::SealAction::kNone;
+        }
+        check(!any, "v14.7: Explorer Cam on with the camera in the bay keeps the seal (no release, no re-seal)");
     }
 
     // ---- Built v14.4: the flicker fix (the reference, the hysteresis, the sequence after a motion release, the safety net) ----------------------

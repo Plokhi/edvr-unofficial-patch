@@ -960,14 +960,16 @@ constexpr float kSealStillM = 0.2f;
 constexpr uint64_t kSealDelayMs = 6000;
 // The camera has left the held box by more than this: the seal is released (riding the elevator down, an external camera flying out).
 constexpr float kCameraLeaveM = 2.0f;
+// Built v14.7: the camera counts in both directions over this many consecutive frames: it must be outside the held box for this long to release,
+// and inside the bay for this long to re-seal (a free camera skimming a wall must not flicker the seal). Explorer Cam is no condition.
+constexpr uint32_t kCameraFrames = 10;
 
 enum class SealAction : uint8_t { kNone = 0, kRequestEngage = 1, kRelease = 2 };
-enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kExplorerCam, kCameraLeft, kPadMoved, kHangarChanged, kLaunch };
+enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kCameraLeft, kPadMoved, kHangarChanged, kLaunch };
 
 struct SealInputs {
     bool setting = false;        // fix.optimized_station is on
     bool docked = false;         // Status.json Flags bit 0
-    bool explorerOn = false;     // Explorer Cam is on: the station neither seals nor stays sealed
     bool pickOk = false;         // the own pad is found this frame, with a pose
     float rel = 0.0f;            // the pad's height above the hangar shell along its up axis now (metres; frame-independent)
     bool relOk = false;          // rel is readable this frame (an unreadable frame holds the trigger's state)
@@ -994,6 +996,9 @@ struct SealState {
     uintptr_t padAddr = 0;
     float firstRel = 0.0f;
     bool moved = false;
+    // Built v14.7: consecutive frames the camera has been outside the held box (camOutRun) or inside the bay (camInRun; starts satisfied).
+    uint32_t camOutRun = 0;
+    uint32_t camInRun = kCameraFrames;
 };
 
 // A release, or the trigger lapsing: the trigger starts again, the pad's motion memory stays (a pad that has descended still waits its delay).
@@ -1064,23 +1069,32 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         }
         return SealAction::kNone;
     }
+    // The camera's runs (built v14.7): the camera rule is the only camera condition, and it needs kCameraFrames frames either way.
+    if (in.cameraOutside) ++st->camOutRun;
+    else st->camOutRun = 0;
+    if (in.cameraInBox) {
+        if (st->camInRun < kCameraFrames) ++st->camInRun;
+    } else {
+        st->camInRun = 0;
+    }
     if (in.held) {
         ReleaseWhy w = ReleaseWhy::kNone;
         if (!in.docked) w = ReleaseWhy::kUndocked;
-        else if (in.explorerOn) w = ReleaseWhy::kExplorerCam;
-        else if (in.cameraOutside) w = ReleaseWhy::kCameraLeft;
+        else if (st->camOutRun >= kCameraFrames) w = ReleaseWhy::kCameraLeft;
         else if (in.padMoved) w = ReleaseWhy::kPadMoved;
         else if (in.hangarChanged) w = ReleaseWhy::kHangarChanged;
         else if (in.launched) w = ReleaseWhy::kLaunch;
         if (w != ReleaseWhy::kNone) {
             if (in.padMoved || in.launched) st->moved = true;   // a release by motion is a descent
             clearTrigger(st);
+            st->camOutRun = 0;
+            if (w == ReleaseWhy::kCameraLeft) st->camInRun = 0;   // the re-seal waits kCameraFrames inside the bay
             *why = w;
             return SealAction::kRelease;
         }
         return SealAction::kNone;
     }
-    if (!in.docked || in.explorerOn || !in.pickOk) {
+    if (!in.docked || !in.pickOk) {
         clearTrigger(st);
         return SealAction::kNone;
     }
@@ -1094,7 +1108,7 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
     if (in.sourceChanged) st->firstRel = in.rel;   // a different centre source is a different reading: the motion reference follows it
     if (std::fabs(in.rel - st->firstRel) > kSealStillM) st->moved = true;
     const bool lowered = in.rel < kLoweredM;
-    if (!lowered || !in.cameraInBox) {
+    if (!lowered || st->camInRun < kCameraFrames) {
         clearTrigger(st);
         return SealAction::kNone;
     }

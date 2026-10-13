@@ -16,7 +16,6 @@
 
 #include "../common/config.h"
 #include "../common/log.h"
-#include "explorer_cam.h"        // explorerCamSessionActive(): Explorer Cam on releases the station and stops its sealing
 #include "journal_watch.h"
 #include "kinematic_eval_hook.h"
 #include "optimized_station_core.h"
@@ -879,7 +878,6 @@ const char* releaseText(sealed::ReleaseWhy w) noexcept {
     switch (w) {
         case sealed::ReleaseWhy::kSettingOff: return "the setting is off";
         case sealed::ReleaseWhy::kUndocked: return "undocked";
-        case sealed::ReleaseWhy::kExplorerCam: return "Explorer Cam is on (the station does not seal with it)";
         case sealed::ReleaseWhy::kCameraLeft: return "the camera left the bay by more than 2 m (riding out of the hangar, or an external camera)";
         case sealed::ReleaseWhy::kPadMoved: return g_releaseWhy;
         case sealed::ReleaseWhy::kHangarChanged: return g_releaseWhy;
@@ -1418,7 +1416,6 @@ void optimizedStationFrame(uint32_t frame) {
     sealed::SealInputs in;
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
-    in.explorerOn = explorerCamSessionActive();
     in.pickOk = g_pickCell.has;
     in.rel = g_relM;
     in.relOk = g_relOk;
