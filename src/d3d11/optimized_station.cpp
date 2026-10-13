@@ -870,13 +870,13 @@ uint64_t g_waitLastMs = 0;                // when the waiting line was last writ
 sealed::SealState g_sealState;             // the seal trigger (optimized_station_core.h sealStep)
 bool g_flagHangarChanged = false;          // promote saw the held pad go or another own pad nearest: the tick releases on it
 bool g_engageAtLoadIn = false;             // the seal in force was requested at load-in (built v14.3): the status line says so
-// Built v14.11: the bay watch (core BayWatch: 512 records, the priority names kept) and the own pad's still watch (core PadWatch).
-// The watch is kept while docked, unsealed and after a descent: it is cleared only on a hangar change, an undock or a seal.
-sealed::BayWatch g_bay;
-sealed::PadWatch g_padWatch;
-sealed::OwnCell g_boxRef;            // the last valid candidate cell: the box the records are noted in (kept on a frame the pad is absent)
-bool g_bayWatching = false;          // docked, unsealed, after a descent: the watch is kept
-bool g_bayNoting = false;            // watching, and the shell read this frame: records are noted
+// Built v14.12: the bay's mechanism, latched once per descent (core LatchSet). Candidates are gathered only while a latch is pending.
+sealed::LatchSet g_latch;
+sealed::LatchCand g_latchCands[sealed::kLatchCandCap];
+size_t g_latchCandN = 0;
+bool g_latchPending = false;         // docked, unsealed, after a descent, not yet latched
+bool g_bayWatching = false;          // docked, unsealed, after a descent: the latch is kept
+bool g_bayNoting = false;            // watching, and the shell read this frame: the latched records are read
 uint64_t g_watchNowMs = 0;
 float g_shellNow[3] = {};
 uint8_t g_shellNowSrc = 4;
@@ -953,50 +953,90 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
     g_sealedFlag.store(false, std::memory_order_release);
 }
 
-// Built v14.11: the watch is kept while docked, unsealed, after a descent. Losing the shell or the pad for a frame does not clear it (the cause of the
-// early seal in 52bada02: the table was cleared, and with it the bay's quiet time, on every frame the pad was absent).
+// Built v14.12: the latch is kept while docked, unsealed, after a descent; it is cleared on a hangar change, a ship change, an undock or a seal.
 bool bayWatchKeep() noexcept {
     return g_setting.load(std::memory_order_acquire) && !g_sealedFlag.load(std::memory_order_acquire) &&
            g_dockedNow.load(std::memory_order_acquire) && g_sealState.moved;
 }
 
-// Built v14.11: one record of the gather. Watched when inside the candidate box (or sphere) with radius >= kBayWatchMinM, and not the own ship. Its
-// centre relative to the shell and its axes go to the BayWatch (a missing frame or another source re-bases; a continuous record is logged once).
-void bayWatchNote(uintptr_t record, const float* centre, float radius, bool containsCam, uint8_t centreSrc) noexcept {
-    if (!g_bayNoting || radius < sealed::kBayWatchMinM) return;
-    if (containsCam && radius < sealed::kOwnShipRadiusM) return;
-    if (record == g_ownRecAddr) return;
-    if (g_boxRef.box) {
-        float x[3] = {};
-        sealed::boxCoordsOf(g_boxRef, centre, x);
-        if (!(std::fabs(x[0]) <= g_boxRef.boxHalf[0] && std::fabs(x[1]) <= g_boxRef.boxHalf[1] && std::fabs(x[2]) <= g_boxRef.boxHalf[2])) return;
-    } else if (sealed::distance(g_boxRef.centre, centre) > g_boxRef.radius) {
-        return;
-    }
+// Built v14.12: a gathered record that may be a mechanism record (its name from the cache), within 150 m of the camera. Only while a latch is pending.
+void latchCandNote(uintptr_t record, const float* centre) noexcept {
+    if (!g_latchPending || g_latchCandN >= sealed::kLatchCandCap) return;
+    if (g_frameCamValid && sealed::distance(centre, g_frameCam) > 150.0f) return;
     char nm[48] = {};
-    if (!cachedName(record, nm, sizeof(nm))) return;
-    if (sealed::ownShipExempt(containsCam, radius, nm, g_ownPrefix)) return;
+    if (!cachedName(record, nm, sizeof(nm)) || !sealed::mechanismName(nm)) return;
+    sealed::LatchCand& cand = g_latchCands[g_latchCandN++];
+    cand.addr = record;
+    std::snprintf(cand.name, sizeof(cand.name), "%s", nm);
+    cand.centre[0] = centre[0];
+    cand.centre[1] = centre[1];
+    cand.centre[2] = centre[2];
+}
+
+// Built v14.12: latch the bay's mechanism once: the own pad's shaft (its up axis), the pads of its size and the mechanism records near the shaft.
+void latchNow(uint64_t now) noexcept {
     float axes[3][3] = {};
     float ext[3] = {};
     bool extOk = false;
     uint8_t src = 4;
-    if (!poseOrientOf(record, axes, ext, &extOk, &src)) return;
-    const float rel[3] = {centre[0] - g_shellNow[0], centre[1] - g_shellNow[1], centre[2] - g_shellNow[2]};
-    const uint32_t frame = g_frameStamp.load(std::memory_order_relaxed);
-    if (g_bay.note(record, nm, rel, axes[0], axes[2], centreSrc, g_shellNowSrc, frame, g_watchNowMs) == sealed::NoteOutcome::kContinuous) {
-        Log::get().note("optimized station: %s moves on most frames over 10 s: ignored as a continuous mover (a drone, a prop or a fixture).",
-                        g_bay.continuousName);
+    if (!poseOrientOf(g_pickCell.pad, axes, ext, &extOk, &src)) return;
+    const float up[3] = {axes[2][0], axes[2][1], axes[2][2]};
+    static sealed::LatchCand cands[sealed::kPadSlots + sealed::kLatchCandCap];
+    size_t n = 0;
+    for (size_t i = 0; i < g_padCount && n < sealed::kPadSlots; ++i) {
+        cands[n].addr = g_pads[i].addr;
+        std::snprintf(cands[n].name, sizeof(cands[n].name), "%s", g_pads[i].name);
+        for (int k = 0; k < 3; ++k) cands[n].centre[k] = g_pads[i].centre[k];
+        ++n;
     }
+    for (size_t i = 0; i < g_latchCandN; ++i) cands[n++] = g_latchCands[i];
+    const float alongMin = -belowFor(g_pickCell.size);
+    const float alongMax = g_pickCell.capLen + 10.0f;
+    const size_t k = sealed::selectMechanism(cands, n, g_pickCell.pad, g_pickCell.padName, g_pickCell.size, g_pickCell.centre, up, alongMin, alongMax,
+                                             g_latch.recs);
+    g_latch.n = k;
+    g_latch.latched = true;
+    g_latch.lastMotionMs = 0;
+    char names[200] = {};
+    size_t used = 0;
+    for (size_t i = 0; i < k; ++i) {
+        const int w = std::snprintf(names + used, sizeof(names) - used, "%s%s", i > 0 ? ", " : "", g_latch.recs[i].name);
+        if (w < 0 || used + static_cast<size_t>(w) >= sizeof(names)) break;
+        used += static_cast<size_t>(w);
+    }
+    Log::get().note("optimized station: watching the bay's mechanism (%u records): %s", static_cast<unsigned>(k), names);
 }
 
-// Built v14.11: the engage's account for the status line: load-in, the bay settled, or the 30 s fallback, with the watch's numbers.
+// Built v14.12: each latched record is read by address in the tick (its world centre and orientation), against the shell read this frame. A record
+// unreadable this frame is skipped and re-based on the next reading.
+void latchRead(uint64_t now) noexcept {
+    const uint32_t frame = g_frameStamp.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < g_latch.n; ++i) {
+        sealed::LatchRec& r = g_latch.recs[i];
+        const WorldRead pw = worldOfRecord(r.addr);
+        if (pw.source == 4) continue;
+        float axes[3][3] = {};
+        float ext[3] = {};
+        bool extOk = false;
+        uint8_t src = 4;
+        if (!poseOrientOf(r.addr, axes, ext, &extOk, &src)) continue;
+        const float rel[3] = {pw.world[0] - g_shellNow[0], pw.world[1] - g_shellNow[1], pw.world[2] - g_shellNow[2]};
+        r.step(frame, rel, axes[0], axes[2], pw.source, g_shellNowSrc, now);
+    }
+    g_latch.recomputeMotion();
+}
+
+// Built v14.12: the engage's account for the status line: load-in, the bay settled, or the 30 s fallback, with the latch's numbers.
 void captureEngageInfo(uint64_t now) noexcept {
     g_engageVia = g_sealState.immediate ? 0 : (g_sealState.fallback ? 2 : 1);
-    g_engageWatched = static_cast<uint32_t>(g_bay.watchedCount());
-    g_bay.lastMover(g_engageLastMover, sizeof(g_engageLastMover));
+    g_engageWatched = static_cast<uint32_t>(g_latch.n);
+    g_latch.lastMover(g_engageLastMover, sizeof(g_engageLastMover));
     g_engageSinceLowerS = (g_sealState.lowerSet && now > g_sealState.lowerSinceMs) ? static_cast<float>(now - g_sealState.lowerSinceMs) / 1000.0f : 0.0f;
-    g_bay.movers(now, g_engageMovers, sizeof(g_engageMovers), 3);
+    g_latch.movers(now, g_engageMovers, sizeof(g_engageMovers), 3);
 }
+
+// The own pad's still time for the seal: the pad's last motion (its latch record).
+uint64_t padLastMotion() noexcept { return g_latch.padLastMotionMs(); }
 
 // The seal's account for the status line (built v14.10).
 const char* engageHow() noexcept {
@@ -1368,7 +1408,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         char tn[48] = {};
         if (cachedName(record, tn, sizeof(tn))) tallyShipPrefix(tn);
     }
-    bayWatchNote(record, centre, radius, containsCam, static_cast<uint8_t>(wr.source));   // built v14.10
+    latchCandNote(record, centre);   // built v14.12: gathered only while a latch is pending
     if (!judge) return;   // gathering only: the pads and the explicit parts are in hand; the judgement is sealed-only
     const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, g_cellPrev, g_explicitPrev, g_explicitPrevCount, record);
     keep = v.keep;
@@ -1490,6 +1530,7 @@ void optimizedStationFrame(uint32_t frame) {
             setOwnPrefixAtEngage(frame);
             g_ownRecAddr = 0;
             g_ownLiveValid = false;
+            g_latch.reset();   // a new ship: the mechanism is latched again
         }
     }
     // Built v14.5: the height above the shell along the pad's own up axis, read live, with the shell picked once per pad (the same pick as the
@@ -1532,11 +1573,6 @@ void optimizedStationFrame(uint32_t frame) {
                     g_shellNow[2] = sw.world[2];
                     g_shellNowSrc = sw.source;
                     g_shellNowValid = true;
-                    {
-                        const float padRel[3] = {pw.world[0] - sw.world[0], pw.world[1] - sw.world[1], pw.world[2] - sw.world[2]};
-                        const uint32_t padFrame = g_frameStamp.load(std::memory_order_relaxed);
-                        (void)g_padWatch.step(padFrame, padRel, axes[0], axes[2], pw.source, sw.source, now);   // built v14.11
-                    }
                     g_heightChanged = g_heightSrc.note(pw.source, sw.source);
                 }
             }
@@ -1552,29 +1588,24 @@ void optimizedStationFrame(uint32_t frame) {
             camIn = sealed::distance(g_pickCell.centre, g_frameCam) <= g_pickCell.radius;
         }
     }
-    // Built v14.11: the watch's keep rule (not the shell or the pad: a frame without either keeps it); the table is cleared only on a hangar change,
-    // an undock or a seal (below). Records are noted only when the shell is read this frame.
+    // Built v14.12: the latch is kept while docked, unsealed, after a descent; the candidates of this frame are consumed here.
     g_watchNowMs = now;
     g_bayWatching = bayWatchKeep();
     g_bayNoting = g_bayWatching && g_shellNowValid;
     if (!g_bayWatching) {
-        g_bay.reset();
-        g_padWatch = sealed::PadWatch{};
-        g_boxRef = sealed::OwnCell{};
+        g_latch.reset();
     }
-    if (g_pickCell.has && sealed::cellInvalidWhy(g_pickCell) == nullptr) g_boxRef = g_pickCell;
-    uint32_t dropped = 0;
-    if (g_bay.takeOverflow(&dropped)) {
-        Log::get().note("optimized station: bay watch full: %u records not watched (512 slots; the LandingPad, Lift, BlastShield, HangarGate and TurboLift names are kept).",
-                        static_cast<unsigned>(dropped));
-    }
+    g_latchPending = g_bayWatching && !g_latch.latched;
+    if (g_latchPending && g_pickCell.has) latchNow(now);
+    g_latchCandN = 0;
+    if (g_latch.latched && g_bayNoting) latchRead(now);
     sealed::SealInputs in;
     in.setting = true;   // the tick returns above while the setting is off
     in.docked = g_dockedNow;
     in.pickOk = g_pickCell.has;
     in.padHeld = padHeld;
-    in.bayLastMotionMs = g_bay.lastMotionMs;
-    in.padLastMotionMs = g_padWatch.lastMovedMs;
+    in.bayLastMotionMs = g_latch.lastMotionMs;
+    in.padLastMotionMs = padLastMotion();
     in.rel = g_relM;
     in.relOk = g_relOk;
     in.sourceChanged = g_heightChanged;
@@ -1588,9 +1619,7 @@ void optimizedStationFrame(uint32_t frame) {
         g_sealState = sealed::SealState{};
         g_heightSrc = sealed::ShellHeightSources{};
         g_preShellValid = false;
-        g_bay.reset();
-        g_padWatch = sealed::PadWatch{};
-        g_boxRef = sealed::OwnCell{};
+        g_latch.reset();
     }
     in.hangarChanged = g_flagHangarChanged;
     in.launched = false;   // the pad state object's reader is not in this build (optimized-station doc, "Not yet")
@@ -1625,9 +1654,9 @@ void optimizedStationFrame(uint32_t frame) {
         w.relM = g_relM;
         w.relOk = g_relOk;
         {
-            const uint64_t quietSince = std::max(std::max(g_sealState.lowerSinceMs, g_bay.lastMotionMs), g_padWatch.lastMovedMs);
+            const uint64_t quietSince = std::max(std::max(g_sealState.lowerSinceMs, g_latch.lastMotionMs), padLastMotion());
             w.bayStillS = (g_sealState.lowerSet && now > quietSince) ? static_cast<float>(now - quietSince) / 1000.0f : 0.0f;
-            g_bay.movers(now, w.movers, sizeof(w.movers), 3);
+            g_latch.movers(now, w.movers, sizeof(w.movers), 3);
         }
         w.cellBuilt = g_relOk && sealed::cellInvalidWhy(g_pickCell) == nullptr;
         w.gathered = g_recordsLast;

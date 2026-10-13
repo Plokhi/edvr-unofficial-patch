@@ -520,17 +520,6 @@ int main(int argc, char** argv) {
         check(req == 100 + se::kBayStillMs, "v14.10: a continuous mover is ignored: sealed 2 s after the pad lowered");
     }
     {
-        // The continuous-mover window: a record moving on every frame for 10 s is continuous; a lift moving 8 s of 10 s is not.
-        se::MoverWindow always;
-        bool becameContinuous = false;
-        for (uint64_t tt = 0; tt <= 10000; tt += 100) becameContinuous = always.step(true, tt) || becameContinuous;
-        check(becameContinuous && always.continuous, "v14.10 movers: a record moving on every frame for 10 s is continuous");
-        se::MoverWindow lift;
-        bool liftContinuous = false;
-        for (uint64_t tt = 0; tt <= 10000; tt += 100) liftContinuous = lift.step(tt < 8000, tt) || liftContinuous;
-        check(!liftContinuous && !lift.continuous, "v14.10 movers: a lift moving 8 s of 10 s is not continuous");
-    }
-    {
         // The watch's motion test: a frame shift of the record and the shell together is not motion; a rotation over 0.5 deg is; so is a 3 cm move.
         const float a0[3] = {1.0f, 0.0f, 0.0f};
         const float a2[3] = {0.0f, 0.0f, 1.0f};
@@ -554,55 +543,104 @@ int main(int argc, char** argv) {
               "v14.10 watch: a 2 cm centre move is not motion; a 5 cm move is");
     }
 
-    // ---- Built v14.11: the bay watch's table (512, the priority names kept), the seal on the bay and the pad, the held absence ------------------
+    // ---- Built v14.12: the latch (selection, cap, the by-address still test), the lift sequence, the held pad absence ----------------------
     {
-        // A 60-record bay: the lift (record 55) moves every frame. No seal while it moves; the seal comes 2 s after its last move.
-        se::BayWatch bay;
+        // Selection: the own pad (A, medium, at the origin); the other medium pad 40 m lateral; a small pad 10 m lateral (no); a medium pad 70 m lateral
+        // (no); a Lift within the span (yes); a Lift beyond the span (no); a BlastShieldBase (yes); a HangarGate_Ramp (yes); a container (no); a guide
+        // marker pad (no).
+        se::LatchCand cands[12] = {};
+        auto put = [](se::LatchCand& cd, uintptr_t addr, const char* nm, float x, float y, float z) {
+            cd.addr = addr;
+            std::snprintf(cd.name, sizeof(cd.name), "%s", nm);
+            cd.centre[0] = x;
+            cd.centre[1] = y;
+            cd.centre[2] = z;
+        };
+        put(cands[0], 0x2, "LandingPadMediumB", 0.0f, 40.0f, -20.0f);
+        put(cands[1], 0x3, "LandingPadSmallA", 10.0f, 0.0f, 0.0f);
+        put(cands[2], 0x4, "LandingPadMediumB", 70.0f, 0.0f, 0.0f);
+        put(cands[3], 0x5, "Lift_1", 20.0f, 0.0f, -30.0f);
+        put(cands[4], 0x6, "Lift_2", 20.0f, 0.0f, 100.0f);
+        put(cands[5], 0x7, "BlastShieldBase", 0.0f, 30.0f, -10.0f);
+        put(cands[6], 0x8, "HangarGate_Ramp1_0", 50.0f, 0.0f, -5.0f);
+        put(cands[7], 0x9, "Container_1", 5.0f, 0.0f, -5.0f);
+        put(cands[8], 0xA, "LandingPadMediumGuideMarkers", 5.0f, 0.0f, 0.0f);
+        const float origin[3] = {0.0f, 0.0f, 0.0f};
+        const float up[3] = {0.0f, 0.0f, 1.0f};
+        se::LatchRec out[se::kLatchCap];
+        const size_t k = se::selectMechanism(cands, 9, 0x1, "LandingPadMediumA", se::PadSize::kMedium, origin, up, -90.0f, 40.0f, out);
+        bool hasB = false, hasLift1 = false, hasShield = false, hasRamp = false, hasLift2 = false, hasSmall = false;
+        for (size_t i = 0; i < k; ++i) {
+            hasB = hasB || std::strcmp(out[i].name, "LandingPadMediumB") == 0 && out[i].addr == 0x2;
+            hasLift1 = hasLift1 || std::strcmp(out[i].name, "Lift_1") == 0;
+            hasShield = hasShield || std::strcmp(out[i].name, "BlastShieldBase") == 0;
+            hasRamp = hasRamp || std::strcmp(out[i].name, "HangarGate_Ramp1_0") == 0;
+            hasLift2 = hasLift2 || std::strcmp(out[i].name, "Lift_2") == 0;
+            hasSmall = hasSmall || std::strcmp(out[i].name, "LandingPadSmallA") == 0;
+        }
+        check(k == 5 && out[0].addr == 0x1 && hasB && hasLift1 && hasShield && hasRamp && !hasLift2 && !hasSmall,
+              "v14.12 latch: the own pad, the medium B 40 m lateral, Lift_1, BlastShieldBase, HangarGate_Ramp within the span; not the small pad, the far pad, the lift beyond the span, the container or the guide markers");
+        se::LatchCand many[40] = {};
+        for (int i = 0; i < 30; ++i) {
+            char nm[48] = {};
+            std::snprintf(nm, sizeof(nm), "Lift_%d", i);
+            put(many[i], static_cast<uintptr_t>(0x100 + i), nm, 5.0f, 0.0f, 0.0f);
+        }
+        const size_t kc = se::selectMechanism(many, 30, 0x1, "LandingPadMediumA", se::PadSize::kMedium, origin, up, -90.0f, 40.0f, out);
+        check(kc == se::kLatchCap, "v14.12 latch: at most kLatchCap (16) records: the own pad and fifteen others");
+    }
+    {
+        // By address: a still record is not moved; 5 cm is; a missing frame re-bases without counting; a frame shift of the record and the shell
+        // together is not motion (the relative centre is the same).
         const float a0[3] = {1.0f, 0.0f, 0.0f};
         const float a2[3] = {0.0f, 0.0f, 1.0f};
+        const float r0[3] = {1.0f, 2.0f, -45.0f};
+        const float r1[3] = {1.0f, 2.05f, -45.0f};
+        se::LatchRec lr;
+        lr.step(10, r0, a0, a2, 1, 1, 1000);
+        check(!lr.step(11, r0, a0, a2, 1, 1, 1100) && lr.lastMovedMs == 0, "v14.12 by address: a still record is not moved");
+        check(lr.step(12, r1, a0, a2, 1, 1, 1200) && lr.lastMovedMs == 1200, "v14.12 by address: a 5 cm move is a move");
+        check(!lr.step(14, r0, a0, a2, 1, 1, 1400) && lr.lastMovedMs == 1200, "v14.12 by address: a missing frame re-bases without counting");
+        const float v[3] = {123.0f, -40.0f, 900.0f};
+        const float shell[3] = {0.0f, 0.0f, 0.0f};
+        const float rec[3] = {5.0f, 6.0f, -45.0f};
+        const float relA[3] = {rec[0] - shell[0], rec[1] - shell[1], rec[2] - shell[2]};
+        const float relB[3] = {rec[0] + v[0] - (shell[0] + v[0]), rec[1] + v[1] - (shell[1] + v[1]), rec[2] + v[2] - (shell[2] + v[2])};
+        se::LatchRec fs;
+        fs.step(1, relA, a0, a2, 1, 1, 100);
+        check(!fs.step(2, relB, a0, a2, 1, 1, 200) && fs.lastMovedMs == 0, "v14.12 by address: a frame shift of the record and the shell together is not motion");
+    }
+    {
+        // The lift moving 8 s (1.0-8.9 s) then still: the seal comes 2 s after its last move; the latch's set (pad + lift) is read by address each tick.
         se::SealState st = descended();
         se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::LatchSet set;
+        set.latched = true;
+        set.n = 2;
+        std::snprintf(set.recs[0].name, sizeof(set.recs[0].name), "%s", "LandingPadMediumA");
+        set.recs[0].addr = 0x1;
+        std::snprintf(set.recs[1].name, sizeof(set.recs[1].name), "%s", "Lift_1");
+        set.recs[1].addr = 0x5;
+        const float a0[3] = {1.0f, 0.0f, 0.0f};
+        const float a2[3] = {0.0f, 0.0f, 1.0f};
         uint64_t req = 0;
         for (uint64_t tt = 200; tt <= 30000; tt += 100) {
             const uint32_t frame = static_cast<uint32_t>(tt / 100);
-            const bool liftMoving = tt >= 1000 && tt <= 8900;   // 8 s of moving: 80% of the 10 s window, not continuous
-            for (int i = 0; i < 60; ++i) {
-                char nm[48] = {};
-                if (i == 55) std::snprintf(nm, sizeof(nm), "%s", "Lift_55");
-                else std::snprintf(nm, sizeof(nm), "Structure_%d", i);
-                float rel[3] = {static_cast<float>(i), 0.0f, 0.0f};
-                if (i == 55 && liftMoving) rel[2] = (frame % 2 == 0) ? 0.1f : 0.0f;   // 10 cm every frame
-                bay.note(0x1000u + static_cast<uintptr_t>(i), nm, rel, a0, a2, 1, 1, frame, tt);
-            }
+            float liftRel[3] = {5.0f, 6.0f, -45.0f};
+            if (tt >= 1000 && tt <= 8900) liftRel[2] = (frame % 2 == 0) ? -44.9f : -45.0f;   // 10 cm every frame
+            const float padRel[3] = {0.0f, 0.0f, -45.0f};
+            set.recs[0].step(frame, padRel, a0, a2, 1, 1, tt);
+            set.recs[1].step(frame, liftRel, a0, a2, 1, 1, tt);
+            set.recomputeMotion();
             se::SealInputs in = quiet(tt);
-            in.bayLastMotionMs = bay.lastMotionMs;
+            in.bayLastMotionMs = set.lastMotionMs;
+            in.padLastMotionMs = set.padLastMotionMs();
             if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
         }
-        check(bay.count() == 60 && req == 8900 + se::kBayStillMs,
-              "v14.11: a 60-record bay with the lift (record 55) still moving does not seal; it seals 2 s after the lift stops");
+        check(req == 8900 + se::kBayStillMs && !st.fallback, "v14.12: the lift moving 8 s then still: sealed 2 s after its last move");
     }
     {
-        // The table is full: 600 ordinary records, 448 kept, the rest counted; the overflow is reported once; a priority Lift still gets in.
-        se::BayWatch bay;
-        const float a0[3] = {1.0f, 0.0f, 0.0f};
-        const float a2[3] = {0.0f, 0.0f, 1.0f};
-        const float rel[3] = {0.0f, 0.0f, 0.0f};
-        for (uint32_t i = 0; i < 600; ++i) {
-            char nm[48] = {};
-            std::snprintf(nm, sizeof(nm), "Structure_%u", static_cast<unsigned>(i));
-            bay.note(0x2000u + i, nm, rel, a0, a2, 1, 1, 1, 100);
-        }
-        check(bay.ordinaryN == se::kBayWatchOrdinaryRoom && bay.dropped == 600 - se::kBayWatchOrdinaryRoom,
-              "v14.11 table full: 448 ordinary records kept, the rest counted as not watched");
-        uint32_t n = 0;
-        check(bay.takeOverflow(&n) && n == 600 - se::kBayWatchOrdinaryRoom && !bay.takeOverflow(&n),
-              "v14.11 table full: the overflow is reported once");
-        bay.note(0x9000u, "Lift_1", rel, a0, a2, 1, 1, 1, 100);
-        check(bay.priorityN == 1 && bay.find(0x9000u) != nullptr && bay.find(0x9000u)->priority,
-              "v14.11 table full: a priority name still gets a slot");
-    }
-    {
-        // A held pad absence does not reset the bay clock: the seal still comes 2 s after the last motion (the absent frames are held).
+        // A held pad absence does not reset the bay clock: the seal still comes 2 s after the last bay motion (the absent frames are held).
         se::SealState st = descended();
         se::ReleaseWhy w = se::ReleaseWhy::kNone;
         uint64_t req = 0;
@@ -615,10 +653,10 @@ int main(int argc, char** argv) {
             }
             if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
         }
-        check(req == 5000 + se::kBayStillMs, "v14.11: a held pad absence does not reset the bay clock: sealed 2 s after the last bay motion");
+        check(req == 5000 + se::kBayStillMs, "v14.12: a held pad absence does not reset the bay clock: sealed 2 s after the last bay motion");
     }
     {
-        // The own pad's own still watch: the pad moved at 4 s, the bay is still: the seal waits for the pad (2 s after its move).
+        // The own pad must be still too: the bay still from 3 s, the pad moves at 4 s; the seal waits for the pad (2 s after its move).
         se::SealState st = descended();
         se::ReleaseWhy w = se::ReleaseWhy::kNone;
         uint64_t req = 0;
@@ -628,22 +666,10 @@ int main(int argc, char** argv) {
             in.padLastMotionMs = tt >= 4000 ? 4000 : 0;
             if (se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage && req == 0) req = tt;
         }
-        check(req == 4000 + se::kBayStillMs, "v14.11: the own pad must be still for 2 s too: sealed 2 s after the pad's last move");
-    }
-    {
-        // PadWatch: a still pad is not moved; a 5 cm move is; a missing frame re-bases without counting.
-        const float a0[3] = {1.0f, 0.0f, 0.0f};
-        const float a2[3] = {0.0f, 0.0f, 1.0f};
-        const float r0[3] = {1.0f, 2.0f, -45.0f};
-        const float r1[3] = {1.0f, 2.05f, -45.0f};
-        se::PadWatch pw;
-        pw.step(10, r0, a0, a2, 1, 1, 1000);
-        check(!pw.step(11, r0, a0, a2, 1, 1, 1100) && pw.lastMovedMs == 0, "v14.11 pad watch: a still pad is not moved");
-        check(pw.step(12, r1, a0, a2, 1, 1, 1200) && pw.lastMovedMs == 1200, "v14.11 pad watch: a 5 cm move is a move");
-        check(!pw.step(14, r0, a0, a2, 1, 1, 1400) && pw.lastMovedMs == 1200, "v14.11 pad watch: a missing frame re-bases without counting");
+        check(req == 4000 + se::kBayStillMs, "v14.12: the own pad must be still for 2 s too: sealed 2 s after the pad's last move");
     }
 
-    // ---- Built v14.9: a pad absent for a frame or two keeps the still clock (the flight's 97 s re-seal) --------------------------------------
+    // ---- Built v14.9: a pad absent    // ---- Built v14.9: a pad absent for a frame or two keeps the still clock (the flight's 97 s re-seal) --------------------------------------
     {
         // The pad is missing from the store one frame in every five while the still clock runs: it still seals at 6.1 s (the clock is not reset).
         se::SealState st = descended();   // moved, the still clock from 100 ms

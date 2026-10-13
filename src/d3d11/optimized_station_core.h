@@ -1006,8 +1006,6 @@ constexpr uint64_t kBayStillTimeoutMs = 30000;
 constexpr float kBayWatchMinM = 5.0f;
 constexpr float kBayPosM = 0.03f;
 constexpr float kBayRotDeg = 0.5f;
-constexpr uint64_t kContinuousWindowMs = 10000;
-constexpr uint32_t kContinuousMinFrames = 10;
 // The camera has left the held box by more than this: the seal is released (riding the elevator down, an external camera flying out).
 constexpr float kCameraLeaveM = 2.0f;
 // Built v14.7: the camera counts in both directions over this many consecutive frames: it must be outside the held box for this long to release,
@@ -1120,35 +1118,6 @@ struct ShipWatch {
     }
 };
 
-// Built v14.10: the continuous-mover window. Over a window of kContinuousWindowMs, a record that moved on more than 80% of its compared frames (at least
-// kContinuousMinFrames of them) is continuous. step() returns true once, when the record becomes continuous.
-struct MoverWindow {
-    bool started = false;
-    uint64_t startMs = 0;
-    uint32_t seen = 0;
-    uint32_t moved = 0;
-    bool continuous = false;
-    bool step(bool movedNow, uint64_t nowMs) noexcept {
-        if (continuous) return false;
-        if (!started) {
-            started = true;
-            startMs = nowMs;
-        }
-        ++seen;
-        if (movedNow) ++moved;
-        if (nowMs < startMs + kContinuousWindowMs) return false;
-        const bool cont = seen >= kContinuousMinFrames && moved * 10u > seen * 8u;
-        startMs = nowMs;
-        seen = 0;
-        moved = 0;
-        if (cont) {
-            continuous = true;
-            return true;
-        }
-        return false;
-    }
-};
-
 // Built v14.10: the angle between two unit axes, degrees.
 inline float axisAngleDeg(const float a[3], const float b[3]) noexcept {
     float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -1168,176 +1137,40 @@ inline bool poseMoved(const float prevRel[3], const float rel[3], const float pr
     return axisAngleDeg(prevA0, a0) > kBayRotDeg || axisAngleDeg(prevA2, a2) > kBayRotDeg;
 }
 
-// Built v14.11: the bay watch. The table is fixed: kBayWatchSlots records, in two regions. Ordinary records take the first
-// kBayWatchOrdinaryRoom slots; the priority names (LandingPad*, Lift*, BlastShield*, HangarGate*, TurboLift*) take the reserved room after them,
-// so a full table never loses the bay's structures. A record that does not fit is counted and not watched; the overflow is reported once.
-constexpr size_t kBayWatchSlots = 512;
-constexpr size_t kBayWatchPriorityRoom = 64;
-constexpr size_t kBayWatchOrdinaryRoom = kBayWatchSlots - kBayWatchPriorityRoom;
+// Built v14.12: the bay's mechanism, latched once per descent. The own pad; the other pads of its size within kLatchLateralM of the shaft; and the
+// mechanism records (Lift*, TurboLift*, BlastShield*, HangarGate*) within kLatchLateralM of the shaft and along it within the box's span. The own pad
+// is first; at most kLatchCap records. Each is read by address each frame (LatchRec::step); nothing else is watched.
+constexpr size_t kLatchCap = 16;
+constexpr size_t kLatchCandCap = 64;
+constexpr float kLatchLateralM = 60.0f;
 
-inline bool bayWatchPriority(const char* name) noexcept {
-    return hasPrefixNoCase(name, "LandingPad") || hasPrefixNoCase(name, "Lift") || hasPrefixNoCase(name, "BlastShield") ||
-           hasPrefixNoCase(name, "HangarGate") || hasPrefixNoCase(name, "TurboLift");
+struct LatchCand {
+    uintptr_t addr = 0;
+    char name[48] = {};
+    float centre[3] = {};
+};
+
+inline bool mechanismName(const char* name) noexcept {
+    return hasPrefixNoCase(name, "Lift") || hasPrefixNoCase(name, "TurboLift") || hasPrefixNoCase(name, "BlastShield") ||
+           hasPrefixNoCase(name, "HangarGate");
 }
 
-struct BayWatchRec {
+// The distance of c from the shaft line through o along the unit up axis, and the position of c along that axis.
+inline float shaftLateralM(const float c[3], const float o[3], const float up[3]) noexcept {
+    const float d[3] = {c[0] - o[0], c[1] - o[1], c[2] - o[2]};
+    const float a = d[0] * up[0] + d[1] * up[1] + d[2] * up[2];
+    const float l[3] = {d[0] - a * up[0], d[1] - a * up[1], d[2] - a * up[2]};
+    return std::sqrt(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+}
+
+inline float shaftAlongM(const float c[3], const float o[3], const float up[3]) noexcept {
+    return (c[0] - o[0]) * up[0] + (c[1] - o[1]) * up[1] + (c[2] - o[2]) * up[2];
+}
+
+// One latched record: its address, name, and its centre relative to the shell and its axes at its last reading.
+struct LatchRec {
     uintptr_t addr = 0;
-    uint32_t stamp = 0;              // the frame of the last reading
-    float rel[3] = {};               // the centre relative to the shell (a frame shift of both cancels)
-    float ax0[3] = {};
-    float ax2[3] = {};
-    uint8_t ps = 4;                  // the centre sources of that reading
-    uint8_t ss = 4;
-    uint64_t lastMovedMs = 0;
-    bool haveMotion = false;
-    bool continuous = false;
-    bool priority = false;
     char name[48] = {};
-    MoverWindow win;
-};
-
-enum class NoteOutcome : uint8_t { kNotWatched = 0, kRead = 1, kMoved = 2, kContinuous = 3 };
-
-struct BayWatch {
-    BayWatchRec recs[kBayWatchSlots];
-    size_t ordinaryN = 0;
-    size_t priorityN = 0;
-    uint64_t lastMotionMs = 0;       // the last time a non-continuous watched record moved (0: none)
-    uint32_t dropped = 0;            // records that did not fit (the table was full)
-    bool overflowPending = false;
-    bool overflowReported = false;
-    char continuousName[48] = {};    // the record that became continuous in the last note
-
-    size_t count() const noexcept { return ordinaryN + priorityN; }
-    BayWatchRec& at(size_t i) noexcept { return i < ordinaryN ? recs[i] : recs[kBayWatchOrdinaryRoom + (i - ordinaryN)]; }
-    const BayWatchRec& at(size_t i) const noexcept { return i < ordinaryN ? recs[i] : recs[kBayWatchOrdinaryRoom + (i - ordinaryN)]; }
-
-    void reset() noexcept {
-        ordinaryN = 0;
-        priorityN = 0;
-        lastMotionMs = 0;
-        dropped = 0;
-        overflowPending = false;
-        overflowReported = false;
-        continuousName[0] = '\0';
-    }
-
-    BayWatchRec* find(uintptr_t addr) noexcept {
-        for (size_t i = 0; i < count(); ++i) {
-            if (at(i).addr == addr) return &at(i);
-        }
-        return nullptr;
-    }
-
-    // Reads one record of the frame. The first read of a record adds it (or counts it dropped). A reading one frame after the last one, from the same
-    // centre sources, is compared: moved when the centre or an axis moved (poseMoved); a missing frame or another source re-bases without counting.
-    NoteOutcome note(uintptr_t addr, const char* name, const float rel[3], const float a0[3], const float a2[3], uint8_t ps, uint8_t ss,
-                     uint32_t frame, uint64_t nowMs) noexcept {
-        continuousName[0] = '\0';
-        BayWatchRec* r = find(addr);
-        if (r == nullptr) {
-            const bool prio = bayWatchPriority(name);
-            if (prio) {
-                if (priorityN >= kBayWatchPriorityRoom) {
-                    drop();
-                    return NoteOutcome::kNotWatched;
-                }
-                r = &recs[kBayWatchOrdinaryRoom + priorityN++];
-            } else {
-                if (ordinaryN >= kBayWatchOrdinaryRoom) {
-                    drop();
-                    return NoteOutcome::kNotWatched;
-                }
-                r = &recs[ordinaryN++];
-            }
-            *r = BayWatchRec{};
-            r->addr = addr;
-            r->priority = prio;
-            std::snprintf(r->name, sizeof(r->name), "%s", name);
-        }
-        if (r->stamp == frame) return NoteOutcome::kRead;   // read this frame already
-        NoteOutcome out = NoteOutcome::kRead;
-        if (r->stamp != 0 && r->stamp + 1 == frame && r->ps == ps && r->ss == ss && !r->continuous) {
-            const bool moved = poseMoved(r->rel, rel, r->ax0, a0, r->ax2, a2);
-            if (r->win.step(moved, nowMs)) {
-                r->continuous = true;
-                std::snprintf(continuousName, sizeof(continuousName), "%s", r->name);
-                out = NoteOutcome::kContinuous;
-            } else if (moved) {
-                r->lastMovedMs = nowMs;
-                r->haveMotion = true;
-                if (nowMs > lastMotionMs) lastMotionMs = nowMs;
-                out = NoteOutcome::kMoved;
-            }
-        }
-        std::memcpy(r->rel, rel, sizeof(r->rel));
-        std::memcpy(r->ax0, a0, sizeof(r->ax0));
-        std::memcpy(r->ax2, a2, sizeof(r->ax2));
-        r->stamp = frame;
-        r->ps = ps;
-        r->ss = ss;
-        return out;
-    }
-
-    void drop() noexcept {
-        ++dropped;
-        if (!overflowReported) overflowPending = true;
-    }
-
-    // True once when the table first overflowed; *count is the records not watched so far.
-    bool takeOverflow(uint32_t* count) noexcept {
-        if (!overflowPending) return false;
-        overflowPending = false;
-        overflowReported = true;
-        *count = dropped;
-        return true;
-    }
-
-    // The names of the watched records that moved within kBayStillMs (up to maxNames), joined with ", ".
-    void movers(uint64_t now, char* out, size_t cap, size_t maxNames) const noexcept {
-        out[0] = '\0';
-        size_t used = 0;
-        size_t named = 0;
-        for (size_t i = 0; i < count() && named < maxNames; ++i) {
-            const BayWatchRec& r = at(i);
-            if (r.continuous || !r.haveMotion || now > r.lastMovedMs + kBayStillMs) continue;
-            if (used + 2 >= cap) break;
-            const int n = std::snprintf(out + used, cap - used, "%s%s", named > 0 ? ", " : "", r.name);
-            if (n < 0) break;
-            used += static_cast<size_t>(n);
-            ++named;
-        }
-    }
-
-    size_t watchedCount() const noexcept {
-        size_t n = 0;
-        for (size_t i = 0; i < count(); ++i) {
-            if (!at(i).continuous) ++n;
-        }
-        return n;
-    }
-
-    // The watched record that moved last (empty when none has moved).
-    void lastMover(char* out, size_t cap) const noexcept {
-        out[0] = '\0';
-        uint64_t latest = 0;
-        bool any = false;
-        for (size_t i = 0; i < count(); ++i) {
-            const BayWatchRec& r = at(i);
-            if (r.continuous || !r.haveMotion) continue;
-            if (!any || r.lastMovedMs >= latest) {
-                any = true;
-                latest = r.lastMovedMs;
-                std::snprintf(out, cap, "%s", r.name);
-            }
-        }
-    }
-};
-
-// Built v14.11: the own pad's own still watch: its centre relative to the shell and its orientation, read in each frame the pad is in the store.
-// A reading one frame after the last, from the same sources, is compared; a missing frame re-bases without counting.
-struct PadWatch {
-    bool have = false;
     uint32_t stamp = 0;
     float rel[3] = {};
     float ax0[3] = {};
@@ -1345,14 +1178,18 @@ struct PadWatch {
     uint8_t ps = 4;
     uint8_t ss = 4;
     uint64_t lastMovedMs = 0;
-    // Returns true when the pad moved since its last reading.
+    bool haveMotion = false;
+    // Reads the record for this frame: a reading one frame after the last, from the same sources, is compared (poseMoved); a missing frame or another
+    // source re-bases without counting. Returns true when the record moved.
     bool step(uint32_t frame, const float r[3], const float a0[3], const float a2[3], uint8_t p, uint8_t s, uint64_t nowMs) noexcept {
         bool moved = false;
-        if (have && stamp + 1 == frame && ps == p && ss == s) {
+        if (stamp != 0 && stamp + 1 == frame && ps == p && ss == s) {
             moved = poseMoved(rel, r, ax0, a0, ax2, a2);
-            if (moved) lastMovedMs = nowMs;
+            if (moved) {
+                lastMovedMs = nowMs;
+                haveMotion = true;
+            }
         }
-        have = true;
         stamp = frame;
         std::memcpy(rel, r, sizeof(rel));
         std::memcpy(ax0, a0, sizeof(ax0));
@@ -1362,6 +1199,88 @@ struct PadWatch {
         return moved;
     }
 };
+
+// The latched set: the own pad (index 0) and the mechanism records. lastMotionMs is the last motion of a record other than the pad.
+struct LatchSet {
+    LatchRec recs[kLatchCap];
+    size_t n = 0;
+    bool latched = false;
+    uint64_t lastMotionMs = 0;
+
+    void reset() noexcept {
+        n = 0;
+        latched = false;
+        lastMotionMs = 0;
+    }
+    void recomputeMotion() noexcept {
+        uint64_t m = 0;
+        for (size_t i = 1; i < n; ++i) {
+            if (recs[i].haveMotion && recs[i].lastMovedMs > m) m = recs[i].lastMovedMs;
+        }
+        lastMotionMs = m;
+    }
+    uint64_t padLastMotionMs() const noexcept { return n > 0 ? recs[0].lastMovedMs : 0; }
+    // The names of the latched records that moved within kBayStillMs, up to maxNames, joined with ", ".
+    void movers(uint64_t now, char* out, size_t cap, size_t maxNames) const noexcept {
+        out[0] = '\0';
+        size_t used = 0;
+        size_t named = 0;
+        for (size_t i = 0; i < n && named < maxNames; ++i) {
+            const LatchRec& r = recs[i];
+            if (!r.haveMotion || now > r.lastMovedMs + kBayStillMs) continue;
+            if (used + 2 >= cap) break;
+            const int w = std::snprintf(out + used, cap - used, "%s%s", named > 0 ? ", " : "", r.name);
+            if (w < 0) break;
+            used += static_cast<size_t>(w);
+            ++named;
+        }
+    }
+    // The latched record that moved last (empty when none has moved).
+    void lastMover(char* out, size_t cap) const noexcept {
+        out[0] = '\0';
+        uint64_t latest = 0;
+        bool any = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (!recs[i].haveMotion) continue;
+            if (!any || recs[i].lastMovedMs >= latest) {
+                any = true;
+                latest = recs[i].lastMovedMs;
+                std::snprintf(out, cap, "%s", recs[i].name);
+            }
+        }
+    }
+};
+
+// The latch: the own pad first (ownAddr, ownName, ownSize, at origin along up), then the candidates that qualify. A pad qualifies with the own
+// size within kLatchLateralM laterally; a mechanism record within kLatchLateralM laterally and with its along position in [alongMin, alongMax].
+// Returns the count written to out (at most kLatchCap).
+inline size_t selectMechanism(const LatchCand* cands, size_t n, uintptr_t ownAddr, const char* ownName, PadSize ownSize, const float origin[3],
+                              const float up[3], float alongMin, float alongMax, LatchRec* out) noexcept {
+    size_t k = 0;
+    if (ownAddr != 0) {
+        out[k] = LatchRec{};
+        out[k].addr = ownAddr;
+        std::snprintf(out[k].name, sizeof(out[k].name), "%s", ownName);
+        ++k;
+    }
+    for (size_t i = 0; i < n && k < kLatchCap; ++i) {
+        const LatchCand& cand = cands[i];
+        if (cand.addr == 0 || cand.addr == ownAddr) continue;
+        bool take = false;
+        if (isPadName(cand.name)) {
+            take = ownSize != PadSize::kNone && padSizeOf(cand.name) == ownSize && shaftLateralM(cand.centre, origin, up) <= kLatchLateralM;
+        } else if (mechanismName(cand.name)) {
+            const float along = shaftAlongM(cand.centre, origin, up);
+            take = shaftLateralM(cand.centre, origin, up) <= kLatchLateralM && along >= alongMin && along <= alongMax;
+        }
+        if (!take) continue;
+        out[k] = LatchRec{};
+        out[k].addr = cand.addr;
+        std::snprintf(out[k].name, sizeof(out[k].name), "%s", cand.name);
+        ++k;
+    }
+    return k;
+}
 
 // Advances the state and returns the action. With kRelease, *why says which rule released (the order of the brief: setting off, undocked,
 // Explorer Cam, camera left, pad moved, hangar changed, launch). A pad first seen lowered with no descent observed seals on the first eligible
