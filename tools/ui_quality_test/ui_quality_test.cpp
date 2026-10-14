@@ -2565,7 +2565,8 @@ void composite(Gpu& g, const Tex& frame, const uint32_t region[4], const float u
     g.ctx->CSSetShaderResources(0, 3, srvs);
     ID3D11UnorderedAccessView* uav = out.uav.Get();
     g.ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-    g.ctx->Dispatch((p.outSize[0] + 7) / 8, (p.outSize[1] + 7) / 8, 1);
+    g.ctx->Dispatch((p.outSize[0] + kUiLayerCompositeGroupX - 1) / kUiLayerCompositeGroupX,
+                    (p.outSize[1] + kUiLayerCompositeGroupY - 1) / kUiLayerCompositeGroupY, 1);
     ID3D11ShaderResourceView* nulls[3] = {};
     g.ctx->CSSetShaderResources(0, 3, nulls);
     ID3D11UnorderedAccessView* nullUav = nullptr;

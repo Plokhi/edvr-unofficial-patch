@@ -129,11 +129,12 @@ static_assert(sizeof(UiLayerCompositeParams) == 64, "the cbuffer is four 16-byte
 // thread that owns the texel) and a texel whose layer is exactly "nothing here" is left
 // untouched, so no output texture is written and the pixels the layer does not cover are
 // neither read nor written. Taken only for a frame EDVR itself rewrites in full every frame,
-// over the whole of it, on a GPU that loads typed UAVs of the frame's format. Its thread group
-// is 32x8: the 8x8 group of the out-of-place shader launches 254,000 groups at the eye's
-// size and the launch, not the memory, was the cost (ui_holo_pass_test --bench-composite:
-// 0.120 ms an eye out of place, 0.045 in place at 32x8, RTX 5090, 4032x4032).
-constexpr uint32_t kUiLayerInPlaceGroupX = 32, kUiLayerInPlaceGroupY = 8;
+// over the whole of it, on a GPU that loads typed UAVs of the frame's format. The thread group
+// of both composite shaders is 32x8: an 8x8 group launches 254,000 groups at the eye's size
+// and the launch, not the memory, was the cost (ui_holo_pass_test --bench-composite and
+// --bench-groups, RTX 5090, 4032x4032: out of place 0.120 ms an eye at 8x8, 0.090 at 32x8;
+// in place 0.045 at 32x8).
+constexpr uint32_t kUiLayerCompositeGroupX = 32, kUiLayerCompositeGroupY = 8;
 
 // The composite's format allowlist: the 8-bit families, read and written
 // through their plain UNORM view (the space the game's UI composites blend

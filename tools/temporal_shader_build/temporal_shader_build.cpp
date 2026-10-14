@@ -779,7 +779,7 @@ static void selfTest() {
     }
 
     // The UI layer's in-place composite (src/d3d11/fixed_shader_source.h kUiLayerCompositeInPlaceHlsl): new, so held to its own contract -- the symbol, source
-    // name, entry, profile and flags, the text it compiles, the 32x8 group ui_layer.cpp dispatches it with (ui_layer_shaders.h kUiLayerInPlaceGroupX/Y) and the
+    // name, entry, profile and flags, the text it compiles, the 32x8 group ui_layer.cpp dispatches it with (ui_layer_shaders.h kUiLayerCompositeGroupX/Y) and the
     // bindings it reads: the frame as a typed UAV at u0 (and no SRV of it -- a frame bound for read and write at once is the one hazard this shader must never
     // have), the layer at t1, the multiply at t2, the parameters at b0.
     {

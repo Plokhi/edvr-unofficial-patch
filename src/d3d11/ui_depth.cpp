@@ -3691,9 +3691,10 @@ bool uiDepthHologramResolve(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* 
             }
             ctx->CSSetUnorderedAccessViews(0, 1, &s.nearLightUav, nullptr);
             ctx->CSSetConstantBuffers(0, 1, &cb);
-            // One group per 8x8 block; its 64 threads are the block's pixels.
-            const uint32_t blocksW = (w + 7) / 8, blocksH = (h + 7) / 8;
-            ctx->Dispatch(blocksW, blocksH, 1);
+            // One group per 16x16 pixels: four of the 8x8 blocks the map is made of, each with its own
+            // flag and its own texel (fixed_shader_source.h kHoloNearLightCsHlsl). An odd count of blocks
+            // leaves the last group's far half writing past the map, which D3D11 drops.
+            ctx->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
             ++counts.ran;
 
             ID3D11UnorderedAccessView* zeroUav = nullptr;

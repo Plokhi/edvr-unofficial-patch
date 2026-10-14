@@ -2173,11 +2173,8 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
     ctx->CSSetShaderResources(0, 3, srvs);
     ID3D11UnorderedAccessView* uav = inPlaceUav ? inPlaceUav : e.outUav.Get();
     ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-    if (inPlaceUav)
-        ctx->Dispatch((rw + kUiLayerInPlaceGroupX - 1) / kUiLayerInPlaceGroupX,
-                      (rh + kUiLayerInPlaceGroupY - 1) / kUiLayerInPlaceGroupY, 1);
-    else
-        ctx->Dispatch((rw + 7) / 8, (rh + 7) / 8, 1);
+    ctx->Dispatch((rw + kUiLayerCompositeGroupX - 1) / kUiLayerCompositeGroupX,
+                  (rh + kUiLayerCompositeGroupY - 1) / kUiLayerCompositeGroupY, 1);
     routeEnd(ctx.Get(), qs);
     gpuCensusEnd(ctx.Get(), GpuCensusSection::DoorUiLayerComposite);
 
@@ -2205,8 +2202,8 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
                 "texture. Same arithmetic as the out-of-place composite, byte for byte "
                 "(ui_holo_pass_test). The layer line counts the in-place composites; a line that never "
                 "says 'in place' is the out-of-place path.",
-                eye == 0 ? "left" : "right", rw, rh, viewName(view), kUiLayerInPlaceGroupX,
-                kUiLayerInPlaceGroupY);
+                eye == 0 ? "left" : "right", rw, rh, viewName(view), kUiLayerCompositeGroupX,
+                kUiLayerCompositeGroupY);
         }
     }
     if (!e.doorFromPass) ++g_win.overGameImage;

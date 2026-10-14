@@ -192,7 +192,9 @@ cbuffer P : register(b0) {
     uint   useMult;    // 1: a multiply drew into M this frame
     uint2  pad;
 };
-[numthreads(8, 8, 1)]
+// 32x8 (ui_layer_shaders.h kUiLayerCompositeGroupX/Y), not 8x8: at the eye's size the 8x8 group launches 254,000 groups
+// and the launch, not the bytes, is the cost (0.120 ms an eye against 0.090).
+[numthreads(32, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= outSize.x || id.y >= outSize.y) return;
     int2 p = region.xy + int2(id.xy);
@@ -231,7 +233,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 // match; a texel whose layer is exactly "nothing here" (0,0,0,1, no multiply)
 // would store its own value back and is skipped, which is also exact.
 // Needs a typed UAV load of the frame's format (D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD).
-// The group is 32x8 (ui_layer_shaders.h kUiLayerInPlaceGroupX/Y): the same shader at 8x8 is
+// The group is 32x8 (ui_layer_shaders.h kUiLayerCompositeGroupX/Y): the same shader at 8x8 is
 // launch-bound at the eye's size.
 constexpr char kUiLayerCompositeInPlaceHlsl[] = R"HLSL(
 RWTexture2D<unorm float4> Frame : register(u0);
@@ -619,6 +621,8 @@ constexpr char kHoloResolvePsHlsl[] =
     "    }\n"
     "}\n";
 
+// One 16x16 group holds four of the 8x8 blocks the map is made of (each with its own flag in groupshared and its own texel): one
+// block a group launched 63,000 groups for 3 small elements and cost 0.031 ms an eye against 0.010 (ui_holo_pass_test --bench-groups).
 constexpr char kHoloNearLightCsHlsl[] =
     "Texture2D<float4> Contribution : register(t0);\n"
     "Texture2D<float> ElementDepth : register(t1);\n"
@@ -628,9 +632,11 @@ constexpr char kHoloNearLightCsHlsl[] =
     "cbuffer HoloResolveCB : register(b0) { float floorValue; float share; uint flags; float radiusDepth;\n"
     "                                       float fillerDepth; float pad0; float pad1; float pad2; }\n"
     "float3 srgbEncode(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0/2.4) - 0.055; }\n"
-    "groupshared uint lightAny;\n"
-    "[numthreads(8,8,1)] void main(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupThreadID, uint3 gid : SV_GroupID) {\n"
-    "    if (all(tid.xy == uint2(0, 0))) lightAny = 0;\n"
+    "groupshared uint lightAny[4];\n"
+    "[numthreads(16,16,1)] void main(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupThreadID, uint3 gid : SV_GroupID) {\n"
+    "    uint blk = (tid.y >> 3) * 2u + (tid.x >> 3);\n"
+    "    uint2 loc = tid.xy & 7u;\n"
+    "    if (all(loc == uint2(0, 0))) lightAny[blk] = 0;\n"
     "    GroupMemoryBarrierWithGroupSync();\n"
     "    bool linearBlend = (flags & 1u) != 0;\n"
     "    bool haveTarget = (flags & 2u) != 0;\n"
@@ -655,11 +661,11 @@ constexpr char kHoloNearLightCsHlsl[] =
     "                float lumaF = dot(f, float3(0.299, 0.587, 0.114));\n"
     "                ok = lumaE >= share * lumaF;\n"
     "            }\n"
-    "            if (ok) InterlockedOr(lightAny, 1u);\n"
+    "            if (ok) InterlockedOr(lightAny[blk], 1u);\n"
     "        }\n"
     "    }\n"
     "    GroupMemoryBarrierWithGroupSync();\n"
-    "    if (all(tid.xy == uint2(0, 0))) NearLight[gid.xy] = lightAny ? 1.0 : 0.0;\n"
+    "    if (all(loc == uint2(0, 0))) NearLight[gid.xy * 2u + uint2(blk & 1u, blk >> 1u)] = lightAny[blk] ? 1.0 : 0.0;\n"
     "}\n";
 
 constexpr char kHoloMarkerReticleDepthPsHlsl[] =
