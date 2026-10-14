@@ -159,6 +159,10 @@ from pathlib import Path
 # cmd treats everything after the label's first whitespace as a comment, so
 # ":rig_x anything" is still the label rig_x and must still be run.
 LABEL = re.compile(r"^:rig_([A-Za-z0-9_]+)(?:\s.*)?$")
+# Any label, not only a rig's: the code that a subroutine runs on into.
+ANY_LABEL = re.compile(r"^:(?!:)([A-Za-z0-9_]+)")
+# A last command that returns for sure: no `|| exit /b 1` after it.
+RETURNS = re.compile(r"^(exit\s+/b\b|goto\s)", re.IGNORECASE)
 SOURCE = re.compile(r'\.cpp"')
 BUILD_GUARD = 'if "%EDVR_RIG_STEP%"=="build" exit /b 0'
 
@@ -297,11 +301,36 @@ def check_system_d3d11(rigs):
                                 for rig, line, output in bound)))
 
 
+def runs_on_into(lines, rig, labels):
+    """The label cmd runs on into when rig's subroutine ends without an
+    unconditional exit /b or goto, else None. labels is (line, name) for every
+    label in the script. cmd does not stop at the next label: the rest of the
+    script runs, so a second rig runs the first one's code too. A two-step rig
+    (BUILD_GUARD) runs on into its own :<label>_run by design, so that is not a
+    fall-through."""
+    after = [(number, name) for number, name in labels if number > rig.line]
+    end = after[0][0] - 1 if after else len(lines)
+    body = lines[rig.line:end]
+    code = [line.strip() for line in body
+            if line.strip() and line.strip().upper() != "REM" and not line.strip().upper().startswith(("REM ", "::"))]
+    if code and RETURNS.match(code[-1]):
+        return None
+    if not after:
+        return None  # the script ends there: no other rig's code follows
+    name = after[0][1]
+    if name == rig.label + "_run" and any(line.strip() == BUILD_GUARD for line in body):
+        return None
+    return ":" + name
+
+
 def parse_rigs(text):
     """Every :rig_<label> in the script, in order, with the number of sources
     its subroutine compiles, whether it honours EDVR_RIG_STEP, and the links
-    that would bind build\\d3d11.dll (the text up to the next label)."""
+    that would bind build\\d3d11.dll (the text up to the next label). A rig
+    that runs on into other code is refused: see runs_on_into."""
     lines = text.splitlines()
+    labels = [(number, match.group(1)) for number, line in enumerate(lines, 1)
+              for match in [ANY_LABEL.match(line)] if match]
     rigs, seen = [], {}
     for number, line in enumerate(lines, 1):
         match = LABEL.match(line)
@@ -321,6 +350,11 @@ def parse_rigs(text):
         rig.sources = len(SOURCE.findall("\n".join(body)))
         rig.two_step = any(line.strip() == BUILD_GUARD for line in body)
         rig.d3d11_in_build = d3d11_in_build(body, rig.line + 1)
+        into = runs_on_into(lines, rig, labels)
+        if into is not None:
+            raise ValueError(":rig_%s (line %d) has no unconditional exit /b at its end, so cmd runs on into %s: "
+                             "that code runs in this rig too, and in the rig it belongs to. End the subroutine "
+                             "with exit /b 0" % (rig.label, rig.line, into))
     return rigs
 
 
@@ -1134,6 +1168,33 @@ def self_test():
         except ValueError:
             pass
 
+    # A rig whose last command is not an unconditional exit /b runs on into the
+    # next label's code: ui_quality_test did, into aa_off_test, and both built
+    # seed_test.exe at once (LNK1104, 2026-10-14). Refused at the plan.
+    def runs_on(*body):
+        try:
+            parse_rigs("\n".join(["@echo off", "exit /b 0", ":run_rig", "call :rig_%EDVR_RIG%", "exit /b 0", ""]
+                                 + list(body)) + "\n")
+        except ValueError as error:
+            return str(error)
+        return None
+
+    text = runs_on(":rig_five", "cl.exe /Fe\"%BUILD%\\five.exe\" \"five.cpp\"", "\"%BUILD%\\five.exe\" --self-test || exit /b 1",
+                   ":rig_six", "exit /b 0")
+    check(text is not None,
+          "a rig ending in || exit /b 1 runs on into the next label, so it is refused: %r" % text)
+    check(text is not None and ":rig_five (line " in text and "cmd runs on into :rig_six" in text,
+          "the refusal names the rig, its line and the label it runs into: %r" % text)
+    check(runs_on(":rig_five", "exit /b 0", ":rig_six", "exit /b 0") is None,
+          "a rig ending in an unconditional exit /b is accepted")
+    check(runs_on(":rig_five", "echo five", "if errorlevel 1 exit /b 1") is None,
+          "a rig at the end of the script runs on into nothing, so it is accepted")
+    check(runs_on(":rig_five", BUILD_GUARD, "echo build", ":five_run", "echo run", "exit /b 0") is None,
+          "a two-step rig runs on into its own :<label>_run by design, so it is accepted")
+    check(runs_on(":rig_five", "exit /b 0", ":rig_six", "exit /b 0") is None
+          and runs_on(":rig_five", "exit /b 0", ":helper", "exit /b 0") is None,
+          "a plain helper label after an exiting rig is not a fall-through")
+
     # A rig that links d3d11.lib into an output directly in %BUILD% binds
     # build\d3d11.dll, EDVR's own proxy, and is refused at the plan (I-8).
     def script_of(*body):
@@ -1177,7 +1238,7 @@ def self_test():
           is not None
           and refusal(":rig_five", 'cl.exe /Fe"%BUILD%\\five.exe" "t.cpp" d3d11.lib', "exit /b 0") is not None,
           "a plain d3d11.lib input, which cl hands to the linker too, is read as well")
-    text = refusal(":rig_a", one, ":rig_b", one.replace("one.exe", "b.exe"), "exit /b 0")
+    text = refusal(":rig_a", one, "exit /b 0", ":rig_b", one.replace("one.exe", "b.exe"), "exit /b 0")
     check(text is not None and ":rig_a," in text and ":rig_b," in text and text.startswith("2 rig link(s)"),
           "every offending rig is named: %r" % text)
     for why, body in (

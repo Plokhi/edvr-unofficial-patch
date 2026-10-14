@@ -3384,6 +3384,10 @@ cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNO
 if errorlevel 1 ( echo [edvr] ERROR: ui quality test build failed & exit /b 1 )
 "%BUILD%\ui_quality_test.exe" --dry-run || exit /b 1
 "%BUILD%\ui_quality_test.exe" --self-test || exit /b 1
+REM The subroutine ends here. Without this exit cmd ran on into :rig_aa_off_test, so this rig also built
+REM and ran aa_off_test and its seed test: the same outputs the aa_off_test rig writes at the same time.
+REM A link of seed_test.exe lost that race (LNK1104, 2026-10-14). run_jobs.py refuses a rig like this.
+exit /b 0
 REM The AA-off draw path (draw_fast_path.h), the Map timer's sampler and its exact call counts (map_wait.h,
 REM map_wait_sample.h), and the GPU timing guard that keeps off-state draw thunks from calling it (gpu_frame_timing.h),
 REM 2026-10-13. The Map timer is linked from its own source; the GPU call is a counting stub.
