@@ -3,6 +3,8 @@
 
 struct ID3D11DeviceContext;
 
+struct ID3D11DeviceContext;
+
 namespace edvr {
 
 // How much of a frame's GPU time is EDVR's own work, feature by feature
@@ -272,9 +274,12 @@ void gpuCensusNoteEyeRun() noexcept;
 // Quiescent cleanup, alongside the other feature modules' Shutdown().
 void gpuCensusShutdown() noexcept;
 
-// The overlay's frame GPU time (2026-10-14), with the application-frame clock off: the last completed frame's
-// boundary-to-boundary GPU span, from gpuCensusFrame's own frame scope (one timestamp pair a frame). False until one
-// pair has completed. The span includes GPU idle between the frame's commands.
+// The overlay's frame GPU work span (2026-10-14), with the application-frame clock off: the last completed frame's span from
+// its first GPU command to the end of EDVR's door work, in gpuCensusFrame's frame scope (one timestamp pair a frame). False until
+// one pair has completed. The span includes GPU idle inside the frame.
 bool gpuCensusFrameSpan(double* ms, unsigned* samples) noexcept;
+// The door end (device_hook.cpp, hookedPresent, before the real Present): closes an open work span. Owner context only.
+void gpuCensusFrameWorkEnd(ID3D11DeviceContext* ctx) noexcept;
+bool gpuCensusFrameWorkOpen() noexcept;
 
 } // namespace edvr

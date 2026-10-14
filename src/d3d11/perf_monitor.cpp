@@ -204,6 +204,7 @@ struct State {
     // The Present block noted by the swapchain hook, for the frame about
     // to be ringed.
     float    pendingPresentWaitMs = 0.0f;
+    unsigned frameWorkSeen = 0;   // the census's work-span sample count last fed to the history (2026-10-14)
 
     // The long-frame book (freeze_book.h): every Present gap over twice the period that reached the judge,
     // what it turned out to be, what was written, and the worst few. Written on the render thread, read at
@@ -1098,6 +1099,16 @@ void perfMonitorFrame(ID3D11Device* dev) {
         const NativeTimingSnapshot timing = nativeTimingSnapshot();
         const GpuFrameSnapshot gpu = gpuFrameSnapshot();
         s.nativeHistory.observe(true, timing, gpu, historyNow);
+        // With the application clock off (2026-10-14), the frame's GPU work span is the application-render series' source: one sample
+        // a completed pair, once. Its benchmark join is not made (the native benchmark joins by native frame sequence).
+        if (!gpu.enabled) {
+            double workMs = 0.0;
+            unsigned workSamples = 0;
+            if (gpuCensusFrameSpan(&workMs, &workSamples) && workSamples != s.frameWorkSeen) {
+                s.frameWorkSeen = workSamples;
+                s.nativeHistory.noteFrameWork(workSamples, historyNow, workMs);
+            }
+        }
         if (!updateBenchmarkMetadata(s, timing, historyNow)) {
             s.nativeBenchmark.reset();
             s.nativeBenchmarkScope = 0;
@@ -1421,11 +1432,16 @@ int perfMonitorTiles(PerfTile* out, int max) {
     // GPU TIME (2026-10-14): the application-render mean when that clock is on; with it off, the census's frame GPU span
     // (boundary to boundary, one pair a frame). "--" only before the first pair has completed.
     if (native) {
-        double spanMs = 0.0;
-        const bool spanHave = gpuCensusFrameSpan(&spanMs, nullptr);
-        const bool appHave = nativeApplicationGpu.count != 0;
-        const char* reason = gpuFrameSnapshot().enabled ? noTiming : "frame GPU span: no sample yet";
-        gpuTimeTileText(appHave, appHave ? nativeApplicationGpu.meanMs : 0.0, spanHave, spanMs, reason, v, sizeof(v), sub, sizeof(sub));
+        // With the application clock off the series holds the frame GPU work span (noteFrameWork), so its mean is the span's, not the application's.
+        const bool clockOn = gpuFrameSnapshot().enabled;
+        double spanLast = 0.0;
+        const bool spanDone = gpuCensusFrameSpan(&spanLast, nullptr);
+        const bool historyHas = nativeApplicationGpu.count != 0;
+        const bool appHave = clockOn && historyHas;
+        const bool workHave = !clockOn && (historyHas || spanDone);
+        const double workMs = historyHas ? nativeApplicationGpu.meanMs : spanLast;
+        const char* reason = clockOn ? noTiming : "frame GPU work span: no sample yet";
+        gpuTimeTileText(appHave, nativeApplicationGpu.meanMs, workHave, workMs, reason, v, sizeof(v), sub, sizeof(sub));
         tile("GPU TIME", v, sub);
     }
     if (native && nativeApplicationCpu.count) {
@@ -1660,7 +1676,7 @@ void perfMonitorLocalGpuLine(char* buf, size_t bufLen) {
         if (!timing.active || !timing.firstSequence) { snprintf(buf, bufLen, "%s: native timing unavailable", label); return; }
         double spanMs = 0.0;
         if (!snap.enabled && gpuCensusFrameSpan(&spanMs, nullptr)) {
-            snprintf(buf, bufLen, "Frame GPU span: %.2f ms (D3D11; boundary to boundary, includes idle)", spanMs); return;
+            snprintf(buf, bufLen, "Frame GPU work span: %.2f ms (D3D11; first command to last; includes GPU idle inside the frame)", spanMs); return;
         }
         if (!snap.enabled) { snprintf(buf, bufLen, "%s: disabled", label); return; }
         if (!snap.haveResult) { snprintf(buf, bufLen, "%s: pending", label); return; }
@@ -1681,7 +1697,7 @@ void perfMonitorLocalGpuLine(char* buf, size_t bufLen) {
     const GpuFrameSnapshot snap = gpuFrameSnapshot();
     double spanMs = 0.0;
     if (!snap.enabled && gpuCensusFrameSpan(&spanMs, nullptr)) {
-        snprintf(buf, bufLen, "Frame GPU span: %.2f ms (D3D11; boundary to boundary, includes idle)", spanMs); return;
+        snprintf(buf, bufLen, "Frame GPU work span: %.2f ms (D3D11; first command to last; includes GPU idle inside the frame)", spanMs); return;
     }
     if (!snap.enabled) { snprintf(buf, bufLen, "Render to submit: disabled"); return; }
     if (!snap.haveResult) { snprintf(buf, bufLen, "Render to submit: pending"); return; }

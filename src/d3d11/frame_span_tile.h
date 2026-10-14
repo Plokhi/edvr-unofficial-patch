@@ -22,12 +22,19 @@ inline bool gpuTimeTileText(bool appHave, double appMeanMs, bool spanHave, doubl
     }
     if (spanHave) {
         std::snprintf(value, valueLen, "%.1f", spanMs);
-        std::snprintf(sub, subLen, "ms frame GPU span, boundary to boundary (includes GPU idle)");
+        std::snprintf(sub, subLen, "ms frame GPU work span (first command to last; includes GPU idle inside the frame)");
         return true;
     }
     std::snprintf(value, valueLen, "--");
     std::snprintf(sub, subLen, "%s", noneReason ? noneReason : "");
     return false;
+}
+
+// The work span's arithmetic (gpu_census.cpp's pair): the GPU time from the first command's timestamp to the door end's.
+// Clamped at zero: a pair the GPU reports out of order is not a negative frame.
+inline double frameWorkSpanMs(double firstCommandMs, double doorEndMs) {
+    const double span = doorEndMs - firstCommandMs;
+    return span > 0.0 ? span : 0.0;
 }
 
 }  // namespace edvr

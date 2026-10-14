@@ -21,6 +21,7 @@ static_assert(edvr::kFrameSpanSlots * 2u <= edvr::DisjointClock::kLeases,
               "the frame span's timestamps fit the disjoint clock's lease budget");
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -33,7 +34,12 @@ void gpuFrameCommand(ID3D11DeviceContext*) noexcept { ++g_gpuCommandCalls; }
 namespace detail {
 thread_local bool g_gpuFrameInternal = false;
 std::atomic<bool> g_gpuFrameCommandLive{false};
+std::atomic<bool> g_frameWorkArmed{false};
 }  // namespace detail
+
+// The stub of gpu_census.cpp's first-command hook (2026-10-14), counting the calls the armed branch makes.
+static unsigned g_frameWorkCalls = 0;
+void frameWorkFirstCommand(ID3D11DeviceContext*) noexcept { ++g_frameWorkCalls; }
 
 }  // namespace edvr
 
@@ -188,6 +194,16 @@ void testMapTotals() {
 // Cut D: the inline guard. With the instrument off, the thunks make no call; on, every call is made.
 void testGpuGuard() {
     using namespace edvr;
+    // The work span's arm (2026-10-14): one more relaxed load in the same gate. Armed, every command reaches the first-command
+    // hook; disarmed, none does, and the frame's first command is the one that begins the span.
+    detail::g_frameWorkArmed.store(false, std::memory_order_relaxed);
+    g_frameWorkCalls = 0;
+    for (int i = 0; i < 100; ++i) gpuFrameCommandIfLive(nullptr);
+    check(g_frameWorkCalls == 0, "work span: disarmed, no command reaches the first-command hook");
+    detail::g_frameWorkArmed.store(true, std::memory_order_relaxed);
+    for (int i = 0; i < 100; ++i) gpuFrameCommandIfLive(nullptr);
+    check(g_frameWorkCalls == 100, "work span: armed, every command reaches the first-command hook");
+    detail::g_frameWorkArmed.store(false, std::memory_order_relaxed);
     detail::g_gpuFrameCommandLive.store(false, std::memory_order_relaxed);
     g_gpuCommandCalls = 0;
     for (int i = 0; i < 1000; ++i) gpuFrameCommandIfLive(nullptr);
@@ -214,9 +230,8 @@ void testGpuTimeTile() {
     // Application clock off (no app samples) and one frame span completed: a number, labelled as the span.
     shown = edvr::gpuTimeTileText(false, 0.0, true, 4.26, "reason", v, sizeof(v), sub, sizeof(sub));
     check(shown && std::strcmp(v, "4.3") == 0, "tile: app clock off with a completed frame span shows that number");
-    check(std::strstr(sub, "frame GPU span") != nullptr && std::strstr(sub, "boundary to boundary") != nullptr &&
-              std::strstr(sub, "includes GPU idle") != nullptr,
-          "tile: the span is labelled as boundary to boundary and including idle");
+    check(std::strstr(sub, "frame GPU work span (first command to last; includes GPU idle inside the frame)") != nullptr,
+          "tile: the work span carries the required label (first command to last; includes GPU idle inside the frame)");
     // Nothing completed yet: "--" with the reason, never a number.
     shown = edvr::gpuTimeTileText(false, 0.0, false, 0.0, "frame GPU span: no sample yet", v, sizeof(v), sub, sizeof(sub));
     check(!shown && std::strcmp(v, "--") == 0 && std::strcmp(sub, "frame GPU span: no sample yet") == 0,
@@ -225,6 +240,27 @@ void testGpuTimeTile() {
     char tiny[2];
     edvr::gpuTimeTileText(false, 0.0, true, 123.4, "", tiny, sizeof(tiny), sub, sizeof(sub));
     check(std::strlen(tiny) < sizeof(tiny), "tile: a short value buffer is truncated, not overrun");
+}
+
+// The work span against the frame period (2026-10-14), in a simulated slack frame: 90 Hz, the GPU idle until the game's first command,
+// then busy briefly, then idle until the next boundary. The work span is first command to door end; the boundary-to-boundary figure
+// is the frame period. The arithmetic only (frameWorkSpanMs); the GPU's own timestamps are not simulated here.
+void testFrameWorkSlack() {
+    const double period = 1000.0 / 90.0;   // 11.11 ms at 90 Hz
+    // One slack frame: the first command at 6.0 ms into the frame, the door end at 8.5 ms. The span is the work, not the period.
+    const double slack = edvr::frameWorkSpanMs(6.0, 8.5);
+    check(slack > 0.0 && slack < period, "work span: a slack frame's span is less than the frame period (11.1 ms at 90 Hz)");
+    check(std::fabs(slack - 2.5) < 1e-9, "work span: the span is the door end minus the first command");
+    // A sequence of slack frames: every span stays under the period, and the boundary-to-boundary figure would be the period each time.
+    bool allUnder = true;
+    for (int i = 0; i < 100; ++i) {
+        const double first = 4.0 + (i % 5) * 0.5;      // the GPU starts the frame's work between 4.0 and 6.0 ms
+        const double end = first + 2.0 + (i % 3) * 0.7; // and works for 2.0 to 3.4 ms
+        const double span = edvr::frameWorkSpanMs(first, end);
+        allUnder = allUnder && span > 0.0 && span < period;
+    }
+    check(allUnder, "work span: every frame of a 100-frame slack run is under the frame period");
+    check(edvr::frameWorkSpanMs(8.0, 7.0) == 0.0, "work span: an out-of-order pair clamps to zero, not a negative frame");
 }
 
 void usage() {
@@ -250,6 +286,7 @@ int main(int argc, char** argv) {
     testMapTotals();
     testGpuGuard();
     testGpuTimeTile();
+    testFrameWorkSlack();
     std::printf("aa_off_test: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

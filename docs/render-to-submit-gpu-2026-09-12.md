@@ -258,39 +258,56 @@ gate before further OpenXR implementation.
 
 
 ## 2026-10-14: the overlay's GPU time with the application clock off
+## 2026-10-14: the overlay's GPU time with the application clock off
 
 With `advanced.app_gpu_timing` off (its default since the AA-off cuts), the
 overlay's GPU TIME tile read "--" permanently: its only source was the
-application-render clock. Fixed without flipping the default back.
+application-render clock.
 
-**What it measures.** One timestamp pair a frame, from one frame boundary to
-the next: the span is the previous frame's door work and Present, the
-frame's own commands, and any GPU idle between them. It is the first-to-last
-GPU span of the frame, not the GPU's busy time. Where the GPU has slack the
-span is longer than the work; the overlay says so in its own sub-text
-("frame GPU span, boundary to boundary (includes GPU idle)").
+**Superseded in part, same day.** The first version timed one pair from frame
+boundary to frame boundary. On a 90 Hz GPU with slack that reads the frame
+period (about 11.1 ms) every frame, because it includes the idle wait for the
+next frame. The work span below replaces it.
 
-**How.** `gpuCensusFrame` (gpu_census.cpp) already opens one disjoint frame
-scope at each boundary and closes it at the next. The span's pair ends before
-the census closes that scope and begins after it opens the next, so each
-pair lies in one scope. Two queries a frame, read back four frames later
-(`GpuIntervals<kFrameSpanSlots>`, six slots). Only with the application clock
-off. Zero per-draw cost: no thunk changes.
+**What it measures.** The frame GPU work span: one timestamp pair a frame, from
+the frame's first GPU command on the owner context to the end of EDVR's door
+work, just before the real Present. Label: "frame GPU work span (first command
+to last; includes GPU idle inside the frame)". The span includes GPU idle inside
+the frame, not the idle between frames.
 
-**Overlay.** The GPU TIME tile shows the application-render mean when that
-clock has samples (unchanged). Otherwise it shows the last completed frame
-span. "--" appears only before the first pair has completed, with the reason
-"frame GPU span: no sample yet". The local GPU line shows "Frame GPU span: N ms
-(D3D11; boundary to boundary, includes idle)" in place of "disabled". With the
-clock on, its detailed lines are as they were.
+**Begin and end.**
+- Arm: `gpuCensusFrame` (gpu_census.cpp) arms the span after it opens the frame
+  scope, at the frame boundary in `presentFrameBoundary` (device_hook.cpp), which
+  runs after the real Present.
+- Begin: the first command through `gpuFrameCommandIfLive` (gpu_frame_timing.h),
+  which every command thunk already calls. One relaxed load of the arm; the
+  first command on the owner context begins the pair and disarms.
+- End: `hookedPresent` (device_hook.cpp), just before `realPresent`, after EDVR's
+  door work, via `gpuCensusFrameWorkEnd`.
+- Ordering: the scope opens after one real Present, the pair begins at the next
+  frame's first command, ends before the next real Present, and the next
+  boundary (after that Present) closes the scope. So the pair lies in one scope.
+  A fallback end at the census's close (`frameSpanEnd`) covers a pair the door
+  end did not close.
+- Not covered: the runtime's own treatment on its transfer thread (another
+  context, not timed here).
 
-**Cost.** Two timestamp queries a frame, and a poll of the pending pairs on the
-census's existing boundary. Leases: at most six pairs in flight, two
-timestamps each, inside `kLeases` = 512 (static check in aa_off_test). No
-standalone disjoint query: the span is refused rather than opening a scope of
-its own.
+**Overlay and history.** The GPU TIME tile shows the application-render mean when
+that clock is on. Off, it shows the last completed work span, and the series
+feeds `NativePerfHistory::noteFrameWork`, so the tile's window mean is the work
+span's. "--" appears only before the first pair has completed. The local GPU
+line reads "Frame GPU work span: N ms (...)". The native benchmark is not fed:
+it joins GPU observations to CPU frames by native frame sequence, which a census
+span does not carry.
 
-**Tests.** `aa_off_test`: the tile shows a number with the application clock
-off and a completed span; "--" only with no sample; the span's sub-text
-labels it; a short buffer is truncated, not overrun; the lease static check.
+**Cost.** Two timestamp queries a frame, plus one relaxed load in the command
+gate, and a poll of pending pairs on the census's boundary. Leases: at most six
+pairs in flight, two timestamps each, inside `kLeases` = 512 (static check in
+aa_off_test). No standalone disjoint query: the pair is refused rather than
+opening a scope of its own.
+
+**Tests.** `aa_off_test`: the tile shows a number with the application clock off
+and a completed span, and "--" only with no sample; the label; a short buffer; the
+arm gate; the lease check; and a simulated 90 Hz slack frame in which the work
+span is less than the frame period (the arithmetic only).
 Not flown.

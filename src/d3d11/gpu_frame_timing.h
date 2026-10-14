@@ -52,8 +52,16 @@ inline bool gpuFrameClockLive() noexcept { return detail::g_gpuFrameCommandLive.
 
 // The draw thunks' call (2026-10-13): with advanced.app_gpu_timing off, gpuFrameCommand returns on its first test, and
 // this keeps that call from being made at all -- one relaxed load per draw instead of an out-of-line call.
+// The frame's work span (2026-10-14, gpu_census.cpp): armed at the census frame boundary, and the first command issued on the
+// owner context after it begins the span. One relaxed load here, the same gate every command thunk already passes through.
+namespace detail {
+extern std::atomic<bool> g_frameWorkArmed;
+}  // namespace detail
+void frameWorkFirstCommand(ID3D11DeviceContext*) noexcept;
+
 inline void gpuFrameCommandIfLive(ID3D11DeviceContext* ctx) noexcept {
     if (gpuFrameCommandMightAct()) gpuFrameCommand(ctx);
+    if (detail::g_frameWorkArmed.load(std::memory_order_relaxed)) frameWorkFirstCommand(ctx);
 }
 
 struct GpuFrameSnapshot {
