@@ -136,7 +136,8 @@ int main(int argc, char** argv) {
     // --- 1. Nomination: nothing until Armed, the scene buffer after -----------
     //
     // The ini states no fix.transition_flash line at all: the fix has no key.
-    reinstall(scratch, "[advanced]\r\ncamera_buffer_bytes = 5376\r\ncamera_buffer_offset = 1100\r\n[log]\r\nenabled = 0\r\n");
+    SetEnvironmentVariableA("EDVR_TEST_NO_CAMERA_TAP", nullptr);
+    reinstall(scratch, "[log]\r\nenabled = 0\r\n");
     check("the tap wants vScreen's hooks with the shipped geometry", glitchFrameWantsHooks());
     // The sun-glare fix and the temporal pass read the same block through vScreen's
     // Unmap tee on this nomination, so it must not wait for, or follow, the engine fix.
@@ -202,21 +203,29 @@ int main(int argc, char** argv) {
     glitchFrameEngineWindow(false);
 
     // --- 4. Geometry before Armed ------------------------------------------------
+    //
+    // The geometry is fixed (5376 bytes, float 1100) and has no ini key: the two
+    // advanced keys that carried it were removed 2026-10-14. A stale line in an old
+    // file, whatever it says, is a line this build does not read, and the tap is the
+    // same. The test rigs' switch (EDVR_TEST_NO_CAMERA_TAP=1) is the only way off.
     {
-        struct Case { const char* name; const char* ini; bool tap; bool hooks; };
+        struct Case { const char* name; const char* ini; const char* env; bool tap; bool hooks; };
         const Case cases[] = {
-            {"no settings at all", "[log]\r\nenabled = 0\r\n", true, true},
-            {"the explicit shipped geometry", "[advanced]\r\ncamera_buffer_bytes=5376\r\ncamera_buffer_offset=1100\r\n", true, true},
-            {"buffer size 0", "[advanced]\r\ncamera_buffer_bytes=0\r\n", false, false},
-            {"offset outside the buffer", "[advanced]\r\ncamera_buffer_offset=5000\r\n", false, false},
-            {"a buffer of another size", "[advanced]\r\ncamera_buffer_bytes=4096\r\ncamera_buffer_offset=100\r\n", false, true},
-            // The key is gone: an old file that still carries it, either way, is
-            // a line this build does not read, and the tap is the same.
-            {"a stale fix.transition_flash = 0 line", "[fix]\r\ntransition_flash=0\r\n", true, true},
-            {"a stale fix.transition_flash = 1 line", "[fix]\r\ntransition_flash=1\r\n", true, true},
+            {"no settings at all", "[log]\r\nenabled = 0\r\n", nullptr, true, true},
+            {"a stale buffer size 0 line", "[advanced]\r\ncamera_buffer_bytes=0\r\n", nullptr, true, true},
+            {"a stale offset line outside the buffer", "[advanced]\r\ncamera_buffer_offset=5000\r\n", nullptr, true, true},
+            {"a stale buffer of another size", "[advanced]\r\ncamera_buffer_bytes=4096\r\ncamera_buffer_offset=100\r\n", nullptr, true, true},
+            {"a stale fix.transition_flash = 0 line", "[fix]\r\ntransition_flash=0\r\n", nullptr, true, true},
+            {"a stale fix.transition_flash = 1 line", "[fix]\r\ntransition_flash=1\r\n", nullptr, true, true},
+            {"the test switch set to 1", "[log]\r\nenabled = 0\r\n", "1", false, false},
+            {"the test switch set to 0 (only 1 switches it)", "[log]\r\nenabled = 0\r\n", "0", true, true},
+            {"the test switch set to 11 (only exactly 1)", "[log]\r\nenabled = 0\r\n", "11", true, true},
+            {"the test switch set to an empty string", "[log]\r\nenabled = 0\r\n", "", true, true},
         };
         for (const Case& c : cases) {
+            SetEnvironmentVariableA("EDVR_TEST_NO_CAMERA_TAP", c.env);
             reinstall(scratch, c.ini);
+            SetEnvironmentVariableA("EDVR_TEST_NO_CAMERA_TAP", nullptr);
             char why[256] = "";
             const bool tap = glitchFrameEngineTapAvailable(why, sizeof(why));
             check((std::string("tap availability: ") + c.name).c_str(), tap == c.tap,

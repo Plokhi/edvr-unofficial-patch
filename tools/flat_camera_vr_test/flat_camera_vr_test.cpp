@@ -1123,9 +1123,12 @@ const Golden kInjectGolden[] = {
     {"observeOffThread", "void observeOffThread(uintptr_t r0, uintptr_t camera) noexcept {", nullptr, 0xFA29885A0B99C0E6ull},
     {"preThread", "    // The thread first. The phase machine, the decision, the census and the\n",
      "    const FlatCameraGateVerdict gate = g_inject.gate.check(GetCurrentThreadId(), GetTickCount64());\n", 0x10741B8A5965C7CCull},
-    {"preFlat", "    // The VR camera census's switch: a process that observes only never leaves it (flatCameraInjectObserveFrame).\n", nullptr, 0xCED9706398525B45ull},
+    // preFlat and flatFrame were re-pinned 2026-10-14 for the kind-3 signature instrument (flat_camera_signature.h): a sampled call
+    // reads its frustum and is counted by signature at every exit (five noteSignature calls), and the 5 s tick prints one more line.
+    // Log-only; no write, no key, no change to what is injected.
+    {"preFlat", "    // The VR camera census's switch: a process that observes only never leaves it (flatCameraInjectObserveFrame).\n", nullptr, 0x20496D35BD80610Cull},
     {"postFlat", "    if (g_refreshTls.observe) {\n", nullptr, 0xD8A87AE0BF95ACF3ull},
-    {"flatFrame", "void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled) {", nullptr, 0x72226A8849CEA69Cull},
+    {"flatFrame", "void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled) {", nullptr, 0x63A413D231280E28ull},
     {"flatPause", "void flatCameraInjectPause(bool paused) {", nullptr, 0x90A83A563BF10BA2ull},
     {"flatClose", "void flatCameraInjectClose(bool phaseNonzero, bool applied, bool clean, bool sceneNamed) {", nullptr, 0x28890A6E5363AED4ull},
     {"flatReset", "void flatCameraInjectReset() {", nullptr, 0xEF58F30F176668DAull},

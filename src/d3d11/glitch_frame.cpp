@@ -1,5 +1,7 @@
 #include "glitch_frame.h"
 
+#include <windows.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -8,6 +10,7 @@
 #include "../common/frame_flag.h"
 #include "../common/log.h"
 #include "transition_flash_eye_base.h"
+#include "transition_flash_eye_base_core.h"
 
 // The camera-buffer tap of the transition-flash engine fix (glitch_frame.h).
 //
@@ -19,12 +22,35 @@
 namespace edvr {
 namespace {
 
+// Where the viewpoint lives in the game's memory: the game's 5376-byte scene
+// constant buffer, the camera origin at float 1100. Build-specific -- the engine
+// fix arms only for the game build it was made for -- so these are the engine
+// fix's own constants (they used to be two ini keys, removed 2026-10-14: nobody
+// had a reason to move them, and a wrong pair only switched the hold off).
+constexpr uint32_t kBufferBytes = tfeb::kSceneCBBytes;
+constexpr uint32_t kPosOffset = static_cast<uint32_t>(tfeb::kSceneCBOriginFloat);
+// Three floats have to fit at that offset, inside that buffer. Checked at compile
+// time now that the pair cannot be edited.
+static_assert(static_cast<uint64_t>(kPosOffset) * 4u + 12u <= kBufferBytes,
+              "the camera origin (three floats at kPosOffset) must fit inside the scene constant buffer");
+
+// The test rigs' switch to run the DLL with the tap off (a transport-only
+// install: vScreen takes no Map/Unmap hooks and has no frame boundary). It was the
+// advanced ini key "camera buffer size = 0", which a user could set and a stale
+// line could carry; an environment variable is something no ini file holds. The
+// value "1" switches it; anything else, or unset, leaves the tap on.
+constexpr const char* kTestNoTapVariable = "EDVR_TEST_NO_CAMERA_TAP";
+
+bool testSwitchesTapOff() {
+    char value[4] = {};
+    const DWORD n = GetEnvironmentVariableA(kTestNoTapVariable, value, sizeof value);
+    return n == 1 && value[0] == '1';
+}
+
 struct State {
-    // The camera buffer is observed: its size is nonzero and three floats fit at
-    // the position offset inside it. Set on every install that passes the check.
+    // The camera buffer is observed: the tap is installed. Set on every install
+    // that is not switched off by the test rigs' variable.
     bool observing = false;
-    uint32_t bufferBytes = 0;
-    uint32_t posOffset = 0;
     // Frames since install, advanced at the frame boundary. A fill carries the
     // PRE-advance value (the boundary that closes the frame records it one
     // higher); the engine fix compensates.
@@ -61,20 +87,14 @@ void glitchFrameNoteEngineFix(bool armed) {
 // glitchFrameObserve, so "armed" means the tap can deliver. It reaches the
 // engine module only when the buffer is observed (size nonzero and the position
 // offset inside it -- install below), Map nominates that buffer by size
-// (bufferBytes == the engine's 5376-byte scene CB), and the position passes the
+// (kBufferBytes == the engine's 5376-byte scene CB), and the position passes the
 // finite check per fill. This answers the static part.
 bool glitchFrameEngineTapAvailable(char* why, size_t whySize) {
     State* s = g_state;
     if (!s) { snprintf(why, whySize, "the tap is not installed"); return false; }
     if (!s->observing) {
-        snprintf(why, whySize, "the camera buffer is not observed -- camera_buffer_bytes = %u and "
-                 "camera_buffer_offset = %u do not describe a buffer holding three floats (see the "
-                 "line above)", s->bufferBytes, s->posOffset);
-        return false;
-    }
-    if (s->bufferBytes != 5376) {
-        snprintf(why, whySize, "camera_buffer_bytes = %u, but the engine fix reads the game's 5376-byte "
-                 "scene buffer", s->bufferBytes);
+        snprintf(why, whySize, "the camera buffer is not observed -- the tap is switched off "
+                 "(%s is set; the test rigs' switch)", kTestNoTapVariable);
         return false;
     }
     return true;
@@ -101,26 +121,9 @@ void installGlitchFrameFix() {
     // not inherit a stale "observing" from a geometry that has since been refused.
     s.observing = false;
 
-    Config& cfg = Config::get();
-    s.bufferBytes = static_cast<uint32_t>(cfg.getInt("advanced.camera_buffer_bytes", 5376));
-    s.posOffset = static_cast<uint32_t>(cfg.getInt("advanced.camera_buffer_offset", 1100));
-
-    if (s.bufferBytes == 0) {
-        Log::get().note("transition flash: camera-buffer tap off: the camera buffer size is zero.");
-        return;
-    }
-    // Three floats have to fit at that offset, inside that buffer.
-    //
-    // Checked here and not only at the read, so an impossible pair is refused
-    // rather than printed. Echoing a value is what makes a wrong one visible --
-    // but echoing one without checking it just states the absurdity and arms
-    // anyway: "looking for the camera at float 4294967295 of a 256-byte buffer".
-    if (static_cast<uint64_t>(s.posOffset) * 4u + 12u > s.bufferBytes) {
-        Log::get().note(
-            "transition flash: camera-buffer tap off: camera_buffer_offset %u needs three floats "
-            "inside a %u-byte buffer, which does not fit. Check [advanced] in %s; the defaults are "
-            "5376 and 1100.",
-            s.posOffset, s.bufferBytes, Config::get().iniName());
+    if (testSwitchesTapOff()) {
+        Log::get().note("transition flash: camera-buffer tap off: %s = 1 (the test rigs' switch).",
+                        kTestNoTapVariable);
         return;
     }
     s.observing = true;
@@ -129,7 +132,7 @@ void installGlitchFrameFix() {
     Log::get().note(
         "transition flash: camera-buffer tap ready: reading float %u of the %u-byte constant "
         "buffer while the engine fix has an event open.",
-        s.posOffset, s.bufferBytes);
+        kPosOffset, kBufferBytes);
 }
 
 bool glitchFrameWantsHooks() {
@@ -143,7 +146,7 @@ bool glitchFrameWantsBuffer(uint32_t bytes) {
     // armed: vScreen's Unmap tee hands the same block to the sun-glare fix and
     // the temporal pass, which depend on this nomination. The tap itself stays
     // idle until an event window opens (glitchFrameObserve).
-    return s && s->observing && bytes == s->bufferBytes;
+    return s && s->observing && bytes == kBufferBytes;
 }
 
 void glitchFrameObserve(const void* data, uint32_t bytes, const void* /*resource*/) {
@@ -151,15 +154,9 @@ void glitchFrameObserve(const void* data, uint32_t bytes, const void* /*resource
     if (!s || !s->observing) return;
     // Idle: three relaxed flag tests, nothing recorded.
     if (!g_engineWindowOpen.load(std::memory_order_relaxed)) return;
-    if (bytes != s->bufferBytes) return;
-    // Widened deliberately. posOffset comes from the ini through getInt and is
-    // stored unsigned, so a negative or very large value becomes something near
-    // 0xFFFFFFFF; (posOffset + 3) * 4 then wraps to a tiny number, this check
-    // passes, and the read below lands gigabytes past the buffer. The identical
-    // wrap in vscreen.cpp was a hard crash on a documented, hand-edited setting.
-    if (static_cast<uint64_t>(s->posOffset) * 4u + 12u > bytes) return;
+    if (bytes != kBufferBytes) return;
 
-    const float* pos = &static_cast<const float*>(data)[s->posOffset];
+    const float* pos = &static_cast<const float*>(data)[kPosOffset];
     // Non-finite values compare false in both directions, so a NaN here would
     // pass every threshold test silently rather than failing one.
     if (!finite3(pos)) return;

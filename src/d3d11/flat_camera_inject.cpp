@@ -13,6 +13,7 @@
 #include "../common/log.h"
 #include "../common/runtime_profile.h"
 #include "flat_camera_ownership.h"
+#include "flat_camera_signature.h"
 #include "flat_camera_stubs.h"
 #include "flat_camera_vr.h"
 #include "flat_cpu.h"
@@ -162,6 +163,8 @@ struct InjectState {
     FlatCameraGate gate;       // the frame window the detour may inject in
     FlatCameraInjectedSet injected; // cameras this session injected (flush candidates); owner thread only
     FlatCameraCensus census;   // owner thread only; reset every window
+    // The sampled kind-3 frustums (flat_camera_signature.h): log-only, owner thread only, reset every window.
+    FlatCameraSignatureTable signatures;
     std::atomic<bool> kind3Seen{false}; // a kind-3 camera reached the detour this frame
     uintptr_t gameBase = 0;    // EliteDangerous64.exe, for the census's call-site offsets
     uint64_t frame = 0;
@@ -660,10 +663,24 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // the last phase, and the game re-derives only what its dirty bits name.
     // One write, once per such edge, never on a camera never injected.
     if (flatCameraFlushDecision(g_inject.injected, camera, admit)) flushCamera(camera);
+    // THE SIGNATURE SAMPLE (flat_camera_signature.h; log-only, no behaviour change). One kind-3 call in sixteen has
+    // its frustum read (four SEH-guarded loads, before any write of the injection) and is counted by signature,
+    // with whether it ended injected. Every exit below reports it exactly once through noteSignature; a window that
+    // never reaches this code prints no `flat camera signatures` line at all.
+    FlatCameraSignature signature;
+    const bool signatureSampled = readable && kind == 3 && g_inject.signatures.noteKind3Call();
+    if (signatureSampled) {
+        const FlatCameraVrFrustum f = readFrustum(camera);
+        signature = flatCameraSignatureOf(f.aspect, f.fov, f.nearZ, f.farZ, callerRva);
+    }
+    const auto noteSignature = [&](bool injected) noexcept {
+        if (signatureSampled) g_inject.signatures.note(signature, injected);
+    };
     if (admit != FlatCameraAdmit::Inject) {
         // A camera that is not the proven branch is named by the census (kinds, top cameras),
         // counted by the tick (kind-refusals, unsupported) and left untouched.
         if (camera) g_inject.census.note(camera, kind, false);
+        noteSignature(false);
         return;
     }
 
@@ -671,6 +688,7 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     if (!sehReadF32(camera + kCamBoundX, &entryX) || !sehReadF32(camera + kCamBoundY, &entryY)) {
         g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
         g_inject.census.note(camera, kind, false);
+        noteSignature(false);
         return;
     }
     // The D3D sign convention W1 proved: content right by jx needs
@@ -687,6 +705,7 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         if (wroteY) sehWriteF32(camera + kCamBoundY, entryY);
         g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
         g_inject.census.note(camera, kind, false);
+        noteSignature(false);
         return;
     }
     // Redirect the body's return to stubB. This must be the LAST step: if
@@ -698,6 +717,7 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         if (haveFlags) sehWriteU32(camera + kCamFlags, flags);
         g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
         g_inject.census.note(camera, kind, false);
+        noteSignature(false);
         return;
     }
     g_refreshTls.realRet = realRet;
@@ -713,6 +733,7 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // bound pair is restored, so it is a flush candidate from here on.
     g_inject.injected.noteInjected(camera);
     g_inject.census.note(camera, kind, true);
+    noteSignature(true);
 }
 
 // The post-forward half, called by stubB after the body's ret. The entry
@@ -981,6 +1002,12 @@ void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled) {
         Log::get().note("%s", census);
         g_inject.census.reset();
         g_inject.windowFrames = 0;
+        // The sampled kind-3 frustums (flat_camera_signature.h), every window while the hook is installed, INCLUDING a
+        // window that saw none (kind3-calls=0 sampled=0 sigs=[]): an absent line is what "this never ran" looks like.
+        char signatures[1100];
+        flatCameraFormatSignatures(signatures, sizeof(signatures), g_inject.signatures);
+        Log::get().note("%s", signatures);
+        g_inject.signatures.reset();
         // kFlatCameraWriteFailureLimit failed writes in one window (a camera the game
         // unmapped under us, a page protection that changed): the hook stands down by name
         // and stays inert for the session. The fallback then hands frames to Legacy.

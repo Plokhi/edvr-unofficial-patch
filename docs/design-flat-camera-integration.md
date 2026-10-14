@@ -50,7 +50,9 @@
   fixed"; static-scene-frames 2,480 of 2,481 accepted menu frames; the
   unkeyed census empty in all 60 ticks; row-pair mismatches 0. Open:
   main-versus-auxiliary camera grouping; c2_coexist C7's unbounded loop
-  (a mutation hangs the rig instead of failing it).
+  (a mutation hangs the rig instead of failing it). 2026-10-14, BUILT, NOT
+  FLOWN, log-only, no key: the `flat camera signatures 5s:` line samples 1 in
+  16 kind-3 calls to see whether auxiliary kind-3 cameras are jittered (end entry).
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable and
   build identities, backend versions, dimensions, formats and mod chain.
@@ -1368,3 +1370,48 @@ then flew with Sharpening at 0.3: "Yep shimmer fixed".
   the game's output copy); measured 0.07 ms a frame (max 0.09).
 - The camera path ran with no key: the removed keys' dead line in Sean's
   edvr-flat.ini is ignored.
+
+## 2026-10-14: the kind-3 signature instrument (BUILT, NOT FLOWN)
+
+Why: `reviews\flat-sun-occlusion-jitter-2026-10-13.md` (kept out of git) found
+that the flat injector jitters every kind-3 refresh call: `flatCameraAdmit`
+(flat_camera_phase.h:293-303) tests only kind, gate, owner and phase, never
+aspect, fov or target. The Epic flight 072015 injected 44025 of 44025 kind-3
+calls, about 98 a frame, from two camera objects. The census names objects and
+call counts and nothing about their frustums, so it cannot say whether a cube
+face, a probe, a narrow square zoom camera or a 16:9 secondary view is among
+them. The VR world route's role test (flat_camera_vr.h `flatCameraVrRole`) is
+the only aspect test in the tree, and it does not apply to flat.
+
+What was built (log-only, no behaviour change, no key):
+- `src\d3d11\flat_camera_signature.h` (new, pure). In `refreshPre`'s flat path,
+  after the flush decision, one kind-3 call in sixteen has its frustum read
+  through the VR route's SEH-guarded `readFrustum` (four loads, before any
+  injection write) and counted by signature: aspect to 0.01, vertical fov to
+  0.01 rad, near and far to two significant digits, plus the caller RVA (the
+  existing `[R0]` read). The first eight distinct signatures of a 5 s window
+  are kept, a ninth is counted in `overflow`. Every exit of the call reports
+  it once with whether it ended injected (`noteSignature`: five exits).
+- The sampler is the top four bits of `index * 0x9E3779B1` over a kind-3 call
+  counter that a window reset does not rewind, not a stride of 16: a stride
+  would be blind to any camera at a fixed place in a repeating call order of 16
+  or a divisor. c2_coexist C17 walks periods 2..8, 12, 16, 32, 98 and finds every
+  place sampled; 4097 samples in 65536, longest gap 21.
+- The line, printed every 5 s with the census (including an empty window):
+  `flat camera signatures 5s: kind3-calls=N sampled=M (1 in 16; calls and
+  injected below count sampled calls) distinct=K overflow=O sigs=[aspect=1.78
+  fov=0.98 near=0.025 far=50000 rva=+0x594E13 calls=40 injected=40 | ...]`.
+  `nan` marks a frustum the reader could not get; `rva=unknown` a call site
+  that did not resolve. Never ran = no line at all. Ran, nothing sampled =
+  `kind3-calls=N sampled=0 ... sigs=[]`. No kind-3 call = `kind3-calls=0
+  sampled=0 ... sigs=[]`.
+- Pins: flat_camera_vr_test's goldens for `preFlat` and `flatFrame` were
+  re-pinned (the regions grew by the sample and the print); nothing else moved.
+
+How to read the flight (the review's discriminating signature): a signature
+beside the scene's (aspect near 1.78, fov near 0.98, far 50000 in the VR
+census; read the flat values from the line) with `injected` above zero means
+auxiliary cameras are jittered in flat, and the fix is a role test on the
+scene signature, as `flatCameraVrRole` does. Only the scene's signature means
+none are. `calls` and `injected` count sampled calls: multiply by 16 for the
+rate. Pair it with the free A/B (flat temporal AA off, sun behind a strut).

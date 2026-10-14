@@ -22,9 +22,15 @@
   `_burst_limit`, `_burst_window`, `_separation`, `_drift_pct`, `_resubmit`,
   `_diagnostics` and `_eye_base`; `_prevent` went in 68bddaaa (2026-09-29).
 - **Kept, on purpose:** `hotkey.dump_camera` (Pause) and its dump, which now
-  prints the temporal pass's camera history only; `advanced.camera_buffer_bytes`
-  and `advanced.camera_buffer_offset` (they now gate only the camera-buffer tap:
-  **propose removing them, needs Sean**).
+  prints the temporal pass's camera history only.
+- **Retired 2026-10-14 (Sean approved), quoted:** `advanced.camera_buffer_bytes`
+  (default `5376`) and `advanced.camera_buffer_offset` (default `1100`): they
+  placed the camera origin in the game's scene constant buffer and gated only
+  the camera-buffer tap. Now constants in `glitch_frame.cpp` (the engine fix's
+  own `kSceneCBBytes`, `kSceneCBOriginFloat`) with a `static_assert` on the
+  fit. The rigs switch the tap off with the environment variable
+  `EDVR_TEST_NO_CAMERA_TAP=1`, not a key. Same day, `vscreen.cpp`'s dead
+  "counted as the scene" promotion (`sceneW`/`sceneH`) went; last entry.
 - **What the bad frame is:** the HMDCamera (the head camera) is deactivated one
   frame and re-activated after the camera driver's consume, so the mailbox the
   driver composes the eyes from is still its reset value; the eye origin
@@ -391,3 +397,68 @@ flight since 095137), and its twelve tuning keys had already gone in Build 2d.
   `native_frame_test` marks a frame under four stale values and expects a jump
   hold each time; `config_test` and `installer_test` hold the key out and pin
   the carry-over.
+
+---
+
+## 2026-10-14: the camera-buffer keys and the scene-count promotion are gone
+
+Cleanup on top of the flight branch (Sean approved all three parts; part 3 is
+in `docs\design-flat-camera-integration.md`).
+
+- **Removed keys, quoted:** `advanced.camera_buffer_bytes` (default `5376`, the
+  size of the scene constant buffer the tap picks out in Map/Unmap) and
+  `advanced.camera_buffer_offset` (default `1100`, the float index of the eye
+  origin in it). Both were read only in `installGlitchFrameFix`. A wrong pair
+  could only switch the hold off, with a log line; nobody had a reason to move
+  them, and the engine fix (`transition_flash_eye_base_core.h`) already carried
+  the same two numbers as `kSceneCBBytes` and `kSceneCBOriginFloat`. The tap now
+  uses those, and `(1100 * 4 + 12) <= 5376` is a `static_assert`. The template's
+  commented lines are gone. The log line `camera-buffer tap ready: reading float
+  1100 of the 5376-byte constant buffer ...` still prints at install; the two
+  "tap off: ... does not fit" lines went with the keys.
+- **Retired-key handling:** both names are in config_test's `kRetiredKeys`, so
+  the shipped file and every source are held clear of them. A stale line in a
+  user's ini is read by nothing; the config audit logs it as a line this build
+  does not read, and the installer carries it under "no longer used".
+- **The test switch.** `test_openxr_transport.py` ran the DLL "transport-only"
+  (vScreen takes no Map/Unmap hooks and has no frame boundary, which is how the
+  Explorer Cam tick is proven not to ride vScreen) by writing
+  `camera_buffer_bytes = 0`. The replacement is the environment variable
+  `EDVR_TEST_NO_CAMERA_TAP=1`, read once in `installGlitchFrameFix` and honoured
+  only when it is exactly `1`. Chosen over an ini key because an ini key is
+  something a user can set and a stale line can carry; over a test hook
+  function because the transport fixture runs the real d3d11.dll in a child
+  process, where only the environment crosses. The fixture passes it with
+  `subprocess.run(env=...)`; glitch_test sets it in-process and also pins `0`,
+  `11` and the empty string as not switching. When honoured the DLL logs
+  `camera-buffer tap off: EDVR_TEST_NO_CAMERA_TAP = 1 (the test rigs' switch)`.
+- **The scene-count promotion (vscreen.cpp), removed.** Proof that nothing read
+  it, by symbol (all at `src\d3d11\vscreen.cpp` before the edit): `sceneW`/`sceneH`
+  were declared at 857, written at 1095 (`eye_render_size = off` zeroed them),
+  1105 (a pin), 6276 (the shaped promotion, equal to `renderW`) and 6323 (the
+  dominance-only promotion), and read at 6253 (the promote-once latch), 6390 (the
+  low-peak notice's gate) and 6676 (a once-only log line). No other file names
+  them (`grep sceneW` over `src` finds only vscreen.cpp and unrelated locals in
+  flat_runtime.cpp). No draw path added their draws to `eyeDrawsLastFrame` or
+  `eyeDrawsMax`, and no accessor in `vscreen.h` exposed them, so "what Explorer
+  Cam and the camera scan read is the two added together" was false once the
+  old detector's count went. Removed: the fields, `sceneSourceNoted`, the
+  dominance-only branch and its `counted as the scene` log, and the
+  `the eye-draw counts above are draws into the ... eye textures` log (also
+  wrong after a shaped promotion, which makes the target count as an eye).
+  The latch is `renderW` now: in an auto session it is set only by the shaped
+  promotion, a pin or `off` turns `renderAuto` off, and clearing a pin zeroes it.
+- **Kept, because it is read:** `noteSceneCandidate`, `cands[]`, `thisFrame` /
+  `bestFrame` and the shaped promotion. They feed `renderW`/`renderH` (the
+  measured render scale), which `targetIsEyeSized` reads at 1216 and 5529, and
+  `g_renderBelowEye` (the VR supersampling notice). That is live and flown; it
+  is not the dead part. `vScreenSceneCandidateDraws` and the
+  `edvr_selftest_scene_draws` export are build.bat's counting check. The
+  busiest non-shaped target is now named in the low-peak notice's second line
+  ("The busiest of them is WxH, with N draws in one frame ... not adopted")
+  where the removed log line used to say it; before, that notice stayed silent
+  in that case.
+- **Behaviour changes, all logs or a latch:** the dominance-only log and the
+  scene-source log are gone; the low-peak notice can now speak in the case the
+  dominance branch used to silence; a non-shaped busy target no longer blocks a
+  later shaped promotion (the old latch was set by either).
