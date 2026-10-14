@@ -152,11 +152,12 @@ quiet 60-iteration test (scratch experiment, 2026-10-14). (a) a leftover
 process from an earlier build: no evidence; the lock is explained by the
 same-build aa_off job's own run.
 
-Fix: `exit /b 0` at the end of `:rig_ui_quality_test` (build.bat). Guard:
-`run_jobs.py` `parse_rigs` now refuses a rig whose last command is not an
-unconditional `exit /b` or `goto` when another label follows it (`runs_on_into`),
-with self-test cases; two-step rigs that run on into their own `:<label>_run`
-are exempt. The pre-fix build.bat is refused by name at the plan.
+Fix: landed on main as 4c3b33b3, which ends `:rig_ui_quality_test` in `exit /b 0`
+and gives the seed test its own `:rig_ui_layer_seed_test`, so no two rigs share
+its output. The guard is `run_jobs.py` `falls_through_line` /
+`check_no_fall_through`, which refuses at the plan a rig whose last command is
+not an exit or a goto. A parallel fix on this branch (`exit /b 0` plus a
+`runs_on_into` guard) duplicated it and was dropped.
 
 Environment: a fresh worktree needs the gitignored OpenXR loader copied in
 (`third_party\openxr\loader`, verified by `tools\fetch_openxr_loader.py --verify`).

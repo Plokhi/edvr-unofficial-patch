@@ -1662,7 +1662,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     "src\d3d11\joy_watch.cpp" "src\common\iat_hook.cpp" "src\common\vtable_hook.cpp" ^
     "src\common\hotkey.cpp" "src\common\config.cpp" "src\common\log.cpp" ^
     "src\common\guard.cpp" "src\common\frame_flag.cpp" "src\common\proxy.cpp" ^
-    /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib dinput8.lib
+    /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib dinput8.lib xinput9_1_0.lib
 if errorlevel 1 ( echo [edvr] ERROR: input_gate_test build failed & exit /b 1 )
 "%BUILD%\input_gate_test.exe" || (
     echo [edvr] ERROR: the menu keyboard gate failed its device or release checks
@@ -3384,10 +3384,8 @@ cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNO
 if errorlevel 1 ( echo [edvr] ERROR: ui quality test build failed & exit /b 1 )
 "%BUILD%\ui_quality_test.exe" --dry-run || exit /b 1
 "%BUILD%\ui_quality_test.exe" --self-test || exit /b 1
-REM The subroutine ends here. Without this exit cmd ran on into :rig_aa_off_test, so this rig also built
-REM and ran aa_off_test and its seed test: the same outputs the aa_off_test rig writes at the same time.
-REM A link of seed_test.exe lost that race (LNK1104, 2026-10-14). run_jobs.py refuses a rig like this.
 exit /b 0
+
 REM The AA-off draw path (draw_fast_path.h), the Map timer's sampler and its exact call counts (map_wait.h,
 REM map_wait_sample.h), and the GPU timing guard that keeps off-state draw thunks from calling it (gpu_frame_timing.h),
 REM 2026-10-13. The Map timer is linked from its own source; the GPU call is a counting stub.
@@ -3402,6 +3400,10 @@ cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNO
 if errorlevel 1 ( echo [edvr] ERROR: aa_off test build failed & exit /b 1 )
 "%BUILD%\aa_off_test.exe" --dry-run || exit /b 1
 "%BUILD%\aa_off_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_ui_layer_seed_test
+echo [edvr] === seed_test.exe ===
 REM The layer's depth-stencil seed on its own (ui_layer_seed.h): the three
 REM depth formats, every stencil value class, a scale, a jitter and a reused
 REM seeder, read back texel for texel. Built outside build\ so its imported
