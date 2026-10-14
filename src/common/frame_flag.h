@@ -211,6 +211,12 @@ void clearIntroRecentreRequest();
 void requestEndFrameHold(uint32_t ms);
 uint32_t endFrameHoldMs();
 
+// The seat memory's word (src/common/seat_context.h, src/openxr/seat_memory.h): d3d11.dll writes the cockpit-centre setting and the commander's
+// seat (Status.json) and journal boundary count; openvr_api.dll reads it each WaitGetPoses. One word, so the pair never tears. 0 is "nobody has
+// written" -- a graphics half that predates it, or a mapping not yet touched -- and reads as game mode: today's behaviour, nothing remembered.
+void publishSeatContext(uint32_t word);
+uint32_t seatContextWord();
+
 // Whether the game is in its VR profile, written by d3d11.dll at launch and at every profile switch (design
 // unified-install section 12). While it reads not-VR and the game makes no frame call, openvr_api.dll's owner runs
 // its own empty frames so the headset does not keep the last frame the game left. Nobody has written it -- an absent

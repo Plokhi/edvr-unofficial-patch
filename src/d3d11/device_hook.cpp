@@ -38,6 +38,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "../common/runtime_profile.h"
 #include "../common/eye_sync.h"
 #include "../common/frame_flag.h"
+#include "../common/seat_context.h"   // seatContextPublish: the seat memory's word for the runtime
 #include "../common/guard.h"
 #include "../common/hotkey.h"
 #include "fss_res.h"
@@ -1597,7 +1598,7 @@ void presentFrameBoundary() {
     // The game's own journal, polled about once a second: it states the
     // boundaries EDVR used to infer -- gameplay starting (LoadGame) and
     // on-foot sessions beginning (Disembark).
-    tkJournalWatch.run([] { journalWatchTick(); });
+    tkJournalWatch.run([] { journalWatchTick(); seatContextPublish(); });
     tkCelestialStatus.run(tickCelestialStatus);
     // Explorer Cam (Phase 1), after the journal's tick it reads (on foot, GuiFocus, gameplay). Unconditional: an EMPTY hotkey.explorer_cam is read here
     // every frame too, so binding it live arms the feature on the next one.
@@ -2195,6 +2196,37 @@ State& ensureState() {
 }
 
 }  // namespace
+
+// advanced.cockpit_centre and the commander's seat, for the runtime's seat memory (src/openxr/seat_memory.h). VR profile only; in the flat profile
+// the word is cleared to "nobody has written". Called at the first export call (so the runtime's start-up finds the setting, before any frame) and
+// from the journal's tick every frame; the setting is re-read every 30th call, the rest is a few atomic loads and one compare.
+void seatContextPublish() {
+    static uint32_t published = 0;
+    static bool wrote = false;
+    static bool keep = true;
+    static uint32_t calls = 0;
+    uint32_t word = 0;
+    if (!runtimeFlatProfile()) {
+        if ((calls++ % 30u) == 0u) keep = Config::get().getString("advanced.cockpit_centre", "keep") != "game";
+        SeatContext c;
+        c.published = true;
+        c.keep = keep;
+        c.gameplay = journalGameplay();
+        c.seatedKnown = journalSeatedKnown();
+        c.seated = c.seatedKnown && journalSeated();
+        c.onFootKnown = journalOnFootKnown();
+        c.onFoot = c.onFootKnown && journalOnFoot();
+        c.cameraOpen = explorerCamSessionActive();
+        c.seatKind = journalSeatKind();
+        c.transitions = (journalEmbarks() + journalDisembarks() + journalLoadGames() + journalUndocks()) & kSeatTransitionMask;
+        word = encodeSeatContext(c);
+    }
+    if (!wrote || word != published) {
+        wrote = true;
+        published = word;
+        publishSeatContext(word);
+    }
+}
 
 bool captureFlatProbeShader(char stage, uint64_t hash) {
     if (!g_state || !runtimeFlatProfile() || !hash ||

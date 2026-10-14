@@ -162,11 +162,15 @@ struct Shared {
     //                current head pose", taken (cleared) by the vr half's
     //                own poll. See frame_flag.h.
     volatile LONG     introRecentre;
+    // seatContext  d3d11 -> openvr, the seat memory's word (src/common/seat_context.h, publishSeatContext in frame_flag.h): the setting, what
+    //              Status.json says about the commander's seat, the journal's boundary count. 0 = nobody has written, which the runtime reads
+    //              as "game": today's behaviour. This slot was reservedPoseReader0, padding that nothing read or wrote (below), so the layout
+    //              and the mapping name do not change: a peer that predates it never writes a non-zero here.
+    volatile LONG     seatContext;
     // UNUSED since advanced.eye_origin_readers was removed (2026-10-09): the
     // pose-reader hunt's request flag and per-call snapshot. Kept as padding
     // so the layout -- and the mapping name the two halves agree on -- does
     // not change; nothing reads or writes them.
-    volatile LONG     reservedPoseReader0;
     volatile LONG     reservedPoseReader1;
     volatile LONG64   reservedPoseReader2;
     volatile LONG64   reservedPoseReader3;
@@ -745,6 +749,16 @@ uint32_t endFrameHoldMs() {
     if (!s) return 0;
     const LONG v = InterlockedCompareExchange(&s->endFrameHold, 0, 0);
     return v > 0 ? static_cast<uint32_t>(v) : 0u;
+}
+
+void publishSeatContext(uint32_t word) {
+    Shared* s = map();
+    if (s) InterlockedExchange(&s->seatContext, static_cast<LONG>(word));
+}
+
+uint32_t seatContextWord() {
+    Shared* s = map();
+    return s ? static_cast<uint32_t>(InterlockedCompareExchange(&s->seatContext, 0, 0)) : 0u;
 }
 
 void setVrProfileActive(bool active) {
