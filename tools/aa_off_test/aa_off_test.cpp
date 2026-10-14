@@ -263,6 +263,45 @@ void testFrameWorkSlack() {
     check(edvr::frameWorkSpanMs(8.0, 7.0) == 0.0, "work span: an out-of-order pair clamps to zero, not a negative frame");
 }
 
+// The in-headset fps overlay's line (2026-10-14): it chose its GPU figure on its own and only the tile learned the work span, so a flight with
+// the application clock off read "gpu -- ms". Now both call chooseGpuTime; this runs the choice and the line the overlay prints.
+void testOverlayLine() {
+    char line[120];
+    using edvr::GpuTimeSource;
+    // Clock off, a span in the series: a number, from the work span.
+    edvr::GpuTimeChoice c = edvr::chooseGpuTime(false, false, true, 4.26, true, 3.0);
+    check(c.source == GpuTimeSource::WorkSpan && std::fabs(c.ms - 4.26) < 1e-9, "overlay: clock off with the series holding spans picks the work span mean");
+    edvr::overlayLineText(line, sizeof(line), 89.6, c, "cpu", true, 2.34);
+    check(std::strcmp(line, "90 fps   gpu 4.3 ms   cpu 2.3 ms") == 0, "overlay: clock off with a span prints a number in the line");
+    // Clock off, the series aged out but a pair completed: the last pair.
+    c = edvr::chooseGpuTime(false, false, false, 0.0, true, 5.04);
+    check(c.source == GpuTimeSource::WorkSpan && std::fabs(c.ms - 5.04) < 1e-9, "overlay: clock off, series empty, a completed pair: the last pair");
+    // Clock off, no span anywhere: "--", never a number.
+    c = edvr::chooseGpuTime(false, false, false, 0.0, false, 0.0);
+    edvr::overlayLineText(line, sizeof(line), 90.0, c, "cpu", false, 0.0);
+    check(c.source == GpuTimeSource::None && std::strcmp(line, "90 fps   gpu -- ms   cpu -- ms") == 0,
+          "overlay: clock off with no span prints '--'");
+    // Clock on keeps today's behaviour: the application mean when ready and sampled, else '--' (the work span is never read).
+    c = edvr::chooseGpuTime(true, true, true, 12.34, true, 4.0);
+    check(c.source == GpuTimeSource::ApplicationRender && std::fabs(c.ms - 12.34) < 1e-9, "overlay: clock on and ready shows the application render mean");
+    c = edvr::chooseGpuTime(true, false, true, 12.34, true, 4.0);
+    check(c.source == GpuTimeSource::None, "overlay: clock on but the snapshot not ready is '--', not the span");
+    c = edvr::chooseGpuTime(true, true, false, 0.0, true, 4.0);
+    check(c.source == GpuTimeSource::None, "overlay: clock on with no application samples is '--', not the span");
+    edvr::overlayLineText(line, sizeof(line), 72.0, edvr::chooseGpuTime(true, true, true, 9.96, false, 0.0), "cpu (pre-submit)", true, 6.0);
+    check(std::strcmp(line, "72 fps   gpu 10.0 ms   cpu (pre-submit) 6.0 ms") == 0, "overlay: clock on prints the application mean and the stand-in label");
+    // A short buffer truncates, never overruns.
+    char tiny[8];
+    edvr::overlayLineText(tiny, sizeof(tiny), 90.0, c, "cpu", true, 1.0);
+    check(std::strlen(tiny) < sizeof(tiny), "overlay: a short line buffer is truncated, not overrun");
+    // The census field the log parser reads (tools\edvr_log.py --gpu-work-span): its exact text.
+    char field[160];
+    edvr::formatFrameWorkSpanField(field, sizeof(field), 0, 0, 0, 0.0);
+    check(std::strcmp(field, "frame work span: completed 0, skipped 0, invalid 0, last - ms") == 0, "census field: nothing completed prints 'last -'");
+    edvr::formatFrameWorkSpanField(field, sizeof(field), 5400, 3, 2, 4.2567);
+    check(std::strcmp(field, "frame work span: completed 5400, skipped 3, invalid 2, last 4.257 ms") == 0, "census field: counts and the last pair in ms");
+}
+
 void usage() {
     std::puts("usage: aa_off_test --self-test | --dry-run");
 }
@@ -287,6 +326,7 @@ int main(int argc, char** argv) {
     testGpuGuard();
     testGpuTimeTile();
     testFrameWorkSlack();
+    testOverlayLine();
     std::printf("aa_off_test: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

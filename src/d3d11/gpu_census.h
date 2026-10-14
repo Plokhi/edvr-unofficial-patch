@@ -278,6 +278,10 @@ void gpuCensusShutdown() noexcept;
 // its first GPU command to the end of EDVR's door work, in gpuCensusFrame's frame scope (one timestamp pair a frame). False until
 // one pair has completed. The span includes GPU idle inside the frame.
 bool gpuCensusFrameSpan(double* ms, unsigned* samples) noexcept;
+// The work span pair's all-time counts, for the census window line's "frame work span:" field (frame_span_tile.h):
+// completed = pairs read back, skipped = pairs not begun, invalid = pairs voided. The only way to tell a span that never ran
+// (all zero while the application clock is off) from one that ran and failed (skipped or invalid climbing).
+void gpuCensusFrameWorkStats(unsigned long long* completed, unsigned long long* skipped, unsigned long long* invalid, double* lastMs) noexcept;
 // The door end (device_hook.cpp, hookedPresent, before the real Present): closes an open work span. Owner context only.
 void gpuCensusFrameWorkEnd(ID3D11DeviceContext* ctx) noexcept;
 bool gpuCensusFrameWorkOpen() noexcept;

@@ -444,6 +444,14 @@ void logAndResetWindow(uint64_t now) {
     char gapBrief[96];
     formatGapBrief(gapBrief, sizeof(gapBrief), gap);
 
+    // The overlay's frame work span pair (frame_span_tile.h): "completed 0" with the application clock off means the pair never ran.
+    char workSpanField[160];
+    {
+        unsigned long long wsDone = 0, wsSkipped = 0, wsInvalid = 0;
+        double wsLast = 0.0;
+        gpuCensusFrameWorkStats(&wsDone, &wsSkipped, &wsInvalid, &wsLast);
+        formatFrameWorkSpanField(workSpanField, sizeof(workSpanField), wsDone, wsSkipped, wsInvalid, wsLast);
+    }
     Log::get().note(
         "EDVR GPU census: %.0f s, %llu frames; EDVR ~%.3f ms/frame = door %.3f "
         "(%s) + in-frame %.3f (%s); application render p50 %s; %s; "
@@ -499,6 +507,9 @@ void logAndResetWindow(uint64_t now) {
     char gapDetail[1100];   // the stalls clause (gpu_frame_gap.h) made 900 too small by about a hundred characters
     formatGapDetail(gapDetail, sizeof(gapDetail), gap);
     Log::get().note("%s", gapDetail);
+    // The overlay's frame work span pair, on a line of its own (the main line is at the log's length; last, so the seed's line still follows the main line at once): frame_span_tile.h formats the field.
+    Log::get().note("EDVR GPU census, the overlay's GPU time: %s. All-time counts. With the application clock off, completed 0 means the pair never ran; "
+                    "skipped or invalid climbing with completed flat means it ran and was voided.", workSpanField);
 
     for (auto& st : g_section) {
         st.baseMs = st.sampler.totals.ms;
@@ -685,6 +696,13 @@ void gpuCensusShutdown() noexcept {
     for (auto& st : g_section) { st.sampler.reset(); st.nullSampler.reset(); }
     g_frameSpan.reset();
     resetSeedNotes();
+}
+
+void gpuCensusFrameWorkStats(unsigned long long* completed, unsigned long long* skipped, unsigned long long* invalid, double* lastMs) noexcept {
+    if (completed) *completed = g_frameSpanCompleted;
+    if (skipped) *skipped = g_frameSpan.totals.skipped;
+    if (invalid) *invalid = g_frameSpan.totals.invalid;
+    if (lastMs) *lastMs = g_frameSpanLastMs;
 }
 
 bool gpuCensusFrameSpan(double* ms, unsigned* samples) noexcept {
