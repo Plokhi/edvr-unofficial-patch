@@ -116,14 +116,27 @@ private:
 // first empty slot or slot of an older generation within the same bound (a full window is a miss the caller reads uncached). A writer claims a slot with a
 // compare-and-swap to a busy word before it writes the name and publishes the word last, and a reader compares the word before and after it copies the name,
 // so a name is never returned torn or under another node's word. A node's name is read once per node per generation.
+// Built v14.32: each entry also holds a validator, a 64-bit hash of the node's name text pointer and the first 16 bytes of the text, taken by the caller with
+// one guarded read on every lookup. A node freed and reallocated within a generation (a streamed asset) shows another validator: the hit is refused as stale and
+// the caller classifies the node afresh, replacing the entry in place.
+inline uint64_t nodeValidator(uint64_t textPtr, const uint8_t first16[16]) noexcept {
+    uint64_t a = 0, b = 0;
+    std::memcpy(&a, first16, 8);
+    std::memcpy(&b, first16 + 8, 8);
+    uint64_t h = (textPtr * 0x9E3779B97F4A7C15ull) ^ (a * 0xC2B2AE3D27D4EB4Full) ^ (b * 0xFF51AFD7ED558CCDull);
+    h ^= h >> 31;
+    return h | 1u;   // never 0: 0 stands for an unreadable node
+}
+
 template <size_t N>
 class NodeCache {
 public:
     static constexpr size_t kNameBytes = 64;
     static_assert((N & (N - 1)) == 0, "the cache size is a power of two");
 
-    // True on a hit: the class and flags (and the name, when `name` is given: kNameBytes, always terminated) of this node under this generation.
-    bool find(uintptr_t node, uint32_t gen, NameClass* cls, uint32_t* flags, char* name = nullptr) const noexcept {
+    // True on a hit: the class and flags (and the name, when `name` is given: kNameBytes, always terminated) of this node under this generation, when the
+    // entry's validator equals `validator`. An entry of this node with another validator is refused (*stale set): the node was reused.
+    bool find(uintptr_t node, uint32_t gen, NameClass* cls, uint32_t* flags, char* name = nullptr, uint64_t validator = 0, bool* stale = nullptr) const noexcept {
         const size_t home = homeOf(node);
         const uint32_t key = classKey(gen);
         for (uint32_t p = 0; p < kTableProbeMax; ++p) {
@@ -134,12 +147,15 @@ public:
             NameClass c = NameClass::kNone;
             uint32_t f = 0;
             if (!unpackSlot(w1, node, key, &c, &f)) continue;
-            if (name != nullptr) {
-                std::memcpy(name, names_[i], kNameBytes);
-                std::atomic_thread_fence(std::memory_order_acquire);
-                if (slots_[i].load(std::memory_order_relaxed) != w1) return false;
-                name[kNameBytes - 1] = '\0';
+            if (name != nullptr) std::memcpy(name, names_[i], kNameBytes);
+            const uint64_t sv = validators_[i].load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (slots_[i].load(std::memory_order_relaxed) != w1) return false;
+            if (sv != validator) {
+                if (stale != nullptr) *stale = true;
+                return false;
             }
+            if (name != nullptr) name[kNameBytes - 1] = '\0';
             *cls = c;
             *flags = f;
             return true;
@@ -147,21 +163,32 @@ public:
         return false;
     }
 
-    // Inserts a node. False when the probe window holds nothing reusable (the node is then read uncached).
-    bool put(uintptr_t node, uint32_t gen, NameClass cls, uint32_t flags, const char* name) noexcept {
+    // Inserts a node, or replaces its entry in place when it has one (a reused node). False when the probe window holds nothing reusable (the node is then
+    // read uncached).
+    bool put(uintptr_t node, uint32_t gen, NameClass cls, uint32_t flags, const char* name, uint64_t validator = 0) noexcept {
         const size_t home = homeOf(node);
         const uint32_t key = classKey(gen);
-        for (uint32_t p = 0; p < kTableProbeMax; ++p) {
-            const size_t i = (home + p) & (N - 1);
-            uint64_t w = slots_[i].load(std::memory_order_acquire);
-            if (w == kBusy) continue;
-            if (w != 0 && ((w >> 50) & kSlotKeyMask) == key) continue;   // a live entry of this generation (this node's or another's)
-            if (!slots_[i].compare_exchange_strong(w, kBusy, std::memory_order_acq_rel, std::memory_order_acquire)) continue;
-            char tmp[kNameBytes] = {};
-            if (name != nullptr) std::strncpy(tmp, name, kNameBytes - 1);
-            std::memcpy(names_[i], tmp, kNameBytes);
-            slots_[i].store(packSlot(node, cls, flags, key), std::memory_order_release);
-            return true;
+        for (int pass = 0; pass < 2; ++pass) {   // pass 0 looks for this node's own entry, pass 1 for a reusable slot
+            for (uint32_t p = 0; p < kTableProbeMax; ++p) {
+                const size_t i = (home + p) & (N - 1);
+                uint64_t w = slots_[i].load(std::memory_order_acquire);
+                if (w == kBusy) continue;
+                if (pass == 0) {
+                    if (w == 0) break;   // the chain ends: the node has no entry
+                    NameClass c0 = NameClass::kNone;
+                    uint32_t f0 = 0;
+                    if (!unpackSlot(w, node, key, &c0, &f0)) continue;
+                } else if (w != 0 && ((w >> 50) & kSlotKeyMask) == key) {
+                    continue;   // a live entry of this generation (another node's)
+                }
+                if (!slots_[i].compare_exchange_strong(w, kBusy, std::memory_order_acq_rel, std::memory_order_acquire)) continue;
+                char tmp[kNameBytes] = {};
+                if (name != nullptr) std::strncpy(tmp, name, kNameBytes - 1);
+                std::memcpy(names_[i], tmp, kNameBytes);
+                validators_[i].store(validator, std::memory_order_relaxed);
+                slots_[i].store(packSlot(node, cls, flags, key), std::memory_order_release);
+                return true;
+            }
         }
         return false;
     }
@@ -182,6 +209,7 @@ private:
         return static_cast<size_t>(((uint64_t(node) >> 3) * 0x9E3779B97F4A7C15ull) >> 32) & (N - 1);
     }
     std::atomic<uint64_t> slots_[N] = {};
+    std::atomic<uint64_t> validators_[N] = {};
     char names_[N][kNameBytes] = {};
 };
 

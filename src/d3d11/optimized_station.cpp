@@ -217,7 +217,7 @@ uint64_t g_prodCalls = 0, g_prodVetoed = 0, g_prodKept = 0, g_prodStyle = 0, g_p
 
 // The class cache (lock-free): a slot per node, a word per slot (sealed_trial_core.h packs it). Written by any thread that runs the store.
 sealed::NodeCache<kNodeCacheSlots> g_nodeCache;   // built v14.31: one entry per node and lifecycle generation (a node's name does not change while it lives)
-std::atomic<uint64_t> g_nodeNameReads{0}, g_nodeCacheFull{0};   // the window's name reads and uncached reads (the cost line)
+std::atomic<uint64_t> g_nodeNameReads{0}, g_nodeCacheFull{0}, g_nodeReuseCaught{0};   // the window's name reads and uncached reads (the cost line)
 std::atomic<uint32_t> g_classGen{0};   // moves at every lifecycle point (bumpRigEpoch): every node's class and name are read afresh
 
 bool readMem(void* dst, uintptr_t src, size_t n) noexcept {
@@ -511,7 +511,17 @@ void costPush(uint8_t which, double ms) noexcept {
 struct NodeInfo {
     sealed::NameClass cls = sealed::NameClass::kUnnamed;
     uint32_t flags = 0;
+    uint64_t validator = 0;   // built v14.32: the node's name-text validator, taken on the lookup (0: the text was unreadable)
 };
+
+// Built v14.32: the validator of a node's name: the text pointer (node+0) and the first 16 bytes of the text, two guarded reads. A node reallocated within
+// a generation holds another name, so another validator, and a cache hit under the old one is refused.
+uint64_t nodeValidatorOf(uintptr_t node) noexcept {
+    uintptr_t text = 0;
+    uint8_t first[16] = {};
+    if (!readVal(&text, node) || !text || !readMem(first, text, sizeof(first))) return 0;
+    return sealed::nodeValidator(static_cast<uint64_t>(text), first);
+}
 
 // Reads a node's name from game memory (guarded) and classifies it; name (64 bytes) is filled when the name is readable.
 NodeInfo classifyNode(uintptr_t node, char* name) noexcept {
@@ -529,27 +539,42 @@ NodeInfo classifyNode(uintptr_t node, char* name) noexcept {
     return info;
 }
 
-// The node's info (and name when `name` is given), cached. A node that is not 8-aligned, or a full probe window, is read uncached.
-NodeInfo nodeInfo(uintptr_t node, char* name) noexcept {
+// The node's info (and name when `name` is given), cached. A node that is not 8-aligned, or a full probe window, is read uncached. A hit is trusted only
+// when the node's name-text validator still equals the entry's (one guarded read of the text pointer and 16 bytes); a reused node is classified afresh.
+// knownValidator: the validator the caller already took for this node in this call (nullptr: take it here).
+NodeInfo nodeInfo(uintptr_t node, char* name, const uint64_t* knownValidator = nullptr) noexcept {
     NodeInfo info;
     const uint32_t gen = g_classGen.load(std::memory_order_relaxed);
-    if (sealed::slotFits(node) && g_nodeCache.find(node, gen, &info.cls, &info.flags, name)) return info;
+    const bool cacheable = sealed::slotFits(node);
+    const uint64_t validator = knownValidator != nullptr ? *knownValidator : nodeValidatorOf(node);
+    info.validator = validator;
+    bool stale = false;
+    if (cacheable) {
+        NodeInfo hit;
+        if (g_nodeCache.find(node, gen, &hit.cls, &hit.flags, name, validator, &stale)) {
+            hit.validator = validator;
+            return hit;
+        }
+    }
+    if (stale) g_nodeReuseCaught.fetch_add(1, std::memory_order_relaxed);
     char local[sealed::NodeCache<kNodeCacheSlots>::kNameBytes];
     char* const buf = name != nullptr ? name : local;
-    info = classifyNode(node, buf);
-    if (sealed::slotFits(node)) {
-        if (!g_nodeCache.put(node, gen, info.cls, info.flags, buf)) g_nodeCacheFull.fetch_add(1, std::memory_order_relaxed);
+    const NodeInfo read = classifyNode(node, buf);
+    info.cls = read.cls;
+    info.flags = read.flags;
+    if (cacheable) {
+        if (!g_nodeCache.put(node, gen, info.cls, info.flags, buf, validator)) g_nodeCacheFull.fetch_add(1, std::memory_order_relaxed);
     }
     return info;
 }
 
 // A node's name; false when it has none or it is unreadable.
-bool cachedNameOfNode(uintptr_t node, char* out, size_t cap) noexcept {
+bool cachedNameOfNode(uintptr_t node, char* out, size_t cap, const uint64_t* knownValidator = nullptr) noexcept {
     if (!out || cap == 0) return false;
     out[0] = '\0';
     if (!node) return false;
     char name[sealed::NodeCache<kNodeCacheSlots>::kNameBytes];
-    const NodeInfo info = nodeInfo(node, name);
+    const NodeInfo info = nodeInfo(node, name, knownValidator);
     if (info.cls == sealed::NameClass::kUnnamed || name[0] == '\0') return false;
     std::snprintf(out, cap, "%s", name);
     return true;
@@ -1603,7 +1628,7 @@ void summaryLine(uint64_t now) noexcept {
                         "sampled), rig veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu sampled), frame tick "
                         "%.3f/%.3f/%.3f ms per frame (%llu frames), mutex wait total %.3f ms max %.3f ms (blocked over 0.1 ms: %llu), waiting lines "
                         "written %llu; gathered entries lost %llu; state lock taken from a callback %llu; rig veto lookups: hit vetoed %llu, hit kept %llu, "
-                        "collection moved %llu, miss %llu, stale epoch %llu (rig requests sent %llu); node names read from the game %llu, uncached node reads %llu.",
+                        "collection moved %llu, miss %llu, stale epoch %llu (rig requests sent %llu); node names read from the game %llu, uncached node reads %llu, node reuse caught %llu.",
                         static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(callsStore),
                         static_cast<double>(callsStore) / fr, meanStore * static_cast<double>(callsStore) / fr, s50, s95, smax,
                         static_cast<unsigned long long>(nStore), static_cast<unsigned long long>(callsProd), static_cast<double>(callsProd) / fr,
@@ -1616,7 +1641,8 @@ void summaryLine(uint64_t now) noexcept {
                         static_cast<unsigned long long>(g_rigTally.hitMoved.load()), static_cast<unsigned long long>(g_rigTally.miss.load()),
                         static_cast<unsigned long long>(g_rigTally.stale.load()), static_cast<unsigned long long>(g_rigTally.asked.load()),
                         static_cast<unsigned long long>(g_nodeNameReads.exchange(0, std::memory_order_relaxed)),
-                        static_cast<unsigned long long>(g_nodeCacheFull.exchange(0, std::memory_order_relaxed)));
+                        static_cast<unsigned long long>(g_nodeCacheFull.exchange(0, std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(g_nodeReuseCaught.exchange(0, std::memory_order_relaxed)));
         g_rigTally.hitVetoed = 0;
         g_rigTally.hitKept = 0;
         g_rigTally.hitMoved = 0;
@@ -2211,7 +2237,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     }
     if (ni.cls == sealed::NameClass::kPad) {
         char name[64] = {};
-        if (cachedNameOfNode(node, name, sizeof(name))) {
+        if (cachedNameOfNode(node, name, sizeof(name), &ni.validator)) {
             const sealed::PadSize size = sealed::padSizeOf(name);
             if (size != sealed::PadSize::kNone) {
                 GatherEntry e = gatherEntry(GKind::kPad, record, centre, radius, stamp, name);
@@ -2221,7 +2247,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         }
     } else if (ni.cls == sealed::NameClass::kExplicit && !s.giveUp) {   // built v14.13: stops after the give-up
         char xn[64] = {};
-        cachedNameOfNode(node, xn, sizeof(xn));   // no name: the explicit part is still gathered, with an empty name
+        cachedNameOfNode(node, xn, sizeof(xn), &ni.validator);   // no name: the explicit part is still gathered, with an empty name
         GatherEntry e = gatherEntry(GKind::kExplicit, record, centre, radius, stamp, xn);
         e.aux = node;
         w.push(e);
@@ -2233,7 +2259,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     if (full) {
         if (dCam <= kOwnNearM) {
             char nn[64] = {};
-            if (cachedNameOfNode(node, nn, sizeof(nn))) {
+            if (cachedNameOfNode(node, nn, sizeof(nn), &ni.validator)) {
                 GatherEntry e = gatherEntry(GKind::kNear, record, centre, radius, stamp, nn);
                 e.dist = dCam;
                 w.push(e);
@@ -2241,7 +2267,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         }
         if (containsCam && radius < sealed::kOwnShipRadiusM) {
             char cn[64] = {};
-            if (cachedNameOfNode(node, cn, sizeof(cn))) {
+            if (cachedNameOfNode(node, cn, sizeof(cn), &ni.validator)) {
                 GatherEntry e = gatherEntry(GKind::kOwnCand, record, centre, radius, stamp, cn);
                 e.dist = dCam;
                 w.push(e);
@@ -2250,7 +2276,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         // The ship's part count by prefix (built v14.8). A name with no prefix counts for nothing, so a node without the prefix flag is not read.
         if (dCam <= sealed::kShipRecordsM && (ni.flags & sealed::kNodeShipPrefix) != 0) {
             char tn[64] = {};
-            if (cachedNameOfNode(node, tn, sizeof(tn))) w.push(gatherEntry(GKind::kTally, record, centre, radius, stamp, tn));
+            if (cachedNameOfNode(node, tn, sizeof(tn), &ni.validator)) w.push(gatherEntry(GKind::kTally, record, centre, radius, stamp, tn));
         }
     }
     latchCandNote(w, record, node, centre, s, ni.flags);   // built v14.12: gathered only while a latch is pending
@@ -2268,12 +2294,12 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         float u[3] = {};
         if (sealed::unitBetween(s.cell.capA, s.cell.capB, u) && sealed::inBayVolume(centre, s.cell.capA, u, s.cell.capLen, belowFor(s.cell.size))) {
             char bn[64] = {};
-            if (cachedNameOfNode(node, bn, sizeof(bn)) && sealed::bayPartName(bn)) keep = true;
+            if (cachedNameOfNode(node, bn, sizeof(bn), &ni.validator) && sealed::bayPartName(bn)) keep = true;
         }
     }
     if (!keep) {
         char nm[64] = {};
-        if (s.ownPrefix[0] != '\0') cachedNameOfNode(node, nm, sizeof(nm));
+        if (s.ownPrefix[0] != '\0') cachedNameOfNode(node, nm, sizeof(nm), &ni.validator);
         if (sealed::ownShipExempt(containsCam, radius, nm, s.ownPrefix)) keep = true;
     }
     if (!keep && s.ownLiveValid && sealed::ownSphereKeeps(centre, s.ownLiveCentre, s.ownLiveRadius, kOwnSphereMarginM)) keep = true;

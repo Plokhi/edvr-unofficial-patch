@@ -2163,6 +2163,41 @@ int main(int argc, char** argv) {
         check(bad.load() == 0 && hits.load() > 0, "v14.31 node cache, threads: eight threads inserting and reading never see a torn or foreign name");
     }
     {
+        // Built v14.32: a node freed and reallocated within a generation (a streamed asset) is caught by the name-text validator on the hit path.
+        uint8_t padText[16] = {'L', 'a', 'n', 'd', 'i', 'n', 'g', 'P', 'a', 'd', 'S', 'm', 'a', 'l', 'l', 'A'};
+        uint8_t liftText[16] = {'L', 'i', 'f', 't', '_', '0', '1', 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        const uint64_t vPad = se::nodeValidator(0x7f0000001000ull, padText);
+        const uint64_t vPadSamePtrOtherText = se::nodeValidator(0x7f0000001000ull, liftText);
+        const uint64_t vPadOtherPtr = se::nodeValidator(0x7f0000002000ull, padText);
+        const uint8_t zero[16] = {};
+        check(vPad != 0 && vPad != vPadSamePtrOtherText && vPad != vPadOtherPtr && se::nodeValidator(0, zero) != 0,
+              "v14.32 node validator: it changes with the text pointer and with the first sixteen bytes, and is never zero");
+        check(vPad == se::nodeValidator(0x7f0000001000ull, padText), "v14.32 node validator: the same pointer and bytes give the same validator");
+        se::NodeCache<64> cache;
+        const uintptr_t node = 0x7ff600001230ull & ~uintptr_t(7);
+        se::NameClass cls = se::NameClass::kNone;
+        uint32_t flags = 0;
+        char name[64] = {};
+        bool stale = false;
+        check(cache.put(node, 4, se::NameClass::kPad, 0, "LandingPadSmallA", vPad), "v14.32 node reuse: a pad node is cached with its validator");
+        check(cache.find(node, 4, &cls, &flags, name, vPad, &stale) && !stale && cls == se::NameClass::kPad && std::strcmp(name, "LandingPadSmallA") == 0,
+              "v14.32 node reuse: the same name (the same validator) is a hit");
+        stale = false;
+        check(!cache.find(node, 4, &cls, &flags, name, vPadSamePtrOtherText, &stale) && stale,
+              "v14.32 node reuse: the same node pointer, another name, the same generation is refused and reported stale");
+        check(cache.put(node, 4, se::NameClass::kExplicit, se::kNodeMechanism, "Lift_01", vPadSamePtrOtherText), "v14.32 node reuse: the node is classified afresh and replaced in place");
+        stale = false;
+        check(cache.find(node, 4, &cls, &flags, name, vPadSamePtrOtherText, &stale) && !stale && cls == se::NameClass::kExplicit && flags == se::kNodeMechanism &&
+                  std::strcmp(name, "Lift_01") == 0,
+              "v14.32 node reuse: the new name is the hit");
+        check(!cache.find(node, 4, &cls, &flags, name, vPad, &stale), "v14.32 node reuse: the old name no longer hits");
+        check(cache.used(4) == 1, "v14.32 node reuse: the entry was replaced in place, not added beside the stale one");
+        // an unreadable node (validator 0) stays a hit while it stays unreadable
+        check(cache.put(node + 8, 4, se::NameClass::kUnnamed, 0, nullptr, 0) && cache.find(node + 8, 4, &cls, &flags, name, 0, &stale) && cls == se::NameClass::kUnnamed,
+              "v14.32 node reuse: an unreadable node (validator 0) is a hit while it stays unreadable");
+        check(!cache.find(node + 8, 4, &cls, &flags, name, vPad, &stale), "v14.32 node reuse: and a node that becomes readable is re-read");
+    }
+    {
         // The sealed sampling: the pass of stamp S is a full one every 4th stamp sealed, every 8th unsealed, every stamp with an engage pending.
         check(se::fullGatherPass(4, false, true) && se::fullGatherPass(8, false, true) && !se::fullGatherPass(5, false, true) && !se::fullGatherPass(6, false, true),
               "v14.31 sampled gathers: sealed, every fourth stamp is a full pass");
