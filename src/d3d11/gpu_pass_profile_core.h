@@ -36,27 +36,76 @@ constexpr uint32_t kCubeArraySlices = 6;
 // v4: the exposure reduction chain's target (Elite's, measured: three 252x252 post passes per eye, with two compute shaders; audit
 // reviews\vr-view-caches-2026-10-13.md candidate 1). Not a probe, whatever its shape rule says.
 constexpr uint32_t kExposureSide = 252;
+// v5 (delay): the front-loaded delay's default and clamp, in milliseconds; a gap above kLargeGapMs is "large"; a pass is suspect when it
+// takes more than kSuspectFactor times its own median and is followed by a large gap.
+constexpr uint32_t kDefaultDelayMs = 6;
+constexpr uint32_t kMinDelayMs = 2;
+constexpr uint32_t kMaxDelayMs = 12;
+constexpr double kLargeGapMs = 0.25;
+constexpr double kSuspectFactor = 3.0;
 
-// The hotkey's value is "KEY" or "KEY COUNT" (or "Ctrl+KEY COUNT"). A trailing whole number after whitespace is the frame count, clamped
-// to 1..kMaxCaptureFrames; without one the count is kDefaultCaptureFrames. The number is not taken when nothing precedes it, so a key
-// named by a digit alone still binds. keyOut receives the value without the count (what the hotkey binds).
-inline uint32_t splitCaptureSpec(const std::string& value, std::string& keyOut) {
-    keyOut = value;
-    size_t end = value.find_last_not_of(" \t");
-    if (end == std::string::npos) return kDefaultCaptureFrames;
-    size_t start = value.find_last_of(" \t", end);
-    if (start == std::string::npos) return kDefaultCaptureFrames;
-    const std::string tail = value.substr(start + 1, end - start);
-    const std::string head = value.substr(0, start);
-    if (head.find_first_not_of(" \t") == std::string::npos) return kDefaultCaptureFrames;
-    if (tail.empty() || tail.size() > 6) return kDefaultCaptureFrames;
-    for (char c : tail)
-        if (c < '0' || c > '9') return kDefaultCaptureFrames;
-    keyOut = head.substr(0, head.find_last_not_of(" \t") + 1);
-    const unsigned long n = std::stoul(tail);
+// v5 (delay): the hotkey's value is "KEY", "KEY COUNT" or "KEY COUNT DELAY_MS". Up to two whole numbers may trail the key, separated by
+// whitespace: the first is the frame count (1..kMaxCaptureFrames, default kDefaultCaptureFrames) and the second the front-loaded delay
+// (kMinDelayMs..kMaxDelayMs, default kDefaultDelayMs). A number is not taken when no key precedes it, so a key named by a digit alone
+// still binds. key is the value without the numbers (what the hotkey binds).
+struct CaptureSpec {
+    std::string key;
+    uint32_t frames = kDefaultCaptureFrames;
+    uint32_t delayMs = kDefaultDelayMs;
+};
+inline uint32_t clampFrames(unsigned long n) {
     if (n < 1) return 1;
-    if (n > kMaxCaptureFrames) return kMaxCaptureFrames;
-    return static_cast<uint32_t>(n);
+    return n > kMaxCaptureFrames ? kMaxCaptureFrames : static_cast<uint32_t>(n);
+}
+inline uint32_t clampDelayMs(unsigned long n) {
+    if (n < kMinDelayMs) return kMinDelayMs;
+    return n > kMaxDelayMs ? kMaxDelayMs : static_cast<uint32_t>(n);
+}
+inline CaptureSpec parseCaptureSpec(const std::string& value) {
+    std::vector<std::string> tok;
+    std::string cur;
+    for (char c : value) {
+        if (c == ' ' || c == '\t') {
+            if (!cur.empty()) tok.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) tok.push_back(cur);
+    auto isNumber = [](const std::string& s) {
+        if (s.empty() || s.size() > 6) return false;
+        for (char c : s)
+            if (c < '0' || c > '9') return false;
+        return true;
+    };
+    size_t end = tok.size();
+    int trailing = 0;
+    while (trailing < 2 && end > 1 && isNumber(tok[end - 1])) {
+        --end;
+        ++trailing;
+    }
+    CaptureSpec spec;
+    for (size_t i = 0; i < end; ++i) {
+        if (i) spec.key += ' ';
+        spec.key += tok[i];
+    }
+    if (trailing >= 1) spec.frames = clampFrames(std::stoul(tok[end]));
+    if (trailing == 2) spec.delayMs = clampDelayMs(std::stoul(tok[end + 1]));
+    return spec;
+}
+// The frame count and key only (the v2 interface, kept for its callers and rig).
+inline uint32_t splitCaptureSpec(const std::string& value, std::string& keyOut) {
+    const CaptureSpec spec = parseCaptureSpec(value);
+    keyOut = spec.key;
+    return spec.frames;
+}
+// v5: the loop count whose dispatch takes about delayMs, from one measured iteration cost (ms per iteration). 0 when the cost is unknown.
+inline uint32_t delayIterations(double msPerIteration, uint32_t delayMs) {
+    if (!(msPerIteration > 0.0)) return 0;
+    const double n = static_cast<double>(delayMs) / msPerIteration;
+    if (n < 1.0) return 1;
+    return n > 4.0e9 ? 4000000000u : static_cast<uint32_t>(n + 0.5);
 }
 
 // The timestamp pool holds one stamp array per captured frame. Pool frames to create for a capture of `frames`: the capture's own count,
@@ -283,6 +332,8 @@ struct Row {
     // "cs:hash(NAME)" of the most-dispatched compute shader for a dispatch-only pass; "-" when neither.
     std::string ident = "-";
     std::vector<HashTally> cs;   // every compute shader this pass dispatched with, by dispatch count (the summary's top_cs_dispatches totals)
+    double gapAfterMs = 0;       // v5: the no-work time (empty boundary segments) directly after this pass, before the next pass
+    bool suspect = false;        // v5: markSuspects: over kSuspectFactor times the pass's own median, and followed by a large gap
     uint32_t rtFormat = 0, dsvFormat = 0, slices = 1;
     bool cube = false;
     // The grouping key: class, target signature and shader identity, not the frame or the index.
@@ -304,7 +355,7 @@ inline std::string csvField(const std::string& s) {
 }
 
 inline const char* csvHeader() {
-    return "frame,pass,class,edvr,ms,draws,dispatches,clears,tris,colours,rt,rt_fmt,slices,cube,dsv,dsv_fmt,top_vs_ps_draws,top_cs_dispatches";
+    return "frame,pass,class,edvr,ms,draws,dispatches,clears,tris,colours,rt,rt_fmt,slices,cube,dsv,dsv_fmt,top_vs_ps_draws,top_cs_dispatches,gap_after_ms,suspect";
 }
 
 inline std::string csvRow(const Row& r) {
@@ -317,6 +368,9 @@ inline std::string csvRow(const Row& r) {
            std::to_string(r.colours) + "," + csvField(r.rt) + "," + std::to_string(r.rtFormat) + "," +
            std::to_string(r.slices) + "," + (r.cube ? "1" : "0") + "," + csvField(r.dsv) + "," +
            std::to_string(r.dsvFormat) + "," + csvField(r.top) + "," + csvField(r.topCs);
+    char gap[32];
+    std::snprintf(gap, sizeof gap, "%.4f", r.gapAfterMs);
+    out += std::string(",") + gap + (r.suspect ? ",1" : ",0");
     return out;
 }
 
@@ -474,6 +528,41 @@ inline Summary summarise(const std::vector<Row>& rows, const std::vector<double>
     std::stable_sort(s.cs.begin(), s.cs.end(), [](const CsTotal& a, const CsTotal& b) { return a.perFrame > b.perFrame; });
     if (s.cs.size() > kTopCs) s.cs.resize(kTopCs);
     return s;
+}
+
+// v5 (delay): one frame's segment times split by kind. kind 0 = work (a draw, dispatch or clear), 1 = the delay, 2 = empty (no work
+// between two boundaries: the no-work gap). busy is the frame time without the delay (work plus gaps, the sum of the pass durations as the
+// rows carry them); gap is the empty time alone.
+enum class SegKind : uint8_t { Work = 0, Delay = 1, Empty = 2 };
+struct SegTotals {
+    double busy = 0, delay = 0, gap = 0;
+};
+inline SegTotals segmentTotals(const std::vector<double>& ms, const std::vector<SegKind>& kind) {
+    SegTotals t;
+    for (size_t i = 0; i < ms.size() && i < kind.size(); ++i) {
+        if (kind[i] == SegKind::Delay) {
+            t.delay += ms[i];
+            continue;
+        }
+        t.busy += ms[i];
+        if (kind[i] == SegKind::Empty) t.gap += ms[i];
+    }
+    return t;
+}
+// v5: the suspect passes. A pass is suspect when its duration is more than kSuspectFactor times the median of its own group (the same
+// key) AND the next gap after it is over kLargeGapMs. Sets Row::suspect; returns how many were flagged.
+inline size_t markSuspects(std::vector<Row>& rows) {
+    std::map<std::string, std::vector<double>> byKey;
+    for (const Row& r : rows) byKey[r.key()].push_back(r.ms);
+    std::map<std::string, double> median;
+    for (auto& kv : byKey) median[kv.first] = medianOf(kv.second);
+    size_t n = 0;
+    for (Row& r : rows) {
+        const double m = median[r.key()];
+        r.suspect = m > 0 && r.ms > kSuspectFactor * m && r.gapAfterMs > kLargeGapMs;
+        if (r.suspect) ++n;
+    }
+    return n;
 }
 
 // Built v13.6: the shared clock is yielded to the profiler from the press until the batch's last frame is closed: wanted while a capture is armed

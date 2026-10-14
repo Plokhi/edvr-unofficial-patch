@@ -38,6 +38,7 @@ v3 fixes (2026-10-13, after the six flights on cb712758; root causes in the Log)
 - Only 4 of 30 frames captured: 4 pass-scope slots for 30 frames. Now 128, and a boundary waits for another holder of the clock.
 - probe_cube on eye passes: squareness is not the rule any more. probe_cube = not at the eye size, and square up to 1024 or a cube array.
 - v4: 252x252 one-draw passes and the dispatches whose top compute shader is B8E727E9 or F1FB2EEF are "exposure" (Elite's exposure chain; reviews\vr-view-caches-2026-10-13.md). probe_cube's square is now 256 to 1024 (or a cube array of 6+ slices).
+Delay (2026-10-14, branch claude/gpu-profile-delay, TEMPORARY): hotkey value KEY COUNT DELAY_MS (delay 2 to 12 ms, default 6). Frame 1 of a capture is the reference (no delay); the others carry a compute delay at their start, as their own segment, excluded from classes and totals. Summary: "delay D ms (measured M ms) placed at frame start; inter-pass gaps median G ms per frame; frame busy B ms". Suspect passes are marked in the CSV (gap_after_ms, suspect).
 UI instruments (2026-10-13, TEMPORARY for this measurement build: g_hdrDrawTimingOn is on in ui_layer.cpp; turn it off after the flight):
 hologram resolve split into depth copy, near-light and resolve draw; moved HDR HUD draw as its own altered item; seeds by reason;
 reissues issued vs empty. Lines in the Log.
@@ -114,6 +115,22 @@ Still open: no flight yet; the overhead below is an estimate, not a measurement.
   Tests: gpu_census_test (instrumentCases: the sub-section order, the door count, the altered class, the issued counter) and
   ui_quality_test (testSeedReasonTally).
 
+- 2026-10-14, delay (branch claude/gpu-profile-delay, from origin/claude/flight-2026-10-14). The flight had GPU slack at 90 Hz, so a
+  pass's timestamps include the GPU waiting for the CPU to submit (the AA-off capture put 2.5 ms on cs:b09aadab, a tiny copy).
+  The feature: a front-loaded compute delay at the start of each captured frame after the first. Frame 1 is the reference (no
+  delay). Calibration, once per capture at the batch start: one blocking trial of 1,000,000 dependent multiply-adds (grown x4, up
+  to three tries, until 0.5 ms is measurable), timed by a disjoint query and two timestamps; ms per iteration = trial ms / trial
+  count; iterations = delay / ms per iteration. The shader (src\d3d11\gpu_pass_delay_shader.h) is one thread into a one-element
+  UAV, compiled at the first capture with d3dcompiler_47.dll and loaded once. DEVIATION: house practice precompiles shaders in the
+  build (temporal_shader_build), and a precompiled entry needs its contract table extended; this one compiles at run time. A
+  compile failure turns the delay off for the session, with a note. The delay's CS, CB0 and UAV0 bindings are read and restored
+  through the context's own methods, and its dispatch is not a pass note (g_delayIssuing).
+  Measured: the delay segment's own time (M). Gap: the no-work boundary segments, per frame (median over the delayed frames; the
+  reference frame's own line). Busy: the frame time without the delay (work plus gaps; each gap stays folded into the pass after it,
+  as before). Suspect: over 3x its key's median and followed by a gap over 0.25 ms (CSV gap_after_ms and suspect; the summary
+  counts them). LIMIT: a submission stall sits before the first command of a segment, so it is inside that pass's time, not in an
+  empty segment. The gap median can read near zero while the passes are long. The test of whether the delay removed waits is the
+  per-pass median and the frame busy time against the reference frame, not the gap alone. Rig: testV5Delay.
 - 2026-10-13, v4 (after the coordinator's correction): the 252x252 passes are Elite's exposure chain, not probes (candidate 1 of
   reviews\vr-view-caches-2026-10-13.md: three 252x252 post passes per eye, with compute shaders B8E727E94D44D891 and
   F1FB2EEFB662F3AA). New class "exposure": 252x252 single-target passes, and dispatch-only passes whose top compute shader is one
