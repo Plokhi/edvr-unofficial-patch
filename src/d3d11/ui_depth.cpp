@@ -6,6 +6,7 @@
 #include "orbital_width.h"    // the orbit lines' factor and the twin's private b13 (fix.ui_quality)
 #include "planet_motion.h"
 #include "gpu_interval.h"
+#include "gpu_census.h"     // the hologram resolve's three sub-sections (DoorHoloDepthCopy, DoorHoloNearLight, DoorHoloResolveDraw)
 #include "ui_content.h"
 #include "holo_material.h"
 #include "holo_families.h"  // the eleven hologram family hashes and the canopy: the depth pass's lists; the crisp take keeps its own eight there (kHoloFamiliesTake)
@@ -3525,7 +3526,12 @@ bool uiDepthHologramResolve(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* 
         ++g_holoWindowDeclinedNotCleared;
         return false;
     }
-    ID3D11DepthStencilView* privateTarget = g_uiDepth[eye].acquire(ctx, scene);
+    // The depth copy (the private target's first CopyResource this frame, inside acquire): a hologram sub-section (gpu_census.h).
+    ID3D11DepthStencilView* privateTarget = nullptr;
+    {
+        GpuCensusScope depthCopy(ctx, GpuCensusSection::DoorHoloDepthCopy);
+        privateTarget = g_uiDepth[eye].acquire(ctx, scene);
+    }
     if (!privateTarget) {
         ++g_holoWindowDeclinedNoPrivate;
         return false;
@@ -3694,7 +3700,10 @@ bool uiDepthHologramResolve(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* 
             // One group per 16x16 pixels: four of the 8x8 blocks the map is made of, each with its own
             // flag and its own texel (fixed_shader_source.h kHoloNearLightCsHlsl). An odd count of blocks
             // leaves the last group's far half writing past the map, which D3D11 drops.
-            ctx->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
+            {
+                GpuCensusScope nearLight(ctx, GpuCensusSection::DoorHoloNearLight);
+                ctx->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
+            }
             ++counts.ran;
 
             ID3D11UnorderedAccessView* zeroUav = nullptr;
@@ -3784,7 +3793,10 @@ bool uiDepthHologramResolve(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* 
 
         ID3D11Query* q = holoAcquireQuery(ctx, s);
         if (q) ctx->Begin(q);
-        vScreenDrawRaw(ctx, 3, 0);
+        {
+            GpuCensusScope resolveDraw(ctx, GpuCensusSection::DoorHoloResolveDraw);
+            vScreenDrawRaw(ctx, 3, 0);
+        }
         if (q) { ctx->End(q); holoQueryBegan(s, q); }
 
         ID3D11ShaderResourceView* nullSrvs[6]{};

@@ -18,6 +18,8 @@ inline bool flatProfileReadsKey(const char* key) {
         std::strcmp(key, "hotkey.menu") == 0 ||
         std::strcmp(key, "fix.temporal_aa_model") == 0 ||
         std::strcmp(key, "hotkey.dump_draws") == 0 ||
+        // TEMPORARY (GPU pass profile, 2026-10-12): the flat profile reads the same key. Remove with the arc.
+        std::strcmp(key, "hotkey.gpu_pass_profile") == 0 ||
         std::strcmp(key, "fix.render_sharpness") == 0 ||
         // TEMPORARY A/B (docs/sky-flicker-2026-10-13.md): a much smaller square target is no candidate for the scene (flat_copy_structure.h, flatSceneRule).
         // ui: hidden in edvr.ini, so no installer row; it goes when the arc closes.

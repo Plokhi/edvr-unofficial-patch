@@ -19,6 +19,7 @@
 #include "device_hook.h"  // contextHookModeFor
 #include "draw_census.h"  // drawCensusDispatch: the census records compute
 #include "exposure_chain.h"  // the engine path: which of the second eye's dispatches are not forwarded (pure half)
+#include "gpu_pass_profile.h"  // TEMPORARY GPU pass profiler: a dispatch is a pass boundary
 #include "engine_velocity.h"  // F2: the palette chain's dispatch feeds the second skin's join
 #include "skin_join.h"        // kChainHash
 #include "flat_runtime.h"
@@ -722,6 +723,7 @@ bool skinChainBound() {
 }
 
 void STDMETHODCALLTYPE hookedDispatch(ID3D11DeviceContext* self, UINT x, UINT y, UINT z) {
+    if (gpuPassProfileCapturing()) gpuPassProfileNoteDispatch(self, x, y, z);
     if (runtimeFlatProfile()) {
         ++g_state->thunkHits[kHitDispatch];
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDispatch(self, x, y, z);

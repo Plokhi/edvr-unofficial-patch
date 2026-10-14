@@ -2,6 +2,7 @@
 #include "gpu_interval.h"
 #include "gpu_frame_gap.h"
 #include "gpu_frame_timing.h"
+#include "gpu_pass_profile.h"   // TEMPORARY pass profiler: an EDVR section's begin and end are pass boundaries
 #include "../common/log.h"
 #include <windows.h>
 #include <d3d11.h>
@@ -29,14 +30,19 @@ unsigned occurrenceCapFor(GpuCensusSection section) noexcept {
 }
 
 // The door's parenthetical breakdown, DoorUpscaler..DoorSkyRing (indices
-// 1..9) -- DoorTemporalWhole (index 0) has no slot of its own; it is the
+// 1..12) -- DoorTemporalWhole (index 0) has no slot of its own; it is the
 // "whole" that five of these nest inside (see gpuCensusLogLine). "sky ring -"
 // in a line means the diag.sky_ring dispatch never ran in the window (key off).
-constexpr size_t kDoorBreakdownCount = 9;
-constexpr const char* kDoorBreakdownNames[kDoorBreakdownCount] = {
-    "upscaler", "motion prep", "hologram resolve", "UI resolve",
-    "sharpen", "menu", "UI layer composite", "FSS heal", "sky ring"
+constexpr const char* kDoorBreakdownNames[] = {
+    "upscaler", "motion prep", "hologram resolve", "hologram depth copy", "hologram near-light", "hologram resolve draw",
+    "UI resolve", "sharpen", "menu", "UI layer composite", "FSS heal", "sky ring"
 };
+constexpr size_t kDoorBreakdownCount = sizeof(kDoorBreakdownNames) / sizeof(kDoorBreakdownNames[0]);
+// The three hologram sub-sections sit right after the umbrella (index DoorHologramResolve); the umbrella's line item carries them in brackets.
+static_assert(static_cast<size_t>(GpuCensusSection::DoorHoloResolveDraw) + 1 == static_cast<size_t>(GpuCensusSection::DoorUiResolve) &&
+                  static_cast<size_t>(GpuCensusSection::DoorHoloDepthCopy) == static_cast<size_t>(GpuCensusSection::DoorHologramResolve) + 1,
+              "the hologram sub-sections follow the hologram resolve umbrella");
+static_assert(kDoorBreakdownCount == kDoorSections - 1, "one name for each door section after DoorTemporalWhole");
 // The in-frame breakdown, FrameHologramPasses..FrameUiLayerHdrSeed (indices 9..16): the item names, in the
 // sections' order. "HDR HUD depth-stencil seed" is the name the UI layer's own 30 s line gives the same stage.
 constexpr const char* kFrameBreakdownNames[] = {
@@ -55,8 +61,9 @@ constexpr size_t kAlteredFirst = static_cast<size_t>(GpuCensusSection::AlteredPo
 constexpr size_t kSeedSection = static_cast<size_t>(GpuCensusSection::FrameUiLayerHdrSeed);
 constexpr size_t kAlteredClassSections = static_cast<size_t>(GpuCensusSection::AlteredFixFirst) - kAlteredFirst;
 constexpr size_t kAlteredFixFirst = static_cast<size_t>(GpuCensusSection::AlteredFixFirst);
-constexpr const char* kAlteredNames[2] = {
-    "pool-family draws (EDVR's slot target and shaders)", "UI draws (redirected to EDVR's layer)"
+constexpr const char* kAlteredNames[3] = {
+    "pool-family draws (EDVR's slot target and shaders)", "UI draws (redirected to EDVR's layer)",
+    "HUD draws moved into the HDR HUD layer (the game's shading at the layer size)"
 };
 constexpr const char* kAlteredFixSumName = "other fix-wrapped draws";
 // The fix names, in AlteredFix's order: fixed strings, never built from a draw.
@@ -65,7 +72,7 @@ constexpr const char* kAlteredFixNames[kAlteredFixCount] = {
     "sun glare clamp", "sun glare steady", "particles", "FSS panel", "FSS reveal",
     "loading scrim", "menu backdrop", "unnamed fix"
 };
-static_assert(kAlteredClassSections == 2, "one name for each altered-draw class");
+static_assert(kAlteredClassSections == 3, "one name for each altered-draw class");
 // The VR world route's three sections (gpu_census.h) come right after the seed and are the last in-frame ones. The
 // rotation gives none of them a turn until it has been called this window, so a session with the key off samples as it did
 // before they existed.
@@ -100,6 +107,7 @@ struct SectionState {
     // never confused with a real one.
     GpuIntervals<8> nullSampler;
     uint64_t occurrences = 0;        // every call this window, timed or not
+    uint64_t issued = 0;             // of those, the calls that issued a real GPU pass (gpuCensusNoteIssued); the rest were empty scopes
     uint32_t skippedThisWindow = 0;  // timer begins that failed on the section's turn (not the K cap)
     // sampler.totals/nullSampler.totals never reset themselves; these are
     // their value at the start of the current window, so the window's
@@ -161,6 +169,7 @@ struct Snapshot {
     bool occurred = false;
     double msPerFrame = 0.0;
     double perFrame = 0.0;
+    double issuedPerFrame = 0.0;   // occurrences that issued a real pass, per frame (the rest were empty scopes)
     unsigned samples = 0;   // the timed occurrences that completed this window (what the figure is a mean of)
 };
 
@@ -188,6 +197,7 @@ Snapshot snapshotOf(const SectionState& st, const SectionState& nullSt, uint64_t
     const unsigned nullWindowSamples = nt.samples >= nullSt.nullBaseSamples ? nt.samples - nullSt.nullBaseSamples : 0;
     const double nullMsPerOccurrence = nullWindowSamples ? nullWindowMs / static_cast<double>(nullWindowSamples) : 0.0;
     s.perFrame = frames ? static_cast<double>(st.occurrences) / static_cast<double>(frames) : 0.0;
+    s.issuedPerFrame = frames ? static_cast<double>(st.issued) / static_cast<double>(frames) : 0.0;
     s.msPerFrame = correctedMsPerCall(msPerOccurrence, nullMsPerOccurrence) * s.perFrame;
     s.samples = windowSamples;
     return s;
@@ -319,12 +329,17 @@ void logAndResetWindow(uint64_t now) {
     // their direct sum.
     const Snapshot doorWhole = snapshotOf(g_section[static_cast<size_t>(GpuCensusSection::DoorTemporalWhole)], frames);
     double doorTotal = doorWhole.msPerFrame;
+    // The hologram resolve's three parts (gpu_census.h): printed in brackets after the umbrella, never separate items, never a total.
+    Snapshot holo[3];   // depth copy, near-light, resolve draw
+    for (size_t k = 0; k < 3; ++k) holo[k] = snapshotOf(g_section[static_cast<size_t>(GpuCensusSection::DoorHoloDepthCopy) + k], frames);
     std::string doorItems;
-    static_assert(kDoorSections == 1 + kDoorBreakdownCount, "one name for each door section after the whole");
-    for (int i = 0; i < static_cast<int>(kDoorBreakdownCount); ++i) {
-        const Snapshot s = snapshotOf(g_section[1 + static_cast<size_t>(i)], frames);
-        appendItem(doorItems, kDoorBreakdownNames[i], s);
+    for (size_t i = 0; i < kDoorBreakdownCount; ++i) {
         const auto section = static_cast<GpuCensusSection>(1 + i);
+        if (section == GpuCensusSection::DoorHoloDepthCopy || section == GpuCensusSection::DoorHoloNearLight ||
+            section == GpuCensusSection::DoorHoloResolveDraw)
+            continue;
+        const Snapshot s = snapshotOf(g_section[1 + i], frames);
+        appendItem(doorItems, kDoorBreakdownNames[i], s);
         if (section == GpuCensusSection::DoorSharpen || section == GpuCensusSection::DoorMenu ||
             section == GpuCensusSection::DoorUiLayerComposite || section == GpuCensusSection::DoorFssHeal) {
             doorTotal += s.msPerFrame;
@@ -336,6 +351,14 @@ void logAndResetWindow(uint64_t now) {
     for (size_t i = 0; i < kFrameSections; ++i) {
         const Snapshot s = snapshotOf(g_section[kDoorSections + i], frames);
         appendItem(frameItems, kFrameBreakdownNames[i], s);
+        // The UI layer reissues: how many of the occurrences issued a real pass, and how many were empty scopes (gpu_census.h's
+        // issued count; a scope that returned before any draw or dispatch is empty). Its figure above is the whole section.
+        if (kDoorSections + i == static_cast<size_t>(GpuCensusSection::FrameUiLayerReissues) && s.occurred) {
+            char real[96];
+            std::snprintf(real, sizeof(real), " [%.2f real a frame, %.2f empty]", s.issuedPerFrame,
+                          s.perFrame > s.issuedPerFrame ? s.perFrame - s.issuedPerFrame : 0.0);
+            frameItems += real;
+        }
         frameTotal += s.msPerFrame;
         if (kDoorSections + i == kSeedSection) seedSnap = s;
     }
@@ -435,6 +458,16 @@ void logAndResetWindow(uint64_t now) {
         formatSeedDetail(seedDetail, sizeof(seedDetail), seedSnap, g_seedNotes, g_seedMixed, g_seedFirst, g_seedOther);
         Log::get().note("%s", seedDetail);
     }
+    // The hologram resolve's three parts (2026-10-13): their own line, because the main line's door items are at the log's length. They
+    // are inside the umbrella's figure, so they are a breakdown of it and never part of a total.
+    if (holo[0].occurred || holo[1].occurred || holo[2].occurred) {
+        std::string parts;
+        appendItem(parts, "depth copy", holo[0]);
+        appendItem(parts, "near-light", holo[1]);
+        appendItem(parts, "resolve draw", holo[2]);
+        Log::get().note("EDVR GPU census, the hologram resolve's parts (inside the door's \"hologram resolve\" figure above, not added to "
+                        "any total): %s; \"-\" means that part did not run this window.", parts.c_str());
+    }
     // The second skin's own line, only when some of that work ran this window (a window with no skinned character prints nothing of it, as before F16).
     {
         Snapshot skin[kSkinSections];
@@ -473,6 +506,7 @@ void logAndResetWindow(uint64_t now) {
         st.nullBaseMs = st.nullSampler.totals.ms;
         st.nullBaseSamples = st.nullSampler.totals.samples;
         st.occurrences = 0;
+        st.issued = 0;
         st.skippedThisWindow = 0;
     }
     resetSeedNotes();
@@ -484,8 +518,15 @@ void logAndResetWindow(uint64_t now) {
 
 } // namespace
 
+void gpuCensusNoteIssued(GpuCensusSection section) noexcept {
+    if (section >= GpuCensusSection::Count) return;
+    ++g_section[static_cast<size_t>(section)].issued;
+}
+
 bool gpuCensusBegin(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept {
     if (section >= GpuCensusSection::Count) return false;
+    // EDVR's own sections only: the Altered sections time Elite's draw and are not EDVR's work (gpu_census.h).
+    if (section < GpuCensusSection::AlteredPoolFamily && gpuPassProfileCapturing()) gpuPassProfileNoteEdvr(ctx, true);
     SectionState& st = g_section[static_cast<size_t>(section)];
     ++st.occurrences;   // Cheap and unconditional: the estimate needs every occurrence counted.
     const GpuCensusSection owner = turnOwnerOf(section);
@@ -532,6 +573,7 @@ void gpuCensusNoteSeedTarget(const GpuCensusSeedTarget& target) noexcept {
 
 void gpuCensusEnd(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept {
     if (section >= GpuCensusSection::Count) return;
+    if (section < GpuCensusSection::AlteredPoolFamily && gpuPassProfileCapturing()) gpuPassProfileNoteEdvr(ctx, false);
     // Safe even when the matching Begin returned false: GpuIntervals::end()
     // is a no-op with nothing open (gpu_interval.h), so a plain Begin/End
     // pair at a call site never needs to branch on Begin's result.

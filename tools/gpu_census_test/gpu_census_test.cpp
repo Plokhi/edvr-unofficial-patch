@@ -57,6 +57,13 @@ void Log::note(const char* fmt, ...) {
 
 #include "../../src/d3d11/gpu_census.cpp"
 
+// gpu_census.cpp calls the GPU pass profiler's two entry points (gpu_pass_profile.cpp is not linked into this rig,
+// and its own rig is tools\gpu_pass_profile_test): unarmed, the flag stays false and they are never reached.
+namespace edvr {
+namespace detail { bool g_gpuPassCapturing = false; }
+void gpuPassProfileNoteEdvr(ID3D11DeviceContext*, bool) {}
+}
+
 namespace {
 unsigned g_checks = 0;
 void check(bool ok, const char* why) { ++g_checks; if (!ok) throw std::runtime_error(why); }
@@ -700,7 +707,8 @@ void alteredLineCases() {
     logAndResetWindow(start + 30000);
     line = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
     check(line && line->find("pool-family draws (EDVR's slot target and shaders) -, "
-                             "UI draws (redirected to EDVR's layer) -, other fix-wrapped draws -;") != std::string::npos &&
+                             "UI draws (redirected to EDVR's layer) -, HUD draws moved into the HDR HUD layer "
+                             "(the game's shading at the layer size) -, other fix-wrapped draws -;") != std::string::npos &&
               line->find("\"-\" means no such draw ran this window") != std::string::npos,
           "altered line: a window with no altered draw prints '-' for all three and says what that means");
     // The timer floor and the spans count include the altered sections' own timers.
@@ -768,9 +776,9 @@ void alteredFixCases() {
         ++cycle;
         onlyOwners = onlyOwners && turnOwnerOf(static_cast<GpuCensusSection>(at)) == static_cast<GpuCensusSection>(at);
     } while (at != 0 && cycle < 200);
-    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 - static_cast<unsigned>(kWorldSections) - static_cast<unsigned>(kSkinSections) && cycle == 21,
-          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones and the idle world-route and second-skin ones (21: the 20 there were before the sky ring's door section, 2026-10-13, and the 22 before the terrain's two sections went, 2026-10-01; the key off changes nothing)");
-    // The same cycle once the VR world route's three sections have been called this window: they take turns, 24.
+    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 - static_cast<unsigned>(kWorldSections) - static_cast<unsigned>(kSkinSections) && cycle == 25,
+          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones and the idle world-route and second-skin ones (25: the 20 there were after the terrain's two sections went, 2026-10-01, plus the three hologram sub-sections and the moved HDR HUD draw, 2026-10-13, and the sky ring's door section, 2026-10-13; the key off changes nothing)");
+    // The same cycle once the VR world route's three sections have been called this window: they take turns, 28.
     for (size_t i = kWorldFirst; i < kWorldFirst + kWorldSections; ++i) g_section[i].occurrences = 1;
     at = 0;
     cycle = 0;
@@ -781,8 +789,8 @@ void alteredFixCases() {
         if (static_cast<size_t>(at) >= kWorldFirst && static_cast<size_t>(at) < kWorldFirst + kWorldSections)
             worldVisited[static_cast<size_t>(at) - kWorldFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 24 && worldVisited[0] && worldVisited[1] && worldVisited[2],
-          "turns: a world-route section that has been called this window takes its turn (24: the 21 and the three)");
+    check(cycle == 28 && worldVisited[0] && worldVisited[1] && worldVisited[2],
+          "turns: a world-route section that has been called this window takes its turn (28: the 20 and the three world ones, then 2026-10-13's five: the hologram sub-sections, the moved HDR HUD draw and the sky ring)");
     for (size_t i = kWorldFirst; i < kWorldFirst + kWorldSections; ++i) g_section[i].occurrences = 0;
     for (auto& s : g_section) s = SectionState{};
     g_section[kAlteredFixFirst + 2].occurrences = 7;
@@ -802,7 +810,7 @@ void alteredFixCases() {
     particle.occurrences = 100;
     owner.turns = 3;
     g_windowFrames = 9;        // gpuCensusFrame counts this frame first: 10
-    g_activeSection = static_cast<int>(GpuCensusSection::AlteredUiLayer);
+    g_activeSection = static_cast<int>(GpuCensusSection::AlteredHdrHud);   // the last class before the fix sections (2026-10-13)
     gpuCensusFrame(nullptr);
     check(g_activeSection == static_cast<int>(GpuCensusSection::AlteredFixFirst),
           "shared turn: the rotation lands on it after the last class");
@@ -1294,8 +1302,8 @@ void skinTurnCases() {
         const size_t a = static_cast<size_t>(at);
         if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) skinVisited[a - kSkinFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 21 && !skinVisited[0] && !skinVisited[1] && !skinVisited[2] && !skinVisited[3] && !skinVisited[4],
-          "second skin turns: with none called this window the rotation gives them no turn (the cycle is the 21 of a build without them: the 20 it was before they existed, and the sky ring)");
+    check(cycle == 25 && !skinVisited[0] && !skinVisited[1] && !skinVisited[2] && !skinVisited[3] && !skinVisited[4],
+          "second skin turns: with none called this window the rotation gives them no turn (the cycle is the 25 it is now: the 20 before they existed and five added on 2026-10-13)");
     for (size_t i = 0; i < kSkinSections; ++i) skinSection(i).occurrences = 1;
     at = 0;
     cycle = 0;
@@ -1306,8 +1314,8 @@ void skinTurnCases() {
         const size_t a = static_cast<size_t>(at);
         if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) skinVisited[a - kSkinFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 26 && skinVisited[0] && skinVisited[1] && skinVisited[2] && skinVisited[3] && skinVisited[4],
-          "second skin turns: once called this window each takes its turn (26: the 21 and the five)");
+    check(cycle == 30 && skinVisited[0] && skinVisited[1] && skinVisited[2] && skinVisited[3] && skinVisited[4],
+          "second skin turns: once called this window each takes its turn (30: the 25 and the five)");
     // one of them alone
     for (size_t i = 0; i < kSkinSections; ++i) skinSection(i).occurrences = 0;
     skinSection(3).occurrences = 1;
@@ -1321,7 +1329,7 @@ void skinTurnCases() {
         if (a == kSkinFirst + 3) ++joinTurns;
         else if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) ++otherSkin;
     } while (at != 0 && cycle < 200);
-    check(cycle == 22 && joinTurns == 1 && otherSkin == 0, "second skin turns: the join called alone has one turn a cycle and the others none");
+    check(cycle == 26 && joinTurns == 1 && otherSkin == 0, "second skin turns: the join called alone has one turn a cycle and the others none");
     for (auto& s : g_section) s = SectionState{};
 }
 
@@ -1459,7 +1467,32 @@ void lineLengths() {
     }
 }
 
+// 2026-10-13 instruments: the hologram sub-sections nest in the umbrella's place, the moved HDR draw is an altered class, and the reissue
+// count tells real passes from empty scopes (the section's issued counter; an empty scope never reaches it).
+void instrumentCases() {
+    check(static_cast<size_t>(GpuCensusSection::DoorHoloDepthCopy) == static_cast<size_t>(GpuCensusSection::DoorHologramResolve) + 1 &&
+              static_cast<size_t>(GpuCensusSection::DoorHoloResolveDraw) == static_cast<size_t>(GpuCensusSection::DoorUiResolve) - 1,
+          "instruments: the hologram sub-sections sit between the resolve umbrella and UI resolve");
+    check(isDoorSection(GpuCensusSection::DoorHoloNearLight), "instruments: the hologram sub-sections are door sections (K=4)");
+    check(occurrenceCapFor(GpuCensusSection::DoorHoloResolveDraw) == 4, "instruments: a hologram sub-section caps at the door's 4");
+    check(kDoorBreakdownCount == 11, "instruments: eleven door items after the temporal whole");
+    check(GpuCensusSection::AlteredHdrHud > GpuCensusSection::AlteredUiLayer && GpuCensusSection::AlteredHdrHud < GpuCensusSection::AlteredFixFirst,
+          "instruments: the moved HDR draw is an altered class, before the fix sections");
+    check(kAlteredClassSections == 3 && std::strstr(kAlteredNames[2], "HDR HUD") != nullptr, "instruments: the altered class has its name");
+
+    // The issued counter: real passes only. Three occurrences in the window: two issued a pass, one was an empty scope (no note).
+    SectionState& st = g_section[static_cast<size_t>(GpuCensusSection::FrameUiLayerReissues)];
+    const uint64_t before = st.issued;
+    gpuCensusNoteIssued(GpuCensusSection::FrameUiLayerReissues);
+    gpuCensusNoteIssued(GpuCensusSection::FrameUiLayerReissues);
+    check(st.issued - before == 2, "issued: two issued passes are counted, and an empty scope adds nothing");
+    gpuCensusNoteIssued(GpuCensusSection::Count);   // out of range: ignored, never a write past the table
+    check(st.issued - before == 2, "issued: an out-of-range section is ignored");
+    st.issued = before;   // put the window's count back as it was
+}
+
 void run() {
+    instrumentCases();
     estimatorMathCases();
     calibrationMathCases();
     logFormatCase();
