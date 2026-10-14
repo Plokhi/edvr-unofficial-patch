@@ -94,8 +94,10 @@ void temporalPassNoteRigidDraw(int eye, const void* resource, uint64_t vertexSha
 // colour targets with a small square depth view starts a mini-render pass whose draws are counted.
 namespace detail {
 extern bool g_cameraDrawWatch;
+extern uint32_t g_cameraDrawCount;   // owner-context draws ever (wraps); a write's "draws after" is the difference to the next write's
 }  // namespace detail
 inline bool temporalPassWantsDraw() { return detail::g_cameraDrawWatch; }
+inline void temporalPassCountDraw() { ++detail::g_cameraDrawCount; }
 void temporalPassNoteDraw(ID3D11DeviceContext* ctx);
 void temporalPassNoteOmSet(unsigned colours);
 // This frame's rows become last frame's; called at the frame boundary.

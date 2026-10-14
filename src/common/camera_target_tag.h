@@ -51,18 +51,51 @@ inline bool eyeSized(const Target& t, uint32_t eyeW, uint32_t eyeH) {
     return withinQuarter(t.w, eyeW) && withinQuarter(t.h, eyeH);
 }
 
-// The rule: a known target that is not eye-sized rejects the write. Unknown never rejects.
+// The size rule alone: a known target that is not eye-sized rejects the write. Unknown never rejects.
 inline bool rejects(const Target& t, uint32_t eyeW, uint32_t eyeH) {
     return t.known() && !eyeSized(t, eyeW, eyeH);
 }
 
+// ---- the identity rule (revised after the 2026-10-13 hangar flight) ---------------------------------------------------------------------------------------
+// The first flight with the size rule off showed it cannot catch the bad picks: the reflection probe's forward face is tagged to a target of the EYE's size
+// (2016x2016) -- the very texture the game submits for the eye, R8G8B8A8_TYPELESS (format 27) -- because the write has no draw of its own and the next
+// draw of the frame is a late pass into the submitted image. The good picks of the same burst frames are tagged to the scene's lit HDR target
+// (R11G11B10_FLOAT, 26). But most ordinary frames pick a late head-camera write that is tagged 27 too (418 of 456 frames outside a burst), on the same
+// track as the scene writes to a millimetre: the format alone is not the discriminator, and a write that is drawn into the SUBMITTED texture is a late-frame
+// (tone/UI/hologram) write, not a scene pass's. So a write qualifies as the scene's camera only when its first draw goes into an eye-sized target that is not
+// the submitted eye texture itself: the scene passes (G-buffer, lit HDR, forward) all draw elsewhere. The submitted texture's format and size are known to
+// the pass exactly (it is the texture it is treating). The R8G8B8A8 formats are one family (typeless, unorm, srgb, ...), as are the B8G8R8A8 ones.
+struct Submit {
+    uint16_t fmt = 0, w = 0, h = 0;
+    bool known() const { return fmt != 0 && w != 0 && h != 0; }
+};
+inline uint16_t formatFamily(uint16_t f) {
+    if (f >= 27 && f <= 32) return 27;     // R8G8B8A8 typeless, unorm, unorm srgb, uint, snorm, sint
+    if (f == 87 || f == 88 || f == 90 || f == 91 || f == 92 || f == 93) return 87;   // B8G8R8A8 / B8G8R8X8, typeless and srgb
+    return f;
+}
+enum class Why : uint8_t { Keep = 0, NotEyeSized = 1, SubmitTarget = 2 };
+inline Why judge(const Target& t, uint32_t eyeW, uint32_t eyeH, const Submit& s) {
+    if (!t.known()) return Why::Keep;
+    if (!eyeSized(t, eyeW, eyeH)) return Why::NotEyeSized;
+    if (t.src == 1 && s.known() && t.w == s.w && t.h == s.h && formatFamily(t.fmt) == formatFamily(s.fmt)) return Why::SubmitTarget;
+    return Why::Keep;
+}
+inline bool rejectsFor(const Target& t, uint32_t eyeW, uint32_t eyeH, const Submit& s) { return judge(t, eyeW, eyeH, s) != Why::Keep; }
+
 // The frame's verdict over all its writes: fed each write's tag once, then asked whether the filter applies. With nothing eligible (every write tagged
-// non-eye: a wrong eye size, or an eye drawn into a target of another shape) it stands down for the frame rather than leave the chooser empty.
+// non-eye or to the submitted texture: a wrong eye size, or a game that draws its scene straight into the submitted image) it stands down for the frame
+// rather than leave the chooser empty.
 struct Filter {
     uint32_t cut = 0;               // writes the rule rejects (counted with the key off too: would-be)
+    uint32_t cutSize = 0, cutSubmit = 0;
     bool eligibleAny = false;       // at least one write the rule keeps
-    void note(const Target& t, uint32_t eyeW, uint32_t eyeH) {
-        if (rejects(t, eyeW, eyeH)) ++cut; else eligibleAny = true;
+    void note(const Target& t, uint32_t eyeW, uint32_t eyeH, const Submit& s) {
+        switch (judge(t, eyeW, eyeH, s)) {
+        case Why::NotEyeSized: ++cut; ++cutSize; break;
+        case Why::SubmitTarget: ++cut; ++cutSubmit; break;
+        default: eligibleAny = true; break;
+        }
     }
     bool active(bool keyOn) const { return keyOn && cut && eligibleAny; }
     bool failedOpen(bool keyOn) const { return keyOn && cut && !eligibleAny; }
@@ -84,9 +117,14 @@ struct Stats {
     uint32_t rejected = 0;         // ...rejected (key on) or that would be (key off)
     uint32_t rejectFrames = 0;     // frames with at least one rejection
     uint32_t failOpen = 0;         // frames where nothing was eligible, so nothing was rejected (key on)
+    uint32_t failOpenNoCont = 0;   // frames where the filter left no continuous candidate, so the unfiltered set was used (key on)
+    uint32_t submitRejected = 0;   // ...of rejected, the writes drawn into the submitted eye texture (the rest are not eye-sized)
+    uint32_t pickChanges = 0;      // frames where the filtered chooser's pick differs from the unfiltered one's (counted with the key off too)
+    float maxPickDiffM = 0.0f, maxPickDiffDeg = 0.0f;   // ...and the largest difference between the two picks' rows
     SizeCount sizes[kSizeSlots];   // the rejected sizes by count; a seventh size is counted in other
     uint32_t other = 0;
     uint32_t eyeW = 0, eyeH = 0;   // the eye size the last frame was judged against
+    Submit submit;                 // the submitted eye texture the last frame was judged against
 };
 
 inline void noteRejected(Stats& s, uint16_t w, uint16_t h) {
@@ -102,12 +140,18 @@ inline void noteRejected(Stats& s, uint16_t w, uint16_t h) {
 
 inline void resetWindow(Stats& s) { s = Stats{}; }
 
-// "temporal camera eye target: frames=.. writes=.. tagged=.. unknown=.. rejected=.. reject_frames=.. fail_open=.. eye=WxH key=on|off rejected_sizes=256x256:12,...".
-// With the key off, rejected is what the rule WOULD have rejected. Returns the length written, or 0 when the buffer is too small.
+// "temporal camera eye target: frames=.. writes=.. tagged=.. unknown=.. rejected=.. reject_frames=.. fail_open=.. eye=WxH key=on|off submit=WxH:fmt
+//  submit_rejected=.. fail_open_nocont=.. changed_picks=.. max_pick_diff_m=.. max_pick_diff_deg=.. rejected_sizes=256x256:12,...".
+// rejected counts every rejection (not eye-sized, plus drawn into the submitted texture); rejected_sizes lists the not-eye-sized ones. With the key off,
+// the counts are what the rule WOULD have done, and changed_picks is how often the filtered chooser would pick other rows than the legacy one, and by how
+// much at most. Returns the length written, or 0 when the buffer is too small.
 inline int formatReport(char* buf, size_t n, const Stats& s, bool keyOn) {
     int len = std::snprintf(buf, n,
-        "temporal camera eye target: frames=%u writes=%u tagged=%u unknown=%u rejected=%u reject_frames=%u fail_open=%u eye=%ux%u key=%s rejected_sizes=",
-        s.frames, s.writes, s.tagged, s.unknown, s.rejected, s.rejectFrames, s.failOpen, s.eyeW, s.eyeH, keyOn ? "on" : "off");
+        "temporal camera eye target: frames=%u writes=%u tagged=%u unknown=%u rejected=%u reject_frames=%u fail_open=%u eye=%ux%u key=%s "
+        "submit=%ux%u:%u submit_rejected=%u fail_open_nocont=%u changed_picks=%u max_pick_diff_m=%.4f max_pick_diff_deg=%.3f rejected_sizes=",
+        s.frames, s.writes, s.tagged, s.unknown, s.rejected, s.rejectFrames, s.failOpen, s.eyeW, s.eyeH, keyOn ? "on" : "off",
+        s.submit.w, s.submit.h, s.submit.fmt, s.submitRejected, s.failOpenNoCont, s.pickChanges,
+        static_cast<double>(s.maxPickDiffM), static_cast<double>(s.maxPickDiffDeg));
     if (len <= 0 || static_cast<size_t>(len) >= n) return 0;
     bool any = false;
     for (const SizeCount& c : s.sizes) {

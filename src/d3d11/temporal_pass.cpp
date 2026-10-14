@@ -69,6 +69,7 @@ namespace detail {
 bool g_temporalPassWantedFssChrome = false;
 // temporalPassWantsDraw reads this likewise: true while a camera-block write waits for the draw that tags it, or a mini-render pass is bound.
 bool g_cameraDrawWatch = false;
+uint32_t g_cameraDrawCount = 0;
 }  // namespace detail
 
 namespace {
@@ -2154,6 +2155,10 @@ struct RowsWrite {
     // The render target the first draw after this write went into (camera_target_tag.h): unknown until such a draw, and for a write overwritten before
     // one. Set by temporalPassNoteDraw, read by chooseCameraRows (fix.camera_eye_target) and the dump.
     camtag::Target tag;
+    // The owner-context draws made between this write and the next (saturating): a write with none or a few is an orphan, one the scene was drawn with has
+    // hundreds. drawBase is the draw count at the write; drawsAfter is set when the next write (or the frame boundary) closes it.
+    uint32_t    drawBase = 0;
+    uint16_t    drawsAfter = 0;
 };
 enum CameraChoiceFlag : uint32_t {
     kChoiceValid          = 1u << 0,
@@ -2193,6 +2198,7 @@ struct RowsChoiceCapture {
     uint32_t candidates = 0, boundCandidates = 0;
     uint32_t continuousCandidates = 0, twinCandidates = 0;
     camtag::Target selectedTarget;      // the render target the selected write was drawn into (unknown when no draw followed it)
+    uint32_t selectedDraws = 0;         // the draws made between the selected write and the next one
     uint32_t rejectedWrites = 0;        // writes rejected as not drawn into an eye-sized target (counted with the key off too: would-be)
 };
 struct RigidDrawRows {
@@ -2275,6 +2281,8 @@ jumpguard::Stats     g_jumpStats;
 camtag::Stats        g_eyeTargetStats;
 int64_t              g_diagWindowTicks = 0;       // the 30 s clock of the four lines below, read at the frame boundary
 uint32_t             g_chooseEyeW = 0, g_chooseEyeH = 0;   // the eye render size the chooser judges targets against (set by the treat that chooses)
+camtag::Submit       g_chooseSubmit;                       // ...and the submitted eye texture's format and size: a write drawn into it is a late-frame write
+int                  g_lastWriteIdx = -1;                  // the newest write's ring slot, whose draws-after is still counting
 inline bool jumpGuardApplies() { return g_jumpKeyAsked && !g_nearKeyOn; }
 // The target tag: the camera write waiting for the draw that tags it (an index into the rows ring), and the colour targets the last OM set bound.
 int                  g_pendingTagIdx = -1;
@@ -2317,6 +2325,20 @@ camtag::Target currentTargetTag() {
     }
     cachedRtvGen = rg; cachedDsvGen = dg; cachedColours = g_omColours; cached = t;
     return t;
+}
+
+// The draws between a write and the next: closed when the next write arrives or the frame ends; a write still open (the frame's last, at the time the
+// chooser looks) reads the live count.
+void closeWriteDraws() {
+    if (g_lastWriteIdx < 0) return;
+    RowsWrite& p = g_rowsRing[g_lastWriteIdx];
+    const uint32_t d = detail::g_cameraDrawCount - p.drawBase;
+    p.drawsAfter = static_cast<uint16_t>(std::min<uint32_t>(d, 0xFFFFu));
+    g_lastWriteIdx = -1;
+}
+uint32_t drawsAfterOf(int idx) {
+    if (idx == g_lastWriteIdx) return std::min<uint32_t>(detail::g_cameraDrawCount - g_rowsRing[idx].drawBase, 0xFFFFu);
+    return g_rowsRing[idx].drawsAfter;
 }
 
 ObservedRowsWrite* observedRowsSlot(const void* resource) {
@@ -2396,12 +2418,16 @@ void chooseCameraRows() {
         temporalRot3Of34(g_prevRows, rp);
         temporalTranspose3(rp, rpT);
     }
-    // fix.camera_eye_target (TEMPORARY A/B; camera_target_tag.h): a write drawn into a render target that is not eye-sized is not a candidate. The
-    // reflection probe's cube faces (256x256) share the eyes' scene block and are picked when one lies within the 3 degree gate. Judged here, at the first
-    // treat, when every draw of the frame has tagged its write; a write no draw followed is unknown and kept. Counted with the key off too (would-be),
-    // and if nothing at all would be eligible the filter stands down for the frame (fail open) so a wrong eye size can never leave the chooser empty.
+    // fix.camera_eye_target (TEMPORARY A/B; camera_target_tag.h): a write qualifies as the scene's camera only if its first draw went into an eye-sized
+    // target that is NOT the texture being submitted. The reflection probe's cube faces share the eyes' scene block and are picked when one lies within
+    // the 3 degree gate: most are drawn into 256, 512, 1024 or 2048x1024 targets (the size rule), but the forward face has no draw of its own and the
+    // next draw of the frame is a late pass into the submitted image itself (the 2026-10-13 hangar flight: rt=2016x2016 format 27, the game's submit
+    // format, on 4 of 4 bad picks), so the identity rule rejects writes drawn into the submitted texture. Judged here, at the first treat, when every
+    // draw of the frame has tagged its write; a write no draw followed is unknown and kept. Counted with the key off too (would-be). Fail open twice: if
+    // nothing at all would be eligible the filter stands down for the frame, and if the filter leaves no continuous candidate the unfiltered set is used.
     g_eyeTargetStats.eyeW = g_chooseEyeW;
     g_eyeTargetStats.eyeH = g_chooseEyeH;
+    g_eyeTargetStats.submit = g_chooseSubmit;
     ++g_eyeTargetStats.frames;
     camtag::Filter eyeVerdict;
     for (int i = 0; i < kRowsRing; ++i) {
@@ -2409,19 +2435,56 @@ void chooseCameraRows() {
         if (!w.valid || w.frame != g_rowsFrame) continue;
         ++g_eyeTargetStats.writes;
         if (w.tag.known()) ++g_eyeTargetStats.tagged; else ++g_eyeTargetStats.unknown;
-        eyeVerdict.note(w.tag, g_chooseEyeW, g_chooseEyeH);
-        if (camtag::rejects(w.tag, g_chooseEyeW, g_chooseEyeH)) camtag::noteRejected(g_eyeTargetStats, w.tag.w, w.tag.h);
+        eyeVerdict.note(w.tag, g_chooseEyeW, g_chooseEyeH, g_chooseSubmit);
+        const camtag::Why why = camtag::judge(w.tag, g_chooseEyeW, g_chooseEyeH, g_chooseSubmit);
+        if (why == camtag::Why::NotEyeSized) camtag::noteRejected(g_eyeTargetStats, w.tag.w, w.tag.h);
+        else if (why == camtag::Why::SubmitTarget) { ++g_eyeTargetStats.rejected; ++g_eyeTargetStats.submitRejected; }
     }
     const uint32_t cutWrites = eyeVerdict.cut;
     if (cutWrites) ++g_eyeTargetStats.rejectFrames;
     if (eyeVerdict.failedOpen(g_eyeTargetKeyOn)) ++g_eyeTargetStats.failOpen;
-    const bool eyeFilter = eyeVerdict.active(g_eyeTargetKeyOn);
+    bool eyeFilter = eyeVerdict.active(g_eyeTargetKeyOn);
     g_rowsChoice.rejectedWrites = cutWrites;
+    // The pick the legacy chooser and the filtered one would each make, for the stats alone (light: continuity, the twin skip, the bound-then-latest
+    // preference): how often, and by how much, the filter changes the rows. Counted with the key off too, so leg 1 says what leg 2 would change.
+    auto lightBest = [&](bool filter) {
+        int best = -1;
+        uint32_t bSeq = 0;
+        bool bBound = false;
+        for (int i = 0; i < kRowsRing; ++i) {
+            const RowsWrite& w = g_rowsRing[i];
+            if (!w.valid || w.frame != g_rowsFrame) continue;
+            if (filter && camtag::rejectsFor(w.tag, g_chooseEyeW, g_chooseEyeH, g_chooseSubmit)) continue;
+            if (!g_prevValid) continue;
+            float rn[9], d[9];
+            temporalRot3Of34(w.rows, rn);
+            temporalMul3(rpT, rn, d);
+            if (!(temporalRotationAngleDeg(d) < 3.0f)) continue;
+            if (memcmp(w.rows, g_prevRows, sizeof(w.rows)) == 0) continue;
+            const bool bound = g_boundSeen && w.buf == g_boundBuf;
+            if (best < 0 || (bound && !bBound) || (bound == bBound && w.seq > bSeq)) { best = i; bSeq = w.seq; bBound = bound; }
+        }
+        return best;
+    };
+    if (cutWrites && eyeVerdict.eligibleAny) {
+        const int a = lightBest(false), b = lightBest(true);
+        if (a >= 0 && b >= 0 && memcmp(g_rowsRing[a].rows, g_rowsRing[b].rows, sizeof(g_rowsRing[a].rows)) != 0) {
+            ++g_eyeTargetStats.pickChanges;
+            const float dm = campose::translationM(g_rowsRing[a].rows, g_rowsRing[b].rows);
+            const float dd = campose::rotationDeg(g_rowsRing[a].rows, g_rowsRing[b].rows);
+            if (dm > g_eyeTargetStats.maxPickDiffM) g_eyeTargetStats.maxPickDiffM = dm;
+            if (dd > g_eyeTargetStats.maxPickDiffDeg) g_eyeTargetStats.maxPickDiffDeg = dd;
+        }
+        if (eyeFilter && lightBest(true) < 0 && lightBest(false) >= 0) {   // the filter would leave nothing continuous: use the unfiltered set
+            eyeFilter = false;
+            ++g_eyeTargetStats.failOpenNoCont;
+        }
+    }
     if (eyeFilter) g_rowsChoice.flags |= kChoiceEyeTargetCut;
     for (int i = 0; i < kRowsRing; ++i) {
         const RowsWrite& w = g_rowsRing[i];
         if (!w.valid || w.frame != g_rowsFrame) continue;
-        if (eyeFilter && camtag::rejects(w.tag, g_chooseEyeW, g_chooseEyeH)) continue;
+        if (eyeFilter && camtag::rejectsFor(w.tag, g_chooseEyeW, g_chooseEyeH, g_chooseSubmit)) continue;
         ++count;
         const bool bound = g_boundSeen && w.buf == g_boundBuf;
         if (bound) ++boundCount;
@@ -2580,6 +2643,7 @@ void chooseCameraRows() {
         g_rowsChoice.selectedResource = g_rowsRing[applyIdx].buf;
         g_rowsChoice.selectedSeq = g_rowsRing[applyIdx].observedSeq;
         g_rowsChoice.selectedTarget = g_rowsRing[applyIdx].tag;
+        g_rowsChoice.selectedDraws = drawsAfterOf(applyIdx);
         memcpy(g_rowsChoice.selectedRows, g_rowsRing[applyIdx].rows, sizeof(g_rowsChoice.selectedRows));
         memcpy(g_rowsChoice.selectedProj, g_rowsRing[applyIdx].proj, sizeof(g_rowsChoice.selectedProj));
         memcpy(g_curRows, g_rowsRing[applyIdx].rows, sizeof(g_curRows));
@@ -3149,6 +3213,9 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
         // This frame's camera rows, chosen from the frame's writes (once), against this eye's render size (the region the pass is treating).
         g_chooseEyeW = w;
         g_chooseEyeH = h;
+        g_chooseSubmit.fmt = static_cast<uint16_t>(sd.Format);
+        g_chooseSubmit.w = static_cast<uint16_t>(std::min<uint32_t>(w, 0xFFFFu));   // the region, as the "first trained frame" line names it: 2016x2016 per eye
+        g_chooseSubmit.h = static_cast<uint16_t>(std::min<uint32_t>(h, 0xFFFFu));
         chooseCameraRows();
         // The rotation delta for this frame's motion source. The depth
         // motion is the head's rotation with its translation term, and
@@ -3551,6 +3618,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
             memcpy(trace.selectedRows, g_rowsChoice.selectedRows, sizeof(trace.selectedRows));
             memcpy(trace.selectedProj, g_rowsChoice.selectedProj, sizeof(trace.selectedProj));
             trace.selectedTarget = g_rowsChoice.selectedTarget;
+            trace.selectedDraws = g_rowsChoice.selectedDraws;
             trace.rejectedWrites = g_rowsChoice.rejectedWrites;
         }
         const RigidDrawRows& draw = g_rigidDraw[eye];
@@ -4640,7 +4708,9 @@ void temporalPassDumpHistory(const char* trigger) {
         "8 previous draw rows valid,10 same resource,20 same observed write,40 same rows,80 selection later. "
         "rt= is the render target the selected write's first following draw went into (WxH:DXGI format/rtv or dsv/colour targets bound; - when no draw "
         "followed it); drt= is the tagged eye draw's; burst= is the frame's offset in a burst of camera writes (- outside one) and wr= the frame's full "
-        "write count over its quiet baseline; rej= the writes the eye-target filter rejected (would-be with the key off). "
+        "write count over its quiet baseline; rej= the writes the eye-target filter rejected (would-be with the key off: not eye-sized, or drawn into the submitted "
+        "eye texture itself); dr= the draws made between the selected write and the next write (a write the scene was drawn with has hundreds, an orphan "
+        "few). "
         "TEMP rot= and mv= are the selected rows' rotation (deg) and translation (m) from the previous same-eye frame (gap= when that is not the previous "
         "frame), and ev=N marks a row inside a camera-row event of N frames. "
         "Rows are literal scene rows; their origin is not assumed to be headset centre or eye pose. "
@@ -4695,7 +4765,7 @@ void temporalPassDumpHistory(const char* trigger) {
             "sel-draw=(%+.9g,%+.9g,%+.9g;%.7gdeg) draw-delta=(%+.9g,%+.9g,%+.9g;%.7gdeg) "
             "proj=(%+.9g,%+.9g)/(%+.9g,%+.9g) "
             "S=[%+.9g,%+.9g,%+.9g,%+.9g;%+.9g,%+.9g,%+.9g,%+.9g;%+.9g,%+.9g,%+.9g,%+.9g] "
-            "D=[%+.9g,%+.9g,%+.9g,%+.9g;%+.9g,%+.9g,%+.9g,%+.9g;%+.9g,%+.9g,%+.9g,%+.9g] rt=%s drt=%s%s rej=%u",
+            "D=[%+.9g,%+.9g,%+.9g,%+.9g;%+.9g,%+.9g,%+.9g,%+.9g;%+.9g,%+.9g,%+.9g,%+.9g] rt=%s drt=%s%s rej=%u dr=%u",
             e.frame,e.eye,e.cameraChoiceFlags,e.cameraDrawFlags,
             reinterpret_cast<void*>(static_cast<uintptr_t>(e.selectedResource)),e.selectedSeq,
             reinterpret_cast<void*>(static_cast<uintptr_t>(e.boundResource)),e.boundLatchSeq,e.twinSeq,
@@ -4715,7 +4785,7 @@ void temporalPassDumpHistory(const char* trigger) {
             double(e.drawRows[0]),double(e.drawRows[1]),double(e.drawRows[2]),double(e.drawRows[3]),
             double(e.drawRows[4]),double(e.drawRows[5]),double(e.drawRows[6]),double(e.drawRows[7]),
             double(e.drawRows[8]),double(e.drawRows[9]),double(e.drawRows[10]),double(e.drawRows[11]),
-            rtText,drtText,burstText,e.rejectedWrites);
+            rtText,drtText,burstText,e.rejectedWrites,e.selectedDraws);
     }
     Log::get().note("--- end temporal submission history ---");
 
@@ -4795,6 +4865,7 @@ void temporalPassConfigure(Config& cfg) {
         g_boundLatchValid = false;
         g_boundLatchRowsValid = false;
         g_pendingTagIdx = -1;
+        g_lastWriteIdx = -1;
         g_miniBound = false;
         detail::g_cameraDrawWatch = false;
     }
@@ -5174,6 +5245,10 @@ void temporalPassNoteSceneWrite(const void* res, const void* data, uint32_t byte
     // The next draw tags this write with its render target (temporalPassNoteDraw). A write already waiting loses its chance: a write no draw
     // followed stays unknown, and an unknown write is never rejected.
     w.tag = camtag::Target{};
+    closeWriteDraws();
+    w.drawBase = detail::g_cameraDrawCount;
+    w.drawsAfter = 0;
+    g_lastWriteIdx = static_cast<int>(slot);
     g_pendingTagIdx = static_cast<int>(slot);
     detail::g_cameraDrawWatch = true;
     memcpy(w.rows, f, sizeof(w.rows));
@@ -5399,6 +5474,7 @@ void temporalPassFrameBoundary() {
         }
     }
     // The frame's full camera-write count, for the burst offset the dump joins by frame; P3's window; no write waits for a draw across a frame.
+    closeWriteDraws();
     g_burst.push(g_rowsFrame, g_rowsWrites);
     ++g_miniWindowFrames;
     if (g_mini.find(g_rowsFrame)) ++g_miniWindowHits;
