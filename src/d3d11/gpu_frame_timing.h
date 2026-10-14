@@ -14,6 +14,12 @@ void gpuFrameCommand(ID3D11DeviceContext*) noexcept;
 bool gpuFrameInternal() noexcept;
 void gpuFramePresent(ID3D11DeviceContext*, uint64_t nextSourceFrame) noexcept;
 void gpuFrameAbandon() noexcept;
+// Built v13.6 (the GPU pass profiler's yield, gpu_timing.h): while the profiler holds the clock, no application frame opens (gpuFrameCommand
+// returns, counted per frame). gpuFrameYieldBegin, called by the profiler on the owner context at its boundary, ends an application frame that is
+// open across that boundary (its lease holds the shared clock); it does nothing when none is open. gpuFrameTakeYieldSkips returns and clears the
+// count of skipped application frames.
+void gpuFrameYieldBegin(ID3D11DeviceContext*) noexcept;
+uint64_t gpuFrameTakeYieldSkips() noexcept;
 
 namespace detail {
 // g_gpuFrameInternal mirrors gpuFrameCommand.cpp's own reentrancy flag

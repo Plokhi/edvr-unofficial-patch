@@ -166,6 +166,8 @@ public:
     DisjointClock& operator=(const DisjointClock&) = delete;
     // No backend calls in destruction. Owner-thread shutdown invalidates all
     // tokens; a process-detach caller must not try to join or use its context.
+    // A scope is open right now: an acquire would only borrow it (the pass profiler's open checks this first).
+    bool scopeOpen() const noexcept { return active_ >= 0; }
     Lease startFrame(uint64_t now) noexcept {
         if (!ownerOk() || stopped_ || shut_ || active_ >= 0) return {};
         collect(now);

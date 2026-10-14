@@ -263,6 +263,20 @@ void gpuFrameConfigure(bool enabled) noexcept {
     Log::get().note("Render-to-submit GPU: %s (advanced.app_gpu_timing); independent of compositor timing.",
                     enabled ? "enabled" : "disabled");
 }
+// Built v13.6: the GPU pass profiler's yield (gpu_frame_timing.h). g_yieldSkips counts application frames skipped while the profiler holds the
+// clock, once per frame (the sequence of the last skipped frame is remembered, since a frame's later commands come back here too).
+namespace {
+std::atomic<uint64_t> g_yieldSkips{0};
+uint64_t g_yieldSkipSequence = 0;
+}  // namespace
+void gpuFrameYieldBegin(ID3D11DeviceContext* ctx) noexcept {
+    auto* c = g_controller.load(std::memory_order_acquire);
+    if (!c || ctx != c->context() || !c->owns(ctx) || !c->activeSequence) return;
+    Internal internal;
+    c->invalidate(GetTickCount64());   // ends the open application frame: its lease is what holds the shared clock
+}
+uint64_t gpuFrameTakeYieldSkips() noexcept { return g_yieldSkips.exchange(0, std::memory_order_acq_rel); }
+
 void gpuFrameCommand(ID3D11DeviceContext* ctx) noexcept {
     if (detail::g_gpuFrameInternal) return;
     auto* c = g_controller.load(std::memory_order_acquire);
@@ -297,6 +311,15 @@ void gpuFrameCommand(ID3D11DeviceContext* ctx) noexcept {
     if (application && !c->segmentAdmitted) return;
     c->seenToken = token; // Set before issuing query commands through hooked End.
     if (!(token & 1) || !sequence || g_poisoned.load(std::memory_order_acquire) >= sequence) return;
+    // Built v13.6: the profiler's capture holds the clock. No application frame opens; the frame is counted once and the rest of it is not
+    // timed (its SubmitBegin finds no open frame and records NoOpenFrame, the same as a frame that never began).
+    if (gpuTimingYielding()) {
+        if (sequence != g_yieldSkipSequence) {
+            g_yieldSkipSequence = sequence;
+            g_yieldSkips.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
     c->applicationMode = application;
     const auto reason = application ? c->ring.beginApplicationFrame(sequence, c->sourceFrame, now,
         c->driver.currentOwner()) : c->ring.beginFrame(sequence,c->sourceFrame,now,c->driver.currentOwner());

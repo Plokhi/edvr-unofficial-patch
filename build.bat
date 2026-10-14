@@ -553,7 +553,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% %XESSFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\map_wait.cpp" ^
     "src\d3d11\native_render_settings.cpp" ^
     "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_frame_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
-    "src\d3d11\gpu_census.cpp" ^
+    "src\d3d11\gpu_census.cpp" "src\d3d11\gpu_pass_profile.cpp" ^
     "src\d3d11\d3d11_proxy.cpp" "src\d3d11\device_hook.cpp" ^
     "src\d3d11\format_support_log.cpp" ^
     "src\d3d11\graphics_bridge.cpp" ^
@@ -737,7 +737,7 @@ set "RUN_JOBS_ARGS="
 if defined EDVR_JOBS set "RUN_JOBS_ARGS=--jobs %EDVR_JOBS%"
 python tools\run_jobs.py --self-test || exit /b 1
 python tools\run_jobs.py --script "%ROOT%\build.bat" --times "%BUILD%\rig_times.json" ^
-    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,vtable_test,stall_sampler_test ^
+    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,gpu_pass_profile_test,vtable_test,stall_sampler_test ^
     --after openxr_module_test=openxr_exports_test ^
     %RUN_JOBS_ARGS% || exit /b 1
 
@@ -2225,6 +2225,18 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: GPU census test build failed & exit /b 1 )
 "%OBJ%\gpucensus\gpu_census_test.exe" --dry-run || exit /b 1
 "%OBJ%\gpucensus\gpu_census_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_gpu_pass_profile_test
+REM TEMPORARY GPU pass profiler (2026-10-12): the pure logic of src\d3d11\gpu_pass_profile_core.h -- classification, cube
+REM runs, the stamp budget, the shader tally, the summary arithmetic and the CSV text. No D3D11 here.
+if not exist "%OBJ%\gpupassprofile" mkdir "%OBJ%\gpupassprofile"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\gpupassprofile\\" ^
+    /Fe"%OBJ%\gpupassprofile\gpu_pass_profile_test.exe" "tools\gpu_pass_profile_test\gpu_pass_profile_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: GPU pass profile test build failed & exit /b 1 )
+"%OBJ%\gpupassprofile\gpu_pass_profile_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_vr_world_mips_test

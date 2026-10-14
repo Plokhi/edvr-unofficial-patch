@@ -57,6 +57,13 @@ void Log::note(const char* fmt, ...) {
 
 #include "../../src/d3d11/gpu_census.cpp"
 
+// gpu_census.cpp calls the GPU pass profiler's two entry points (gpu_pass_profile.cpp is not linked into this rig,
+// and its own rig is tools\gpu_pass_profile_test): unarmed, the flag stays false and they are never reached.
+namespace edvr {
+namespace detail { bool g_gpuPassCapturing = false; }
+void gpuPassProfileNoteEdvr(ID3D11DeviceContext*, bool) {}
+}
+
 namespace {
 unsigned g_checks = 0;
 void check(bool ok, const char* why) { ++g_checks; if (!ok) throw std::runtime_error(why); }

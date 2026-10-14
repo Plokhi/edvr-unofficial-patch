@@ -2,6 +2,7 @@
 #include "gpu_interval.h"
 #include "gpu_frame_gap.h"
 #include "gpu_frame_timing.h"
+#include "gpu_pass_profile.h"   // TEMPORARY pass profiler: an EDVR section's begin and end are pass boundaries
 #include "../common/log.h"
 #include <windows.h>
 #include <d3d11.h>
@@ -483,6 +484,8 @@ void logAndResetWindow(uint64_t now) {
 
 bool gpuCensusBegin(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept {
     if (section >= GpuCensusSection::Count) return false;
+    // EDVR's own sections only: the Altered sections time Elite's draw and are not EDVR's work (gpu_census.h).
+    if (section < GpuCensusSection::AlteredPoolFamily && gpuPassProfileCapturing()) gpuPassProfileNoteEdvr(ctx, true);
     SectionState& st = g_section[static_cast<size_t>(section)];
     ++st.occurrences;   // Cheap and unconditional: the estimate needs every occurrence counted.
     const GpuCensusSection owner = turnOwnerOf(section);
@@ -529,6 +532,7 @@ void gpuCensusNoteSeedTarget(const GpuCensusSeedTarget& target) noexcept {
 
 void gpuCensusEnd(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept {
     if (section >= GpuCensusSection::Count) return;
+    if (section < GpuCensusSection::AlteredPoolFamily && gpuPassProfileCapturing()) gpuPassProfileNoteEdvr(ctx, false);
     // Safe even when the matching Begin returned false: GpuIntervals::end()
     // is a no-op with nothing open (gpu_interval.h), so a plain Begin/End
     // pair at a call site never needs to branch on Begin's result.
