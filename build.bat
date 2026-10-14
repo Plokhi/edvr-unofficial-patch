@@ -580,7 +580,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% %XESSFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\fss_panel.cpp" ^
     "src\d3d11\fss_reveal.cpp" ^
     "src\d3d11\fss_heal.cpp" ^
-    "src\d3d11\vertex_resync_hook.cpp" ^
+    "src\d3d11\vertex_resync_hook.cpp" "src\d3d11\light_grid_cache_hook.cpp" ^
     "src\d3d11\xinput_watch.cpp" ^
     "src\d3d11\fss_panel_rect.cpp" ^
     "src\d3d11\panel_curve.cpp" "src\d3d11\screen_motion.cpp" "src\d3d11\weapon_motion.cpp" ^
@@ -2184,6 +2184,20 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: exposure chain test build failed & exit /b 1 )
 "%BUILD%\exposure_chain_test.exe" --dry-run || exit /b 1
 "%BUILD%\exposure_chain_test.exe" --self-test "%ROOT%" || exit /b 1
+exit /b 0
+
+:rig_light_grid_cache_test
+echo [edvr] === light_grid_cache_test.exe ===
+REM The light grid cache's pure half (src\d3d11\light_grid_cache_core.h): the identity and pin decision, the key built as the game builds its own, the state regions, the
+REM bit-exact compare and the LRU, whole-state swaps against a fake builder that owns tracked allocations (an ownership audit after every frame), the forward reasons, the
+REM verify-and-disable path, faults in the memory policy, the thread rule, the jitter probe and the exact line texts. No DLL and no game.
+if not exist "%OBJ%\lightgridcache" mkdir "%OBJ%\lightgridcache"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\lightgridcache\\" ^
+    /Fe"%BUILD%\light_grid_cache_test.exe" "tools\light_grid_cache_test\light_grid_cache_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: light grid cache test build failed & exit /b 1 )
+"%BUILD%\light_grid_cache_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_pad_state_test
