@@ -283,9 +283,9 @@ void sayFirstSight(void* self, void* view, uint32_t width, uint32_t height, cons
         s = reinterpret_cast<uintptr_t>(self);
         const int gi = g_cache.groupFor(reinterpret_cast<uintptr_t>(self));
         const bool templ = gi >= 0 && g_cache.group(gi).haveTemplate;
-        char line[320];
-        std::snprintf(line, sizeof(line), "light grid cache: new context %p (view block %p, %ux%u target, tile %u, %u slices); it %s.", self, view, width, height, in.tile,
-                      in.slices, templ ? "was as the game constructed it (template taken)" : "was already built (no template: the cache stands down for it)");
+        char line[480];
+        std::snprintf(line, sizeof(line), "light grid cache: new context %p (view block %p, %ux%u target, tile %u, %u slices); first seen with %s; %s.", self, view, width, height,
+                      in.tile, in.slices, gi >= 0 ? g_cache.group(gi).firstSeen : "no group", templ ? "empty template made" : "no template: the cache stands down for it");
         say(line);
         return;
     }

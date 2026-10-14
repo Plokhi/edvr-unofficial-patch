@@ -32,8 +32,9 @@
 // the slot owns what the context had (a state that is valid for ITS key, because it was). A MISS first swaps the context with the least recently used slot, so the context's old
 // state is kept, and then lets the game rebuild in place over the state it was handed (exactly what the game does to its own, only into recycled memory). No allocation, no
 // refcount, no release, no copy of a table: ownership of every buffer is unique at every instant, so nothing the game frees is ever ours and nothing ours is ever freed by the
-// game. An empty slot starts from the TEMPLATE, the context's own state as the game constructed it (key zero, empty vectors, no GPU objects), captured at first sight; a
-// context first seen already built has no template and is never cached.
+// game. An empty slot starts from the TEMPLATE, an empty state made at first sight (key zero, empty
+// vectors, no GPU objects; makeEmptyTemplate says why the game's code accepts it). It is made rather than captured because the contexts of the first flight were already
+// built when the hook first saw them.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -138,6 +139,29 @@ inline bool statePristine(const uint8_t* state) noexcept {
         if (load64(state + kGpuOff + 8 * g) != 0) return false;
     }
     return true;
+}
+
+// THE EMPTY STATE a fresh slot starts from: key zero, three vectors with capacity 0, size 0 and no data, no GPU object. It cannot be captured from a context (the flight met
+// contexts already built, and a built state owns buffers that must never be in two places), so it is made. It is valid because the game's own vector code is written for it:
+// every grow path (0x598740, 0x5988F0, 0x598F10 under 0x5954A0 and 0x5955E0) reallocates through 0x55B720 / 0x53A590, and 0x55B720 takes a null old block (58B735: test rcx, je to
+// a fresh allocation), 0x55B810 (the release) returns at once for a null block (55B813), the shrink path (0x598CC0) is entered only when the size falls below half the capacity, and
+// the build tests each GPU pointer for null before it releases it (58BA42, 58BA7F, 58BABA, 58BAF6). The one word the vectors keep besides capacity, size and data is the second
+// header word (+8, read only by the shrink path); it is copied from the context's own vector so a nonzero floor the game set stays.
+inline void makeEmptyTemplate(const uint8_t* ctxState, uint8_t* out) noexcept {
+    std::memset(out, 0, kStateBytes);
+    for (int v = 0; v < 3; ++v) std::memcpy(out + kVecOff[v] + 8, ctxState + kVecOff[v] + 8, 8);
+}
+
+// One line about a state as first seen: for the log, so a context that is not what was expected is described rather than guessed at.
+inline void describeState(const uint8_t* state, uint8_t flag, char* out, size_t cap) noexcept {
+    bool keyZero = true;
+    for (size_t i = 0; i < kKeyBytes; ++i) keyZero = keyZero && state[i] == 0;
+    int gpu = 0;
+    for (int g = 0; g < 4; ++g) gpu += load64(state + kGpuOff + 8 * g) != 0 ? 1 : 0;
+    std::snprintf(out, cap, "first-call flag %u, key %s, vector sizes %llu/%llu/%llu, vector data %s/%s/%s, %d GPU objects", static_cast<unsigned>(flag), keyZero ? "zero" : "set",
+                  static_cast<unsigned long long>(stateVecSize(state, 0)), static_cast<unsigned long long>(stateVecSize(state, 1)),
+                  static_cast<unsigned long long>(stateVecSize(state, 2)), stateVecData(state, 0) ? "set" : "null", stateVecData(state, 1) ? "set" : "null",
+                  stateVecData(state, 2) ? "set" : "null", gpu);
 }
 
 // EDVR's own jitter at the time of a call (part 2's probe; published by the temporal pass).
@@ -388,6 +412,7 @@ struct Group {
     uint64_t clock = 0;
     uint64_t ctxExtra = kExtraUnknown;   // the extra near of the build behind the context's current state
     uint8_t templ[kStateBytes] = {};
+    char firstSeen[200] = {};   // the context's state as first seen, for the log
 };
 
 class Cache {
@@ -580,10 +605,12 @@ inline Result serve(Cache& c, uint8_t* ctx, const CallInputs& in, Fwd&& fwd, Clo
     Group& grp = c.group(g);
     gp = &grp;
     if (created) grp.renderer = in.renderer;
-    // A context's state as the game constructed it is the template (the empty state a fresh slot starts from): taken at first sight and at every new life.
-    if ((created || flag != 0) && statePristine(ctxState)) {
+    // The template (the empty state a fresh slot starts from) is made, not captured: see makeEmptyTemplate. Made at first sight and at every new life, whatever state the
+    // context is in then (the flight of 2026-10-13 met four contexts already built, with the first-call flag clear, and a captured template never existed).
+    if (created || flag != 0) {
         grp.haveTemplate = true;
-        std::memcpy(grp.templ, ctxState, kStateBytes);
+        makeEmptyTemplate(ctxState, grp.templ);
+        if (created) describeState(ctxState, flag, grp.firstSeen, sizeof(grp.firstSeen));
     }
     // The first call of a context (the game constructs it with this byte set and the call clears it): a new life. Its kept states, if any, are dropped.
     if (flag != 0) {
