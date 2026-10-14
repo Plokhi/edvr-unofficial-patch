@@ -50,9 +50,9 @@
   fixed"; static-scene-frames 2,480 of 2,481 accepted menu frames; the
   unkeyed census empty in all 60 ticks; row-pair mismatches 0. Open:
   main-versus-auxiliary camera grouping; c2_coexist C7's unbounded loop
-  (a mutation hangs the rig instead of failing it). 2026-10-14, BUILT, NOT
-  FLOWN, no key: `flat camera signatures 5s:` (1 in 16 kind-3 calls); the VR-to-flat
-  re-arm flew but the relay gate stayed shut (refresh-calls=0); flat owns it now (last entry).
+  (a mutation hangs the rig instead of failing it). 2026-10-14, BUILT, NOT FLOWN:
+  `flat camera signatures 5s:`; flat owns the relay gate (refresh-calls=0 flight). OPEN
+  on foot: foreground-active-query refusals, 2.5 min; `flat replay query rejected` logs why (last entry).
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable and
   build identities, backend versions, dimensions, formats and mod chain.
@@ -1502,3 +1502,18 @@ owner, so it is independent of Upstream receiving refresh calls. The 06:21 log s
 about 6 s after Status.json lost its GuiFocus field at 09:34:45.355 (the census comment notes it is unreadable on foot): that is the nearest the log
 gets to the disembark. The journal reader does not write Disembark lines, so the exact time is not recorded. Next flight, to separate the two:
 log which query kind `replayQueriesSafe` rejects (occlusion, predicate, statistics) and the draw (VS/PS) it was on.
+
+The on-foot instrument (BUILT, NOT FLOWN, log only, no key). When the foreground draw's replay-safety test refuses (`replayQueriesSafe(ctx)` false:
+the stage=state reason `foreground-active-query`, the cause of the 09:34:54-09:37:34 refusals), flat_runtime.cpp's `noteReplayQueryCheck` counts the
+check and logs why, with the tracker's own view of the context (flat_replay_query_reject.h, pure):
+- the first 8 rejections of the session, one line each:
+  `flat replay query rejected 3/8: frame=104910 mode=dlss VS=7B0DC42D383F694C PS=0DF03E64DF9DBEF1 target=3840x2160 queries=OCCLUSION_PREDICATE#5(predicate)+PIPELINE_STATISTICS#4 open-brackets=3`
+  (`queries=` is the open count-bearing brackets' D3D11_QUERY names and numbers, read back from the objects the tracker holds; `(predicate)` marks
+  OCCLUSION_PREDICATE and the SO overflow predicates; `UNCERTAIN_BRACKET#100`, `TABLE_FULL#101`, `NOT_IMMEDIATE_CONTEXT#102` and `UNREADABLE_QUERY#103` are
+  the tracker's reasons with no query to name);
+- then a window line every 5 s, with the foreground report, counted per (primary query kind, VS, PS), top 4:
+  `flat replay query rejections 5s: checked=N rejected=M distinct=K overflow=O total-checked=.. total-rejected=.. logged=8/8 mode=dlss top=[NAME#code VS=.. PS=.. n=..| ...]`.
+  No line at all = the instrument did not run; `checked=0` = no foreground draw reached the test; `rejected=0` with `checked>0` = none refused.
+The decision itself is unchanged (`queriesUnsafe = opaque && bytes && !replayQueriesSafe(ctx)`, pinned). Tests: flat_temporal_test's
+flat_replay_query_reject_tests.h (the words, the counting, the wiring pins). To read on the next flight: which query kind and which VS/PS dominate the
+refused on-foot frames, and whether the first rejection falls at the disembark or at the AA-mode change.

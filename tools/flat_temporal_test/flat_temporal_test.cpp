@@ -33,6 +33,7 @@
 #include "flat_camera_table_tests.h"
 #include "flat_query_cut_tests.h"
 #include "flat_wrapper_note_tests.h"
+#include "flat_replay_query_reject_tests.h"
 #include "flat_hdr_route_tests.h"
 #include "flat_laser_scene_tone_tests.h"
 #include "flat_deferred_camera_tests.h"
@@ -3977,6 +3978,7 @@ int main(int argc, char** argv) {
     testFlatForegroundOwnershipWiring();
     testFlatUntrustedCameraWiring();
     failures += flatWrapperNoteTests();
+    failures += flatReplayQueryRejectTests();
     testFlatWrapperNoteWiring();
     failures += flatQueryCutTests();
     testFlatQueryCutWiring();
