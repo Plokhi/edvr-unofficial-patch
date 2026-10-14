@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "../common/config.h"
 #include "../common/log.h"
 #include "binding_shadow.h"
 #include "blend_probe_core.h"
@@ -651,18 +652,13 @@ void finishCapture() {
 
 }  // namespace
 
-void blendProbeInstall(bool flatProfile) {
+void blendProbeInstall(bool flatProfile, bool keyBound, const char* key) {
     g_installed = true;
     g_flat = flatProfile;
-    if (flatProfile)
-        Log::get().note("blend probe: off. VR only; hotkey.blend_probe does nothing in the flat profile.");
-    else
-        Log::get().note("blend probe: off. hotkey.blend_probe arms a capture of %u frames: the eye draws that blend or write no depth and "
-                        "reach a %ux%u window at the view centre (up to %u rows a frame), and an %ux%u grid of the temporal pass's "
-                        "decisions over the same window. Log only; costs nothing until pressed.",
-                        kFrames, kWindow, kWindow, kMaxRowsPerFrame, kGrid, kGrid);
+    char line[kRowBuf];
+    formatInstallLine(line, sizeof(line), flatProfile, keyBound, key, Config::get().iniName());
+    say(line);
 }
-
 void blendProbeRequest(const char* trigger) {
     if (g_flat) {
         refuse(Refusal::kNotVr);

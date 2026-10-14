@@ -2915,8 +2915,8 @@ void hookDevice(ID3D11Device* device) {
             terrainCullCoverInstall(!runtimeScopeIncludesVr());
             // The optimized station (optimized_station.cpp): reads fix.optimized_station; its hooks attach while it is on (VR by default; flat off).
             optimizedStationInstall(runtimeFlatProfile());
-            // The blend probe (TEMPORARY, blend_probe.cpp): armed by key only; nothing is observed until then. Says what it is, once.
-            blendProbeInstall(runtimeFlatProfile());
+            // The blend probe (TEMPORARY, blend_probe.cpp): armed by key only; nothing is observed until then. One line: whether the key is bound.
+            blendProbeInstall(runtimeFlatProfile(), g_state->blendProbeKey.bound(), g_state->blendProbeKeyText.c_str());
 
             // AFTER BOTH INSTALLERS, and the order is the whole point. EDVR's
             // own commit writes two dozen entries of this table in the shared

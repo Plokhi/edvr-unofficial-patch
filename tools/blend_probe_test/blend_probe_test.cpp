@@ -412,6 +412,23 @@ void testGridText() {
     check(std::strstr(b, "n/a (needs both paths)") != nullptr, "the summary says when there is no delta");
 }
 
+void testInstallLine() {
+    char b[kRowBuf];
+    formatInstallLine(b, sizeof(b), false, true, "F3", "edvr.ini");
+    check(std::strcmp(b, "blend probe: off; hotkey.blend_probe is bound to F3") == 0, "install line, bound: pinned text");
+    formatInstallLine(b, sizeof(b), false, false, "", "edvr.ini");
+    check(std::strcmp(b, "blend probe: off; hotkey.blend_probe is NOT bound -- add \"blend_probe = <a free key>\" under [hotkey] in edvr.ini to use it") == 0,
+          "install line, unbound or empty: pinned text");
+    formatInstallLine(b, sizeof(b), false, false, nullptr, nullptr);
+    check(std::strstr(b, "is NOT bound") != nullptr, "install line, unbound with a null key");
+    formatInstallLine(b, sizeof(b), false, true, nullptr, "edvr.ini");
+    check(std::strcmp(b, "blend probe: off; hotkey.blend_probe is bound to ") == 0, "install line, a null key text does not crash");
+    formatInstallLine(b, sizeof(b), true, false, "", "edvr.ini");
+    check(std::strstr(b, "flat profile") != nullptr && std::strchr(b, '\n') == nullptr, "install line, flat");
+    formatInstallLine(b, sizeof(b), false, false, "", "edvr.ini");
+    check(std::strchr(b, '\n') == nullptr && std::strlen(b) < kLogMessageMax, "install line is one line and fits the log");
+}
+
 void testFrameLines() {
     char b[kRowBuf];
     FrameCounts c;
@@ -450,6 +467,7 @@ int main(int argc, char** argv) {
     testMedianAndSummary();
     testGridText();
     testFrameLines();
+    testInstallLine();
     std::printf("blend_probe_test: %u checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

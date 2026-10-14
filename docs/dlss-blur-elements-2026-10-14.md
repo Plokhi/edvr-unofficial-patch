@@ -22,7 +22,7 @@
 - **Candidates:** element 1 may be the additive six-vertex sprite pair VS `94D5C556DFD6D705` / PS `912477AEF6958379`, which the glare fix
   and the UI layer both claim (log 10-13 21:43 and 21:55). NOT proven for the pad. The railing's pair is not known to be in `kFamilies`.
   The adverts, the weapons and the force field have no hash in any doc.
-- **Temporary key:** `hotkey.blend_probe` (section `[hotkey]`, unbound; F9 is a good bare key). Remove it, `src\d3d11\blend_probe*`,
+- **Temporary key:** `hotkey.blend_probe` (section `[hotkey]`, unbound; use a free key, for example F3 (avoid keys the game uses)). Remove it, `src\d3d11\blend_probe*`,
   `tools\blend_probe_test`, the four small hooks in vscreen.cpp / temporal_pass.cpp / ui_depth / ui_layer, and its build.bat lines when
   this arc closes (ship the winning behaviour, propose removing the key, quoted, as AGENTS.md Scope control says).
 - **Cannot be captured on this build:** `advanced.temporal_aa_debug` (the `motion_source`, `ui_layer`, `depth`, `motion` views) and
@@ -108,7 +108,7 @@ The summary is the railing answer: the median motion over all cells, over camera
 with `p` = 11 and `e` = 1 has exact per-object motion. The pass's camera term is reported as rotation and translation rather than a
 per-pixel value because the decision texture has no room for it (a second capture shader variant would be a bigger change).
 
-Other lines: `blend probe: off. ...` at install; `armed (trigger ...)`; `collecting 3 frames from game frame N`; per frame
+Other lines: at install `blend probe: off; hotkey.blend_probe is bound to KEY` or `... is NOT bound -- add "blend_probe = <a free key>" under [hotkey] in edvr.ini to use it` (check it before flying); `armed (trigger ...)`; `collecting 3 frames from game frame N`; per frame
 `blend probe: frame f=N (game frame G): E eye draws seen (...); C candidates ..., T tested, K cover the window, L rows listed, truncated X;
 not tested: ...; M answers missing`; `blend probe: captured 3 frames, R rows (G of 3 motion grids staged)`. Refusals read
 `blend probe: refused (REASON)`: not VR, a capture already running, no eye pass seen, occlusion queries unavailable, some queries
@@ -119,7 +119,7 @@ arrived (a menu, no VR), none was a candidate, or none reached the window.
 
 1. Set `fix.particle_billboard = stock` in `edvr.ini` (the live ini is Sean's: edit it with the Edit tool, never a regex). The probe offers
    each draw before any verdict substitutes its shaders, so it would see the game's hashes either way; stock removes the one other
-   difference, the billboards' orientation, from the picture being judged. Bind `hotkey.blend_probe` to a bare key such as F9.
+   difference, the billboards' orientation, from the picture being judged. Bind `hotkey.blend_probe` to a free bare key, for example F3 (avoid keys the game uses).
 2. For each element in the order 1 to 5, look straight at it so it sits at the centre of the view, press the key once while still, and
    once more (after the report, a second or so later) while moving the head. Note the order; the log numbers the captures by time.
 3. Element 1: stand in the station hangar with the pad under the hologram. Element 3: adverts inside a station, and the two rows outside a
