@@ -255,3 +255,42 @@ pair, including the current timing work, has replaced the rollback in Frontier.
 Both DLL hashes match the clean build and the current INI bytes are preserved.
 Use `--expect-build f622cd2` for the next flight. Visual recovery remains the
 gate before further OpenXR implementation.
+
+
+## 2026-10-14: the overlay's GPU time with the application clock off
+
+With `advanced.app_gpu_timing` off (its default since the AA-off cuts), the
+overlay's GPU TIME tile read "--" permanently: its only source was the
+application-render clock. Fixed without flipping the default back.
+
+**What it measures.** One timestamp pair a frame, from one frame boundary to
+the next: the span is the previous frame's door work and Present, the
+frame's own commands, and any GPU idle between them. It is the first-to-last
+GPU span of the frame, not the GPU's busy time. Where the GPU has slack the
+span is longer than the work; the overlay says so in its own sub-text
+("frame GPU span, boundary to boundary (includes GPU idle)").
+
+**How.** `gpuCensusFrame` (gpu_census.cpp) already opens one disjoint frame
+scope at each boundary and closes it at the next. The span's pair ends before
+the census closes that scope and begins after it opens the next, so each
+pair lies in one scope. Two queries a frame, read back four frames later
+(`GpuIntervals<kFrameSpanSlots>`, six slots). Only with the application clock
+off. Zero per-draw cost: no thunk changes.
+
+**Overlay.** The GPU TIME tile shows the application-render mean when that
+clock has samples (unchanged). Otherwise it shows the last completed frame
+span. "--" appears only before the first pair has completed, with the reason
+"frame GPU span: no sample yet". The local GPU line shows "Frame GPU span: N ms
+(D3D11; boundary to boundary, includes idle)" in place of "disabled". With the
+clock on, its detailed lines are as they were.
+
+**Cost.** Two timestamp queries a frame, and a poll of the pending pairs on the
+census's existing boundary. Leases: at most six pairs in flight, two
+timestamps each, inside `kLeases` = 512 (static check in aa_off_test). No
+standalone disjoint query: the span is refused rather than opening a scope of
+its own.
+
+**Tests.** `aa_off_test`: the tile shows a number with the application clock
+off and a completed span; "--" only with no sample; the span's sub-text
+labels it; a short buffer is truncated, not overrun; the lease static check.
+Not flown.

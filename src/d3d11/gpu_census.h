@@ -272,4 +272,9 @@ void gpuCensusNoteEyeRun() noexcept;
 // Quiescent cleanup, alongside the other feature modules' Shutdown().
 void gpuCensusShutdown() noexcept;
 
+// The overlay's frame GPU time (2026-10-14), with the application-frame clock off: the last completed frame's
+// boundary-to-boundary GPU span, from gpuCensusFrame's own frame scope (one timestamp pair a frame). False until one
+// pair has completed. The span includes GPU idle between the frame's commands.
+bool gpuCensusFrameSpan(double* ms, unsigned* samples) noexcept;
+
 } // namespace edvr

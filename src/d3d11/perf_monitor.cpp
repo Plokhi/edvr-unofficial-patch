@@ -5,6 +5,8 @@
 #include "frame_ticks.h"
 #include "gpu_frame_timing.h"
 #include "vscreen.h"   // vScreenAaOffForDraws, vScreenEyeDrawsThisFrame: the draw hook CPU line
+#include "gpu_census.h"      // gpuCensusFrameSpan: the overlay's GPU time with the application clock off (2026-10-14)
+#include "frame_span_tile.h" // gpuTimeTileText: which GPU number the GPU TIME tile shows
 
 #include <windows.h>
 #include <algorithm>
@@ -1416,11 +1418,15 @@ int perfMonitorTiles(PerfTile* out, int max) {
         tile("FRAME RATE", "--", "measuring");
         tile("1% LOW", "--", "");
     }
-    if (native && nativeApplicationGpu.count) {
-        snprintf(v, sizeof(v), "%.1f", nativeApplicationGpu.meanMs);
-        tile("GPU TIME", v, "ms application render; elapsed");
-    } else if (native) {
-        tile("GPU TIME", "--", gpuFrameSnapshot().enabled ? noTiming : "disabled: advanced.app_gpu_timing");
+    // GPU TIME (2026-10-14): the application-render mean when that clock is on; with it off, the census's frame GPU span
+    // (boundary to boundary, one pair a frame). "--" only before the first pair has completed.
+    if (native) {
+        double spanMs = 0.0;
+        const bool spanHave = gpuCensusFrameSpan(&spanMs, nullptr);
+        const bool appHave = nativeApplicationGpu.count != 0;
+        const char* reason = gpuFrameSnapshot().enabled ? noTiming : "frame GPU span: no sample yet";
+        gpuTimeTileText(appHave, appHave ? nativeApplicationGpu.meanMs : 0.0, spanHave, spanMs, reason, v, sizeof(v), sub, sizeof(sub));
+        tile("GPU TIME", v, sub);
     }
     if (native && nativeApplicationCpu.count) {
         // The caller work per cycle: the game's thread from one pose wait's
@@ -1652,6 +1658,10 @@ void perfMonitorLocalGpuLine(char* buf, size_t bufLen) {
         const char* label = snap.haveResult && snap.result.source == GpuSpanSource::ApplicationRender
                                 ? "Application render" : "Render to submit";
         if (!timing.active || !timing.firstSequence) { snprintf(buf, bufLen, "%s: native timing unavailable", label); return; }
+        double spanMs = 0.0;
+        if (!snap.enabled && gpuCensusFrameSpan(&spanMs, nullptr)) {
+            snprintf(buf, bufLen, "Frame GPU span: %.2f ms (D3D11; boundary to boundary, includes idle)", spanMs); return;
+        }
         if (!snap.enabled) { snprintf(buf, bufLen, "%s: disabled", label); return; }
         if (!snap.haveResult) { snprintf(buf, bufLen, "%s: pending", label); return; }
         if (snap.result.reason == GpuSpanReason::Valid && snap.result.sequence < timing.firstSequence) {
@@ -1669,6 +1679,10 @@ void perfMonitorLocalGpuLine(char* buf, size_t bufLen) {
         return;
     }
     const GpuFrameSnapshot snap = gpuFrameSnapshot();
+    double spanMs = 0.0;
+    if (!snap.enabled && gpuCensusFrameSpan(&spanMs, nullptr)) {
+        snprintf(buf, bufLen, "Frame GPU span: %.2f ms (D3D11; boundary to boundary, includes idle)", spanMs); return;
+    }
     if (!snap.enabled) { snprintf(buf, bufLen, "Render to submit: disabled"); return; }
     if (!snap.haveResult) { snprintf(buf, bufLen, "Render to submit: pending"); return; }
     if (snap.result.reason != GpuSpanReason::Valid) {

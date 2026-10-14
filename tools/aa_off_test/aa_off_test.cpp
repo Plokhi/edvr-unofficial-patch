@@ -9,9 +9,16 @@
 //          with the instrument off, no call is made; on, every call is made.
 //
 // Exit codes: 0 pass, 1 a check failed, 2 usage. --dry-run touches nothing.
+#include "../../src/common/gpu_disjoint_clock.h"
 #include "../../src/d3d11/draw_fast_path.h"
+#include "../../src/d3d11/frame_span_tile.h"
 #include "../../src/d3d11/gpu_frame_timing.h"
 #include "../../src/d3d11/map_wait.h"
+
+// The frame span holds at most kFrameSpanSlots pairs of two timestamps each (gpu_census.cpp); every one must fit the
+// clock's per-record lease budget (kLeases, 512), or a pair would be refused rather than held.
+static_assert(edvr::kFrameSpanSlots * 2u <= edvr::DisjointClock::kLeases,
+              "the frame span's timestamps fit the disjoint clock's lease budget");
 
 #include <atomic>
 #include <cstdio>
@@ -197,6 +204,29 @@ void testGpuGuard() {
     detail::g_gpuFrameCommandLive.store(false, std::memory_order_relaxed);
 }
 
+// The overlay's GPU TIME tile (2026-10-14): the application mean when it has samples; with the application clock off, the
+// frame span when a pair has completed; "--" with its reason before either.
+void testGpuTimeTile() {
+    char v[16], sub[160];
+    bool shown = edvr::gpuTimeTileText(true, 12.34, false, 0.0, "reason", v, sizeof(v), sub, sizeof(sub));
+    check(shown && std::strcmp(v, "12.3") == 0 && std::strstr(sub, "application render") != nullptr,
+          "tile: with app_gpu_timing on and samples, the application mean is shown");
+    // Application clock off (no app samples) and one frame span completed: a number, labelled as the span.
+    shown = edvr::gpuTimeTileText(false, 0.0, true, 4.26, "reason", v, sizeof(v), sub, sizeof(sub));
+    check(shown && std::strcmp(v, "4.3") == 0, "tile: app clock off with a completed frame span shows that number");
+    check(std::strstr(sub, "frame GPU span") != nullptr && std::strstr(sub, "boundary to boundary") != nullptr &&
+              std::strstr(sub, "includes GPU idle") != nullptr,
+          "tile: the span is labelled as boundary to boundary and including idle");
+    // Nothing completed yet: "--" with the reason, never a number.
+    shown = edvr::gpuTimeTileText(false, 0.0, false, 0.0, "frame GPU span: no sample yet", v, sizeof(v), sub, sizeof(sub));
+    check(!shown && std::strcmp(v, "--") == 0 && std::strcmp(sub, "frame GPU span: no sample yet") == 0,
+          "tile: '--' appears only when no sample has completed yet, with its reason");
+    // A tiny buffer truncates, never overruns.
+    char tiny[2];
+    edvr::gpuTimeTileText(false, 0.0, true, 123.4, "", tiny, sizeof(tiny), sub, sizeof(sub));
+    check(std::strlen(tiny) < sizeof(tiny), "tile: a short value buffer is truncated, not overrun");
+}
+
 void usage() {
     std::puts("usage: aa_off_test --self-test | --dry-run");
 }
@@ -219,6 +249,7 @@ int main(int argc, char** argv) {
     testSampler();
     testMapTotals();
     testGpuGuard();
+    testGpuTimeTile();
     std::printf("aa_off_test: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }
