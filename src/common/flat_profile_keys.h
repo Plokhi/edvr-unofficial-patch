@@ -24,6 +24,8 @@ inline bool flatProfileReadsKey(const char* key) {
         // The interface quality (flat panel row; ui_panel_scale.cpp's flat factor and the flat UI layer). The VR layer reads it
         // too, but stays inert in flat: it is live only with fix.temporal_aa on through this gate, which refuses that key.
         std::strcmp(key, "fix.ui_quality") == 0 ||
+        // The optimized station (optimized_station.cpp), on in flat as in VR (built v14.34). Unlisted, getString answers "off" here and the station never starts.
+        std::strcmp(key, "fix.optimized_station") == 0 ||
         // The flat jitter cycle's length (flat_runtime.cpp, FlatLivePhase::phaseCount; temporal_math.h). Developer tier, no flat panel
         // row. Unlisted, getInt answers 0 here whatever the file says, which the reader takes for out of range and reads as 8.
         std::strcmp(key, "advanced.temporal_aa_jitter_phases") == 0 ||

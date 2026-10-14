@@ -1032,6 +1032,8 @@ bool journalInJumpTunnel() {
 bool journalOnFootKnown() { return journalWatchActive() && peek(g_v.onFootKnown); }
 bool journalOnFoot() { return !runtimeFlatProfile() && peek(g_v.onFoot); }
 bool journalDockedKnown() { return journalWatchActive() && peek(g_v.dockedKnown); }
+bool journalStatusDockedKnown() { return g_v.active.load(std::memory_order_acquire) && peek(g_v.dockedKnown); }
+bool journalStatusDocked() { return peek(g_v.docked); }
 bool journalDocked() { return !runtimeFlatProfile() && peek(g_v.docked); }
 bool journalSeatedKnown() { return journalWatchActive() && peek(g_v.seatedKnown); }
 bool journalSeated() { return !runtimeFlatProfile() && peek(g_v.seated); }
