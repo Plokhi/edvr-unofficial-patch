@@ -316,6 +316,8 @@ static std::vector<Variant> fixedVariants(const std::string& core) {
     variants.insert(variants.end(), sibling.begin(), sibling.end());
     const auto skyRing = skyRingVariants();
     variants.insert(variants.end(), skyRing.begin(), skyRing.end());
+    const auto composite = compositeInPlaceVariants();
+    variants.insert(variants.end(), composite.begin(), composite.end());
     return variants;
 }
 
@@ -577,8 +579,8 @@ static void selfTest() {
     coreLegacy.insert(coreLegacy.end(), originalCore.begin(), originalCore.end());
     coreLegacy.insert(coreLegacy.end(), originalExtra.begin(), originalExtra.end());
     auto coreFixed = fixedVariants(extractCore(edvr::kTemporalCsHlsl));
-    check(originalCore.size() == 28 && originalExtra.size() == 14 && coreFixed.size() == 64 && coreLegacy.size() + 15 == coreFixed.size(),
-          "all original fixed shader contracts, three bounded diagnostics, six flat foreground shaders, the supercruise bars' geometry shader, the foreground map's four sibling-pass compute shaders (donor, fit and the shadow's two) and the sky ring's compute shader are registered");
+    check(originalCore.size() == 28 && originalExtra.size() == 14 && coreFixed.size() == 65 && coreLegacy.size() + 16 == coreFixed.size(),
+          "all original fixed shader contracts, three bounded diagnostics, six flat foreground shaders, the supercruise bars' geometry shader, the foreground map's four sibling-pass compute shaders (donor, fit and the shadow's two), the sky ring's compute shader and the UI layer's in-place composite are registered");
     for(size_t i=0;i<coreFixed.size();++i)for(size_t j=0;j<i;++j)
         check(std::strcmp(coreFixed[i].symbol,coreFixed[j].symbol)!=0,"generated shader symbols do not collide");
     using ReflectFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
@@ -814,6 +816,42 @@ static void selfTest() {
             ID3D11ShaderReflectionConstantBuffer* cbuffer = reflection ? reflection->GetConstantBufferByName("P") : nullptr;
             check(bound && cbuffer && SUCCEEDED(cbuffer->GetDesc(&bufferDesc)) && bufferDesc.Size == sizeof(edvr::SkyRingParams),
                   "the sky ring's shader keeps its inputs, the ring and the 48-byte parameter block at the slots the module sets them at");
+        }
+    }
+
+    // The UI layer's in-place composite (src/d3d11/fixed_shader_source.h kUiLayerCompositeInPlaceHlsl): new, so held to its own contract -- the symbol, source
+    // name, entry, profile and flags, the text it compiles, the 32x8 group ui_layer.cpp dispatches it with (ui_layer_shaders.h kUiLayerCompositeGroupX/Y) and the
+    // bindings it reads: the frame as a typed UAV at u0 (and no SRV of it -- a frame bound for read and write at once is the one hazard this shader must never
+    // have), the layer at t1, the multiply at t2, the parameters at b0.
+    {
+        auto& shader = coreFixed[coreLegacy.size() + 15];
+        check(!std::strcmp(shader.symbol, "kUiLayerCompositeInPlaceBytecode") && !std::strcmp(shader.sourceName, "ui_layer_composite_inplace_cs") &&
+              !std::strcmp(shader.entry, "main") && !std::strcmp(shader.profile, "cs_5_0") && shader.alternate == edvr::kUiLayerCompositeInPlaceHlsl &&
+              shader.macros == nullptr && !shader.flags1 && !shader.flags2,
+              "the UI layer's in-place composite has its distinct symbol and exact source/stage contract");
+        check(compile(compiler.fn, shader.alternate, shader, true) && shader.bytes.size() > 4 && !std::memcmp(shader.bytes.data(), "DXBC", 4),
+              "the UI layer's in-place composite compiles to fixed DXBC");
+        if (reflect && !shader.bytes.empty()) {
+            ComPtr<ID3D11ShaderReflection> reflection;
+            D3D11_SHADER_DESC desc{};
+            const HRESULT hr = reflect(shader.bytes.data(), shader.bytes.size(), __uuidof(ID3D11ShaderReflection),
+                                       reinterpret_cast<void**>(reflection.GetAddressOf()));
+            UINT x = 0, y = 0, z = 0;
+            if (reflection) reflection->GetThreadGroupSize(&x, &y, &z);
+            check(SUCCEEDED(hr) && reflection && SUCCEEDED(reflection->GetDesc(&desc)) &&
+                  D3D11_SHVER_GET_TYPE(desc.Version) == D3D11_SHVER_COMPUTE_SHADER && D3D11_SHVER_GET_MAJOR(desc.Version) == 5 &&
+                  x == 32 && y == 8 && z == 1,
+                  "the in-place composite reflects as a Shader Model 5 compute shader in the 32x8 group it is dispatched with");
+            struct Binding { const char* name; D3D_SHADER_INPUT_TYPE type; UINT slot; };
+            const Binding bindings[] = {{"Frame", D3D_SIT_UAV_RWTYPED, 0}, {"Layer", D3D_SIT_TEXTURE, 1}, {"Mult", D3D_SIT_TEXTURE, 2}, {"P", D3D_SIT_CBUFFER, 0}};
+            bool bound = reflection != nullptr;
+            for (size_t j = 0; reflection && j < sizeof(bindings) / sizeof(bindings[0]); ++j) {
+                D3D11_SHADER_INPUT_BIND_DESC bind{};
+                bound = bound && SUCCEEDED(reflection->GetResourceBindingDescByName(bindings[j].name, &bind)) &&
+                        bind.Type == bindings[j].type && bind.BindPoint == bindings[j].slot && bind.BindCount == 1;
+            }
+            check(bound && desc.BoundResources == 4,
+                  "the in-place composite reads the frame only as the typed UAV at u0, the layer at t1, the multiply at t2 and the parameters at b0");
         }
     }
 
