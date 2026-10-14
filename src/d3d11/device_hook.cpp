@@ -82,6 +82,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "stall_watch.h"     // stallWatchBeat: the stall sampler's heartbeat, once per owned Present
 #include "vram_tick.h"       // vramWatchTick: the graphics memory watch, once per owned Present
 #include "vertex_resync_hook.h"   // vertexResyncInstall at startup, vertexResyncPoll once a second: the f3d vertex-buffer cache repair (both profiles)
+#include "light_grid_cache_hook.h"   // lightGridCacheInstall at startup, lightGridCachePoll once a second, lightGridCacheNoteFrame per Present: the fragment-culling grid cache (both profiles)
 #include "terrain_cull_cover_hook.h"   // terrainCullCoverInstall at startup, terrainCullCoverPoll once a second: the terrain cull frustum cover (VR)
 #include "cross_profile_cost.h"   // the flat hooks' and the creation captures' cost while VR is active (log only)
 #include "frame_ticks.h"     // g_frameTicks: what the Present hook's own work cost, by name
@@ -1224,6 +1225,7 @@ EDVR_BOUNDARY_TICK(tkSchedulerProbe, "scheduler_probe");
 EDVR_BOUNDARY_TICK(tkVtableWatch, "vtable_watch");
 EDVR_BOUNDARY_TICK(tkVrRuntime, "vr_runtime");
 EDVR_BOUNDARY_TICK(tkOptimizedStation, "optimized_station");
+EDVR_BOUNDARY_TICK(tkLightGridCache, "light_grid_cache");
 EDVR_BOUNDARY_TICK(tkToggleKey, "toggle_key");
 EDVR_BOUNDARY_TICK(tkHotkeys, "hotkeys");
 EDVR_BOUNDARY_TICK(tkEliteBinds, "elite_binds");
@@ -1571,6 +1573,7 @@ void presentFrameBoundary() {
     tkVrRuntime.run([] { vrRuntimeTick(); });
     // The optimized station's tick: the setting, the seal and release rules, the held cell in the pad's frame, the 30 s summary.
     tkOptimizedStation.run([] { optimizedStationFrame(static_cast<uint32_t>(g_state->frameCounter)); });
+    tkLightGridCache.run([] { lightGridCacheNoteFrame(g_state->frameCounter); });   // the frame count for the grid cache's 30 s line
     tkToggleKey.run([] {
         if (g_state->toggleKey.pressed()) toggleExposureFix();
     });
@@ -1652,6 +1655,7 @@ void presentFrameBoundary() {
             else vScreenRefreshConfig();
             // The vertex-buffer resync's 60 s count and its ten-minute heartbeat: it needs no vScreen State, so it is asked here, after the reload, in both profiles.
             vertexResyncPoll(stampMs());
+            lightGridCachePoll(stampMs());
             // The terrain cull cover's ten-minute heartbeat (written while its hook is live, zero counts included).
             terrainCullCoverPoll(stampMs());
             // The four diagnostic keys follow the file too (the menu's Hotkeys page).
@@ -2879,6 +2883,9 @@ void hookDevice(ID3D11Device* device) {
             // The game's own vertex-buffer cache repair (vertex_resync_hook.cpp): a CodeHook on Frontier's input-assembler flush, once, in BOTH profiles -- the stale
             // cache is the game's, not VR's. A build that is not 332841 is one log line and nothing patched.
             vertexResyncInstall();
+            // The light grid cache (light_grid_cache_hook.cpp; docs/light-grid-cache-2026-10-13.md): a CodeHook on the game's fragment-culling cluster builder, once, in BOTH
+            // profiles -- the builder is the game's. No key: exact, and verified against the game's own rebuild while it runs. A build that is not 332841 is one log line.
+            lightGridCacheInstall();
             // The terrain cull cover (terrain_cull_cover_hook.cpp; docs/terrain-culling.md): a CodeHook on the game's cull-plane builder, always on for a scope with VR (the flat
             // profile passes through per call). A build that is not 332841 is scanned for the call site; anything short of one match is one log line and nothing patched.
             terrainCullCoverInstall(!runtimeScopeIncludesVr());

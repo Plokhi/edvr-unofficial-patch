@@ -78,6 +78,9 @@ void vrWorldRouteNoteSceneReset(){++worldRouteSceneResets;}}
 // The terrain cull cover (src/d3d11/terrain_cull_cover_hook.cpp, docs/terrain-culling.md), which begin() tells the frusta the game is handed: recorded here, asserted below.
 unsigned coverNotes=0;float coverLast[2][4]{};
 namespace edvr{void terrainCullCoverNoteFrusta(const float f[2][4]){++coverNotes;std::memcpy(coverLast,f,sizeof(coverLast));}}
+// The light grid cache's jitter probe (src/d3d11/light_grid_cache_hook.cpp), which begin() tells this frame's jitter: recorded here, asserted below.
+unsigned jitterNotes=0;float jitterLastShift[2][2]{};
+namespace edvr{void lightGridCacheNoteJitter(uint64_t,float,float,const float shift[2][2]){++jitterNotes;std::memcpy(jitterLastShift,shift,sizeof(jitterLastShift));}}
 // The served floor's NGX query (dlaa.cpp), shaped the way the flights'
 // modes lines read (edvr_gfx_20260923_153446.log line 435): quality,
 // balanced and performance take half the output up to the output, ultra
@@ -268,6 +271,7 @@ void run(){
   check(!edvr::nativeTemporalWarmTarget(&warmDev,&warmThread),"no warm target before any channel is acquired");
   Device d;auto source=d.texture();auto t=acquire(d,11);auto f=frame(11,1);auto p=begin(t,f);
   check(coverNotes>=1&&std::memcmp(coverLast,f.frusta,sizeof(coverLast))==0,"the terrain cull cover is told the frusta the game is handed (the begun frame's, as given)");
+  check(jitterNotes>=1&&jitterLastShift[0][0]==p.tangentShift[0][0]&&jitterLastShift[1][1]==p.tangentShift[1][1],"the light grid cache's jitter probe is told the shift the game is handed (the begun frame's)");
   warmDev=nullptr;warmThread=0;
   check(edvr::nativeTemporalWarmTarget(&warmDev,&warmThread)&&warmDev==d.device.Get()&&warmThread==GetCurrentThreadId(),
       "warm target names the acquiring thread and device");
