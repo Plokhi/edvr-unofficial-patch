@@ -67,6 +67,14 @@ static std::vector<Variant> siblingVariants() {
     };
 }
 
+// The sky ring's compute shader (src/d3d11/sky_ring_shader.h; TEMPORARY, diag.sky_ring; docs/sky-flicker-2026-10-13.md): new, held to its own contract
+// -- the symbol, source name, entry, profile, the text it compiles, the one 1024-thread group it is dispatched with and the bindings the module sets.
+static std::vector<Variant> skyRingVariants() {
+    return {
+        {"kSkyRingBytecode", "sky ring", "main", nullptr, {}, false, edvr::kSkyRingCs, "cs_5_0"},
+    };
+}
+
 static std::vector<LegacyContract> coreLegacyContracts() {
     return {
         {"ui_layer_composite_cs", "main", "cs_5_0", nullptr, 0x237EEBB920BC9015ull},

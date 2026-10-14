@@ -154,7 +154,10 @@ void rotationAndRealTimerCase(Device& d) {
     check(gpuTimingBind(d.dev.Get(), d.ctx.Get()), "bind canonical WARP timer owner");
     check(occurrenceCapFor(GpuCensusSection::DoorSharpen) == 4, "K cap: a door section caps at 4 (both eyes, two occurrences each)");
     check(occurrenceCapFor(GpuCensusSection::FrameUiLayerReissues) == 8, "K cap: a per-draw section caps at 8");
-    check(isDoorSection(GpuCensusSection::DoorFssHeal), "section split: the last door section is still door");
+    check(isDoorSection(GpuCensusSection::DoorFssHeal) && isDoorSection(GpuCensusSection::DoorSkyRing),
+          "section split: the last door section (the sky ring's) is still door");
+    check(static_cast<size_t>(GpuCensusSection::DoorSkyRing) + 1 == static_cast<size_t>(GpuCensusSection::FrameHologramPasses),
+          "section split: the sky ring is the last door section, nested inside the whole and in no top-level door total");
     check(!isDoorSection(GpuCensusSection::FrameHologramPasses), "section split: the first in-frame section is not door");
 
     ComPtr<ID3D11RenderTargetView> rtv;
@@ -765,9 +768,9 @@ void alteredFixCases() {
         ++cycle;
         onlyOwners = onlyOwners && turnOwnerOf(static_cast<GpuCensusSection>(at)) == static_cast<GpuCensusSection>(at);
     } while (at != 0 && cycle < 200);
-    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 - static_cast<unsigned>(kWorldSections) - static_cast<unsigned>(kSkinSections) && cycle == 20,
-          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones and the idle world-route and second-skin ones (20: the 22 there were before the terrain's two sections went, 2026-10-01; the key off changes nothing)");
-    // The same cycle once the VR world route's three sections have been called this window: they take turns, 23.
+    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 - static_cast<unsigned>(kWorldSections) - static_cast<unsigned>(kSkinSections) && cycle == 21,
+          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones and the idle world-route and second-skin ones (21: the 20 there were before the sky ring's door section, 2026-10-13, and the 22 before the terrain's two sections went, 2026-10-01; the key off changes nothing)");
+    // The same cycle once the VR world route's three sections have been called this window: they take turns, 24.
     for (size_t i = kWorldFirst; i < kWorldFirst + kWorldSections; ++i) g_section[i].occurrences = 1;
     at = 0;
     cycle = 0;
@@ -778,8 +781,8 @@ void alteredFixCases() {
         if (static_cast<size_t>(at) >= kWorldFirst && static_cast<size_t>(at) < kWorldFirst + kWorldSections)
             worldVisited[static_cast<size_t>(at) - kWorldFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 23 && worldVisited[0] && worldVisited[1] && worldVisited[2],
-          "turns: a world-route section that has been called this window takes its turn (23: the 20 and the three)");
+    check(cycle == 24 && worldVisited[0] && worldVisited[1] && worldVisited[2],
+          "turns: a world-route section that has been called this window takes its turn (24: the 21 and the three)");
     for (size_t i = kWorldFirst; i < kWorldFirst + kWorldSections; ++i) g_section[i].occurrences = 0;
     for (auto& s : g_section) s = SectionState{};
     g_section[kAlteredFixFirst + 2].occurrences = 7;
@@ -1291,8 +1294,8 @@ void skinTurnCases() {
         const size_t a = static_cast<size_t>(at);
         if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) skinVisited[a - kSkinFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 20 && !skinVisited[0] && !skinVisited[1] && !skinVisited[2] && !skinVisited[3] && !skinVisited[4],
-          "second skin turns: with none called this window the rotation gives them no turn (the cycle is the 20 it was before they existed)");
+    check(cycle == 21 && !skinVisited[0] && !skinVisited[1] && !skinVisited[2] && !skinVisited[3] && !skinVisited[4],
+          "second skin turns: with none called this window the rotation gives them no turn (the cycle is the 21 of a build without them: the 20 it was before they existed, and the sky ring)");
     for (size_t i = 0; i < kSkinSections; ++i) skinSection(i).occurrences = 1;
     at = 0;
     cycle = 0;
@@ -1303,8 +1306,8 @@ void skinTurnCases() {
         const size_t a = static_cast<size_t>(at);
         if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) skinVisited[a - kSkinFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 25 && skinVisited[0] && skinVisited[1] && skinVisited[2] && skinVisited[3] && skinVisited[4],
-          "second skin turns: once called this window each takes its turn (25: the 20 and the five)");
+    check(cycle == 26 && skinVisited[0] && skinVisited[1] && skinVisited[2] && skinVisited[3] && skinVisited[4],
+          "second skin turns: once called this window each takes its turn (26: the 21 and the five)");
     // one of them alone
     for (size_t i = 0; i < kSkinSections; ++i) skinSection(i).occurrences = 0;
     skinSection(3).occurrences = 1;
@@ -1318,7 +1321,7 @@ void skinTurnCases() {
         if (a == kSkinFirst + 3) ++joinTurns;
         else if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) ++otherSkin;
     } while (at != 0 && cycle < 200);
-    check(cycle == 21 && joinTurns == 1 && otherSkin == 0, "second skin turns: the join called alone has one turn a cycle and the others none");
+    check(cycle == 22 && joinTurns == 1 && otherSkin == 0, "second skin turns: the join called alone has one turn a cycle and the others none");
     for (auto& s : g_section) s = SectionState{};
 }
 

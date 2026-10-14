@@ -14,7 +14,7 @@ namespace edvr {
 namespace {
 
 constexpr size_t kSections = static_cast<size_t>(GpuCensusSection::Count);
-// DoorTemporalWhole .. DoorFssHeal are indices 0..8; the in-frame sections
+// DoorTemporalWhole .. DoorSkyRing are indices 0..9; the in-frame sections
 // start at FrameHologramPasses. Both ranges are contiguous by construction
 // (gpu_census.h), so a single index split is enough.
 constexpr size_t kDoorSections = static_cast<size_t>(GpuCensusSection::FrameHologramPasses);
@@ -28,12 +28,14 @@ unsigned occurrenceCapFor(GpuCensusSection section) noexcept {
     return isDoorSection(section) ? kDoorOccurrenceCap : kFrameOccurrenceCap;
 }
 
-// The door's parenthetical breakdown, DoorUpscaler..DoorFssHeal (indices
-// 1..8) -- DoorTemporalWhole (index 0) has no slot of its own; it is the
-// "whole" that four of these nest inside (see gpuCensusLogLine).
-constexpr const char* kDoorBreakdownNames[8] = {
+// The door's parenthetical breakdown, DoorUpscaler..DoorSkyRing (indices
+// 1..9) -- DoorTemporalWhole (index 0) has no slot of its own; it is the
+// "whole" that five of these nest inside (see gpuCensusLogLine). "sky ring -"
+// in a line means the diag.sky_ring dispatch never ran in the window (key off).
+constexpr size_t kDoorBreakdownCount = 9;
+constexpr const char* kDoorBreakdownNames[kDoorBreakdownCount] = {
     "upscaler", "motion prep", "hologram resolve", "UI resolve",
-    "sharpen", "menu", "UI layer composite", "FSS heal"
+    "sharpen", "menu", "UI layer composite", "FSS heal", "sky ring"
 };
 // The in-frame breakdown, FrameHologramPasses..FrameUiLayerHdrSeed (indices 9..16): the item names, in the
 // sections' order. "HDR HUD depth-stencil seed" is the name the UI layer's own 30 s line gives the same stage.
@@ -318,7 +320,8 @@ void logAndResetWindow(uint64_t now) {
     const Snapshot doorWhole = snapshotOf(g_section[static_cast<size_t>(GpuCensusSection::DoorTemporalWhole)], frames);
     double doorTotal = doorWhole.msPerFrame;
     std::string doorItems;
-    for (int i = 0; i < 8; ++i) {
+    static_assert(kDoorSections == 1 + kDoorBreakdownCount, "one name for each door section after the whole");
+    for (int i = 0; i < static_cast<int>(kDoorBreakdownCount); ++i) {
         const Snapshot s = snapshotOf(g_section[1 + static_cast<size_t>(i)], frames);
         appendItem(doorItems, kDoorBreakdownNames[i], s);
         const auto section = static_cast<GpuCensusSection>(1 + i);
