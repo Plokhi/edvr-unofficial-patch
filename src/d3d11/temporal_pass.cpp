@@ -56,7 +56,7 @@
 #include "../common/camera_nearest.h"       // the nearest write: a veto on the legacy pick (fix.camera_nearest, TEMPORARY A/B)
 #include "../common/camera_jump_guard.h"    // the jump guard: a legacy pick's jump replaced by the next-best candidate (fix.camera_jump_guard, TEMPORARY A/B)
 #include "../common/camera_row_events.h"    // I-1: rot= mv= on the dump's TEMP lines and the event summary
-#include "../common/camera_target_tag.h"    // the render target a camera write is drawn into, fix.camera_eye_target, the burst offset
+#include "../common/camera_target_tag.h"    // the render target a camera write is drawn into, the eye-target rule, the burst offset
 #include "../common/mini_render.h"          // P3: the 256x256 deferred mini-render, joined to the events
 #include "temporal_shader_bytecode.h"
 
@@ -2154,7 +2154,7 @@ struct RowsWrite {
     uint32_t    observedSeq = 0; // diagnostic clock, includes rejected non-rotation writes
     bool        valid = false;
     // The render target the first draw after this write went into (camera_target_tag.h): unknown until such a draw, and for a write overwritten before
-    // one. Set by temporalPassNoteDraw, read by chooseCameraRows (fix.camera_eye_target) and the dump.
+    // one. Set by temporalPassNoteDraw, read by chooseCameraRows (the eye-target rule) and the dump.
     camtag::Target tag;
     // The owner-context draws made between this write and the next (saturating): a write with none or a few is an orphan, one the scene was drawn with has
     // hundreds. drawBase is the draw count at the write; drawsAfter is set when the next write (or the frame boundary) closes it.
@@ -2175,7 +2175,7 @@ enum CameraChoiceFlag : uint32_t {
     // 10..12 are the IPD pair's and the headset tag's on the branch that refuted them (not on main); kept free so the numbers read the same.
     kChoiceNearest        = 1u << 13,   // the nearest-write rule took a write other than the legacy pick (fix.camera_nearest on)
     kChoiceJumpReplaced   = 1u << 14,   // the jump guard replaced the legacy pick with the next-best candidate (fix.camera_jump_guard on)
-    kChoiceEyeTargetCut   = 1u << 15,   // fix.camera_eye_target on: this frame's chooser rejected at least one write (a write drawn into a non-eye target)
+    kChoiceEyeTargetCut   = 1u << 15,   // the eye-target rule: this frame's chooser rejected at least one write (drawn into a non-eye target or the submitted texture)
 };
 enum CameraDrawFlag : uint32_t {
     kDrawSeen             = 1u << 0,
@@ -2200,7 +2200,7 @@ struct RowsChoiceCapture {
     uint32_t continuousCandidates = 0, twinCandidates = 0;
     camtag::Target selectedTarget;      // the render target the selected write was drawn into (unknown when no draw followed it)
     uint32_t selectedDraws = 0;         // the draws made between the selected write and the next one
-    uint32_t rejectedWrites = 0;        // writes rejected as not drawn into an eye-sized target (counted with the key off too: would-be)
+    uint32_t rejectedWrites = 0;        // writes the eye-target rule rejected: drawn into a non-eye-sized target or into the submitted eye texture
 };
 struct RigidDrawRows {
     const void* resource = nullptr;
@@ -2268,13 +2268,15 @@ RigidDrawRows g_rigidDraw[2];
 RigidDrawRows g_prevRigidDraw[2];
 
 // ---- the sky-flicker diagnostic build (docs/sky-flicker-2026-10-13.md) ---------------------------------------------------------------------------------
-// Three TEMPORARY A/B keys, all default off, all read live in temporalPassConfigure and VR only (the flat allow-list does not list them, so flat reads
-// off): fix.camera_eye_target (a filter on the chooser's candidates), fix.camera_nearest and fix.camera_jump_guard (rules on its pick). The nearest-write
-// rule and the jump guard are mutually exclusive: with both on, the nearest write wins and the guard only counts. Each rule runs and counts with its key
-// off too, on the legacy pick, so the 30 s lines say what it would have done on the flown track; the eye-target filter counts what it would reject.
+// The eye-target rule (a filter on the chooser's candidates) is behaviour in VR, with no key (it was a temporary A/B key until 2026-10-14; proven in the
+// hangar flight). Two TEMPORARY A/B keys remain, default off, read live in temporalPassConfigure and VR only (the flat allow-list does not list them, so
+// flat reads off): fix.camera_nearest and fix.camera_jump_guard (rules on its pick). The nearest-write rule and the jump guard are mutually exclusive: with
+// both on, the nearest write wins and the guard only counts. Each runs and counts with its key off too, on the pick, so the 30 s lines say what it would
+// have done on the flown track.
+// The eye-target rule is on in the VR profile and not in the flat one (whose scene picker has its own, unflown, rule that only logs: flat_scene_log.h).
+inline bool eyeTargetRuleOn() { return !runtimeFlatProfile(); }
 bool                 g_nearKeyOn = false;
 bool                 g_jumpKeyAsked = false;      // fix.camera_jump_guard as asked; it applies only when g_nearKeyOn is off
-bool                 g_eyeTargetKeyOn = false;
 camnearest::State    g_nearState;
 camnearest::Stats    g_nearStats;
 jumpguard::Guard     g_jumpGuard;
@@ -2419,12 +2421,12 @@ void chooseCameraRows() {
         temporalRot3Of34(g_prevRows, rp);
         temporalTranspose3(rp, rpT);
     }
-    // fix.camera_eye_target (TEMPORARY A/B; camera_target_tag.h): a write qualifies as the scene's camera only if its first draw went into an eye-sized
+    // The eye-target rule (camera_target_tag.h; always on in VR): a write qualifies as the scene's camera only if its first draw went into an eye-sized
     // target that is NOT the texture being submitted. The reflection probe's cube faces share the eyes' scene block and are picked when one lies within
     // the 3 degree gate: most are drawn into 256, 512, 1024 or 2048x1024 targets (the size rule), but the forward face has no draw of its own and the
     // next draw of the frame is a late pass into the submitted image itself (the 2026-10-13 hangar flight: rt=2016x2016 format 27, the game's submit
     // format, on 4 of 4 bad picks), so the identity rule rejects writes drawn into the submitted texture. Judged here, at the first treat, when every
-    // draw of the frame has tagged its write; a write no draw followed is unknown and kept. Counted with the key off too (would-be). Fail open twice: if
+    // draw of the frame has tagged its write; a write no draw followed is unknown and kept. Fail open twice: if
     // nothing at all would be eligible the filter stands down for the frame, and if the filter leaves no continuous candidate the unfiltered set is used.
     g_eyeTargetStats.eyeW = g_chooseEyeW;
     g_eyeTargetStats.eyeH = g_chooseEyeH;
@@ -2443,11 +2445,11 @@ void chooseCameraRows() {
     }
     const uint32_t cutWrites = eyeVerdict.cut;
     if (cutWrites) ++g_eyeTargetStats.rejectFrames;
-    if (eyeVerdict.failedOpen(g_eyeTargetKeyOn)) ++g_eyeTargetStats.failOpen;
-    bool eyeFilter = eyeVerdict.active(g_eyeTargetKeyOn);
+    if (eyeVerdict.failedOpen(eyeTargetRuleOn())) ++g_eyeTargetStats.failOpen;
+    bool eyeFilter = eyeVerdict.active(eyeTargetRuleOn());
     g_rowsChoice.rejectedWrites = cutWrites;
     // The pick the legacy chooser and the filtered one would each make, for the stats alone (light: continuity, the twin skip, the bound-then-latest
-    // preference): how often, and by how much, the filter changes the rows. Counted with the key off too, so leg 1 says what leg 2 would change.
+    // preference): how often, and by how much, the filter changes the rows.
     auto lightBest = [&](bool filter) {
         int best = -1;
         uint32_t bSeq = 0;
@@ -4740,11 +4742,11 @@ void temporalPassDumpHistory(const char* trigger) {
         "TCAM legend: choice flags 1 valid,2 bound seen,4 bound write observed,8 selected bound,"
         "10 continuous,20 identical-to-previous twin present,40 twin fallback,80 resync,100 refollow,"
         "200 bound rows valid,2000 chosen by the nearest-write rule (fix.camera_nearest),4000 replaced by the jump guard (fix.camera_jump_guard),"
-        "8000 the eye-target filter rejected a write this frame (fix.camera_eye_target). Draw flags 1 eligible draw seen,2 mapped write observed,4 rows valid,"
+        "8000 the eye-target rule rejected a write this frame. Draw flags 1 eligible draw seen,2 mapped write observed,4 rows valid,"
         "8 previous draw rows valid,10 same resource,20 same observed write,40 same rows,80 selection later. "
         "rt= is the render target the selected write's first following draw went into (WxH:DXGI format/rtv or dsv/colour targets bound; - when no draw "
         "followed it); drt= is the tagged eye draw's; burst= is the frame's offset in a burst of camera writes (- outside one) and wr= the frame's full "
-        "write count over its quiet baseline; rej= the writes the eye-target filter rejected (would-be with the key off: not eye-sized, or drawn into the submitted "
+        "write count over its quiet baseline; rej= the writes the eye-target rule rejected (not eye-sized, or drawn into the submitted "
         "eye texture itself); dr= the draws made between the selected write and the next write (a write the scene was drawn with has hundreds, an orphan "
         "few). "
         "TEMP rot= and mv= are the selected rows' rotation (deg) and translation (m) from the previous same-eye frame (gap= when that is not the previous "
@@ -4905,23 +4907,21 @@ void temporalPassConfigure(Config& cfg) {
         g_miniBound = false;
         detail::g_cameraDrawWatch = false;
     }
-    // The sky-flicker build's TEMPORARY keys (docs/sky-flicker-2026-10-13.md), all default off, all live (this runs on every config reload), VR only: the
-    // flat allow-list lists none of them, so flat reads off. A change is told once, with the rule that wins when two pick rules are on.
+    // The sky-flicker build's TEMPORARY keys (docs/sky-flicker-2026-10-13.md), both default off, both live (this runs on every config reload), VR only: the
+    // flat allow-list lists neither, so flat reads off. A change is told once, with the rule that wins when two pick rules are on.
     {
-        const bool eyeTarget = cfg.getString("fix.camera_eye_target", "off") == "on";
         const bool nearest = cfg.getString("fix.camera_nearest", "off") == "on";
         const bool guardAsked = cfg.getString("fix.camera_jump_guard", "off") == "on";
-        static bool told = false;   // said once even when all three read off, so a log names the state it was flown in
-        const bool changed = eyeTarget != g_eyeTargetKeyOn || nearest != g_nearKeyOn || guardAsked != g_jumpKeyAsked;
-        g_eyeTargetKeyOn = eyeTarget;
+        static bool told = false;   // said once even when both read off, so a log names the state it was flown in
+        const bool changed = nearest != g_nearKeyOn || guardAsked != g_jumpKeyAsked;
         g_nearKeyOn = nearest;
         g_jumpKeyAsked = guardAsked;
-        if (!runtimeFlatProfile() && (!told || changed)) {   // flat has its own copy of the eye-target rule (flat_scene_log.h) and logs it there
+        if (!runtimeFlatProfile() && (!told || changed)) {
             told = true;
             Log::get().note(
-                "temporal camera keys (TEMPORARY A/B): fix.camera_eye_target=%s (a write drawn into a render target that is not eye-sized is not a candidate), "
+                "temporal camera keys (TEMPORARY A/B): "
                 "fix.camera_nearest=%s (the continuous write nearest the last pick replaces a legacy pick beyond its limit), fix.camera_jump_guard=%s%s.",
-                eyeTarget ? "on" : "off", nearest ? "on" : "off", guardAsked ? "on" : "off",
+                nearest ? "on" : "off", guardAsked ? "on" : "off",
                 (nearest && guardAsked) ? " -- ASKED but superseded: with both pick rules on, the nearest-write rule wins and the jump guard only counts"
                                         : "");
         }
@@ -5479,7 +5479,7 @@ static void temporalPassSkyDiagTick() {
     if (freq <= 0 || now - g_diagWindowTicks < 30 * freq) return;
     g_diagWindowTicks = now;
     char line[512];
-    if (g_eyeTargetStats.frames && camtag::formatReport(line, sizeof(line), g_eyeTargetStats, g_eyeTargetKeyOn) > 0) Log::get().note("%s", line);
+    if (g_eyeTargetStats.frames && camtag::formatReport(line, sizeof(line), g_eyeTargetStats) > 0) Log::get().note("%s", line);
     camtag::resetWindow(g_eyeTargetStats);
     if (g_nearStats.frames && camnearest::formatReport(line, sizeof(line), g_nearStats, g_nearKeyOn) > 0) Log::get().note("%s", line);
     camnearest::resetWindow(g_nearStats);

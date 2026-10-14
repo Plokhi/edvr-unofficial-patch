@@ -1,5 +1,5 @@
 #pragma once
-// The render target a camera-block write is drawn into, the rule that filters on it (fix.camera_eye_target), the burst offset of a frame and the
+// The render target a camera-block write is drawn into, the rule that filters on it (the eye-target rule: always on in VR since 2026-10-14), the burst offset of a frame and the
 // P3 mini-render record (docs\sky-flicker-2026-10-13.md; reviews\skybox-flicker-2026-10-13.md, the second follow-up; vr-view-caches-2026-10-13.md, P3).
 //
 // WHY. The 1.006 s camera-row excursions are the reflection probe's forward cube-face camera, written into the same scene constant block as the eyes'
@@ -87,7 +87,7 @@ inline bool rejectsFor(const Target& t, uint32_t eyeW, uint32_t eyeH, const Subm
 // non-eye or to the submitted texture: a wrong eye size, or a game that draws its scene straight into the submitted image) it stands down for the frame
 // rather than leave the chooser empty.
 struct Filter {
-    uint32_t cut = 0;               // writes the rule rejects (counted with the key off too: would-be)
+    uint32_t cut = 0;               // writes the rule rejects 
     uint32_t cutSize = 0, cutSubmit = 0;
     bool eligibleAny = false;       // at least one write the rule keeps
     void note(const Target& t, uint32_t eyeW, uint32_t eyeH, const Submit& s) {
@@ -97,8 +97,8 @@ struct Filter {
         default: eligibleAny = true; break;
         }
     }
-    bool active(bool keyOn) const { return keyOn && cut && eligibleAny; }
-    bool failedOpen(bool keyOn) const { return keyOn && cut && !eligibleAny; }
+    bool active(bool on) const { return on && cut && eligibleAny; }
+    bool failedOpen(bool on) const { return on && cut && !eligibleAny; }
 };
 
 // ---- the rule's 30 s line -----------------------------------------------------------------------------------------------------------------------------------
@@ -114,12 +114,12 @@ struct Stats {
     uint32_t writes = 0;           // camera writes it looked at
     uint32_t tagged = 0;           // ...with a known target
     uint32_t unknown = 0;          // ...with none (no draw followed): kept
-    uint32_t rejected = 0;         // ...rejected (key on) or that would be (key off)
+    uint32_t rejected = 0;         // ...rejected
     uint32_t rejectFrames = 0;     // frames with at least one rejection
-    uint32_t failOpen = 0;         // frames where nothing was eligible, so nothing was rejected (key on)
-    uint32_t failOpenNoCont = 0;   // frames where the filter left no continuous candidate, so the unfiltered set was used (key on)
+    uint32_t failOpen = 0;         // frames where nothing was eligible, so nothing was rejected
+    uint32_t failOpenNoCont = 0;   // frames where the filter left no continuous candidate, so the unfiltered set was used
     uint32_t submitRejected = 0;   // ...of rejected, the writes drawn into the submitted eye texture (the rest are not eye-sized)
-    uint32_t pickChanges = 0;      // frames where the filtered chooser's pick differs from the unfiltered one's (counted with the key off too)
+    uint32_t pickChanges = 0;      // frames where the filtered chooser's pick differs from the unfiltered one's
     float maxPickDiffM = 0.0f, maxPickDiffDeg = 0.0f;   // ...and the largest difference between the two picks' rows
     SizeCount sizes[kSizeSlots];   // the rejected sizes by count; a seventh size is counted in other
     uint32_t other = 0;
@@ -140,16 +140,14 @@ inline void noteRejected(Stats& s, uint16_t w, uint16_t h) {
 
 inline void resetWindow(Stats& s) { s = Stats{}; }
 
-// "temporal camera eye target: frames=.. writes=.. tagged=.. unknown=.. rejected=.. reject_frames=.. fail_open=.. eye=WxH key=on|off submit=WxH:fmt
+// "temporal camera eye target: frames=.. writes=.. tagged=.. unknown=.. rejected=.. reject_frames=.. fail_open=.. eye=WxH submit=WxH:fmt
 //  submit_rejected=.. fail_open_nocont=.. changed_picks=.. max_pick_diff_m=.. max_pick_diff_deg=.. rejected_sizes=256x256:12,...".
-// rejected counts every rejection (not eye-sized, plus drawn into the submitted texture); rejected_sizes lists the not-eye-sized ones. With the key off,
-// the counts are what the rule WOULD have done, and changed_picks is how often the filtered chooser would pick other rows than the legacy one, and by how
-// much at most. Returns the length written, or 0 when the buffer is too small.
-inline int formatReport(char* buf, size_t n, const Stats& s, bool keyOn) {
+// rejected counts every rejection (not eye-sized, plus drawn into the submitted texture); rejected_sizes lists the not-eye-sized ones. changed_picks is how often the filter made the chooser pick other rows than the unfiltered one, and by how much at most. Returns the length written, or 0 when the buffer is too small.
+inline int formatReport(char* buf, size_t n, const Stats& s) {
     int len = std::snprintf(buf, n,
-        "temporal camera eye target: frames=%u writes=%u tagged=%u unknown=%u rejected=%u reject_frames=%u fail_open=%u eye=%ux%u key=%s "
+        "temporal camera eye target: frames=%u writes=%u tagged=%u unknown=%u rejected=%u reject_frames=%u fail_open=%u eye=%ux%u "
         "submit=%ux%u:%u submit_rejected=%u fail_open_nocont=%u changed_picks=%u max_pick_diff_m=%.4f max_pick_diff_deg=%.3f rejected_sizes=",
-        s.frames, s.writes, s.tagged, s.unknown, s.rejected, s.rejectFrames, s.failOpen, s.eyeW, s.eyeH, keyOn ? "on" : "off",
+        s.frames, s.writes, s.tagged, s.unknown, s.rejected, s.rejectFrames, s.failOpen, s.eyeW, s.eyeH,
         s.submit.w, s.submit.h, s.submit.fmt, s.submitRejected, s.failOpenNoCont, s.pickChanges,
         static_cast<double>(s.maxPickDiffM), static_cast<double>(s.maxPickDiffDeg));
     if (len <= 0 || static_cast<size_t>(len) >= n) return 0;

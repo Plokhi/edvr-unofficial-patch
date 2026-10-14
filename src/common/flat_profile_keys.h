@@ -21,9 +21,6 @@ inline bool flatProfileReadsKey(const char* key) {
         // TEMPORARY (GPU pass profile, 2026-10-12): the flat profile reads the same key. Remove with the arc.
         std::strcmp(key, "hotkey.gpu_pass_profile") == 0 ||
         std::strcmp(key, "fix.render_sharpness") == 0 ||
-        // TEMPORARY A/B (docs/sky-flicker-2026-10-13.md): a much smaller square target is no candidate for the scene (flat_copy_structure.h, flatSceneRule).
-        // ui: hidden in edvr.ini, so no installer row; it goes when the arc closes.
-        std::strcmp(key, "fix.camera_eye_target") == 0 ||
         // The interface quality (flat panel row; ui_panel_scale.cpp's flat factor and the flat UI layer). The VR layer reads it
         // too, but stays inert in flat: it is live only with fix.temporal_aa on through this gate, which refuses that key.
         std::strcmp(key, "fix.ui_quality") == 0 ||

@@ -15,7 +15,7 @@
 //   S  the sky ring: half floats, the entry layout, the ring's slot arithmetic and wrap, the readback decode, the windows around events, the
 //      per-second buckets and the "no samples" line; and G, the shipped HLSL on WARP against the CPU reference, including the ring wrap and the
 //      asynchronous readback
-//   F  the flat scene picker's candidate log and the eye-target rule (src/d3d11/flat_scene_log.h): the F8 flip's 256x256 versus 1440x810
+//   F  the flat scene picker's candidate log (src/d3d11/flat_scene_log.h): the F8 flip's 256x256 versus 1440x810, the picker unchanged, and what the unflown rule WOULD drop
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -320,7 +320,7 @@ void caseChoosers() {
         for (size_t k = 0; at && k < 4; ++k) at = ev[k * 2].frame == k * 91 + 5 && ev[k * 2 + 1].frame == k * 91 + 16;
         check(at, "C1 the detector finds them: events at burst offset 5 of both probes, 11 frames apart, every 91 frames");
     }
-    // 2. With fix.camera_eye_target on, no face is ever picked and the picked rows never leave the head's track.
+    // 2. With the eye-target rule on (always, in VR), no face is ever picked and the picked rows never leave the head's track.
     Sim eye;
     eye.eyeOn = true;
     int facePicksEye = 0;
@@ -332,7 +332,7 @@ void caseChoosers() {
         rowsOf(f * 0.05, 0, 0, 0, head);
         if (std::memcmp(head, near23[f][a].rows, sizeof(head)) != 0) worst += 1.0;   // not bit-equal to the head's track
     }
-    check(facePicksEye == 0 && worst == 0.0, "C2 fix.camera_eye_target: the faces are never a candidate; the picked rows are the head's track to the last bit");
+    check(facePicksEye == 0 && worst == 0.0, "C2 the eye-target rule: the faces are never a candidate; the picked rows are the head's track to the last bit");
     check(eye.cutWrites == bursts.size() && bursts.size() == 48, "C2 ...and the filter counted the face of each burst frame (48 in four cycles) as rejected");
     // 3. Key off counts what it would reject, and changes nothing: the picks equal the legacy picks.
     Sim off;
@@ -531,8 +531,8 @@ void caseChoosers() {
     st.frames = 2700; st.writes = 250000; st.tagged = 249000; st.unknown = 1000; st.rejected = 2160; st.rejectFrames = 360; st.failOpen = 0; st.eyeW = 2016; st.eyeH = 2016;
     camtag::noteRejected(st, 256, 256); camtag::noteRejected(st, 256, 256); camtag::noteRejected(st, 2048, 1024);
     char line[400];
-    camtag::formatReport(line, sizeof(line), st, true);
-    check(std::strstr(line, "temporal camera eye target: frames=2700 writes=250000 tagged=249000 unknown=1000") && std::strstr(line, "eye=2016x2016 key=on") &&
+    camtag::formatReport(line, sizeof(line), st);
+    check(std::strstr(line, "temporal camera eye target: frames=2700 writes=250000 tagged=249000 unknown=1000") && (std::strstr(line, "eye=2016x2016 submit=") && !std::strstr(line, "key=")) &&
           std::strstr(line, "rejected_sizes=256x256:2,2048x1024:1"), "C10 the eye-target line names the counts, the eye size and the rejected sizes");
     camnearest::Stats ns; ns.frames = 100; ns.differs = 3; ns.reanchors = 1; ns.maxDistM = 0.2f;
     camnearest::formatReport(line, sizeof(line), ns, false);
@@ -908,26 +908,30 @@ void caseFlat() {
     addTarget(*p, 2048, 1024, 40, 26);       // a sun cascade is not an R11G11B10F scene target with its own-size depth here: still listed (it passes the tests)
     addTarget(*p, 640, 360, 5);              // under eight draws: not a candidate
     addTarget(*p, 800, 600, 90, 27);         // not R11G11B10F: not a candidate
-    flatSceneRule().eyeTarget = false;
     const FlatSceneFacts off = flatSceneFacts(*p, 3840, 2160);
-    check(off.offShape && !off.onShape && off.width == 256 && off.height == 256 && off.draws == 285, "F1 key off: the 256x256 probe out-draws the scene and wins as the off-shape candidate (the F8 flip)");
-    flatSceneRule().eyeTarget = true;
-    const FlatSceneFacts on = flatSceneFacts(*p, 3840, 2160);
-    check(on.offShape && on.width == 1440 && on.height == 810 && on.draws == 120, "F2 key on: the tiny square is no candidate; the scene is the next off-shape target, 1440x810");
+    check(off.offShape && !off.onShape && off.width == 256 && off.height == 256 && off.draws == 285, "F1 the picker is unchanged: the 256x256 probe out-draws the scene and wins as the off-shape candidate (the F8 flip)");
+    {   // What the flat counterpart of the rule WOULD do (it is not applied: unflown): drop the tiny square, leave the 1440x810 scene.
+        FlatSceneCandidate c0[kFlatSceneMaxCandidates];
+        const uint32_t n0 = flatSceneCandidates(*p, 3840, 2160, c0);
+        const FlatSceneWould would = flatSceneWould(c0, n0);
+        check(would.rejected == 1 && would.width == 1440 && would.height == 810 && would.draws == 120 && !would.onShape,
+              "F2 the would-be rule drops the 256x256 and would leave the 1440x810 scene (reported, not applied)");
+    }
     addTarget(*p, 2880, 1620, 100);
     const FlatSceneFacts ons = flatSceneFacts(*p, 3840, 2160);
-    check(ons.onShape && ons.width == 2880, "F2 an on-shape scene still wins whatever the rule");
-    flatSceneRule().eyeTarget = false;
+    check(ons.onShape && ons.width == 2880, "F2 an on-shape scene wins, as it did");
     // The rule's edge: a square target under a sixteenth of the output's area (200x200 on 1024x1024) is excluded; at exactly a sixteenth (256x256) it is not.
     auto q = std::make_unique<FlatRuntimePrefix>();
     q->width = 1024; q->height = 1024;
     addTarget(*q, 200, 200, 200);
-    flatSceneRule().eyeTarget = false;
-    check(flatSceneFacts(*q, 1024, 1024).offShape, "F3 key off: a 200x200 target is the (off-shape) scene");
-    flatSceneRule().eyeTarget = true;
-    check(!flatSceneFacts(*q, 1024, 1024).offShape && !flatSceneFacts(*q, 1024, 1024).onShape, "F3 key on: a square target under a sixteenth of the output's area is no candidate (Elite's scene is never square at the output's aspect)");
+    check(flatSceneFacts(*q, 1024, 1024).offShape, "F3 a 200x200 target is still the (off-shape) scene: the picker is unchanged");
+    {
+        FlatSceneCandidate cq[kFlatSceneMaxCandidates];
+        const uint32_t nq = flatSceneCandidates(*q, 1024, 1024, cq);
+        const FlatSceneWould wq = flatSceneWould(cq, nq);
+        check(nq == 1 && cq[0].tinySquare && wq.rejected == 1 && wq.width == 0, "F3 ...and the would-be rule reports it as a tiny square (a sixteenth of the output's area) that would leave no scene");
+    }
     check(!flatTinySquare(256, 256, 1024, 1024) && flatTinySquare(255, 255, 1024, 1024) && !flatTinySquare(1440, 810, 3840, 2160), "F3 the edge is exactly a sixteenth, and a non-square target is never tiny");
-    flatSceneRule().eyeTarget = false;
 
     // The candidate list: every target that passes, biggest draw count first; tiny squares flagged.
     FlatSceneCandidate c[kFlatSceneMaxCandidates];
@@ -953,12 +957,30 @@ void caseFlat() {
     none.note(10, 0, 0);
     check(none.noneFrames == 2, "F5 a frame with no scene is counted as none");
     char line[1100];
-    flatSceneRule().eyeTarget = false;
     const FlatSceneFacts w = flatSceneFacts(*p, 3840, 2160);
-    flatSceneFormatLine(line, sizeof(line), 10288, 3840, 2160, false, w, c, n, log, "the winner changed or the first look");
-    check(std::strstr(line, "flat scene candidates (frame 10288, output 3840x2160, fix.camera_eye_target=off, the winner changed or the first look): winner 2880x1620 on-shape draws=100") &&
+    flatSceneFormatLine(line, sizeof(line), 10288, 3840, 2160, w, c, n, log, "the winner changed or the first look");
+    check(std::strstr(line, "flat scene candidates (frame 10288, output 3840x2160, the winner changed or the first look): winner 2880x1620 on-shape draws=100") &&
           std::strstr(line, "candidates: 256x256 fmt=26 draws=285 off-shape tiny-square, 1440x810 fmt=26 draws=120 off-shape") && std::strstr(line, "frames won in this window (6 frames): 1440x810:5 256x256:1"),
-          "F6 the line names the output, the key, the winner, every candidate with size, format and draws, and the frames won per size");
+          "F6 the line names the output, the winner, every candidate with size, format and draws, and the frames won per size");
+    check(std::strstr(line, "would_reject=1 (not applied; the winner would not change)") && std::strstr(line, "frames won by a would-be-rejected size: 0") && !std::strstr(line, "fix."),
+          "F7 the line says what the unflown rule would drop (1 tiny square), that it is not applied, and that here the winner would not change; no key is named");
+    {   // The F8 flip frame: no on-shape candidate, the 256x256 wins; the rule would change the winner, and the window counts the frames a would-be-rejected size won.
+        auto flip = std::make_unique<FlatRuntimePrefix>();
+        flip->width = 3840; flip->height = 2160;
+        addTarget(*flip, 1440, 810, 120);
+        addTarget(*flip, 256, 256, 285);
+        FlatSceneCandidate cf[kFlatSceneMaxCandidates];
+        const uint32_t nf = flatSceneCandidates(*flip, 3840, 2160, cf);
+        const FlatSceneFacts wf = flatSceneFacts(*flip, 3840, 2160);
+        FlatSceneLog lf;
+        lf.note(1000, 1440, 810, false);
+        lf.note(1010, wf.width, wf.height, flatTinySquare(wf.width, wf.height, 3840, 2160));
+        char fl[1100];
+        flatSceneFormatLine(fl, sizeof(fl), 10300, 3840, 2160, wf, cf, nf, lf, "the winner changed");
+        check(wf.width == 256 && std::strstr(fl, "winner 256x256 off-shape draws=285") && std::strstr(fl, "would_reject=1 (not applied; the rule would leave 1440x810, the winner changes)") &&
+              std::strstr(fl, "frames won by a would-be-rejected size: 1"),
+              "F7 on the flip frame the picker still names 256x256 and the line says the rule would leave 1440x810 and counts the frame a would-be-rejected size won");
+    }
 }
 
 }  // namespace

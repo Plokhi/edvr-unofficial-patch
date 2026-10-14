@@ -1149,6 +1149,11 @@ static const char* const kRetiredExactKeys[] = {
     // fix.share_exposure, removed 2026-10-14: both eyes always share one exposure in the VR profile (docs/eye-brightness.md). The flat profile never read it
     // (its key allow-list never listed it), so nothing changed there.
     "fix.share_exposure",
+    // fix.camera_eye_target, retired 2026-10-14: the eye-target rule (a camera write drawn into the submitted eye texture or a non-eye-sized target is not a
+    // candidate for the pick) is behaviour in the VR profile, with no key (docs/sky-flicker-2026-10-13.md). The flat profile's counterpart is unflown and
+    // only logged what it would drop. Only the qualified spelling is held out of the sources and the shipped file; an old line in a user's ini is carried over
+    // by the installer under "no longer used by this version" and never read.
+    "fix.camera_eye_target",
 };
 static const int kRetiredExactKeyCount = int(sizeof(kRetiredExactKeys) / sizeof(kRetiredExactKeys[0]));
 
@@ -1216,7 +1221,7 @@ static void retiredKeyScan(const std::wstring& root) {
         bool foundAll = true, passedAll = true;
         for (const std::string& t : retired) foundAll = foundAll && spellsRetiredKey(t) != nullptr && std::strcmp(spellsRetiredKey(t), kRetiredExactKeys[0]) == 0;
         for (const std::string& t : liveKeys) passedAll = passedAll && spellsRetiredKey(t) == nullptr;
-        if (foundAll && passedAll && kRetiredExactKeyCount == 5)
+        if (foundAll && passedAll && kRetiredExactKeyCount == 6)
             ok("the exact-name scan finds fix.explorer_cam in a read, a message, a comment and at the end of a sentence, and passes hotkey.explorer_cam, "
                "fix.explorer_cam_eye_*, the trims and the smoothing beside it");
         else

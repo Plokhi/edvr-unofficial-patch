@@ -64,14 +64,11 @@ inline bool flatRenderFitsOutput(uint32_t w, uint32_t h, uint32_t ow, uint32_t o
     return flatUniformScale(w, h, ow, oh) && uint64_t(w) * 2 >= ow && uint64_t(h) * 2 >= oh &&
            uint64_t(w) <= uint64_t(ow) * 2 && uint64_t(h) <= uint64_t(oh) * 2;
 }
-// fix.camera_eye_target on flat (TEMPORARY A/B; docs/sky-flicker-2026-10-13.md): "never let a much smaller square target win the scene". The reflection
-// probe renders a 256x256 deferred view with more draws than the scene on some frames; with no on-shape candidate it won as the off-shape one, and the
-// scene flipped between 1440x810 and 256x256 (edvr_gfx_20261001_103559). With the rule on, a SQUARE candidate under a sixteenth of the output's area is no
-// candidate at all. Elite's scene is never square at the output's aspect, so this removes the probe faces and nothing else. Off (the default) changes
-// nothing: the rule is a process-wide switch the runtime sets from the key each final copy (flatSceneRule), read here so every caller of
-// flatSceneFacts -- the admission and the panel's sizes -- agrees.
-struct FlatSceneRule { bool eyeTarget = false; };
-inline FlatSceneRule& flatSceneRule() { static FlatSceneRule r; return r; }
+// A SQUARE target under a sixteenth of the output's area is not Elite's scene (its scene is never square at the output's aspect): the reflection probe's 256x256
+// deferred view, which on some frames out-draws the scene and, with no on-shape candidate, won as the off-shape one, flipping `scene=` between 1440x810 and
+// 256x256 (edvr_gfx_20261001_103559; INFERRED to be the probe, never proven on flat). The VR eye-target rule (docs/sky-flicker-2026-10-13.md) is proven in
+// flight; this flat counterpart is NOT flown, so flatSceneFacts below does not apply it: the picker is what it was. flat_scene_log.h counts what the
+// rule would drop and whether it would change the winner (the candidate line), so a flat flight can decide.
 inline bool flatTinySquare(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     return w == h && uint64_t(w) * h * 16u < uint64_t(ow) * oh;
 }
@@ -83,7 +80,6 @@ inline FlatSceneFacts flatSceneFacts(const FlatRuntimePrefix& p, uint32_t outW, 
         if (t.writes.draws < kFlatSceneMinDraws || k.format != 26 || !k.color || !k.rtv || !k.depth || !k.dsv ||
             !k.width || !k.height || k.depthWidth != k.width || k.depthHeight != k.height)
             continue;
-        if (flatSceneRule().eyeTarget && flatTinySquare(k.width, k.height, outW, outH)) continue;
         FlatSceneFacts& slot = flatRenderFitsOutput(k.width, k.height, outW, outH) ? on : off;
         if (slot.draws < t.writes.draws) {
             slot.width = k.width; slot.height = k.height; slot.draws = t.writes.draws; slot.resource = t.resource;
