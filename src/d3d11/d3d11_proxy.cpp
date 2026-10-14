@@ -290,6 +290,8 @@ BOOL CALLBACK initOnceCallback(PINIT_ONCE, PVOID, PVOID*) {
     edvr::Log::get().note("%s", edvr::runtimeProfileLogLine().c_str());
     // The launch's profile, for the runtime's headset-while-flat frames (frame_flag.h).
     edvr::setVrProfileActive(edvr::runtimeVrProfile());
+    // The seat memory's setting, before any frame: the runtime's start-up reads it to choose between the stored seat and its own centre.
+    edvr::seatContextPublish();
     edvr::Log::get().note("game command line: %s", edvr::runtimeGameCommandLine().c_str());
     edvr::modeWatchStart();  // after the profile lines: the watch's first line follows them (mode_watch.h)
     edvr::oculusRouteReport();

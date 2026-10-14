@@ -2680,6 +2680,18 @@ if errorlevel 1 ( echo [edvr] ERROR: OpenXR launch centering test build failed &
 "%BUILD%\openxr_launch_centre_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_seat_memory_test
+REM The seat memory's decisions and its file (src\openxr\seat_memory.h, seat_store.h, src\common\seat_context.h): the decision table, the
+REM transitions, the start and intro plans, the capture, the LOCAL-change compensation and the persistence round trip in a scratch folder.
+if not exist "%OBJ%\seat_memory_test" mkdir "%OBJ%\seat_memory_test"
+cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\seat_memory_test\\" /Fe"%BUILD%\seat_memory_test.exe" ^
+    "tools\seat_memory_test\seat_memory_test.cpp" /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: seat memory test build failed & exit /b 1 )
+"%BUILD%\seat_memory_test.exe" --dry-run || exit /b 1
+"%BUILD%\seat_memory_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_openxr_compositor_test
 if not exist "%OBJ%\openxr_compositor_test" mkdir "%OBJ%\openxr_compositor_test"
 cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /D_CRT_SECURE_NO_WARNINGS /I"third_party\openxr\include" ^

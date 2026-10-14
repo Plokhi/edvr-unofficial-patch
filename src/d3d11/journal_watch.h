@@ -154,6 +154,10 @@ bool journalSeated();
 // Built v14.21 (optimized station): Status.json Flags bits 24-26 alone (in a main ship, a fighter or an SRV). Flags 0 (menu, loading) is not in a vehicle.
 bool journalVehicleKnown();
 bool journalVehicle();
+// Which seat, from the same Status.json read: Flags bits 24-26 (main ship, fighter, SRV) in bits 0-2, Flags2 bits 1-2 (taxi, multicrew) in
+// bits 3-4. 0 when none, when Flags is not in the file, or in flat. The seat memory (src/openxr/seat_memory.h) treats a change of this
+// word, aboard before and after, as a change of cockpit.
+uint32_t journalSeatKind();
 
 // How many Status.json samples have been read: lets a caller require a sample
 // taken AFTER some event, since the previous one can be a second stale.
