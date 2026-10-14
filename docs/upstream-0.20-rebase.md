@@ -2,6 +2,8 @@
 
 ## Status
 
+- Final development worktree: `/Users/ploki/GitHub/edvr-0.20-mfx`, on
+  `mfx/0.20-port`.
 - Source rebase completed on `mfx/0.20-port`; both downstream source commits
   retain their boundaries, authors and author dates.
 - Exact upstream base: `v0.20.0-rc.1`, annotated tag
@@ -62,6 +64,27 @@ directory:
 `vc140.pdb` is retained in the archive rather than added to the source patch
 stack. No original file was discarded.
 
+## Final worktree layout
+
+The completed branch was transferred from the temporary managed checkout using
+Git operations: detach that clean checkout at its completed commit, then `git
+worktree add /Users/ploki/GitHub/edvr-0.20-mfx mfx/0.20-port`. No rebase was
+repeated, no branch checkout was forced and no registered directory was moved
+with filesystem commands. The temporary managed checkout was subsequently
+archived with a recoverable snapshot.
+
+- `/Users/ploki/GitHub/edvr-0.19.1-mfx`: original `mfx/0.19.1-port`, original
+  dirty source/test/config state and index.
+- `/Users/ploki/GitHub/edvr-0.20-mfx`: `mfx/0.20-port`, tracking
+  `fork/mfx/0.20-port`, with the complete rebased stack.
+
+After the layout operation, all original development files and both Git diffs
+still match the preservation records. Two macOS `.DS_Store` metadata files
+changed after the earlier all-file verification. The original metadata remains
+in `worktree.tar.gz`; the newer versions were also copied into
+`later-finder-metadata/` beside that archive, without overwriting either
+version or any dirty source file.
+
 ## Conflict decisions and semantic adaptation
 
 | Area | Resolution |
@@ -98,7 +121,8 @@ Passed on macOS:
 - Sibling/shadow policy, shader/runtime wiring and mutation checks, with
   floating-point contraction disabled.
 - HDR isolation, pass ordering and breadcrumb regressions.
-- MetalFX source checker: 106 checks; its 38 mutation fixtures pass.
+- MetalFX source checker: 109 checks in the final layout, including the nearby
+  DXMT header cross-check; its 38 mutation fixtures pass.
 - Config contract: 132 read keys, 132 documented keys, all agree; installer
   resource and flight-log parser self-tests.
 - The build's Python gates: 91 of 99 pass. Each of the eight failures also
