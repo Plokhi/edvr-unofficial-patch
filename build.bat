@@ -601,6 +601,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% %XESSFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\temporal_pass.cpp" ^
     "src\d3d11\depth_probe.cpp" ^
     "src\d3d11\luma_probe.cpp" ^
+    "src\d3d11\sky_ring.cpp" ^
     "src\d3d11\terrain_cull_cover_hook.cpp" ^
     "src\d3d11\dlaa.cpp" ^
     "src\d3d11\fsr3_engine.cpp" ^
@@ -1809,6 +1810,23 @@ if errorlevel 1 ( echo [edvr] ERROR: temporal_test build failed & exit /b 1 )
     echo [edvr] ERROR: the temporal pass's arithmetic is wrong
     exit /b 1
 )
+exit /b 0
+
+:rig_sky_flicker_test
+echo [edvr] === sky_flicker_test.exe ===
+REM The sky-flicker diagnostic build (docs\sky-flicker-2026-10-13.md, TEMPORARY): the camera-row event detector on synthetic rows built from the
+REM review's numbers, the pick rules and the eye-target filter on the probe-face sequence, the burst offset, the P3 mini-render record and its join,
+REM the sky ring's entry layout and ring arithmetic, the flat scene picker's candidate log -- and the sky ring's shipped HLSL run on WARP against its
+REM CPU reference, across the ring's wrap and an asynchronous readback. Needs no real GPU.
+if not exist "%OBJ%\skyflickertest" mkdir "%OBJ%\skyflickertest"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\d3d11" ^
+    /Fo"%OBJ%\skyflickertest"\ /Fe"%OBJ%\skyflickertest\sky_flicker_test.exe" ^
+    "tools\sky_flicker_test\sky_flicker_test.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib dxguid.lib
+if errorlevel 1 ( echo [edvr] ERROR: sky_flicker_test build failed & exit /b 1 )
+"%OBJ%\skyflickertest\sky_flicker_test.exe" --dry-run || exit /b 1
+"%OBJ%\skyflickertest\sky_flicker_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_ui_depth

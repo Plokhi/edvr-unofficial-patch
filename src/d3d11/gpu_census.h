@@ -38,6 +38,7 @@ enum class GpuCensusSection : uint8_t {
     DoorMenu,                 // menu_panel.cpp's dispatch
     DoorUiLayerComposite,     // ui_layer.cpp's kComposite dispatch
     DoorFssHeal,              // fss_heal.cpp's dispatch
+    DoorSkyRing,              // sky_ring.cpp's dispatch (diag.sky_ring, TEMPORARY; docs/sky-flicker-2026-10-13.md) -- nested inside DoorTemporalWhole, so not a top-level door item
     // In-frame: per game draw. K = 8 while active.
     FrameHologramPasses,      // the two hologram/icon depth reissues
     FrameUiDepthCoverage,     // the UI-depth family reissue (UiContent::prepare, stellar coverage nest inside)

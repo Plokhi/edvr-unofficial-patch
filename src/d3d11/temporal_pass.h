@@ -86,6 +86,17 @@ void temporalPassNoteFirstEyeDraw(ID3D11DeviceContext* ctx);
 // path do not read this state. `resource` is the VS b1 object used by the draw.
 bool temporalPassWantsRigidDraw(int eye);
 void temporalPassNoteRigidDraw(int eye, const void* resource, uint64_t vertexShaderHash);
+// The render target a camera-block write is drawn into (docs/sky-flicker-2026-10-13.md; camera_target_tag.h). The write precedes its draw, so the
+// chooser cannot know the target when the write is made; the FIRST DRAW AFTER the write tags it. vscreen.cpp's draw thunks (the owner context, the VR
+// path) call temporalPassNoteDraw while temporalPassWantsDraw() is true -- one bool load a draw -- and its OM set thunks call temporalPassNoteOmSet
+// with the number of render targets just bound, after the binding shadow has the new views. Both also serve P3 (mini_render.h): a bind of four or more
+// colour targets with a small square depth view starts a mini-render pass whose draws are counted.
+namespace detail {
+extern bool g_cameraDrawWatch;
+}  // namespace detail
+inline bool temporalPassWantsDraw() { return detail::g_cameraDrawWatch; }
+void temporalPassNoteDraw(ID3D11DeviceContext* ctx);
+void temporalPassNoteOmSet(unsigned colours);
 // This frame's rows become last frame's; called at the frame boundary.
 void temporalPassFrameBoundary();
 // The rows the pass CHOSE for the frame in progress (chooseCameraRows' pick: float 932 of the scene block, three 3x4 rows), for the VR camera census's episodes

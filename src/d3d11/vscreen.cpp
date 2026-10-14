@@ -2894,6 +2894,8 @@ void STDMETHODCALLTYPE hookedOMSetRenderTargets(ID3D11DeviceContext* self, UINT 
     bindingSet(BindSlot::Rtv0, (n && rtvs) ? rtvs[0] : nullptr);
     bindingSet(BindSlot::Dsv0, dsv);
     if (flatTemporalCapturing()) flatTemporalBind((n && rtvs) ? rtvs[0] : nullptr, dsv);
+    // The camera-write tags and P3 (the third view): the colour targets bound, after the shadow holds the new views (docs/sky-flicker-2026-10-13.md).
+    if (temporalPassWantsFssChrome()) temporalPassNoteOmSet(n);
     g_state->realOMSetRenderTargets(self, n, rtvs, dsv);
 }
 
@@ -2930,6 +2932,7 @@ void STDMETHODCALLTYPE hookedOMSetRtvAndUav(ID3D11DeviceContext* self, UINT n,
         bindingSet(BindSlot::Rtv0, (n && rtvs) ? rtvs[0] : nullptr);
         bindingSet(BindSlot::Dsv0, dsv);
         if (flatTemporalCapturing()) flatTemporalBind((n && rtvs) ? rtvs[0] : nullptr, dsv);
+        if (temporalPassWantsFssChrome()) temporalPassNoteOmSet(n);
     } else if (flatRuntimeActive()) {
         // The targets stay as they are and the UAVs go beside them: engine motion's MRT6, if it is still bound over the
         // game's targets, is among the targets those UAV slots must follow. The game's own set first.
@@ -4702,6 +4705,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     }
     if (g_vrWorldInternal) { g_state->realDraw(self, count, start); return; }   // the world route's own draw (vr_world_route.h)
     gpuFrameCommand(self);
+    if (temporalPassWantsDraw() && self == g_state->ownerCtx) temporalPassNoteDraw(self);   // tags the camera write before it / counts a mini-render's draws
     DrawClock clock;
     ++g_state->thunkHits[kHitDraw];
     noteStaleForward(kSlotDraw, reinterpret_cast<const void*>(g_state->realDraw),
@@ -4762,6 +4766,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     }
     if (g_vrWorldInternal) { g_state->realDrawIndexed(self, count, startIndex, baseVertex); return; }
     gpuFrameCommand(self);
+    if (temporalPassWantsDraw() && self == g_state->ownerCtx) temporalPassNoteDraw(self);
     DrawClock clock;
     ++g_state->thunkHits[kHitDrawIndexed];
     noteStaleForward(kSlotDrawIndexed,
@@ -4808,6 +4813,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     }
     if (g_vrWorldInternal) { g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); return; }
     gpuFrameCommand(self);
+    if (temporalPassWantsDraw() && self == g_state->ownerCtx) temporalPassNoteDraw(self);
     noteStaleForward(kSlotDrawInstanced, reinterpret_cast<const void*>(g_state->realDrawInstanced),
                      "DrawInstanced");
     DrawClock clock;
@@ -4867,6 +4873,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     }
     if (g_vrWorldInternal) { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); return; }
     gpuFrameCommand(self);
+    if (temporalPassWantsDraw() && self == g_state->ownerCtx) temporalPassNoteDraw(self);
     noteStaleForward(kSlotDrawIndexedInstanced, reinterpret_cast<const void*>(g_state->realDrawIndexedInstanced),
                      "DrawIndexedInstanced");
     DrawClock clock;
