@@ -70,6 +70,16 @@ void gpuTimingSetYield(bool on) noexcept;
 bool gpuTimingYielding() noexcept;
 uint64_t gpuTimingTakeYieldRefusals() noexcept;
 
+// The GPU census's own frequency scope (2026-10-14). Every census span (a GpuTimer pair) borrows a scope that is already open; with none open,
+// each span opens a TIMESTAMP_DISJOINT of its own, takes one of the clock's eight records, and holds it until its result is polled four or more
+// frames later. The application-frame clock (advanced.app_gpu_timing) kept one scope open across the render, so every census span borrowed it; with
+// that clock off (the default since the AA-off cuts) a frame's two to nine spans needed two to nine records each and the pool ran out: 85-90% of
+// spans failed in the 2026-10-13 flight. EnsureCensus opens ONE scope on the first timed span of a frame (refused while another scope is open or
+// the profiler yields) and EndCensus closes it at the frame boundary. Owner context only; the caller opens it only while the application-frame clock is off.
+bool gpuTimingCensusScopeEnsure(ID3D11DeviceContext*, uint64_t now) noexcept;
+void gpuTimingCensusScopeEnd(ID3D11DeviceContext*, uint64_t now) noexcept;
+bool gpuTimingCensusScopeOpen() noexcept;
+
 enum class GpuTimerPoll { Pending, Ready, Invalid };
 
 // A reusable timestamp pair that borrows the domain's disjoint interval.

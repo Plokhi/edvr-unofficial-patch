@@ -66,6 +66,8 @@ std::shared_ptr<Domain>& registry() {
 std::shared_ptr<Domain> current() { return std::atomic_load(&registry()); }
 // The pass profiler's scopes, one per slot (gpu_timing.h).
 DisjointClock::Lease g_passLease[kPassScopeSlots]{};
+// The census's one frame-long scope (gpu_timing.h, gpuTimingCensusScopeEnsure).
+DisjointClock::Lease g_censusLease{};
 const char* disjointReasonText(DisjointReason r) {
     switch (r) {
     case DisjointReason::None: return "ok";
@@ -115,6 +117,7 @@ bool gpuTimingShutdown(ID3D11DeviceContext* ctx) noexcept {
     if (!d || !d->owns(ctx)) return false;
     d->unavailable.store(true, std::memory_order_release);
     const bool result = d->clock.shutdown(GetTickCount64());
+    g_censusLease = {};   // the clock's shutdown closed it
     auto expected = d;
     std::atomic_compare_exchange_strong(&registry(), &expected, std::shared_ptr<Domain>{});
     return result;
@@ -137,6 +140,26 @@ void noteYieldRefusal() noexcept { g_yieldRefusals.fetch_add(1, std::memory_orde
 void gpuTimingSetYield(bool on) noexcept { g_yieldOn.store(on, std::memory_order_release); }
 bool gpuTimingYielding() noexcept { return g_yieldOn.load(std::memory_order_acquire); }
 uint64_t gpuTimingTakeYieldRefusals() noexcept { return g_yieldRefusals.exchange(0, std::memory_order_acq_rel); }
+
+bool gpuTimingCensusScopeOpen() noexcept { return static_cast<bool>(g_censusLease); }
+bool gpuTimingCensusScopeEnsure(ID3D11DeviceContext* ctx, uint64_t now) noexcept {
+    if (g_censusLease) return true;
+    auto d = current();
+    // Another scope open (the application frame's, the profiler's) is borrowed by the spans as it stands; the profiler's yield keeps this one closed.
+    if (!d || !d->owns(ctx) || d->unavailable.load(std::memory_order_acquire) || d->clock.scopeOpen() || gpuTimingYielding()) return false;
+    d->collectExpired(now);
+    g_censusLease = d->clock.startFrame(now);
+    return static_cast<bool>(g_censusLease);
+}
+void gpuTimingCensusScopeEnd(ID3D11DeviceContext* ctx, uint64_t now) noexcept {
+    if (!g_censusLease) return;
+    auto d = current();
+    if (d && d->owns(ctx) && !d->unavailable.load(std::memory_order_acquire)) {
+        d->clock.finishFrame(g_censusLease, now);   // closes the scope; spans that began inside it keep their own leases on the record
+        d->clock.release(g_censusLease, now);
+    }
+    g_censusLease = {};
+}
 
 bool gpuTimingPassScopeHeld() noexcept {
     auto d = current();

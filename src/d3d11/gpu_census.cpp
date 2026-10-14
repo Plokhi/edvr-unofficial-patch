@@ -535,6 +535,9 @@ bool gpuCensusBegin(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept
     if (call < g_activeOffset || (call - g_activeOffset) % g_activeStride != 0) return false;
     if (g_activeTimed >= occurrenceCapFor(section)) return false;   // K reached: counted, not timed
     ++g_activeTimed;
+    // With the application-frame clock off, nothing keeps a frequency scope open, and every span would open its own and hold one of the clock's eight
+    // records for four-plus frames (the 2026-10-13 flight: 85-90% of spans failed). One scope for the frame's spans; closed in gpuCensusFrame.
+    if (!gpuFrameClockLive()) gpuTimingCensusScopeEnsure(ctx, GetTickCount64());
     if (!g_activeNullDone) {
         // The turn's first timed call also times one empty pair, immediately
         // before the real one, nothing between: the timer's own overhead,
@@ -581,6 +584,7 @@ void gpuCensusEnd(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept {
 }
 
 void gpuCensusFrame(ID3D11DeviceContext* ctx) noexcept {
+    gpuTimingCensusScopeEnd(ctx, GetTickCount64());   // the frame's spans are all issued; closing lets their result be read
     for (auto& st : g_section) { st.sampler.poll(ctx); st.nullSampler.poll(ctx); }
 
     ++g_windowFrames;
@@ -598,6 +602,10 @@ void gpuCensusFrame(ID3D11DeviceContext* ctx) noexcept {
     g_activeNullDone = false;
     const uint64_t now = GetTickCount64();
     if (g_windowStartMs == 0) g_windowStartMs = now;
+    // The next frame's one frequency scope, opened here rather than at its first census span so that EVERY timer pair of the frame borrows it, the
+    // census's and the others' (the HUD route's per-draw spans, the seed's): a pair that finds none open opens its own and holds a record of the
+    // clock's eight for four-plus frames (gpu_timing.h, gpuTimingCensusScopeEnsure). The application-frame clock does this itself when it is on.
+    if (!gpuFrameClockLive()) gpuTimingCensusScopeEnsure(ctx, now);
 
     GpuFrameSnapshot completions[32]{};
     uint64_t dropped = 0;

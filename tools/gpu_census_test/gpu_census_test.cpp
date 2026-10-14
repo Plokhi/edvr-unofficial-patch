@@ -22,6 +22,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -258,6 +259,7 @@ void rotationAndRealTimerCase(Device& d) {
     const uint64_t deadline = GetTickCount64() + 1500;
     while ((st.sampler.totals.samples == 0 || st.nullSampler.totals.samples == 0) && GetTickCount64() < deadline) {
         gpuCensusFrame(d.ctx.Get());
+        d.ctx->Flush();   // the boundary closed the census scope: its End reaches WARP only with a flush (the game's Present does this)
         if (st.sampler.totals.samples == 0 || st.nullSampler.totals.samples == 0) Sleep(1);
     }
     check(st.sampler.totals.samples > 0,
@@ -274,6 +276,7 @@ void rotationAndRealTimerCase(Device& d) {
         const uint64_t drainBy = GetTickCount64() + 1500;
         while ((st.sampler.totals.samples < 4 || st.nullSampler.totals.samples < 1) && GetTickCount64() < drainBy) {
             gpuCensusFrame(d.ctx.Get());
+            d.ctx->Flush();
             Sleep(1);
         }
         check(st.sampler.totals.samples == 4, "WARP round trip: the door section's four samples all completed before the seed's are taken");
@@ -297,6 +300,7 @@ void rotationAndRealTimerCase(Device& d) {
         const uint64_t seedDeadline = GetTickCount64() + 1500;
         while ((seed.sampler.totals.samples < 2 || seed.nullSampler.totals.samples < 1) && GetTickCount64() < seedDeadline) {
             gpuCensusFrame(d.ctx.Get());
+            d.ctx->Flush();
             if (seed.sampler.totals.samples < 2 || seed.nullSampler.totals.samples < 1) Sleep(1);
         }
         check(seed.sampler.totals.samples == 2 && seed.sampler.totals.invalid == 0,
@@ -1491,6 +1495,166 @@ void instrumentCases() {
     st.issued = before;   // put the window's count back as it was
 }
 
+// ---- the 2026-10-13 flight's failure rate, reproduced: the merged section set with NO application-frame scope open ----------------------------
+// The flight (build 57f5393e, advanced.app_gpu_timing off by default since the AA-off cuts) logged "spans timed 665, failed 4963" a window: with
+// no scope open, every census span opened a TIMESTAMP_DISJOINT of its own and held one of the clock's eight records until its result was polled
+// (four-plus frames later). This drives the real gpuCensusBegin/End/Frame, the real GpuIntervals and GpuTimer and the real DisjointClock over a
+// scripted query backend (a result is readable `latency` frames after its End), with the per-frame span counts of that flight's log: the door
+// sections twice a frame (the whole around four nested ones), the three hologram sub-sections, and the in-frame sections at their counts.
+// The census rotation is the real one, so every merged section takes its turn (the cycle is 25 with the sky ring and the sub-sections).
+struct ScriptedQuery { bool disjoint = false; bool ended = false; unsigned endFrame = 0; };
+struct ScriptedBackend {
+    std::map<ID3D11Asynchronous*, ScriptedQuery> queries;
+    unsigned frame = 0;
+    unsigned latency = 3;
+    uint64_t nextTick = 1000;
+    unsigned disjointBegins = 0;
+};
+HRESULT scriptedCreate(void* user, ID3D11Device* dev, const D3D11_QUERY_DESC* desc, ID3D11Query** out) {
+    const HRESULT h = dev->CreateQuery(desc, out);
+    if (SUCCEEDED(h) && *out) static_cast<ScriptedBackend*>(user)->queries[*out] = ScriptedQuery{desc->Query == D3D11_QUERY_TIMESTAMP_DISJOINT, false, 0};
+    return h;
+}
+HRESULT scriptedBegin(void* user, ID3D11DeviceContext*, ID3D11Asynchronous* q) {
+    auto* b = static_cast<ScriptedBackend*>(user);
+    if (b->queries[q].disjoint) ++b->disjointBegins;
+    return S_OK;
+}
+HRESULT scriptedEnd(void* user, ID3D11DeviceContext*, ID3D11Asynchronous* q) {
+    auto* b = static_cast<ScriptedBackend*>(user);
+    auto& s = b->queries[q];
+    s.ended = true;
+    s.endFrame = b->frame;
+    return S_OK;
+}
+HRESULT scriptedData(void* user, ID3D11DeviceContext*, ID3D11Asynchronous* q, void* out, UINT size, UINT) {
+    auto* b = static_cast<ScriptedBackend*>(user);
+    const auto it = b->queries.find(q);
+    if (it == b->queries.end() || !it->second.ended) return E_FAIL;
+    if (b->frame < it->second.endFrame + b->latency) return S_FALSE;
+    if (it->second.disjoint) {
+        if (size != sizeof(D3D11_QUERY_DATA_TIMESTAMP_DISJOINT)) return E_FAIL;
+        *static_cast<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT*>(out) = {1000000000ull, FALSE};
+        return S_OK;
+    }
+    if (size != sizeof(uint64_t)) return E_FAIL;
+    *static_cast<uint64_t*>(out) = (b->nextTick += 50000);   // 0.05 ms between two successive reads: end > begin
+    return S_OK;
+}
+void scriptedRelease(void*, ID3D11Query* q) noexcept { q->Release(); }
+
+struct FailureRate { uint64_t timed = 0, failed = 0, routeTimed = 0; unsigned disjointBegins = 0; unsigned sectionsTimed = 0; };
+
+// One simulated run of `frames` presented frames. appClockLive models the build: true = advanced.app_gpu_timing on and its frame clock open
+// (the old default: the shared scope is held by the application frame, which this rig does not open, so true here means NOTHING owns a scope -- the
+// flight's failure, produced without touching the census); false = the clock off, so the census opens its own scope (the fix).
+FailureRate simulateCensus(Device& d, ScriptedBackend& backend, unsigned frames, bool appClockLive) {
+    for (auto& s : g_section) { s.sampler.reset(d.ctx.Get()); s.nullSampler.reset(d.ctx.Get()); s = SectionState{}; }
+    gpuTimingCensusScopeEnd(d.ctx.Get(), GetTickCount64());
+    g_activeSection = 0;
+    g_activeCalls = g_activeTimed = 0;
+    g_activeStride = 1;
+    g_activeOffset = 0;
+    g_activeNullDone = false;
+    g_windowFrames = 0;
+    g_windowStartMs = GetTickCount64() + 3600000;   // no 30 s window closes during the run
+    detail::g_gpuFrameCommandLive.store(appClockLive, std::memory_order_relaxed);
+    // The scripted GPU clock keeps counting between runs: a query left over from the last run is still read at its own time, not stranded.
+    backend.disjointBegins = 0;
+
+    const auto span = [&](GpuCensusSection section) {
+        gpuCensusBegin(d.ctx.Get(), section);
+        gpuCensusEnd(d.ctx.Get(), section);
+    };
+    // Timer pairs that are not the census's but share its clock: the HUD route's per-draw spans (ui_layer.cpp, g_hdrDrawTimingOn = true in the
+    // flight build) were taking three or more records a frame between them in the flight, so the census found fewer still.
+    GpuIntervals<8> route;
+    const struct { GpuCensusSection section; unsigned perFrame; } inFrame[] = {
+        {GpuCensusSection::FrameHologramPasses, 4}, {GpuCensusSection::FrameUiDepthCoverage, 3}, {GpuCensusSection::FramePlanet, 1},
+        {GpuCensusSection::FrameEngineVelocity, 6}, {GpuCensusSection::FrameUiLayerReissues, 60}, {GpuCensusSection::FrameUiLayerHdrSeed, 6},
+    };
+    for (unsigned f = 0; f < frames; ++f) {
+        ++backend.frame;
+        for (int eye = 0; eye < 2; ++eye) {
+            gpuCensusBegin(d.ctx.Get(), GpuCensusSection::DoorTemporalWhole);   // the whole temporal call, the rest nested inside it
+            span(GpuCensusSection::DoorUpscaler);
+            span(GpuCensusSection::DoorMotionPrep);
+            gpuCensusBegin(d.ctx.Get(), GpuCensusSection::DoorHologramResolve);
+            span(GpuCensusSection::DoorHoloDepthCopy);
+            span(GpuCensusSection::DoorHoloNearLight);
+            span(GpuCensusSection::DoorHoloResolveDraw);
+            gpuCensusEnd(d.ctx.Get(), GpuCensusSection::DoorHologramResolve);
+            span(GpuCensusSection::DoorUiResolve);
+            gpuCensusEnd(d.ctx.Get(), GpuCensusSection::DoorTemporalWhole);
+            span(GpuCensusSection::DoorSharpen);
+            span(GpuCensusSection::DoorMenu);
+            span(GpuCensusSection::DoorUiLayerComposite);
+        }
+        for (unsigned i = 0; i < 3; ++i) { route.begin(d.ctx.Get()); route.end(d.ctx.Get()); }
+        for (const auto& item : inFrame) for (unsigned i = 0; i < item.perFrame; ++i) span(item.section);
+        gpuCensusFrame(d.ctx.Get());
+        route.poll(d.ctx.Get());
+    }
+    FailureRate out;
+    out.routeTimed = route.totals.samples;
+    route.reset(d.ctx.Get());
+    for (const auto& s : g_section) {
+        out.timed += s.sampler.totals.samples;
+        out.failed += s.skippedThisWindow + s.sampler.totals.invalid;
+        if (s.sampler.totals.samples) ++out.sectionsTimed;
+    }
+    out.disjointBegins = backend.disjointBegins;
+    detail::g_gpuFrameCommandLive.store(false, std::memory_order_relaxed);
+    return out;
+}
+
+void failureRateCases() {
+    Runtime runtime;
+    Device d(runtime);
+    ScriptedBackend backend;
+    const GpuSpanD3D11Ops ops{&backend, scriptedCreate, scriptedBegin, scriptedEnd, scriptedData, scriptedRelease};
+    check(gpuTimingBind(d.dev.Get(), d.ctx.Get(), ops), "failure rate: bind the scripted timing owner");
+
+    // The merged section set takes 25 turns a cycle (the rotation cases above pin it), so 25 * 40 frames give every section forty turns.
+    const unsigned frames = 25 * 40;
+    const FailureRate noScope = simulateCensus(d, backend, frames, true);
+    std::printf("failure rate, nothing owning a scope (the flight): spans timed %llu, failed %llu, %u sections timed, %u disjoint scopes opened, route pairs timed %llu\n",
+                static_cast<unsigned long long>(noScope.timed), static_cast<unsigned long long>(noScope.failed), noScope.sectionsTimed,
+                noScope.disjointBegins, static_cast<unsigned long long>(noScope.routeTimed));
+    const FailureRate owned = simulateCensus(d, backend, frames, false);
+    std::printf("failure rate, the census owning its scope (the fix): spans timed %llu, failed %llu, %u sections timed, %u disjoint scopes opened, route pairs timed %llu\n",
+                static_cast<unsigned long long>(owned.timed), static_cast<unsigned long long>(owned.failed), owned.sectionsTimed,
+                owned.disjointBegins, static_cast<unsigned long long>(owned.routeTimed));
+
+    // The flight: 85-90% of spans failed (665 timed, 4963 failed). The unowned run must show the same collapse, so this rig fails on a census
+    // that stops taking its own scope.
+    check(noScope.failed * 100 >= (noScope.timed + noScope.failed) * 60,
+          "failure rate: with no scope open, at least 60% of the census spans fail (the flight logged 85-90%)");
+    // The fix: a frame's spans share one scope. Nothing fails once the first results are back; a span a window opens on may.
+    check(owned.failed * 100 <= (owned.timed + owned.failed) * 2,
+          "failure rate: the census opening its own scope keeps failed spans under 2% of the total");
+    check(owned.timed > noScope.timed * 3, "failure rate: the census timed more than three times as many spans as the unowned run");
+    check(owned.routeTimed > noScope.routeTimed, "failure rate: the other timer pairs sharing the clock are timed more often too, not starved by the census");
+    check(owned.sectionsTimed == 17, "failure rate: all 17 sections the run drives (the whole, nine door parts, the six in-frame ones) took samples");
+    // One disjoint scope a frame at most (a frame whose turn times nothing opens none), not one per span.
+    check(owned.disjointBegins <= frames + 1, "failure rate: one disjoint scope a frame, not one per span");
+    // simulateCensus ended on a boundary: the scope is open for the next frame's spans, and closes when asked (yield, shutdown, the clock turning on).
+    check(gpuTimingCensusScopeOpen(), "failure rate: the boundary leaves the next frame's scope open");
+    gpuTimingCensusScopeEnd(d.ctx.Get(), GetTickCount64());
+    check(!gpuTimingCensusScopeOpen(), "failure rate: ending the census scope closes it");
+    gpuTimingSetYield(true);
+    gpuCensusFrame(d.ctx.Get());
+    check(!gpuTimingCensusScopeOpen(), "failure rate: while the pass profiler yields the clock, the census opens no scope");
+    gpuTimingSetYield(false);
+    detail::g_gpuFrameCommandLive.store(true, std::memory_order_relaxed);
+    gpuCensusFrame(d.ctx.Get());
+    check(!gpuTimingCensusScopeOpen(), "failure rate: with the application-frame clock on, the census leaves the scope to it");
+    detail::g_gpuFrameCommandLive.store(false, std::memory_order_relaxed);
+
+    for (auto& s : g_section) { s.sampler.reset(d.ctx.Get()); s.nullSampler.reset(d.ctx.Get()); s = SectionState{}; }
+    check(gpuTimingShutdown(d.ctx.Get()), "failure rate: release the scripted owner so the real WARP timer cases bind their own");
+}
+
 void run() {
     instrumentCases();
     estimatorMathCases();
@@ -1509,6 +1673,7 @@ void run() {
     skinTurnCases();
     skinWiringCases();
     lineLengths();
+    failureRateCases();
     Runtime runtime;
     Device device(runtime);
     rotationAndRealTimerCase(device);

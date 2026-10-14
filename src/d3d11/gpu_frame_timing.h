@@ -46,6 +46,10 @@ inline bool gpuFrameCommandMightAct() noexcept {
            detail::g_gpuFrameCommandLive.load(std::memory_order_relaxed);
 }
 
+// True while advanced.app_gpu_timing is on with a controller bound: the application-frame clock keeps a frequency scope open across the render, which
+// the GPU census's spans then borrow. False: the census opens its own (gpu_timing.h, gpuTimingCensusScopeEnsure).
+inline bool gpuFrameClockLive() noexcept { return detail::g_gpuFrameCommandLive.load(std::memory_order_relaxed); }
+
 // The draw thunks' call (2026-10-13): with advanced.app_gpu_timing off, gpuFrameCommand returns on its first test, and
 // this keeps that call from being made at all -- one relaxed load per draw instead of an out-of-line call.
 inline void gpuFrameCommandIfLive(ID3D11DeviceContext* ctx) noexcept {
