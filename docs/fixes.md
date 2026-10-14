@@ -314,7 +314,8 @@ runtime, which implements the OpenVR interfaces Elite calls and speaks OpenXR
 itself.
 
 Most of the fixes never touch the game. They change how frames are drawn from
-outside it: four small copies per frame so both eyes share an exposure value,
+outside it: five small copies per frame (and the second eye's exposure shaders
+not sent to the GPU) so both eyes share an exposure value,
 one substituted argument to a screen-clearing call, and one substituted copy of
 the panel's position if you change the distance. For the transition flash, EDVR
 reads a constant buffer the game has already filled and, on the rare frame

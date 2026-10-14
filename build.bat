@@ -2170,6 +2170,22 @@ if errorlevel 1 ( echo [edvr] ERROR: optimized station test build failed & exit 
 "%BUILD%\optimized_station_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_exposure_chain_test
+echo [edvr] === exposure_chain_test.exe ===
+REM The exposure engine path (src\d3d11\exposure_chain.h, fix.share_exposure): the pure decision (learning, the second-eye skip, every decline,
+REM fallback and latch), three pipelines of stand-in chain shaders on a WARP device with the debug layer (stock, the old share copy, the engine
+REM path: eye 0 and eye 1 must come out bit-identical frame by frame through engaging, a lost confirmation and a stand-down), and source pins on
+REM the hook's glue and on the removal of the Scroll Lock toggle. No DLL, no game, no window.
+if not exist "%OBJ%\exposurechain" mkdir "%OBJ%\exposurechain"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\exposurechain\\" ^
+    /Fe"%BUILD%\exposure_chain_test.exe" "tools\exposure_chain_test\exposure_chain_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib d3dcompiler.lib
+if errorlevel 1 ( echo [edvr] ERROR: exposure chain test build failed & exit /b 1 )
+"%BUILD%\exposure_chain_test.exe" --dry-run || exit /b 1
+"%BUILD%\exposure_chain_test.exe" --self-test "%ROOT%" || exit /b 1
+exit /b 0
+
 :rig_pad_state_test
 echo [edvr] === pad_state_test.exe ===
 REM The pad-state probe's pure half (src\d3d11\pad_state_core.h): the identity and prologue decision, change detection, the exact line texts, the

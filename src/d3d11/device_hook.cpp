@@ -258,7 +258,6 @@ struct State {
     PFN_CreateSwapChain        realCreateSwapChain = nullptr;
     PFN_CreateSwapChainForHwnd realCreateSwapChainForHwnd = nullptr;
 
-    Hotkey toggleKey;
     Hotkey dumpKey;
     // The draw census key (issue 69074 instrumentation). Unbound by default;
     // the census costs nothing until this is both bound and pressed.
@@ -266,10 +265,10 @@ struct State {
     // The eye dump key: both eyes as the headset receives them, to
     // edvr_logs\eyes as BMP (temporalPassArmEyeDump). Unbound by default.
     Hotkey eyesKey;
-    // What each of those four was last bound from (the ini text), so a reload
+    // What each of those three was last bound from (the ini text), so a reload
     // that changes one re-resolves it and one that does not says nothing: the
     // settings menu's Hotkeys page writes them while the game runs.
-    std::string toggleKeyText, dumpKeyText, censusKeyText, eyesKeyText;
+    std::string dumpKeyText, censusKeyText, eyesKeyText;
     bool        diagnosticKeysBound = false;
     // The player's own FSS enter/quit keys, adopted from their Elite
     // bindings; they give the FSS mode latch its frame-exact edges.
@@ -1199,9 +1198,7 @@ HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers1(IDXGISwapChain3* self, UINT c
 // falls together.
 //   vtable_watch      the re-arm and the frame tick are one instrument; the tick
 //                     publishes the frame number the re-arm is judged against.
-//   toggle_key        the exposure fix's own key, apart from the diagnostic keys
-//                     below it: a probe's dump must not take the fix's switch along.
-//   hotkeys           the diagnostic keys (history, census, eye dump), their
+//   hotkeys          the diagnostic keys (history, census, eye dump), their
 //                     missed-press notes and the delayed dump: one instrument.
 //   config_refresh    the reload and the settings derived from what it re-read.
 //   hook_reclaim      three detection-only passes over the device, swapchain and
@@ -1224,7 +1221,6 @@ EDVR_BOUNDARY_TICK(tkSchedulerProbe, "scheduler_probe");
 EDVR_BOUNDARY_TICK(tkVtableWatch, "vtable_watch");
 EDVR_BOUNDARY_TICK(tkVrRuntime, "vr_runtime");
 EDVR_BOUNDARY_TICK(tkOptimizedStation, "optimized_station");
-EDVR_BOUNDARY_TICK(tkToggleKey, "toggle_key");
 EDVR_BOUNDARY_TICK(tkHotkeys, "hotkeys");
 EDVR_BOUNDARY_TICK(tkEliteBinds, "elite_binds");
 EDVR_BOUNDARY_TICK(tkJournalWatch, "journal_watch");
@@ -1586,9 +1582,6 @@ void presentFrameBoundary() {
     tkVrRuntime.run([] { vrRuntimeTick(); });
     // The optimized station's tick: the setting, the seal and release rules, the held cell in the pad's frame, the 30 s summary.
     tkOptimizedStation.run([] { optimizedStationFrame(static_cast<uint32_t>(g_state->frameCounter)); });
-    tkToggleKey.run([] {
-        if (g_state->toggleKey.pressed()) toggleExposureFix();
-    });
     tkHotkeys.run(tickHotkeys);
     tkEliteBinds.run(tickEliteBinds);
     // The game's own journal, polled about once a second: it states the
@@ -1669,7 +1662,7 @@ void presentFrameBoundary() {
             vertexResyncPoll(stampMs());
             // The terrain cull cover's ten-minute heartbeat (written while its hook is live, zero counts included).
             terrainCullCoverPoll(stampMs());
-            // The four diagnostic keys follow the file too (the menu's Hotkeys page).
+            // The three diagnostic keys follow the file too (the menu's Hotkeys page).
             configureDiagnosticHotkeys();
             g_state->fssModeLatchWanted =
                 eyeSyncFromConfig(Config::get()).any();
@@ -1991,7 +1984,7 @@ std::string hotkeyDescribe(const Hotkey& k) {
     return out;
 }
 
-// The four diagnostic keys, bound at launch and RE-bound whenever the ini says
+// The three diagnostic keys, bound at launch and RE-bound whenever the ini says
 // something else: the settings menu's Hotkeys page writes these while the game
 // runs, so (like hotkey.menu and hotkey.explorer_cam) they re-resolve live. A
 // reload that changed none of them says nothing.
@@ -2017,8 +2010,6 @@ void configureDiagnosticHotkeys() {
         const char*  detail;        // what a press does, said with the bind
     };
     Item items[] = {
-        {&s.toggleKey, &s.toggleKeyText, Config::get().getString("hotkey.toggle_exposure", "SCROLLLOCK"),
-         "hotkey.toggle_exposure", "brightness fix toggle", nullptr, ""},
         {&s.dumpKey, &s.dumpKeyText, Config::get().getString("hotkey.dump_camera", "PAUSE"),
          "hotkey.dump_camera", "camera history", nullptr, ""},
         // Empty default: the census is chased-bug instrumentation, and an unbound key is how
