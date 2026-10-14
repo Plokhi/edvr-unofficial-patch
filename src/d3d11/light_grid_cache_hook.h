@@ -5,7 +5,7 @@
 // per context and, when a call's key matches one of them bit for bit, swaps that whole state back in instead of building.
 //
 // Always on, both profiles, no key: it is a pure optimisation and exact (see the core for why, and the verification below for how the flight proves it). Installed ONCE at
-// startup; a build whose PE stamp or whose entry's sixteen bytes are not 332841's is one log line and nothing patched, never retried. While it runs, one in 64 cache hits is
+// startup; a build whose PE stamp or whose entry's sixteen bytes are not 332841's is one log line and nothing patched, never retried. While it runs, one in 1024 cache hits is
 // not served: the game rebuilds and the result is compared with the cached state byte for byte. A difference, or a stored key that is not the one built from the call's inputs,
 // turns the cache off for the session with a line saying why.
 #include <cstdint>

@@ -4,7 +4,8 @@
 // them. One 32-bit word crosses, so the runtime can never read half a change: a count that moved together with the flag it belongs to.
 //
 //   bit  0       published    d3d11.dll has written the word (0 is a fresh mapping or a graphics half that does not know the seat memory)
-//   bit  1       keep         advanced.cockpit_centre = keep (0 is "game": today's behaviour exactly)
+//   bit  1       keep         the seat memory is active. Always set by this build (advanced.cockpit_centre = keep | game was retired 2026-10-14 with
+//                             keep shipped); the bit stays so the layout and the pure logic's inactive path (published = 0) are unchanged
 //   bit  2       gameplay     LoadGame seen in this process
 //   bit  3, 4    seatedKnown, seated    Status.json says the commander is in a seat (ship, fighter, SRV, taxi, multicrew)
 //   bit  5, 6    onFootKnown, onFoot    Status.json Flags2 bit 0

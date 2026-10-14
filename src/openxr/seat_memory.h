@@ -282,7 +282,7 @@ inline const char* seatWhereName(SeatWhere w) {
 
 // What to do with a ResetSeatedZeroPose the game just made.
 enum class SeatResetDecision {
-  GameMode,          // advanced.cockpit_centre = game, or the graphics half has not spoken: honoured, nothing remembered (today's behaviour)
+  GameMode,          // the graphics half has not spoken (the word is 0), or the memory is switched off: honoured, nothing remembered (the old behaviour)
   PassThrough,       // in a menu or a load (or on foot, when onFootIsSeated() is false): honoured, nothing remembered
   ReplaceWithSeat,   // aboard or on foot, inside a transition window, a seat is stored: the stored seat replaces the head pose
   HonourNoSeat,      // aboard, inside a window, nothing stored: honoured as today (an automatic reset is not evidence of where the player sits)

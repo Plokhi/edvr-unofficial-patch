@@ -646,10 +646,10 @@ uint64_t g_routeLatestSeq = 0;              // the newest frame a stage began in
 constexpr size_t kStages = static_cast<size_t>(UiRouteStage::kCount);
 constexpr size_t kRouteTotal = kStages;     // the stats slot of the whole route's sum
 constexpr size_t kRouteWithMoved = kStages + 1;
-// TEMPORARY (2026-10-13 measurement build): on, so the HDR HUD draws' shading in the 4032^2 layer is priced (the moved draw's census
-// item, AlteredHdrHud, and the "HDR draw price" line), and the seed census and its by-reason counters run with it. Off again after the
-// flight: it arms per-draw timers on the shared clock. Its note: docs\gpu-pass-profile-2026-10-12.md (the 2026-10-13 UI instruments).
-constexpr bool g_hdrDrawTimingOn = true;
+// Off since 2026-10-14 (it was on for the 2026-10-13 measurement build). On, it prices the HDR HUD draws' shading in the 4032^2 layer (the
+// moved draw's census item, AlteredHdrHud, and the "HDR draw price" line) and runs the seed census and its by-reason counters, by arming
+// per-draw timers on the shared clock. Turn it on for a measurement flight, not for shipping. Its note: docs\gpu-pass-profile-2026-10-12.md.
+constexpr bool g_hdrDrawTimingOn = false;
 UiSeedCensus g_seedCensus;
 UiHdrSeedGpuProbe g_hdrSeedGpu;
 UiHdrSeedGpuProbe::Token g_hdrSeedActive = 0; // explicit outer-guard recovery for SEH

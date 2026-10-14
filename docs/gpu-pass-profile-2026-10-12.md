@@ -39,7 +39,7 @@ v3 fixes (2026-10-13, after the six flights on cb712758; root causes in the Log)
 - probe_cube on eye passes: squareness is not the rule any more. probe_cube = not at the eye size, and square up to 1024 or a cube array.
 - v4: 252x252 one-draw passes and the dispatches whose top compute shader is B8E727E9 or F1FB2EEF are "exposure" (Elite's exposure chain; reviews\vr-view-caches-2026-10-13.md). probe_cube's square is now 256 to 1024 (or a cube array of 6+ slices).
 Delay (2026-10-14, branch claude/gpu-profile-delay, TEMPORARY): hotkey value KEY COUNT DELAY_MS (delay 2 to 12 ms, default 6). Frame 1 of a capture is the reference (no delay); the others carry a compute delay at their start, as their own segment, excluded from classes and totals. Summary: "delay D ms (measured M ms) placed at frame start; inter-pass gaps median G ms per frame; frame busy B ms". Suspect passes are marked in the CSV (gap_after_ms, suspect).
-UI instruments (2026-10-13, TEMPORARY for this measurement build: g_hdrDrawTimingOn is on in ui_layer.cpp; turn it off after the flight):
+UI instruments (2026-10-13, TEMPORARY for this measurement build: g_hdrDrawTimingOn was on in ui_layer.cpp; OFF since 2026-10-14, turn it on only for a measurement flight):
 hologram resolve split into depth copy, near-light and resolve draw; moved HDR HUD draw as its own altered item; seeds by reason;
 reissues issued vs empty. Lines in the Log.
 

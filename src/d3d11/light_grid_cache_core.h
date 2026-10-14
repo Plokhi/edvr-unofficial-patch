@@ -470,7 +470,7 @@ inline size_t formatSampleLine(char* out, size_t cap, const Sample& m) noexcept 
 constexpr int kPoolSlots = 32;       // all contexts together
 constexpr int kMaxContexts = 4;
 constexpr int kSlotsPerContext = 20; // 8 jitter phases x 2 eyes, a third view, and room
-constexpr uint64_t kVerifyEvery = 64;
+constexpr uint64_t kVerifyEvery = 1024;   // one hit in 1024 is compared with a real build (was 1 in 64 until 2026-10-14: several flights showed 0 mismatches)
 constexpr int kEvictedRing = 64;
 
 // The build reads one thing the key does not hold: the view block's own near plane (a4+0x234) for the first depth slice. A state is only matched by a call whose value is the
