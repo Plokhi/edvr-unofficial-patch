@@ -2165,6 +2165,57 @@ int main(int argc, char** argv) {
         check(bad.load() == 0 && hits.load() > 0, "v14.31 node cache, threads: eight threads inserting and reading never see a torn or foreign name");
     }
     {
+        // Release review 2026-10-14 finding 2: two writers rewrite ONE node's entry in place (the same node, class, flags and generation, so the published word is identical
+        // every time) while readers copy its name. The name is a seqlock payload of atomic words; a hit must be exactly one of the two names, never a mix of both.
+        auto cacheHeap = std::make_unique<se::NodeCache<64>>();
+        se::NodeCache<64>& cache = *cacheHeap;
+        const uintptr_t node = 0x30008;
+        char nameA[64], nameB[64];
+        std::memset(nameA, 'A', 63);
+        std::memset(nameB, 'B', 63);
+        nameA[63] = nameB[63] = '\0';
+        check(cache.put(node, 3, se::NameClass::kOther, 0, nameA), "node cache seqlock: the entry is created");
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> torn{0}, hits{0}, misses{0}, puts{0};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 2; ++t) {
+            threads.emplace_back([&, t] {
+                const char* mine = t == 0 ? nameA : nameB;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    if (cache.put(node, 3, se::NameClass::kOther, 0, mine)) puts.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([&] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    se::NameClass cls = se::NameClass::kNone;
+                    uint32_t flags = 0;
+                    char got[64];
+                    std::memset(got, 0, sizeof(got));
+                    if (cache.find(node, 3, &cls, &flags, got)) {
+                        hits.fetch_add(1, std::memory_order_relaxed);
+                        const char c = got[0];
+                        bool whole = (c == 'A' || c == 'B') && got[63] == '\0';
+                        for (int k = 0; whole && k < 63; ++k) whole = got[k] == c;
+                        if (!whole) torn.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        misses.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        stop.store(true);
+        for (auto& th : threads) th.join();
+        check(torn.load() == 0 && hits.load() > 0 && puts.load() > 0, "node cache seqlock, threads: two writers rewriting one node and four readers never see a name that mixes the two");
+        // after the writers stop the entry is whole and readable
+        se::NameClass cls = se::NameClass::kNone;
+        uint32_t flags = 0;
+        char got[64];
+        check(cache.find(node, 3, &cls, &flags, got) && (std::strcmp(got, nameA) == 0 || std::strcmp(got, nameB) == 0), "node cache seqlock: the entry is one whole name once the writers stop");
+    }
+    {
         // Built v14.32: a node freed and reallocated within a generation (a streamed asset) is caught by the name-text validator on the hit path.
         uint8_t padText[16] = {'L', 'a', 'n', 'd', 'i', 'n', 'g', 'P', 'a', 'd', 'S', 'm', 'a', 'l', 'l', 'A'};
         uint8_t liftText[16] = {'L', 'i', 'f', 't', '_', '0', '1', 0, 0, 0, 0, 0, 0, 0, 0, 0};
