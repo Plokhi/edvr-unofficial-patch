@@ -187,7 +187,7 @@ int main(int argc, char** argv) {
         check(full.maxProbes <= edvr::sealed::kTableProbeMax, "no probe walks past the 32-probe bound");
     }
 
-    // ---- the line cap: 2000 change lines, one notice, then counted only ---------------------------------------------------------------------
+    // ---- the line cap: 200 change lines, one notice, then counted only ---------------------------------------------------------------------
     {
         pad::PadTable t;
         size_t written = 0;
@@ -197,9 +197,9 @@ int main(int argc, char** argv) {
             if (v == pad::ChangeLine::kWrite) ++written;
             if (v == pad::ChangeLine::kSuppressedFirst) ++notices;
         }
-        check(written == pad::kChangeLineCap && t.changeLines == pad::kChangeLineCap, "exactly 2000 change lines are written in a session");
+        check(written == pad::kChangeLineCap && t.changeLines == pad::kChangeLineCap, "exactly kChangeLineCap (200) change lines are written in a session");
         check(notices == 1 && t.capNoticed, "the cap is announced once");
-        check(t.suppressed == 100 && t.suppressedTotal == 100, "the lines past the cap are counted, not logged");
+        check(t.suppressed == 2100 - pad::kChangeLineCap && t.suppressedTotal == 2100 - pad::kChangeLineCap, "the lines past the cap are counted, not logged");
     }
 
     std::printf("pad_state_test: %d checks, %d failures\n", g_checks, g_failures);

@@ -17,7 +17,7 @@
 #include "../common/vtable_hook.h"
 #include "binding_shadow.h"
 #include "optimized_station.h"  // optimizedStationSunOff: the sun-shadow probe counts dispatches only while the sun is skipped
-#include "sun_shadow_probe.h"
+#include "sun_shadow_skip.h"
 #include "device_hook.h"  // contextHookModeFor
 #include "draw_census.h"  // drawCensusDispatch: the census records compute
 #include "engine_velocity.h"  // F2: the palette chain's dispatch feeds the second skin's join
@@ -726,8 +726,8 @@ void STDMETHODCALLTYPE hookedDispatch(ID3D11DeviceContext* self, UINT x, UINT y,
         return;
     }
 
-    // Built v14.30: the sun-shadow probe (log only), owner context, only while the station's sun skip is on: does a dispatch bind the cascade map?
-    if (optimizedStationSunOff()) sunShadowProbeDispatch(bindingShaderHash(BindSlot::Cs));
+    // Built v14.31: the sun shadow skip's scan, owner context, only while the station's sun skip is on: does a dispatch read the cascade map?
+    if (optimizedStationSunOff()) sunShadowSkipDispatch(self, bindingShaderHash(BindSlot::Cs));
     // The census's view of compute, recorded before the forward the way the
     // draw hooks record before theirs, so the q= ordinals across draws,
     // copies and dispatches share one timeline. One bool call per dispatch

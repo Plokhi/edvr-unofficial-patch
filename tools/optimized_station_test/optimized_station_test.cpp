@@ -7,11 +7,11 @@
 #include "../../src/d3d11/station_gather_core.h"
 #include "../../src/d3d11/station_lockfree_core.h"
 #include "../../src/d3d11/station_pass_core.h"
-#include "../../src/d3d11/cluster_probe_core.h"
-#include "../../src/d3d11/sun_shadow_probe_core.h"
+#include "../../src/d3d11/sun_shadow_skip_core.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <random>
 #include <thread>
@@ -1923,21 +1923,17 @@ int main(int argc, char** argv) {
     // ---- Built v14.29: the node cache with flags, the sampled gathers, the per-thread pin ---------------------------------------------------------------
     {
         const uintptr_t node = 0x7ff612345678ull & ~uintptr_t(7);
-        const uint32_t key = se::classKey(100, 0);
+        const uint32_t key = se::classKey(7);
         const uint64_t v = se::packSlot(node, se::NameClass::kExplicit, se::kNodeMechanism | se::kNodeShipPrefix, key);
         se::NameClass cls = se::NameClass::kNone;
         uint32_t flags = 0;
         check(se::unpackSlot(v, node, key, &cls, &flags) && cls == se::NameClass::kExplicit && flags == (se::kNodeMechanism | se::kNodeShipPrefix),
               "v14.29 node cache: a slot returns the node's class and flags under its key");
         check(!se::unpackSlot(v, node + 8, key, &cls, &flags), "v14.29 node cache: another node in the same slot is a miss (node reuse)");
-        check(se::unpackSlot(v, node, se::classKey(100 + se::kClassKeyFrames - 1 - (100 % se::kClassKeyFrames), 0), &cls, &flags),
-              "v14.29 node cache: a node is trusted for the rest of its group of frames");
-        check(!se::unpackSlot(v, node, se::classKey(100 + se::kClassKeyFrames, 0), &cls, &flags), "v14.29 node cache: the next group of frames reads the name again");
-        check(!se::unpackSlot(v, node, se::classKey(100, 1), &cls, &flags), "v14.29 node cache: a lifecycle generation (an epoch bump) reads every name again");
+        check(!se::unpackSlot(v, node, se::classKey(8), &cls, &flags), "v14.29 node cache: a lifecycle generation (an epoch bump) reads every name again");
         check(!se::unpackSlot(0, node, key, &cls, &flags), "v14.29 node cache: an empty slot is a miss");
-        // a node reused by another model after a bump gets its own flags
-        const uint64_t v2 = se::packSlot(node, se::NameClass::kOther, 0, se::classKey(100, 1));
-        check(se::unpackSlot(v2, node, se::classKey(100, 1), &cls, &flags) && cls == se::NameClass::kOther && flags == 0,
+        const uint64_t v2 = se::packSlot(node, se::NameClass::kOther, 0, se::classKey(8));
+        check(se::unpackSlot(v2, node, se::classKey(8), &cls, &flags) && cls == se::NameClass::kOther && flags == 0,
               "v14.29 node cache: after a bump the node's new name is cached with its own flags");
         check(se::nodeFlagsOf("Lift_01") == (se::kNodeMechanism | se::kNodeHangarLike | se::kNodeShipPrefix), "v14.29 node flags: a Lift is a mechanism and a hangar name");
         check(se::nodeFlagsOf("CobraMkV_Hull") == se::kNodeShipPrefix, "v14.29 node flags: a ship part has the prefix flag only");
@@ -1954,8 +1950,8 @@ int main(int argc, char** argv) {
         check(se::nodeWantsCentre(NC::kOther, se::kNodeHangarLike, false, false, true, false) && !se::nodeWantsCentre(NC::kOther, se::kNodeHangarLike, false, false, false, false),
               "v14.29 gather: a hangar-like record is read only while the names are wanted");
         check(se::nodeWantsCentre(NC::kOther, 0, false, false, false, true), "v14.29 gather: a full pass reads every record");
-        check(se::fullGatherPass(8, false) && se::fullGatherPass(16, false) && !se::fullGatherPass(9, false) && se::fullGatherPass(9, true),
-              "v14.29 gather: every eighth stamp is a full pass, and every stamp while sealed or an engage is pending");
+        check(se::fullGatherPass(8, false, false) && se::fullGatherPass(16, false, false) && !se::fullGatherPass(9, false, false) && se::fullGatherPass(9, true, false),
+              "v14.29 gather: every eighth stamp is a full pass unsealed, and every stamp while an engage is pending");
     }
     {
         // The sampled gathers over many ticks: the pad is seen at every informative tick (it is read on every pass), the own candidate and the tally
@@ -1988,7 +1984,7 @@ int main(int argc, char** argv) {
             for (int t = 0; t < ticks; ++t) {
                 const uint32_t st = stamp.load();
                 const int ship = (shipAfter >= 0 && t >= shipAfter) ? 2 : 1;
-                const bool full = se::fullGatherPass(st, gatherAll);
+                const bool full = se::fullGatherPass(st, gatherAll, false);
                 {
                     se::PassGather<E, 4, 2048>::Writer w(gb);
                     for (const Rec& r : recs) {
@@ -2087,137 +2083,167 @@ int main(int argc, char** argv) {
         check(torn.load() == 0 && reads.load() > 0, "v14.29 per-thread pin, threads: ten readers (four hazard cells, six counted pins) never see a torn slot");
     }
 
-    // ---- Built v14.30: the cluster builder's probe and the sun-shadow probe (log only; the pure halves) -------------------------------------------------
+    // ---- Built v14.31: the node cache (a probed table, name beside the word), the sealed sampling, the sun shadow skip's gate --------------------------------
     {
-        namespace cp = edvr::clusterprobe;
-        uint8_t a[cp::kKeyBytes] = {};
-        for (size_t i = 0; i < sizeof(a); ++i) a[i] = static_cast<uint8_t>(i * 7 + 3);
-        uint8_t b[cp::kKeyBytes];
-        std::memcpy(b, a, sizeof(a));
-        check(cp::hashBytes(a, sizeof(a)) == cp::hashBytes(b, sizeof(b)), "v14.30 cluster probe: equal bytes hash equal");
-        b[0x33] ^= 1;
-        check(cp::hashBytes(a, sizeof(a)) != cp::hashBytes(b, sizeof(b)), "v14.30 cluster probe: one changed bit changes the hash");
-        check(cp::hashBytes(a, 16) != cp::hashBytes(a, 17), "v14.30 cluster probe: the length is part of the hash");
-        const cp::KeyDiff d1 = cp::diffKeys(a, b);
-        check(d1.rows == (1u << 3) && !d1.nearFar && !d1.dims, "v14.30 cluster probe: a change in row 3 is named row 3 only");
-        std::memcpy(b, a, sizeof(a));
-        b[0x41] ^= 0x10;
-        const cp::KeyDiff d2 = cp::diffKeys(a, b);
-        check(d2.rows == 0 && d2.nearFar && !d2.dims, "v14.30 cluster probe: a change in the depth range is named as such");
-        std::memcpy(b, a, sizeof(a));
-        b[0x60] ^= 1;
-        const cp::KeyDiff d3 = cp::diffKeys(a, b);
-        check(d3.rows == 0 && !d3.nearFar && d3.dims && d3.any(), "v14.30 cluster probe: a change in the grid or size is named as such");
-        check(sizeof(cp::kClusterPrologue) == 16 && cp::kClusterPrologue[0] == 0x48 && cp::kClusterPrologue[2] == 0xC4 && cp::kClusterRva == 0x58B150u,
-              "v14.30 cluster probe: the pinned entry is the function's, sixteen bytes");
-
-        // The eyes alternate and the game's single memo slot never hits: every call's key differs from the one the context held at entry.
-        {
-            auto stats = std::make_unique<cp::Stats>();
-            uint64_t ka = 0xAAAA, kb = 0xBBBB;
-            uint64_t prev = 0;
-            for (int f = 0; f < 100; ++f) {
-                for (int eye = 0; eye < 2; ++eye) {
-                    cp::CallRecord c;
-                    c.keyBefore = prev;
-                    c.keyAfter = eye == 0 ? ka : kb;
-                    c.out = c.keyAfter * 31;
-                    c.outHashed = true;
-                    c.havePrev = f > 0 || eye > 0;
-                    c.vsPrev.rows = 1;   // the eyes differ in row 0
-                    c.callMs = 0.6;
-                    c.probeMs = 0.02;
-                    c.tableBytes = 4096;
-                    c.hashedBytes = 4096;
-                    stats->record(c);
-                    prev = c.keyAfter;
-                }
-                stats->endFrame();
-            }
-            check(stats->hits() == 0 && stats->misses() == 200, "v14.30 cluster probe: alternating eyes give a memo that never hits");
-            check(stats->distinctKeys() == 2 && stats->distinctOutputs() == 2, "v14.30 cluster probe: two eyes are two distinct keys and two tables");
-            check(stats->missEqualTwoBack() >= 197, "v14.30 cluster probe: each miss equals the key two calls back (the same eye)");
-            check(stats->sameKeyChecks() >= 190 && stats->sameKeyMismatches() == 0, "v14.30 cluster probe: the same key always gave the same table");
-            check(stats->framesWith2() == 100 && stats->missRow(0) >= 199, "v14.30 cluster probe: two calls a frame, the rows differing between them");
-            char line[1500];
-            const size_t n = stats->line(line, sizeof(line), 30);
-            check(n > 200 && n < sizeof(line) - 1 && std::strstr(line, "cluster probe last 30 s") != nullptr && std::strstr(line, "missed 200 (0.0% hit)") != nullptr,
-                  "v14.30 cluster probe: the 30 s line names the window, the calls and the hit rate");
+        se::NodeCache<64> cache;
+        const uintptr_t n1 = 0x7ff612345678ull & ~uintptr_t(7);
+        se::NameClass cls = se::NameClass::kNone;
+        uint32_t flags = 0;
+        char name[64] = {};
+        check(!cache.find(n1, 1, &cls, &flags, name), "v14.31 node cache: an empty cache misses");
+        check(cache.put(n1, 1, se::NameClass::kExplicit, se::kNodeMechanism, "Lift_01") && cache.find(n1, 1, &cls, &flags, name) &&
+                  cls == se::NameClass::kExplicit && flags == se::kNodeMechanism && std::strcmp(name, "Lift_01") == 0,
+              "v14.31 node cache: a node comes back with its class, flags and name");
+        check(!cache.find(n1 + 8, 1, &cls, &flags, name), "v14.31 node cache: another node is a miss");
+        check(!cache.find(n1, 2, &cls, &flags, name), "v14.31 node cache: a lifecycle generation bump starts every node afresh");
+        check(cache.put(n1, 2, se::NameClass::kOther, 0, "Rock") && cache.find(n1, 2, &cls, &flags, name) && std::strcmp(name, "Rock") == 0 && flags == 0,
+              "v14.31 node cache: after a bump the node's new name is cached; the old generation's slot is reused");
+        check(cache.find(n1, 2, &cls, &flags, nullptr), "v14.31 node cache: a lookup without a name works");
+        // a long name is cut at 63 characters and terminated
+        char longName[200];
+        std::memset(longName, 'x', sizeof(longName));
+        longName[199] = '\0';
+        check(cache.put(n1 + 16, 2, se::NameClass::kOther, 0, longName) && cache.find(n1 + 16, 2, &cls, &flags, name) && std::strlen(name) == 63,
+              "v14.31 node cache: a long name is cut to 63 characters");
+        // the table is bounded: far more live nodes than slots, every put either lands or reports a full window, and no hit returns another node's name
+        size_t landed = 0, refused = 0;
+        for (uintptr_t k = 0; k < 400; ++k) {
+            const uintptr_t node = 0x10000 + 8 * k;
+            char nm[32];
+            std::snprintf(nm, sizeof(nm), "N%llu", static_cast<unsigned long long>(k));
+            if (cache.put(node, 5, se::NameClass::kOther, k & 7u, nm)) ++landed;
+            else ++refused;
         }
-        // One eye and a steady camera: the memo hits.
-        {
-            auto stats = std::make_unique<cp::Stats>();
-            for (int f = 0; f < 50; ++f) {
-                cp::CallRecord c;
-                c.keyBefore = c.keyAfter = 0x1234;
-                c.out = 77;
-                c.outHashed = true;
-                c.callMs = 0.01;
-                stats->record(c);
-                stats->endFrame();
+        bool consistent = true;
+        size_t hits = 0;
+        for (uintptr_t k = 0; k < 400; ++k) {
+            const uintptr_t node = 0x10000 + 8 * k;
+            char nm[32];
+            std::snprintf(nm, sizeof(nm), "N%llu", static_cast<unsigned long long>(k));
+            if (cache.find(node, 5, &cls, &flags, name)) {
+                ++hits;
+                consistent = consistent && std::strcmp(name, nm) == 0 && flags == (k & 7u);
             }
-            check(stats->hits() == 50 && stats->misses() == 0 && stats->distinctKeys() == 1, "v14.30 cluster probe: a steady key is a memo hit every call");
         }
-        // The jitter moves the rows every call; and a table that the key does not determine is caught.
-        {
-            auto stats = std::make_unique<cp::Stats>();
-            for (int i = 0; i < 300; ++i) {
-                cp::CallRecord c;
-                c.keyBefore = 1000 + static_cast<uint64_t>(i);
-                c.keyAfter = 1001 + static_cast<uint64_t>(i);
-                c.out = c.keyAfter;
-                c.outHashed = true;
-                c.havePrev = true;
-                c.vsPrev.rows = 0x3;
-                stats->record(c);
-            }
-            check(stats->hits() == 0 && stats->distinctKeys() == 256, "v14.30 cluster probe: the distinct-key set is bounded and says so");
-            char line[1500];
-            stats->line(line, sizeof(line), 30);
-            check(std::strstr(line, "256+") != nullptr, "v14.30 cluster probe: a full distinct set is marked with a plus");
-            auto s2 = std::make_unique<cp::Stats>();
-            cp::CallRecord c;
-            c.keyBefore = c.keyAfter = 5;
-            c.outHashed = true;
-            c.out = 1;
-            s2->record(c);
-            c.out = 2;
-            s2->record(c);
-            check(s2->sameKeyChecks() == 1 && s2->sameKeyMismatches() == 1, "v14.30 cluster probe: the same key with another table is counted as a mismatch");
-        }
+        check(landed <= 64 && refused >= 336 && hits == landed && consistent, "v14.31 node cache: the probe bound keeps the table bounded and a hit is always the node's own");
     }
     {
-        namespace sp = edvr::sunprobe;
-        check(sp::isCascadeMap(true, 2048, 1024, 53) && sp::isCascadeMap(true, 2048, 1024, 55), "v14.30 sun probe: a 2048x1024 R16 or D16 texture is the cascade map");
-        check(!sp::isCascadeMap(true, 256, 256, 53) && !sp::isCascadeMap(true, 2048, 1024, 40) && !sp::isCascadeMap(false, 2048, 1024, 53) &&
-                  !sp::isCascadeMap(true, 1024, 2048, 53),
-              "v14.30 sun probe: the 256x256 map, another format, a buffer and a swapped size are not");
-        auto counts = std::make_unique<sp::Counts>();
-        for (int f = 0; f < 10; ++f) counts->noteSkippedFrame();
-        for (int i = 0; i < 130; ++i) counts->noteIntoCascade();
-        for (int i = 0; i < 5; ++i) counts->noteSampler(0x1111, 0x2222);
-        for (int i = 0; i < 9; ++i) counts->noteSampler(0x3333, 0x4444);
-        counts->noteSampler(0x5555, 0x6666);
-        counts->noteDispatchBound(0x7777);
-        counts->noteResource(true);
-        counts->noteResource(false);
-        sp::ShaderPair top[sp::kTopShown];
-        const size_t m = counts->topSamplers(top);
-        check(m == 3 && top[0].a == 0x3333 && top[0].n == 9 && top[1].n == 5 && top[2].n == 1, "v14.30 sun probe: the samplers come back most first");
-        check(counts->samplers() == 15 && counts->into() == 130 && counts->dispatchBound() == 1 && counts->resources() == 1,
-              "v14.30 sun probe: the counts add up");
-        char line[1700];
-        const size_t n = counts->line(line, sizeof(line), 30);
-        check(n > 200 && std::strstr(line, "sun shadow probe last 30 s") != nullptr && std::strstr(line, "(13.0 a frame") != nullptr &&
-                  std::strstr(line, "VS 0000000000003333 PS 0000000000004444 x9") != nullptr && std::strstr(line, "CS 0000000000007777 x1") != nullptr,
-              "v14.30 sun probe: the 30 s line carries the draws a frame, the sampler shaders and the dispatch shaders");
-        auto empty = std::make_unique<sp::Counts>();
-        empty->noteSkippedFrame();
-        char line2[1700];
-        empty->line(line2, sizeof(line2), 30);
-        check(std::strstr(line2, "sample it through a pixel-shader slot 0 to 3 0;") != nullptr, "v14.30 sun probe: no sampler reads as a zero, not as a missing field");
-        for (uint64_t i = 0; i < 100; ++i) empty->noteSampler(i, i);
-        check(empty->samplers() == 100 && empty->topSamplers(top) == sp::kTopShown, "v14.30 sun probe: a full pair table counts the total and shows the top eight");
+        // threads: writers and readers on a small cache; a hit must carry the name its node implies, never a torn one
+        auto cacheHeap = std::make_unique<se::NodeCache<256>>();
+        se::NodeCache<256>& cache = *cacheHeap;
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> bad{0}, hits{0};
+        auto nameOf = [](uintptr_t node, char* out) { std::snprintf(out, 64, "Node_%llu_abcdefghijklmnopqrstuvwxyz", static_cast<unsigned long long>(node >> 3)); };
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&, t] {
+                uint64_t x = 88172645463325252ull + static_cast<uint64_t>(t);
+                while (!stop.load(std::memory_order_relaxed)) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    const uintptr_t node = 0x20000 + 8 * (x % 600);
+                    char want[64];
+                    nameOf(node, want);
+                    se::NameClass cls = se::NameClass::kNone;
+                    uint32_t flags = 0;
+                    char got[64];
+                    if (cache.find(node, 3, &cls, &flags, got)) {
+                        hits.fetch_add(1);
+                        if (std::strcmp(got, want) != 0) bad.fetch_add(1);
+                    } else {
+                        cache.put(node, 3, se::NameClass::kOther, 0, want);
+                    }
+                }
+            });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        stop.store(true);
+        for (auto& th : threads) th.join();
+        check(bad.load() == 0 && hits.load() > 0, "v14.31 node cache, threads: eight threads inserting and reading never see a torn or foreign name");
+    }
+    {
+        // The sealed sampling: the pass of stamp S is a full one every 4th stamp sealed, every 8th unsealed, every stamp with an engage pending.
+        check(se::fullGatherPass(4, false, true) && se::fullGatherPass(8, false, true) && !se::fullGatherPass(5, false, true) && !se::fullGatherPass(6, false, true),
+              "v14.31 sampled gathers: sealed, every fourth stamp is a full pass");
+        check(se::fullGatherPass(8, false, false) && !se::fullGatherPass(4, false, false), "v14.31 sampled gathers: unsealed, every eighth");
+        check(se::fullGatherPass(5, true, true) && se::fullGatherPass(5, true, false), "v14.31 sampled gathers: an engage pending gathers every pass");
+        // ShipWatch over sampled readings: ten readings of a new prefix make the change, so about 40 ticks sealed and about 80 unsealed
+        auto swap = [](bool sealed) {
+            se::ShipWatch w;
+            int seen = -1;
+            for (uint32_t t = 0; t < 400; ++t) {
+                if (!se::fullGatherPass(t, false, sealed)) continue;   // no reading on a pass that did not gather the candidate
+                const char* pfx = t < 100 ? "Cobra_" : "Anaconda_";
+                if (w.step(pfx) && seen < 0) seen = static_cast<int>(t);
+            }
+            return seen;
+        };
+        const int sealedSeen = swap(true);
+        const int unsealedSeen = swap(false);
+        check(sealedSeen >= 100 + 36 && sealedSeen <= 100 + 44, "v14.31 sampled gathers: a sealed ship swap is seen about forty ticks after it (ten readings, one in four)");
+        check(unsealedSeen >= 100 + 72 && unsealedSeen <= 100 + 88, "v14.31 sampled gathers: an unsealed ship swap is seen about eighty ticks after it");
+    }
+    {
+        namespace sk = edvr::sunskip;
+        check(sk::isCascadeMap(true, 2048, 1024, 53) && sk::isCascadeMap(true, 2048, 1024, 55), "v14.31 sun skip: a 2048x1024 R16 or D16 texture is the cascade map");
+        check(!sk::isCascadeMap(true, 256, 256, 53) && !sk::isCascadeMap(true, 2048, 1024, 40) && !sk::isCascadeMap(false, 2048, 1024, 53) &&
+                  !sk::isCascadeMap(true, 1024, 2048, 53),
+              "v14.31 sun skip: the 256x256 map, another format, a buffer and a swapped size are not");
+        // the window: idle, then scanning for kScanFrames frames, then skipping; a consumer stands the skip down
+        auto gate = std::make_unique<sk::SkipGate>();
+        check(gate->phase() == sk::Phase::kIdle && !gate->skipping(), "v14.31 sun skip: the gate starts idle");
+        bool changed = false;
+        for (uint32_t f = 0; f < sk::kScanFrames - 1; ++f) changed = changed || gate->frame(true);
+        check(gate->phase() == sk::Phase::kScanning && !gate->skipping() && !changed, "v14.31 sun skip: the draws still run while the window is scanned");
+        check(gate->frame(true) && gate->skipping(), "v14.31 sun skip: after kScanFrames frames with no consumer the gate skips, and says so once");
+        check(!gate->frame(true) && gate->skipping(), "v14.31 sun skip: and says so only once");
+        sk::Consumer c;
+        c.stage = sk::Stage::kCs;
+        c.slot = 2;
+        c.cs = 0xABCD;
+        check(gate->consumer(c) && gate->phase() == sk::Phase::kStoodDown && !gate->skipping() && gate->standDowns() == 1,
+              "v14.31 sun skip: a consumer found while skipping stands the skip down (fail-safe) and reports it once");
+        check(!gate->consumer(c) && gate->standDowns() == 1 && gate->consumers() == 2, "v14.31 sun skip: a second consumer in the window is counted, not reported again");
+        for (uint32_t f = 0; f < 200; ++f) gate->frame(true);
+        check(gate->phase() == sk::Phase::kStoodDown, "v14.31 sun skip: the stand-down lasts the rest of the sun-skip window");
+        gate->frame(false);
+        check(gate->phase() == sk::Phase::kIdle, "v14.31 sun skip: the sun coming back ends the window");
+        for (uint32_t f = 0; f < sk::kScanFrames; ++f) gate->frame(true);
+        check(gate->skipping(), "v14.31 sun skip: the next window scans afresh and skips again when clear");
+        // a consumer while scanning also stands it down, before any draw was skipped
+        auto g2 = std::make_unique<sk::SkipGate>();
+        for (uint32_t f = 0; f < 10; ++f) g2->frame(true);
+        check(g2->consumer(c) && g2->phase() == sk::Phase::kStoodDown, "v14.31 sun skip: a consumer found while scanning stands it down before the first skip");
+        for (uint32_t f = 0; f < sk::kScanFrames * 2; ++f) g2->frame(true);
+        check(!g2->skipping(), "v14.31 sun skip: a stood-down window never reaches skipping");
+        // the scan's stride reaches every position of the draw order over a window
+        std::vector<bool> reached(sk::kScanDrawStride, false);
+        for (uint32_t frame = 1; frame <= sk::kScanFrames; ++frame) {
+            for (uint32_t ord = 0; ord < 1400; ++ord) {
+                if (sk::takeScan(ord, frame, sk::drawStride(sk::Phase::kScanning))) reached[ord % sk::kScanDrawStride] = true;
+            }
+        }
+        bool all = true;
+        for (bool r : reached) all = all && r;
+        check(all && sk::dispatchStride(sk::Phase::kScanning) == 1 && sk::drawStride(sk::Phase::kSkipping) > sk::drawStride(sk::Phase::kScanning),
+              "v14.31 sun skip: the scan reaches every draw position over the window, every dispatch while scanning, and watches more sparsely once skipping");
+        auto g3 = std::make_unique<sk::SkipGate>();
+        for (uint32_t f = 0; f < sk::kScanFrames; ++f) g3->frame(true);
+        g3->addInto(250000);
+        g3->addSkipped(240000);
+        char line[1400];
+        const size_t n = g3->line(line, sizeof(line), 30);
+        check(n > 200 && std::strstr(line, "sun shadow map last 30 s") != nullptr && std::strstr(line, "state skipping") != nullptr &&
+                  std::strstr(line, "240000 skipped") != nullptr,
+              "v14.31 sun skip: the 30 s line carries the state, the draws seen and skipped, and the scan counts");
+        c.stage = sk::Stage::kPs;
+        c.vs = 0x11;
+        c.ps = 0x22;
+        g3->consumer(c);
+        g3->line(line, sizeof(line), 30);
+        check(std::strstr(line, "state stood down") != nullptr && std::strstr(line, "last consumer: pixel shader slot 2") != nullptr,
+              "v14.31 sun skip: a stood-down line names the stage, the slot and the shaders");
     }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);

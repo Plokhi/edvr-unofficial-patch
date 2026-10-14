@@ -111,6 +111,80 @@ private:
     std::atomic<uint64_t> publishes_{0};
 };
 
+// Built v14.31: the node class cache. One 64-bit word per slot (the node, its class, its flags and the lifecycle generation: optimized_station_core.h
+// packSlot) and the node's name beside it. A lookup probes at most kTableProbeMax slots from the node's hash and stops at an empty one; an insert takes the
+// first empty slot or slot of an older generation within the same bound (a full window is a miss the caller reads uncached). A writer claims a slot with a
+// compare-and-swap to a busy word before it writes the name and publishes the word last, and a reader compares the word before and after it copies the name,
+// so a name is never returned torn or under another node's word. A node's name is read once per node per generation.
+template <size_t N>
+class NodeCache {
+public:
+    static constexpr size_t kNameBytes = 64;
+    static_assert((N & (N - 1)) == 0, "the cache size is a power of two");
+
+    // True on a hit: the class and flags (and the name, when `name` is given: kNameBytes, always terminated) of this node under this generation.
+    bool find(uintptr_t node, uint32_t gen, NameClass* cls, uint32_t* flags, char* name = nullptr) const noexcept {
+        const size_t home = homeOf(node);
+        const uint32_t key = classKey(gen);
+        for (uint32_t p = 0; p < kTableProbeMax; ++p) {
+            const size_t i = (home + p) & (N - 1);
+            const uint64_t w1 = slots_[i].load(std::memory_order_acquire);
+            if (w1 == 0) return false;
+            if (w1 == kBusy) continue;
+            NameClass c = NameClass::kNone;
+            uint32_t f = 0;
+            if (!unpackSlot(w1, node, key, &c, &f)) continue;
+            if (name != nullptr) {
+                std::memcpy(name, names_[i], kNameBytes);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (slots_[i].load(std::memory_order_relaxed) != w1) return false;
+                name[kNameBytes - 1] = '\0';
+            }
+            *cls = c;
+            *flags = f;
+            return true;
+        }
+        return false;
+    }
+
+    // Inserts a node. False when the probe window holds nothing reusable (the node is then read uncached).
+    bool put(uintptr_t node, uint32_t gen, NameClass cls, uint32_t flags, const char* name) noexcept {
+        const size_t home = homeOf(node);
+        const uint32_t key = classKey(gen);
+        for (uint32_t p = 0; p < kTableProbeMax; ++p) {
+            const size_t i = (home + p) & (N - 1);
+            uint64_t w = slots_[i].load(std::memory_order_acquire);
+            if (w == kBusy) continue;
+            if (w != 0 && ((w >> 50) & kSlotKeyMask) == key) continue;   // a live entry of this generation (this node's or another's)
+            if (!slots_[i].compare_exchange_strong(w, kBusy, std::memory_order_acq_rel, std::memory_order_acquire)) continue;
+            char tmp[kNameBytes] = {};
+            if (name != nullptr) std::strncpy(tmp, name, kNameBytes - 1);
+            std::memcpy(names_[i], tmp, kNameBytes);
+            slots_[i].store(packSlot(node, cls, flags, key), std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
+
+    size_t used(uint32_t gen) const noexcept {
+        size_t n = 0;
+        const uint32_t key = classKey(gen);
+        for (size_t i = 0; i < N; ++i) {
+            const uint64_t w = slots_[i].load(std::memory_order_relaxed);
+            if (w != 0 && w != kBusy && ((w >> 50) & kSlotKeyMask) == key) ++n;
+        }
+        return n;
+    }
+
+private:
+    static constexpr uint64_t kBusy = ~uint64_t(0);
+    static size_t homeOf(uintptr_t node) noexcept {
+        return static_cast<size_t>(((uint64_t(node) >> 3) * 0x9E3779B97F4A7C15ull) >> 32) & (N - 1);
+    }
+    std::atomic<uint64_t> slots_[N] = {};
+    char names_[N][kNameBytes] = {};
+};
+
 // One cached record: the record's address, the frame generation it belongs to, and four floats (centre x, y, z and radius).
 struct SeqCell {
     std::atomic<uint32_t> seq{0};   // even: stable; odd: a writer holds the cell

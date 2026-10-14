@@ -16,7 +16,7 @@ namespace edvr::padstate {
 
 constexpr size_t kReaders = 4;
 constexpr size_t kObjects = 64;
-constexpr uint32_t kChangeLineCap = 2000;
+constexpr uint32_t kChangeLineCap = 200;   // built v14.31 (was 2000): the own pad only, and few
 constexpr uintptr_t kReaderRva[kReaders] = {0x12C3C20u, 0x12CAF80u, 0x12CADE0u, 0x12CB320u};
 // push rbx; sub rsp,20h: the same six bytes in all four readers (build 332841).
 constexpr uint8_t kReaderPin[6] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20};

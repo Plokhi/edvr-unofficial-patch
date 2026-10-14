@@ -23,8 +23,7 @@
 #include "station_lockfree_core.h"
 #include "station_pass_core.h"
 #include "pad_state_probe.h"
-#include "cluster_probe_hook.h"
-#include "sun_shadow_probe.h"
+#include "sun_shadow_skip.h"
 #include "store_hook.h"
 #include "view_source.h"
 
@@ -70,7 +69,6 @@ struct TlsCounters {
     uint64_t producerVetoes = 0, rigVetoes = 0;
     uint64_t rigSeen = 0, rigVetoed = 0, rigMixed = 0, rigUnknown = 0, rigRefresh = 0;
     uint64_t rigHitVetoed = 0, rigHitKept = 0, rigHitMoved = 0, rigMiss = 0, rigStale = 0, rigAsked = 0;
-    uint64_t nodeHit = 0, nodeMiss = 0, skippedWorld = 0, fullPassCalls = 0;
     uint32_t sampleStore = 0, sampleProducer = 0, sampleRig = 0;   // the 1-in-32 sampling counters (the thread's own)
 };
 thread_local TlsCounters tlsTc;
@@ -130,7 +128,7 @@ uint64_t g_winPadSeen = 0, g_winPadMissed = 0, g_winPadAbsentWindow = 0;   // in
 uint64_t g_winCamHold = 0, g_winCamJump = 0, g_winCtxChange = 0;           // camera resolutions covered by the hold, jumps over kCamJumpM, context changes
 uintptr_t g_lastPassCtx = 0;
 uintptr_t g_passCtx = 0;                    // the context the last informative pass's busiest thread saw (the camera is resolved from it)
-bool g_gatherAllPublished = false;          // built v14.29: the last published view asked every pass to gather the near list, the candidate and the tally
+bool g_engagePublished = false;             // built v14.31: the last published view had an engage pending (every pass gathers the near list, the candidate, the tally)
 uint32_t g_recordsLast = 0;                 // store callbacks the last drained passes held (the waiting line's evidence)
 bool g_stickyPadInPass = false;
 constexpr float kCamJumpM = 2.0f;
@@ -204,9 +202,8 @@ constexpr uintptr_t kBucketBase = 0x28;     // the bucket's base record
 
 constexpr uintptr_t kRecName = 0x18;        // pointer: the record's node (node+0 is the text pointer)
 
-constexpr size_t kClassSlots = 4096;         // the class cache: one slot per node (lock-free, valid for one frame)
+constexpr size_t kNodeCacheSlots = 16384;    // built v14.31: the node cache (class, flags and name per node, probed within the table's bound)
 
-constexpr size_t kNameSlots = 512;           // the name cache for the builder probe and the report (under the lock)
 
 constexpr uint32_t kViewTries = 64;
 
@@ -219,8 +216,9 @@ uint64_t g_prodCalls = 0, g_prodVetoed = 0, g_prodKept = 0, g_prodStyle = 0, g_p
 
 
 // The class cache (lock-free): a slot per node, a word per slot (sealed_trial_core.h packs it). Written by any thread that runs the store.
-std::atomic<uint64_t> g_classSlots[kClassSlots] = {};
-std::atomic<uint32_t> g_classGen{0};   // built v14.29: moves at every lifecycle point (bumpRigEpoch): every node's class and name are read afresh
+sealed::NodeCache<kNodeCacheSlots> g_nodeCache;   // built v14.31: one entry per node and lifecycle generation (a node's name does not change while it lives)
+std::atomic<uint64_t> g_nodeNameReads{0}, g_nodeCacheFull{0};   // the window's name reads and uncached reads (the cost line)
+std::atomic<uint32_t> g_classGen{0};   // moves at every lifecycle point (bumpRigEpoch): every node's class and name are read afresh
 
 bool readMem(void* dst, uintptr_t src, size_t n) noexcept {
     if (!src) return false;
@@ -426,7 +424,7 @@ struct PadSnapshot {
     float ownLiveCentre[3] = {};
     float ownLiveRadius = 0.0f;
     bool lost = false;            // gathered entries were lost before this publication: the callbacks keep every record
-    bool gatherAll = false;       // built v14.29: sealed or an engage pending: every pass gathers the near list, the own candidate and the tally
+    bool engagePending = false;   // built v14.31: an engage is pending: every pass gathers the near list, the own candidate and the tally
 };
 sealed::SnapshotRing<PadSnapshot, 40, 32> g_snapRing;
 
@@ -508,39 +506,62 @@ void costPush(uint8_t which, double ms) noexcept {
     w.push(e);
 }
 
-// The record's name, cached per thread and per frame: the one name reader on every path (built v14.25; lock-free since v14.26).
+// Built v14.31: the node's class, flags and name come from the shared node cache: the name is read from game memory once per node per lifecycle
+// generation (a node's name does not change while the node lives; undock, hangar change, ship change and a setting toggle start every node afresh).
+struct NodeInfo {
+    sealed::NameClass cls = sealed::NameClass::kUnnamed;
+    uint32_t flags = 0;
+};
+
+// Reads a node's name from game memory (guarded) and classifies it; name (64 bytes) is filled when the name is readable.
+NodeInfo classifyNode(uintptr_t node, char* name) noexcept {
+    NodeInfo info;
+    if (name != nullptr) name[0] = '\0';
+    uintptr_t text = 0;
+    uint8_t bytes[sealed::kNameBytes] = {};
+    g_nodeNameReads.fetch_add(1, std::memory_order_relaxed);
+    if (!readVal(&text, node) || !text || !readMem(bytes, text, sizeof(bytes))) return info;
+    std::string parsed;
+    const bool ok = sealed::textName(bytes, sizeof(bytes), false, &parsed) || sealed::textName(bytes, sizeof(bytes), true, &parsed);
+    info.cls = sealed::classifyName(ok, parsed.c_str());
+    info.flags = ok ? sealed::nodeFlagsOf(parsed.c_str()) : 0u;
+    if (ok && name != nullptr) std::snprintf(name, sealed::NodeCache<kNodeCacheSlots>::kNameBytes, "%s", parsed.c_str());
+    return info;
+}
+
+// The node's info (and name when `name` is given), cached. A node that is not 8-aligned, or a full probe window, is read uncached.
+NodeInfo nodeInfo(uintptr_t node, char* name) noexcept {
+    NodeInfo info;
+    const uint32_t gen = g_classGen.load(std::memory_order_relaxed);
+    if (sealed::slotFits(node) && g_nodeCache.find(node, gen, &info.cls, &info.flags, name)) return info;
+    char local[sealed::NodeCache<kNodeCacheSlots>::kNameBytes];
+    char* const buf = name != nullptr ? name : local;
+    info = classifyNode(node, buf);
+    if (sealed::slotFits(node)) {
+        if (!g_nodeCache.put(node, gen, info.cls, info.flags, buf)) g_nodeCacheFull.fetch_add(1, std::memory_order_relaxed);
+    }
+    return info;
+}
+
+// A node's name; false when it has none or it is unreadable.
+bool cachedNameOfNode(uintptr_t node, char* out, size_t cap) noexcept {
+    if (!out || cap == 0) return false;
+    out[0] = '\0';
+    if (!node) return false;
+    char name[sealed::NodeCache<kNodeCacheSlots>::kNameBytes];
+    const NodeInfo info = nodeInfo(node, name);
+    if (info.cls == sealed::NameClass::kUnnamed || name[0] == '\0') return false;
+    std::snprintf(out, cap, "%s", name);
+    return true;
+}
+
+// The record's name: the one name reader on every path (built v14.25; lock-free since v14.26; the shared node cache since v14.31).
 bool cachedName(uintptr_t record, char* out, size_t cap) noexcept {
     if (!out || cap == 0) return false;
     out[0] = '\0';
     uintptr_t node = 0;
     if (!record || !readVal(&node, record + kRecName) || !node) return false;
-    struct NameSlot {
-        uintptr_t node = 0;
-        uint32_t stamp = 0;
-        bool ok = false;
-        char name[64] = {};
-    };
-    thread_local NameSlot names[kNameSlots];
-    // Built v14.29: a node's name is trusted for kClassKeyFrames frames and one lifecycle generation (the key), not one frame.
-    const uint32_t stamp = sealed::classKey(g_frameStamp.load(std::memory_order_relaxed), g_classGen.load(std::memory_order_relaxed));
-    NameSlot& slot = names[(node >> 4) % kNameSlots];
-    if (slot.node != node || slot.stamp != stamp) {
-        slot.node = node;
-        slot.stamp = stamp;
-        slot.ok = false;
-        slot.name[0] = '\0';
-        uintptr_t text = 0;
-        uint8_t bytes[sealed::kNameBytes] = {};
-        std::string name;
-        if (readVal(&text, node) && text && readMem(bytes, text, sizeof(bytes)) &&
-            (sealed::textName(bytes, sizeof(bytes), false, &name) || sealed::textName(bytes, sizeof(bytes), true, &name))) {
-            std::snprintf(slot.name, sizeof(slot.name), "%s", name.c_str());
-            slot.ok = true;
-        }
-    }
-    if (!slot.ok) return false;
-    std::snprintf(out, cap, "%s", slot.name);
-    return true;
+    return cachedNameOfNode(node, out, cap);
 }
 
 // The producer-B decision from the published view (built v14.25; was producerDecide under the lock). Caches the record's sphere in the snapshot's
@@ -597,40 +618,13 @@ WorldRead worldOfRecord(uintptr_t rec) noexcept {
 }
 
 // The class of a node's name, read from game memory with no lock (the census's accept rules). The miss path of the class cache.
-// Built v14.29: the class and the flags (what the name is good for) from the one name read.
-struct NodeInfo {
-    sealed::NameClass cls = sealed::NameClass::kUnnamed;
-    uint32_t flags = 0;
-};
-
-NodeInfo classifyNode(uintptr_t node) noexcept {
-    NodeInfo info;
-    uintptr_t text = 0;
-    uint8_t bytes[sealed::kNameBytes] = {};
-    if (!readVal(&text, node) || !text || !readMem(bytes, text, sizeof(bytes))) return info;
-    std::string name;
-    const bool ok = sealed::textName(bytes, sizeof(bytes), false, &name) || sealed::textName(bytes, sizeof(bytes), true, &name);
-    info.cls = sealed::classifyName(ok, name.c_str());
-    info.flags = ok ? sealed::nodeFlagsOf(name.c_str()) : 0u;
-    return info;
-}
-
-// The class and flags of a record's node. Lock-free: one guarded read of the node pointer and one atomic load on a hit; the name is read only on a
-// miss, once per node per kClassKeyFrames frames and per lifecycle generation (built v14.29; it was once per node per frame).
-NodeInfo nodeInfoOf(uintptr_t record, uintptr_t* nodeOut, bool* missOut = nullptr) noexcept {
+// The class and flags of a record's node: one guarded read of the node pointer and the cache lookup.
+NodeInfo nodeInfoOf(uintptr_t record, uintptr_t* nodeOut) noexcept {
     *nodeOut = 0;
-    NodeInfo info;
     uintptr_t node = 0;
-    if (!record || !readVal(&node, record + kRecName) || !node) return info;
+    if (!record || !readVal(&node, record + kRecName) || !node) return NodeInfo{};
     *nodeOut = node;
-    if (!sealed::slotFits(node)) return classifyNode(node);
-    const uint32_t key = sealed::classKey(g_frameStamp.load(std::memory_order_relaxed), g_classGen.load(std::memory_order_relaxed));
-    std::atomic<uint64_t>& slot = g_classSlots[(uint64_t(node) >> 3) & (kClassSlots - 1)];
-    if (sealed::unpackSlot(slot.load(std::memory_order_acquire), node, key, &info.cls, &info.flags)) return info;
-    if (missOut != nullptr) *missOut = true;
-    info = classifyNode(node);
-    slot.store(sealed::packSlot(node, info.cls, info.flags, key), std::memory_order_release);
-    return info;
+    return nodeInfo(node, nullptr);
 }
 
 // Built v14.8: count one record of a type prefix (the records within kShipRecordsM of the camera).
@@ -995,33 +989,6 @@ uint64_t g_waitingLinesWritten = 0;   // waiting lines written this window (the 
 void costAdd(CostRing& r, double ms) noexcept { r.add(ms); }
 bool costSampleCall(uint32_t& calls) noexcept { return ((++calls) & 31u) == 0u; }   // built v14.29: the thread's own counter (no shared line)
 
-// Built v14.29: the store observer's time by stage, for the sampled calls (one in 32). A StageClock lives on the sampled call's stack; each stage adds the
-// ticks since the last mark. The unsampled call passes no clock and pays nothing. The split goes to the tick as a cost entry (flags 3; the seven stage
-// times in ms are packed in the entry's name bytes) and the summary prints the mean per sampled call.
-enum StoreStage : size_t { kStgWriter, kStgPin, kStgReads, kStgNode, kStgWorld, kStgGather, kStgJudge, kStgCount };
-struct StageClock {
-    int64_t last = 0;
-    int64_t ticks[kStgCount] = {};
-};
-inline void stageMark(StageClock* c, StoreStage st) noexcept {
-    if (c == nullptr) return;
-    const int64_t now = costTicks();
-    c->ticks[st] += now - c->last;
-    c->last = now;
-}
-void costPushSplit(const StageClock& c) noexcept {
-    GatherEntry e;
-    e.kind = GKind::kCost;
-    e.flags = 3;
-    float ms[kStgCount];
-    for (size_t i = 0; i < kStgCount; ++i) ms[i] = static_cast<float>(costMs(0, c.ticks[i]));
-    static_assert(sizeof(ms) <= sizeof(e.name), "the stage times fit the entry's name bytes");
-    std::memcpy(e.name, ms, sizeof(ms));
-    GatherWriter w(g_gather);
-    w.push(e);
-}
-double g_splitSumMs[kStgCount] = {};   // the window's stage times over the sampled calls (the tick adds them)
-uint64_t g_splitN = 0;
 
 // The state lock, with its wait timed. Built v14.26: taken by the tick (and the setting's toggle) only. An acquisition made by a callback is counted
 // (the cost line reports the count, which must stay 0).
@@ -1157,6 +1124,7 @@ bool cullCounted(uintptr_t record, bool containing) noexcept {
     return false;
 }
 // ---- The product's state: the setting, the seal, the release, the window counts ----------------------------------------------------------------
+bool g_settingDefaultOn = true;                // the key's default: on in VR, off in the flat profile (set at install; the poll uses the same)
 std::atomic<bool> g_setting{false};        // fix.optimized_station is on (read at install and every kSettingPollFrames frames)
 bool g_vetoesAttached = false;             // the producer and rig vetoes are attached (under g_installMutex-free single writer: the render tick)
 bool g_storeWanted = false;                // the store observer is wanted (the setting is on)
@@ -1237,12 +1205,12 @@ uint32_t g_settingPoll = 0;                // frames since the setting was last 
 uint64_t g_summaryStartMs = 0;             // the 30 s summary's window
 uint64_t g_winFrames = 0;                  // ticks in the window
 uint64_t g_winSealedFrames = 0;            // ticks in the window while sealed
+uint64_t g_winDockedFrames = 0;            // built v14.31: ticks in the window while docked (the 30 s lines are written only for a window that was docked or sealed)
 std::atomic<uint64_t> g_winRigVetoes{0};               // rig vetoes (before the forward) in the window
 std::atomic<uint64_t> g_winProducerVetoes{0};          // records the producer-B veto skipped in the window
 std::atomic<uint64_t> g_winCulled{0};                  // records culled after the store in the window
 std::atomic<uint64_t> g_winKeptUnknown{0};             // records kept because their centre could not be read, in the window
-// Built v14.29: the node cache and pass sampling counts of the window (flushed from the threads' counters).
-std::atomic<uint64_t> g_winNodeHit{0}, g_winNodeMiss{0}, g_winSkippedWorld{0}, g_winFullPassCalls{0};
+
 
 void tcFlush(TlsCounters& t) noexcept {
     g_callsStore.fetch_add(t.callsStore, std::memory_order_relaxed);
@@ -1268,10 +1236,6 @@ void tcFlush(TlsCounters& t) noexcept {
     g_rigTally.miss.fetch_add(t.rigMiss, std::memory_order_relaxed);
     g_rigTally.stale.fetch_add(t.rigStale, std::memory_order_relaxed);
     g_rigTally.asked.fetch_add(t.rigAsked, std::memory_order_relaxed);
-    g_winNodeHit.fetch_add(t.nodeHit, std::memory_order_relaxed);
-    g_winNodeMiss.fetch_add(t.nodeMiss, std::memory_order_relaxed);
-    g_winSkippedWorld.fetch_add(t.skippedWorld, std::memory_order_relaxed);
-    g_winFullPassCalls.fetch_add(t.fullPassCalls, std::memory_order_relaxed);
     const uint32_t keepStamp = t.stamp;
     const uint32_t s0 = t.sampleStore, s1 = t.sampleProducer, s2 = t.sampleRig;
     t = TlsCounters{};
@@ -1351,11 +1315,11 @@ bool bayWatchKeep() noexcept {
 
 // Built v14.12, v14.26: a gathered record that may be a mechanism record (its name from the cache), within 400 m of the camera. Only while a latch is
 // pending (the view says so). The tick applies it.
-void latchCandNote(GatherWriter& w, uintptr_t record, const float* centre, const PadSnapshot& s, uint32_t flags) noexcept {
+void latchCandNote(GatherWriter& w, uintptr_t record, uintptr_t node, const float* centre, const PadSnapshot& s, uint32_t flags) noexcept {
     if (!s.latchPending || (flags & sealed::kNodeMechanism) == 0) return;
     if (s.camValid && sealed::distance(centre, s.cam) > 400.0f) return;   // a bay's span reaches ~270 m along the shaft (built v14.15)
     char nm[64] = {};
-    if (!cachedName(record, nm, sizeof(nm)) || !sealed::mechanismName(nm)) return;
+    if (!cachedNameOfNode(node, nm, sizeof(nm)) || !sealed::mechanismName(nm)) return;
     w.push(gatherEntry(GKind::kLatch, record, centre, 0.0f, 0, nm));
 }
 
@@ -1488,12 +1452,12 @@ const char* engageHow() noexcept {
 }
 
 // Built v14.13, v14.26: a gathered record that may name the hangar, near the pad, while the names are wanted (the view says so). The tick applies it.
-void hangarNameNote(GatherWriter& w, uintptr_t record, const float* centre, float radius, const PadSnapshot& s, uint32_t flags) noexcept {
+void hangarNameNote(GatherWriter& w, uintptr_t record, uintptr_t node, const float* centre, float radius, const PadSnapshot& s, uint32_t flags) noexcept {
     if (!s.namesPending || (flags & sealed::kNodeHangarLike) == 0) return;
     const float d = sealed::distance(centre, s.padC);
     if (d > 150.0f) return;
     char nm[64] = {};
-    if (!cachedName(record, nm, sizeof(nm)) || !sealed::hangarLikeName(nm)) return;
+    if (!cachedNameOfNode(node, nm, sizeof(nm)) || !sealed::hangarLikeName(nm)) return;
     GatherEntry e = gatherEntry(GKind::kHangar, record, centre, radius, 0, nm);
     e.dist = d;
     w.push(e);
@@ -1543,7 +1507,13 @@ void sealStatus(const sealed::OwnCell& cell, uint32_t frame) noexcept {
 
 // The 30 s summary: what the station did in the window. A user's log shows the station's work here.
 void summaryLine(uint64_t now) noexcept {
-    Log::get().note("optimized station: last %llu s: sealed for %llu of %llu frames; rigs vetoed early %llu, records vetoed early %llu, "
+    // Built v14.31: the lines are written for a window in which the commander was docked or sealed (a flight in space writes none); the window resets either way.
+    const bool quiet = g_winDockedFrames == 0 && g_winSealedFrames == 0;
+#define SUMMARY_NOTE(...) \
+    do {                  \
+        if (!quiet) Log::get().note(__VA_ARGS__); \
+    } while (0)
+    SUMMARY_NOTE("optimized station: last %llu s: sealed for %llu of %llu frames; rigs vetoed early %llu, records vetoed early %llu, "
                     "records culled after the store %llu, records kept unread %llu, faults %llu (unreadable bucket %llu, cull read %llu, cull restored "
                     "%llu, cull torn %llu, tick view %llu; callbacks before the first camera %llu, not faults).",
                     static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(g_winSealedFrames),
@@ -1558,7 +1528,7 @@ void summaryLine(uint64_t now) noexcept {
     {
         const sealed::PassGate& g = g_passGate;
         const double avg = g.informative > 0 ? static_cast<double>(g.callsSum) / static_cast<double>(g.informative) : 0.0;
-        Log::get().note("optimized station: last %llu s passes: %llu informative, %llu empty, %llu unfinished (a writer was still inside), %llu thin (under "
+        SUMMARY_NOTE("optimized station: last %llu s passes: %llu informative, %llu empty, %llu unfinished (a writer was still inside), %llu thin (under "
                         "half the usual calls); callbacks per informative pass min/avg/max %llu/%.0f/%llu; the own pad's record in %llu informative passes, "
                         "missing from %llu, missing from the whole window %llu; camera held through %llu failed resolutions, %llu jumps over %.0f m, %llu "
                         "context changes; rig publications %llu (%.0f rigs each); rig requests sent %llu; origin shifts re-based by the latch %llu.",
@@ -1572,35 +1542,13 @@ void summaryLine(uint64_t now) noexcept {
                         g_winRigPublications > 0 ? static_cast<double>(g_winRigPublished) / static_cast<double>(g_winRigPublications) : 0.0,
                         static_cast<unsigned long long>(g_rigTally.asked.load()), static_cast<unsigned long long>(g_winOriginShifts));
         g_winOriginShifts = 0;
-        // Built v14.29: where the store observer's time goes, by stage, over the sampled calls; and what the node flags and the pass sampling saved.
-        {
-            const double n = g_splitN > 0 ? static_cast<double>(g_splitN) : 1.0;
-            double tot = 0.0;
-            double ns[kStgCount];
-            for (size_t i = 0; i < kStgCount; ++i) {
-                ns[i] = g_splitSumMs[i] * 1.0e6 / n;
-                tot += ns[i];
-            }
-            const uint64_t hit = g_winNodeHit.exchange(0, std::memory_order_relaxed);
-            const uint64_t miss = g_winNodeMiss.exchange(0, std::memory_order_relaxed);
-            const uint64_t skipped = g_winSkippedWorld.exchange(0, std::memory_order_relaxed);
-            const uint64_t fullCalls = g_winFullPassCalls.exchange(0, std::memory_order_relaxed);
-            Log::get().note("optimized station: cost split last %llu s (store observer, %llu sampled calls of one in 32, mean ns per call): dispatch and "
-                            "writer %.0f, snapshot pin %.0f, bucket and view reads %.0f, node class and flags %.0f, world read %.0f, gathers %.0f, "
-                            "judgement and return %.0f; total %.0f ns. Node cache: %llu hits, %llu name reads. World read skipped by the node flags: %llu "
-                            "calls; calls in a full gather pass (near list, own candidate, tally): %llu.",
-                            static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(g_splitN), ns[kStgWriter],
-                            ns[kStgPin], ns[kStgReads], ns[kStgNode], ns[kStgWorld], ns[kStgGather], ns[kStgJudge], tot, static_cast<unsigned long long>(hit),
-                            static_cast<unsigned long long>(miss), static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(fullCalls));
-            for (double& v : g_splitSumMs) v = 0.0;
-            g_splitN = 0;
-        }
         g_passGate.clearWindow();
         g_winPadSeen = g_winPadMissed = g_winPadAbsentWindow = g_winCamHold = g_winCamJump = g_winCtxChange = 0;
         g_winRigPublications = g_winRigPublished = 0;
     }
-    // Built v14.20 (review 5): the tables' occupancy now, the longest probe and the bounded (full) count this window, and the rig epoch count.
-    Log::get().note("optimized station: last %llu s tables: producer %u of %u used, longest probe %u, bounded %llu; rigs %u of %u, longest %u, "
+    // Built v14.20 (review 5), v14.31: the tables' occupancy now (written only when a probe bound was hit), the longest probe and the bounded (full) count this window, and the rig epoch count.
+    if (g_prodStats.full.load(std::memory_order_relaxed) + g_rigStats.full + g_collStats.full > 0)
+    SUMMARY_NOTE("optimized station: last %llu s tables: producer %u of %u used, longest probe %u, bounded %llu; rigs %u of %u, longest %u, "
                     "bounded %llu; collections %u of %u, longest %u, bounded %llu; rig epochs %llu (epoch %u).",
                     static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned>(prodOccupancy()),
                     static_cast<unsigned>(kProdSlots), static_cast<unsigned>(g_prodStats.maxProbes),
@@ -1650,12 +1598,12 @@ void summaryLine(uint64_t now) noexcept {
         g_winLost = 0;
         g_lockOnCallback.store(0, std::memory_order_relaxed);
         const double fr = frames > 0 ? static_cast<double>(frames) : 1.0;
-        Log::get().note("optimized station: cost last %llu s: store observer %llu calls (%.1f per frame, ~%.4f ms per frame; p50/p95/max %.4f/%.4f/%.4f "
+        SUMMARY_NOTE("optimized station: cost last %llu s: store observer %llu calls (%.1f per frame, ~%.4f ms per frame; p50/p95/max %.4f/%.4f/%.4f "
                         "ms per call, %llu sampled), producer veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu "
                         "sampled), rig veto %llu calls (%.1f per frame, ~%.4f ms per frame; %.4f/%.4f/%.4f ms per call, %llu sampled), frame tick "
                         "%.3f/%.3f/%.3f ms per frame (%llu frames), mutex wait total %.3f ms max %.3f ms (blocked over 0.1 ms: %llu), waiting lines "
                         "written %llu; gathered entries lost %llu; state lock taken from a callback %llu; rig veto lookups: hit vetoed %llu, hit kept %llu, "
-                        "collection moved %llu, miss %llu, stale epoch %llu (rig requests sent %llu).",
+                        "collection moved %llu, miss %llu, stale epoch %llu (rig requests sent %llu); node names read from the game %llu, uncached node reads %llu.",
                         static_cast<unsigned long long>((now - g_summaryStartMs) / 1000), static_cast<unsigned long long>(callsStore),
                         static_cast<double>(callsStore) / fr, meanStore * static_cast<double>(callsStore) / fr, s50, s95, smax,
                         static_cast<unsigned long long>(nStore), static_cast<unsigned long long>(callsProd), static_cast<double>(callsProd) / fr,
@@ -1666,7 +1614,9 @@ void summaryLine(uint64_t now) noexcept {
                         static_cast<unsigned long long>(lost), static_cast<unsigned long long>(onCallback),
                         static_cast<unsigned long long>(g_rigTally.hitVetoed.load()), static_cast<unsigned long long>(g_rigTally.hitKept.load()),
                         static_cast<unsigned long long>(g_rigTally.hitMoved.load()), static_cast<unsigned long long>(g_rigTally.miss.load()),
-                        static_cast<unsigned long long>(g_rigTally.stale.load()), static_cast<unsigned long long>(g_rigTally.asked.load()));
+                        static_cast<unsigned long long>(g_rigTally.stale.load()), static_cast<unsigned long long>(g_rigTally.asked.load()),
+                        static_cast<unsigned long long>(g_nodeNameReads.exchange(0, std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(g_nodeCacheFull.exchange(0, std::memory_order_relaxed)));
         g_rigTally.hitVetoed = 0;
         g_rigTally.hitKept = 0;
         g_rigTally.hitMoved = 0;
@@ -1675,9 +1625,8 @@ void summaryLine(uint64_t now) noexcept {
         g_rigTally.asked = 0;
     }
 
-    // Built v14.30: the log-only probes' windows (each writes its own line and starts afresh).
-    clusterProbeReport((now - g_summaryStartMs) / 1000);
-    sunShadowProbeReport((now - g_summaryStartMs) / 1000);
+    // Built v14.31: the sun shadow skip's 30 s line (written only when the sun skip was on in the window).
+    sunShadowSkipReport((now - g_summaryStartMs) / 1000);
 
     g_prodStats.maxProbes.store(0, std::memory_order_relaxed);
     g_rigStats.maxProbes = g_collStats.maxProbes = 0;
@@ -1685,11 +1634,12 @@ void summaryLine(uint64_t now) noexcept {
     g_rigStats.full = g_collStats.full = 0;
     g_rigEpochs = 0;
     g_summaryStartMs = now;
-    g_winFrames = g_winSealedFrames = g_winRigVetoes = g_winProducerVetoes = 0;
+    g_winFrames = g_winSealedFrames = g_winDockedFrames = g_winRigVetoes = g_winProducerVetoes = 0;
     g_winCulled = g_winKeptUnknown = g_winFaults = 0;
     g_winNoCamera = 0;
     for (auto& f : g_winFaultBy) f = 0;
 }
+#undef SUMMARY_NOTE
 
 // The producer-B and rig vetoes: attached while the setting is on, and they answer only while sealed.
 bool producerVetoBody(uintptr_t rec, uintptr_t owner) noexcept {
@@ -1775,7 +1725,6 @@ void applySetting(bool on, uint32_t frame) noexcept {
     } else {
         Log::get().note("optimized station: off (frame %u).", frame);
     }
-    clusterProbeSetOn(on);   // built v14.30: the cluster builder's probe follows the setting (log only)
     padStateSetOn(on);   // built v14.22: the pad-state probe (temporary, log only) installs with the setting
     g_vetoesAttached = on;
 }
@@ -1944,13 +1893,6 @@ void applyEntry(const GatherEntry& e) {
             applyRigAssoc(e.aux, e.coll);
             break;
         case GKind::kCost:
-            if (e.flags == 3) {
-                float ms[kStgCount];
-                std::memcpy(ms, e.name, sizeof(ms));
-                for (size_t i = 0; i < kStgCount; ++i) g_splitSumMs[i] += static_cast<double>(ms[i]);
-                ++g_splitN;
-                break;
-            }
             if (e.flags == 0) costAdd(g_costStore, static_cast<double>(e.ms));
             else if (e.flags == 1) costAdd(g_costProducer, static_cast<double>(e.ms));
             else costAdd(g_costRig, static_cast<double>(e.ms));
@@ -1990,7 +1932,7 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
     g_ownCandidateDist = -1.0f;
     g_prefixTallyN = 0;   // the tally is this frame's records (built v14.8)
     // Built v14.29: a pass that did not sample the near list leaves the last sampled one standing (the engage reads it).
-    if (g_nearCurN > 0 || g_gatherAllPublished) {
+    if (g_nearCurN > 0 || g_engagePublished) {
         std::memcpy(g_nearPrev, g_nearCur, sizeof(g_nearPrev));
         g_nearPrevN = g_nearCurN;
     }
@@ -2172,8 +2114,8 @@ void publishSnapshot() noexcept {
     std::memcpy(s.ownLiveCentre, g_ownLiveCentre, sizeof(s.ownLiveCentre));
     s.ownLiveRadius = g_ownLiveRadius;
     s.lost = g_lossPublished;
-    s.gatherAll = g_heldValid || g_engagePending;
-    g_gatherAllPublished = s.gatherAll;
+    s.engagePending = g_engagePending;
+    g_engagePublished = g_engagePending;
     g_snapRing.publish();
 }
 
@@ -2223,15 +2165,13 @@ void gatherRigNote(GatherWriter& w, uintptr_t bucket, uintptr_t record, const fl
 // the tick needs into its thread's slot, and judges from the view alone. Order: the centre (unreadable: kept), the gathered parts (pads, explicit parts,
 // the near list, the own candidate, the ship's tally, the latch and the hangar names), then (judge only) the named keep, the bay keep, the own ship, and
 // otherwise culled. judge: the sealed judgement; false: gathering only.
-void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock* sc) noexcept {
+void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     // Built v14.27: the callback is one Writer. Its entries all go to the pass of the stamp it read on entry, and the pass is not read while it is inside.
     GatherWriter w(g_gather);
     w.call(0);
     TlsCounters& tc = tcFor(g_frameStamp.load(std::memory_order_relaxed));   // built v14.29: the thread's own counters
-    stageMark(sc, kStgWriter);
     SnapshotPin pin;
     const PadSnapshot& s = pin.get();
-    stageMark(sc, kStgPin);
     if (judge && !s.held) return;
     uintptr_t ctx = 0;
     uint32_t count = 0;
@@ -2245,7 +2185,6 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
         ++tc.noCamera;
         return;
     }
-    stageMark(sc, kStgReads);
     const float* cam = s.cam;
     const uint32_t stamp = w.stamp();
     const bool lost = s.lost || w.lostSinceDrain() != 0;   // a loss keeps every record (fail-safe)
@@ -2253,15 +2192,9 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
     // pass that does not sample the near list, the own candidate and the tally reads the centre only of the nodes that can matter (pads, explicit parts,
     // and the mechanism and hangar names while they are wanted); every other record returns here.
     uintptr_t node = 0;
-    bool nodeMiss = false;
-    const NodeInfo ni = nodeInfoOf(record, &node, &nodeMiss);
-    if (nodeMiss) ++tc.nodeMiss;
-    else ++tc.nodeHit;
-    stageMark(sc, kStgNode);
-    const bool full = sealed::fullGatherPass(stamp, s.gatherAll);
-    if (full) ++tc.fullPassCalls;
+    const NodeInfo ni = nodeInfoOf(record, &node);
+    const bool full = sealed::fullGatherPass(stamp, s.engagePending, s.held);
     if (!judge && !sealed::nodeWantsCentre(ni.cls, ni.flags, s.giveUp, s.latchPending, s.namesPending, full)) {
-        ++tc.skippedWorld;
         return;
     }
     const WorldRead wr = worldOfRecord(record);
@@ -2269,7 +2202,6 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
         ++tc.worldSrc[wr.source];
         if (wr.source != 4) gatherRigNote(w, bucket, record, wr.world, wr.radius, stamp);
     }
-    stageMark(sc, kStgWorld);
     const float* centre = wr.world;
     const float radius = wr.radius;
     if (wr.source == 4 || !std::isfinite(radius) || !(radius > 0.0f) || !std::isfinite(centre[0]) || !std::isfinite(centre[1]) ||
@@ -2279,7 +2211,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
     }
     if (ni.cls == sealed::NameClass::kPad) {
         char name[64] = {};
-        if (cachedName(record, name, sizeof(name))) {
+        if (cachedNameOfNode(node, name, sizeof(name))) {
             const sealed::PadSize size = sealed::padSizeOf(name);
             if (size != sealed::PadSize::kNone) {
                 GatherEntry e = gatherEntry(GKind::kPad, record, centre, radius, stamp, name);
@@ -2289,7 +2221,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
         }
     } else if (ni.cls == sealed::NameClass::kExplicit && !s.giveUp) {   // built v14.13: stops after the give-up
         char xn[64] = {};
-        cachedName(record, xn, sizeof(xn));   // no name: the explicit part is still gathered, with an empty name
+        cachedNameOfNode(node, xn, sizeof(xn));   // no name: the explicit part is still gathered, with an empty name
         GatherEntry e = gatherEntry(GKind::kExplicit, record, centre, radius, stamp, xn);
         e.aux = node;
         w.push(e);
@@ -2301,7 +2233,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
     if (full) {
         if (dCam <= kOwnNearM) {
             char nn[64] = {};
-            if (cachedName(record, nn, sizeof(nn))) {
+            if (cachedNameOfNode(node, nn, sizeof(nn))) {
                 GatherEntry e = gatherEntry(GKind::kNear, record, centre, radius, stamp, nn);
                 e.dist = dCam;
                 w.push(e);
@@ -2309,7 +2241,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
         }
         if (containsCam && radius < sealed::kOwnShipRadiusM) {
             char cn[64] = {};
-            if (cachedName(record, cn, sizeof(cn))) {
+            if (cachedNameOfNode(node, cn, sizeof(cn))) {
                 GatherEntry e = gatherEntry(GKind::kOwnCand, record, centre, radius, stamp, cn);
                 e.dist = dCam;
                 w.push(e);
@@ -2318,12 +2250,11 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
         // The ship's part count by prefix (built v14.8). A name with no prefix counts for nothing, so a node without the prefix flag is not read.
         if (dCam <= sealed::kShipRecordsM && (ni.flags & sealed::kNodeShipPrefix) != 0) {
             char tn[64] = {};
-            if (cachedName(record, tn, sizeof(tn))) w.push(gatherEntry(GKind::kTally, record, centre, radius, stamp, tn));
+            if (cachedNameOfNode(node, tn, sizeof(tn))) w.push(gatherEntry(GKind::kTally, record, centre, radius, stamp, tn));
         }
     }
-    latchCandNote(w, record, centre, s, ni.flags);   // built v14.12: gathered only while a latch is pending
-    hangarNameNote(w, record, centre, radius, s, ni.flags);   // built v14.13: only while the names are wanted
-    stageMark(sc, kStgGather);
+    latchCandNote(w, record, node, centre, s, ni.flags);   // built v14.12: gathered only while a latch is pending
+    hangarNameNote(w, record, node, centre, radius, s, ni.flags);   // built v14.13: only while the names are wanted
     if (!judge) return;   // gathering only: the judgement is sealed-only
     if (lost) {
         ++tc.kept;
@@ -2337,12 +2268,12 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
         float u[3] = {};
         if (sealed::unitBetween(s.cell.capA, s.cell.capB, u) && sealed::inBayVolume(centre, s.cell.capA, u, s.cell.capLen, belowFor(s.cell.size))) {
             char bn[64] = {};
-            if (cachedName(record, bn, sizeof(bn)) && sealed::bayPartName(bn)) keep = true;
+            if (cachedNameOfNode(node, bn, sizeof(bn)) && sealed::bayPartName(bn)) keep = true;
         }
     }
     if (!keep) {
         char nm[64] = {};
-        if (s.ownPrefix[0] != '\0') cachedName(record, nm, sizeof(nm));
+        if (s.ownPrefix[0] != '\0') cachedNameOfNode(node, nm, sizeof(nm));
         if (sealed::ownShipExempt(containsCam, radius, nm, s.ownPrefix)) keep = true;
     }
     if (!keep && s.ownLiveValid && sealed::ownSphereKeeps(centre, s.ownLiveCentre, s.ownLiveRadius, kOwnSphereMarginM)) keep = true;
@@ -2359,6 +2290,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge, StageClock*
 
 // Once, at install: reads fix.optimized_station (on in VR, off in flat; the flat profile does not read it).
 void optimizedStationInstall(bool flatProfile) {
+    g_settingDefaultOn = !flatProfile;
     const std::string text = Config::get().getString("fix.optimized_station", flatProfile ? "off" : "on");
     const bool on = text != "off";
     g_setting.store(on, std::memory_order_release);
@@ -2373,21 +2305,21 @@ bool optimizedStationGathers() noexcept { return g_setting.load(std::memory_orde
 bool optimizedStationSealed() noexcept { return g_sealedFlag.load(std::memory_order_acquire); }
 
 // The draw path asks: while sealed, the sun pair is not drawn.
-bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps) noexcept {
+bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps, void* ctx) noexcept {
     if (!g_sunOff.load(std::memory_order_acquire)) return false;
-    sunShadowProbeDraw(vs, ps);   // built v14.30: log only; counts the draws into and the samplers of the sun's shadow map while the sun is skipped
-    return vs == kSunVs && ps == kSunPs;   // the sun skip follows the pad, not the seal (built v14.13)
+    if (vs == kSunVs && ps == kSunPs) return true;   // the sun skip follows the pad, not the seal (built v14.13)
+    return sunShadowSkipDraw(ctx, vs, ps);           // built v14.31: the sun's shadow cascade map is not drawn while the sun is skipped (scan and fail-safe inside)
 }
 
 bool optimizedStationSunOff() noexcept { return g_sunOff.load(std::memory_order_acquire); }
 
 // The store calls this after it has written a record (bucket = the collection, record = its record). While sealed it judges the record; while
 // docked and unsealed it only gathers the frame's pads, explicit parts and camera for the seal trigger (built v14.1).
-void afterStoreDispatch(uintptr_t bucket, uintptr_t record, StageClock* sc) noexcept {
+void afterStoreDispatch(uintptr_t bucket, uintptr_t record) noexcept {
     const sealed::StoreMode mode = sealed::storeMode(g_setting.load(std::memory_order_acquire), g_sealedFlag.load(std::memory_order_acquire),
                                                      g_dockedNow.load(std::memory_order_acquire));
     if (mode == sealed::StoreMode::kNone) return;
-    afterStoreJudge(bucket, record, mode == sealed::StoreMode::kJudge, sc);
+    afterStoreJudge(bucket, record, mode == sealed::StoreMode::kJudge);
 }
 
 // The store observer's entry (the store hook calls it per record), timed one call in 32 (built v14.24; the sample is gathered since v14.26).
@@ -2396,18 +2328,9 @@ void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept {
     TlsCounters& tc = tcFor(g_frameStamp.load(std::memory_order_relaxed));
     ++tc.callsStore;
     const bool sample = costSampleCall(tc.sampleStore);
-    if (!sample) {
-        afterStoreDispatch(bucket, record, nullptr);
-        return;
-    }
-    // Built v14.29: a sampled call (one in 32) is split by stage; the total and the split go to the tick as cost entries.
-    StageClock clk;
-    clk.last = costTicks();
-    const int64_t t0 = clk.last;
-    afterStoreDispatch(bucket, record, &clk);
-    stageMark(&clk, kStgJudge);
-    costPush(0, costMs(t0, costTicks()));
-    costPushSplit(clk);
+    const int64_t t0 = sample ? costTicks() : 0;
+    afterStoreDispatch(bucket, record);
+    if (sample) costPush(0, costMs(t0, costTicks()));
 }
 
 // The render thread's frame tick: the setting, the held cell in the pad's frame, the seal and release rules, the rig verdicts, the summary.
@@ -2524,7 +2447,7 @@ void optimizedStationFrame(uint32_t frame) {
 void optimizedStationFrameBody(uint32_t frame) {
     if (++g_settingPoll >= kSettingPollFrames) {
         g_settingPoll = 0;
-        const std::string text = Config::get().getString("fix.optimized_station", "on");
+        const std::string text = Config::get().getString("fix.optimized_station", g_settingDefaultOn ? "on" : "off");   // the install's default (VR on, flat off)
         const bool on = text != "off";
         if (on != g_setting.load(std::memory_order_acquire)) {
             g_setting.store(on, std::memory_order_release);
@@ -2538,14 +2461,14 @@ void optimizedStationFrameBody(uint32_t frame) {
     }
     if (g_summaryStartMs == 0) g_summaryStartMs = now;
     // Built v14.2: the frame advances here, once per tick. The observer's promote and view resolve run once per frame off this stamp.
-    clusterProbeFrame();                                              // built v14.30: log-only probes' frame clocks
-    sunShadowProbeFrame(g_sunOff.load(std::memory_order_acquire));
+    sunShadowSkipFrame(g_sunOff.load(std::memory_order_acquire));   // built v14.31: the sun shadow skip's window
     g_frameStamp.fetch_add(1, std::memory_order_seq_cst);   // built v14.27: the callbacks that read the old stamp are the old pass's writers
     TimedStateLock lock;
     prodSync();   // built v14.26: the producer generation moves with the frame (the callbacks never move it)
     drainGather();          // the entries of the passes the stamp just closed, if every writer of them has left (built v14.27)
     resolveTickView();      // the camera from the pass's busiest context; held when the pass is empty or unfinished (built v14.27)
     ++g_winFrames;
+    if (g_dockedNow.load(std::memory_order_acquire)) ++g_winDockedFrames;
     if (g_heldValid) ++g_winSealedFrames;
     g_dockedKnownNow.store(journalDockedKnown(), std::memory_order_release);
     g_dockedNow.store(journalDockedKnown() && journalDocked(), std::memory_order_release);

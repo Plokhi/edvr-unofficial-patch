@@ -14,8 +14,9 @@ bool optimizedStationGathers() noexcept;
 bool optimizedStationSealed() noexcept;
 // Whether the station's sun skip is on now (one atomic load; built v14.30: the sun-shadow probe and the dispatch hook read it).
 bool optimizedStationSunOff() noexcept;
-// The draw path asks: true skips the draw (the sun pair, while sealed).
-bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps) noexcept;
+// The draw path asks: true skips the draw (the sun pair while the sun skip is on, and, once a scan has cleared it, the draws into the sun's shadow cascade
+// map). ctx is the immediate context (the shadow skip's scan enumerates its shader-resource bindings).
+bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps, void* ctx) noexcept;
 // The admission store calls this after it has written a record (bucket = the collection, record = its record).
 void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept;
 // The render thread's frame tick: the setting, the seal and release rules, the 30 s summary.

@@ -367,14 +367,16 @@ void padStateTick(uint64_t nowMs, uintptr_t own) noexcept {
     if (nowMs - g_summaryStartMs >= 30000) {
         char line[512];
         const double windowS = static_cast<double>(nowMs - g_summaryStartMs) / 1000.0;
+        bool anyCalls = false;
         {
             SpinLock guard;
+            for (const uint64_t c : g_table.readerCalls) anyCalls = anyCalls || c != 0;
             pad::formatPadSummary(line, sizeof(line), g_table, windowS);
             for (uint64_t& c : g_table.readerCalls) c = 0;
             g_table.maxProbes = 0;
             g_table.suppressed = 0;
         }
-        Log::get().note("%s", line);
+        if (anyCalls) Log::get().note("%s", line);   // built v14.31: a window in which the game called no docking reader writes no line
         g_summaryStartMs = nowMs;
     }
 }

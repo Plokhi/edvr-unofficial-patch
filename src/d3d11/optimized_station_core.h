@@ -911,13 +911,12 @@ inline NamedKeep keepNamedCell(const float centre[3], float radius, const float 
 
 // The class cache's slot (lock-free): node>>3 in bits 0..43, the class in bits 44..46 (never 0 for a stored slot), the frame's stamp in bits
 // 47..63. A zero word is an empty slot. A node that is not 8-aligned or is out of the 47-bit user range is not cached.
-// Built v14.29: the slot also carries the node's flags (what its name is good for) in bits 47..49, and the key in bits 50..63 (14 bits). The key is the
-// frame stamp in groups of kClassKeyFrames plus the lifecycle generation, so a node's name is read once per group of frames (it was once per frame), and a
+// Built v14.29: the slot also carries the node's flags (what its name is good for) in bits 47..49, and the key in bits 50..63 (14 bits). Built v14.31:
+// the key is the lifecycle generation alone: a node's name does not change while the node lives, so it is read once per node per generation, and a
 // lifecycle point (undock, hangar change, ship change, setting toggle) starts every node afresh.
 constexpr uint64_t kSlotNodeMask = (uint64_t(1) << 44) - 1;
 
 constexpr uint32_t kSlotKeyMask = (1u << 14) - 1;
-constexpr uint32_t kClassKeyFrames = 8;   // frames a node's class and flags are trusted (a node is a model definition; a freed and reused node is the risk)
 
 constexpr uint32_t kNodeMechanism = 1;    // the name is a bay mechanism record (Lift, BlastShield, HangarGate ...): a latch candidate
 constexpr uint32_t kNodeHangarLike = 2;   // the name could name the hangar (Hanger, Pad, Lift, Bay ...): the names note wants it
@@ -925,8 +924,8 @@ constexpr uint32_t kNodeShipPrefix = 4;   // the name has a type prefix up to an
 
 inline bool slotFits(uintptr_t node) noexcept { return (node & 7u) == 0 && (uint64_t(node) >> 3) <= kSlotNodeMask; }
 
-// The key a frame stamp and a lifecycle generation give.
-inline uint32_t classKey(uint32_t stamp, uint32_t generation) noexcept { return (stamp / kClassKeyFrames + generation) & kSlotKeyMask; }
+// The key a lifecycle generation gives.
+inline uint32_t classKey(uint32_t generation) noexcept { return generation & kSlotKeyMask; }
 
 inline uint64_t packSlot(uintptr_t node, NameClass cls, uint32_t flags, uint32_t key) noexcept {
     return (uint64_t(node) >> 3) | (uint64_t(static_cast<uint8_t>(cls)) << 44) | (uint64_t(flags & 7u) << 47) | (uint64_t(key & kSlotKeyMask) << 50);
@@ -1759,10 +1758,13 @@ inline bool nodeWantsCentre(NameClass cls, uint32_t flags, bool giveUp, bool lat
     return false;
 }
 
-// Built v14.29: whether a pass is a full one. The pass of stamp S samples the near list, the own candidate and the ship tally every kSamplePass-th stamp,
-// and every stamp while sealed or while an engage is pending.
+// Built v14.29, v14.31: whether a pass is a full one. The pass of stamp S samples the near list, the own candidate and the ship tally every
+// kSamplePass-th stamp unsealed and every kSamplePassSealed-th while sealed, and every stamp while an engage is pending.
 constexpr uint32_t kSamplePass = 8;
-inline bool fullGatherPass(uint32_t stamp, bool gatherAll) noexcept { return gatherAll || (stamp % kSamplePass) == 0; }
+constexpr uint32_t kSamplePassSealed = 4;
+inline bool fullGatherPass(uint32_t stamp, bool engagePending, bool sealed) noexcept {
+    return engagePending || (stamp % (sealed ? kSamplePassSealed : kSamplePass)) == 0;
+}
 
 // Advances the state and returns the action (built v14.23: the game's pad state decides). Seal when the own pad is in the hangar by the game (r1 1,
 // fresh), the setting is on, Status says docked, the pad pick and cell are valid, and the camera is in the bay for kCameraFrames. Seal at once: no
