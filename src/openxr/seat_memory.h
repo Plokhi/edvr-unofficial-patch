@@ -329,17 +329,25 @@ struct SeatEvents {
   bool applyWanted = false;     // put the stored seat back (the host retries until it lands, then calls applyDone)
   bool noSeat = false;          // an apply was due and nothing is stored
   const char* why = "";
+  // A manual-looking recentre made less than kRetroMs before this transition is retroactively inside its window: it is dropped and the seat
+  // it was going to replace stands. The host logs it (seat_store,action=discard_pending).
+  bool discardedPending = false;
+  uint64_t discardAgeMs = 0;
+  SeatPose discardedSeat, restoredSeat;
 };
 
 class SeatMemory {
  public:
+  // The window also reaches BACKWARD: Elite's reset on the way up the ramp lands 2.6 to 4.4 s before the boarding flip is even visible, so a
+  // reset outside any window is held for this long before it is believed to be the player's own (the disk is not written until then).
+  static constexpr uint64_t kRetroMs = 8000;
   static constexpr uint64_t kWindowMs = 10000;   // measured: game resets near an Embark fall between 4.4 s before and 4.2 s after its journal line
 
   // --- the stored seat
   bool has() const { return has_; }
   const SeatPose& seat() const { return seat_; }
-  void setSeat(const SeatPose& s) { seat_ = s; has_ = true; }
-  void clearSeat() { has_ = false; originIsSeat_ = false; pendingApply_ = false; }
+  void setSeat(const SeatPose& s) { seat_ = s; has_ = true; pendingStore_ = false; }
+  void clearSeat() { has_ = false; originIsSeat_ = false; pendingApply_ = false; pendingStore_ = false; }
   // The seated origin right now IS the stored seat (set after the host applies or stores it; cleared by any other origin change).
   bool originIsSeat() const { return originIsSeat_; }
   void noteOrigin(bool isSeat) { originIsSeat_ = isSeat && has_; }
@@ -354,7 +362,21 @@ class SeatMemory {
   // A recentre the runtime made (SteamVR's dashboard, Pimax Play) is always the player's: the head as it is in the new LOCAL is the seat.
   // `applied` true: the host has already made it the origin (it is then exactly HonourStore's outcome, and the caller says so with noteReset).
   // This is the other case: the head could not be sampled, LOCAL's own origin is the seat, and it goes back as soon as a frame allows.
-  void storeAndApplyLater(const SeatPose& s) { seat_ = s; has_ = true; originIsSeat_ = false; pendingApply_ = true; }
+  void storeAndApplyLater(const SeatPose& s) { seat_ = s; has_ = true; originIsSeat_ = false; pendingApply_ = true; pendingStore_ = false; }
+  // The runtime's recentre has been applied as the origin: always the player, never deferred. True: write the seat out now.
+  bool noteRuntimeRecentre(const SeatPose& origin) {
+    seat_ = origin; has_ = true; originIsSeat_ = true; pendingApply_ = false; pendingStore_ = false;
+    return true;
+  }
+  // A deferred store has waited kRetroMs with no transition: it is the player's. True once, with how long it waited; the host writes it out.
+  bool takeCommit(uint64_t now, uint64_t& deferredMs) {
+    if (!pendingStore_ || now < pendingAt_ || now - pendingAt_ < kRetroMs) return false;
+    pendingStore_ = false;
+    deferredMs = now - pendingAt_;
+    return true;
+  }
+  bool storePending() const { return pendingStore_; }
+  const SeatPose& previousSeat() const { return pendingPrev_; }
   void applyDone() { pendingApply_ = false; }
 
   static SeatWhere whereOf(const SeatContext& c) {
@@ -404,11 +426,20 @@ class SeatMemory {
   }
 
   // The host honoured or replaced the reset: the origin is now `origin` (for a replacement, the stored seat itself). Returns true when the stored
-  // seat changed and must be written out.
-  bool noteReset(SeatResetDecision d, const SeatPose& origin) {
+  // seat changed and must be written out NOW. A player-looking recentre over a stored seat is not: the seat it replaces is kept for kRetroMs
+  // (the memory holds the new seat meanwhile, as it always did), and a transition inside that time throws the new one away. With no seat
+  // stored there is nothing to go back to and it is written at once.
+  bool noteReset(SeatResetDecision d, const SeatPose& origin, uint64_t now = 0) {
     switch (d) {
       case SeatResetDecision::ReplaceWithSeat: originIsSeat_ = has_; pendingApply_ = false; return false;
-      case SeatResetDecision::HonourStore: seat_ = origin; has_ = true; originIsSeat_ = true; pendingApply_ = false; return true;
+      case SeatResetDecision::HonourStore: {
+        const bool deferred = has_;
+        if (deferred && !pendingStore_) pendingPrev_ = seat_;      // a second reset inside the wait keeps the FIRST previous seat
+        seat_ = origin; has_ = true; originIsSeat_ = true; pendingApply_ = false;
+        pendingStore_ = deferred;
+        pendingAt_ = now;
+        return !deferred;
+      }
       default: originIsSeat_ = false; return false;
     }
   }
@@ -417,6 +448,13 @@ class SeatMemory {
   SeatEvents& transition(SeatEvents& ev, uint64_t now, const char* why, bool apply) {
     windowOpen_ = true; windowBegan_ = now;
     ev.windowOpened = true; ev.why = why;
+    if (pendingStore_) {
+      ev.discardedPending = true;
+      ev.discardAgeMs = now >= pendingAt_ ? now - pendingAt_ : 0;
+      ev.discardedSeat = seat_; ev.restoredSeat = pendingPrev_;
+      seat_ = pendingPrev_; originIsSeat_ = false; pendingStore_ = false;     // the origin is the discarded pose; the old seat goes back
+      apply = true;
+    }
     if (apply) {
       if (!has_) ev.noSeat = true;
       else if (!originIsSeat_) { ev.applyWanted = true; pendingApply_ = true; }
@@ -428,6 +466,9 @@ class SeatMemory {
   SeatWhere where_ = SeatWhere::Unknown;
   bool seen_ = false;
   bool has_ = false, originIsSeat_ = false, pendingApply_ = false;
+  bool pendingStore_ = false;
+  uint64_t pendingAt_ = 0;
+  SeatPose pendingPrev_;
   bool windowOpen_ = false;
   uint64_t windowBegan_ = 0;
   SeatPose seat_;

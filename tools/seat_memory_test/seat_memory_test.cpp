@@ -108,7 +108,11 @@ void noteResets() {
     check(!m.noteReset(SeatResetDecision::GameMode, fresh) && !m.originIsSeat(), "game mode stores nothing");
     check(!m.noteReset(SeatResetDecision::HonourNoSeat, fresh) && nearPose(m.seat(), seat), "an automatic reset with nothing stored stores nothing");
     check(!m.noteReset(SeatResetDecision::ReplaceWithSeat, seat) && m.originIsSeat(), "a replacement leaves the origin on the seat, nothing to write");
-    check(m.noteReset(SeatResetDecision::HonourStore, fresh) && nearPose(m.seat(), fresh) && m.originIsSeat(), "the player's own recentre is stored (and says write)");
+    check(!m.noteReset(SeatResetDecision::HonourStore, fresh, 100) && nearPose(m.seat(), fresh) && m.originIsSeat() && m.storePending(),
+          "the player's own recentre over a stored seat is held, not written");
+    uint64_t waited = 0;
+    check(!m.takeCommit(8099, waited) && m.takeCommit(8100, waited) && waited == 8000 && !m.storePending() && !m.takeCommit(9000, waited),
+          "...and committed once, eight seconds later");
     SeatMemory none;
     check(none.noteReset(SeatResetDecision::HonourStore, fresh) && none.has() && nearPose(none.seat(), fresh), "the first recentre aboard becomes the seat");
     none.noteOrigin(true);
@@ -312,12 +316,19 @@ void runtimeRecentre() {
         m.onContext(ctx(true, SeatWhere::Unknown), 0);
         m.onContext(ctx(true, where), 100);
         // inside the window the game's reset would be replaced; the runtime's recentre is stored whatever the window says
-        m.noteReset(SeatResetDecision::HonourStore, head);
+        check(m.noteRuntimeRecentre(head), "a runtime recentre says write now");
         check(nearPose(m.seat(), head) && m.originIsSeat() && !m.applyPending(), "a runtime recentre stores the sampled head as the seat, in any state, in or out of a window");
     }
     SeatMemory none;
-    none.noteReset(SeatResetDecision::HonourStore, head);
+    none.noteRuntimeRecentre(head);
     check(none.has() && nearPose(none.seat(), head), "...even with no seat stored");
+    // never held: a held manual recentre is overtaken by the runtime's, and nothing is left pending to be taken back
+    SeatMemory held; held.setSeat(seat); held.onContext(ctx(true, SeatWhere::Aboard), 0); held.applyDone(); held.noteOrigin(true);
+    held.noteReset(SeatResetDecision::HonourStore, SeatPose{0.1, 0, 0, 0}, 20000);
+    check(held.storePending(), "(a manual recentre is held)");
+    held.noteRuntimeRecentre(head);
+    uint64_t w2 = 0;
+    check(!held.storePending() && !held.takeCommit(99999, w2) && nearPose(held.seat(), head), "...the runtime's recentre stores at once and cancels the hold");
     // the head could not be sampled: LOCAL's own origin, applied when a frame allows
     SeatMemory fb; fb.setSeat(seat); fb.onContext(ctx(true, SeatWhere::Aboard), 0); fb.applyDone(); fb.noteOrigin(true);
     fb.storeAndApplyLater(SeatPose{});
@@ -330,7 +341,7 @@ void runtimeRecentre() {
     // next boarding uses it
     SeatMemory nb; nb.setSeat(seat);
     nb.onContext(ctx(true, SeatWhere::OnFoot), 0); nb.applyDone(); nb.noteOrigin(true);
-    nb.noteReset(SeatResetDecision::HonourStore, head);
+    nb.noteRuntimeRecentre(head);
     nb.onContext(ctx(true, SeatWhere::Aboard, 1, 1), 5000);
     check(nb.classifyReset(5100) == SeatResetDecision::ReplaceWithSeat && nearPose(nb.seat(), head), "the next boarding's replacement is the runtime-recentred seat");
 }
@@ -459,6 +470,91 @@ void files() {
     check(GetFileAttributesW(root.c_str()) == INVALID_FILE_ATTRIBUTES, "the scratch folder is gone");
 }
 
+// ---- a reset outside any window is held for eight seconds before it is believed
+void retroWindow() {
+    const SeatPose seat{-0.53, 0.45, -1.11, seatDegToRad(-28)}, ramp{-0.20, 0.05, -0.40, seatDegToRad(20)};
+    // the ramp's reset 3 s before the boarding flip is dropped and the old seat applied
+    {
+        SeatMemory m; m.setSeat(seat);
+        m.onContext(ctx(true, SeatWhere::Unknown), 0);
+        m.onContext(ctx(true, SeatWhere::OnFoot, 0, 1), 1000);
+        m.applyDone(); m.noteOrigin(true);
+        const uint64_t t = 30000;                 // long after the on-foot window
+        check(m.classifyReset(t) == SeatResetDecision::HonourStore, "the ramp's reset is outside a window");
+        check(!m.noteReset(SeatResetDecision::HonourStore, ramp, t) && nearPose(m.seat(), ramp) && m.storePending() && nearPose(m.previousSeat(), seat),
+              "...honoured, held, with the old seat kept beside it");
+        uint64_t w = 0;
+        check(!m.takeCommit(t + 2999, w), "...not written yet");
+        const SeatEvents ev = m.onContext(ctx(true, SeatWhere::Aboard, 1, 2), t + 3000);
+        check(ev.discardedPending && ev.discardAgeMs == 3000, "boarding 3 s later discards it, saying how long it had waited");
+        check(nearPose(ev.discardedSeat, ramp) && nearPose(ev.restoredSeat, seat) && nearPose(m.seat(), seat), "...the old seat is back");
+        check(ev.applyWanted && m.applyPending() && !m.originIsSeat() && std::string(ev.why) == "boarded", "...and applied, as a transition (the origin is on the ramp pose)");
+        check(!m.storePending() && !m.takeCommit(t + 99999, w), "...and nothing is left to commit");
+        m.applyDone(); m.noteOrigin(true);
+    }
+    // a reset 9 s before boarding was committed a second ago
+    {
+        SeatMemory m; m.setSeat(seat);
+        m.onContext(ctx(true, SeatWhere::Unknown), 0);
+        m.onContext(ctx(true, SeatWhere::OnFoot, 0, 1), 1000);
+        m.applyDone(); m.noteOrigin(true);
+        const uint64_t t = 30000;
+        m.noteReset(SeatResetDecision::HonourStore, ramp, t);
+        uint64_t w = 0;
+        check(m.takeCommit(t + 8000, w) && w == 8000, "eight seconds on, it commits");
+        const SeatEvents ev = m.onContext(ctx(true, SeatWhere::Aboard, 1, 2), t + 9000);
+        check(!ev.discardedPending && nearPose(m.seat(), ramp), "boarding 9 s after is too late to take it back: it is the seat");
+        check(ev.windowOpened && !ev.applyWanted, "...and the origin is already on it");
+    }
+    // aboard, no transition: commits after eight seconds, once
+    {
+        SeatMemory m; m.setSeat(seat);
+        m.onContext(ctx(true, SeatWhere::Aboard, 1, 1), 0);
+        m.applyDone(); m.noteOrigin(true);
+        const uint64_t t = 60000;
+        check(m.classifyReset(t) == SeatResetDecision::HonourStore, "aboard long after the window: the player's recentre");
+        const SeatPose mine{-0.50, 0.46, -1.05, seatDegToRad(-25)};
+        check(!m.noteReset(SeatResetDecision::HonourStore, mine, t) && m.storePending(), "held");
+        uint64_t w = 0;
+        check(!m.takeCommit(t + 7999, w), "not at 7.999 s");
+        check(m.takeCommit(t + 8000, w) && w == 8000 && nearPose(m.seat(), mine) && !m.storePending(), "committed at 8 s, saying how long it waited");
+        check(!m.takeCommit(t + 20000, w), "...once");
+        const SeatEvents ev = m.onContext(ctx(true, SeatWhere::Aboard, 1, 2), t + 30000);
+        check(!ev.discardedPending && nearPose(m.seat(), mine), "a transition after the commit keeps it");
+    }
+    // a second recentre inside the wait keeps the first previous seat, and the wait starts again
+    {
+        SeatMemory m; m.setSeat(seat);
+        m.onContext(ctx(true, SeatWhere::Aboard, 1, 1), 0);
+        m.applyDone(); m.noteOrigin(true);
+        const SeatPose a{0.1, 0.1, 0.1, 0.1}, b{0.2, 0.2, 0.2, 0.2};
+        m.noteReset(SeatResetDecision::HonourStore, a, 60000);
+        m.noteReset(SeatResetDecision::HonourStore, b, 63000);
+        uint64_t w = 0;
+        check(nearPose(m.previousSeat(), seat) && nearPose(m.seat(), b), "two recentres in a row: the previous seat is still the stored one");
+        check(!m.takeCommit(67999, w) && m.takeCommit(71000, w) && w == 8000, "...and the wait counts from the last");
+        SeatMemory n; n.setSeat(seat);
+        n.onContext(ctx(true, SeatWhere::Aboard, 1, 1), 0); n.applyDone(); n.noteOrigin(true);
+        n.noteReset(SeatResetDecision::HonourStore, a, 60000);
+        n.noteReset(SeatResetDecision::HonourStore, b, 63000);
+        const SeatEvents ev = n.onContext(ctx(true, SeatWhere::Aboard, 1, 3), 65000);
+        check(ev.discardedPending && nearPose(n.seat(), seat) && ev.discardAgeMs == 2000, "a journal event inside the wait takes both back");
+    }
+    // nothing stored: nothing to go back to, so it is written at once
+    {
+        SeatMemory m;
+        m.onContext(ctx(true, SeatWhere::Aboard, 1, 1), 0);
+        check(m.noteReset(SeatResetDecision::HonourStore, ramp, 60000) && !m.storePending(), "with no seat stored the first recentre is written at once");
+    }
+    // game mode and replaced resets hold nothing
+    {
+        SeatMemory m; m.setSeat(seat);
+        m.onContext(ctx(true, SeatWhere::Aboard, 1, 1), 0);
+        m.noteReset(SeatResetDecision::ReplaceWithSeat, seat, 100);
+        check(!m.storePending(), "a replaced reset holds nothing");
+    }
+}
+
 // ---- the whole story, as the first flight will tell it
 void story() {
     const SeatPose seat{-0.53, 0.45, -1.11, seatDegToRad(-28)};
@@ -477,9 +573,9 @@ void story() {
     // 3. boarding by the ramp: a reset lands BEFORE the flip (4.4 s early), outside any window: read as the player's own, and stored
     check(m.classifyReset(60000) == SeatResetDecision::HonourStore, "boarding: an early reset, outside a window, is read as the player's own");
     const SeatPose early{-0.40, 0.10, -1.00, seatDegToRad(-10)};
-    check(m.noteReset(SeatResetDecision::HonourStore, early) && nearPose(m.seat(), early), "...and stored (the price of the on-foot rule)");
-    m.setSeat(seat); m.noteReset(SeatResetDecision::PassThrough, SeatPose{});
+    check(!m.noteReset(SeatResetDecision::HonourStore, early, 60000) && m.storePending(), "...but held, not written");
     ev = m.onContext(ctx(true, SeatWhere::Aboard, 1, 2), 64400);
+    check(ev.discardedPending && ev.discardAgeMs == 4400 && nearPose(m.seat(), seat), "boarding 4.4 s later takes the ramp's reset back: the old seat stands");
     check(ev.applyWanted, "boarding: the flip puts the seat back");
     m.applyDone(); m.noteOrigin(true);
     // 4. the game resets again 5 s after the flip (the interface route): replaced
@@ -489,7 +585,9 @@ void story() {
     // 5. a quarter of an hour later the player presses recentre
     check(m.classifyReset(900000) == SeatResetDecision::HonourStore, "later: the player's own recentre");
     const SeatPose mine{-0.50, 0.46, -1.05, seatDegToRad(-25)};
-    check(m.noteReset(SeatResetDecision::HonourStore, mine) && nearPose(m.seat(), mine), "...becomes the seat");
+    uint64_t held = 0;
+    check(!m.noteReset(SeatResetDecision::HonourStore, mine, 900000) && !m.takeCommit(907999, held) && m.takeCommit(908000, held) && nearPose(m.seat(), mine),
+          "...becomes the seat after eight quiet seconds");
     // 6. docking, disembarking, boarding again: the new seat
     ev = m.onContext(ctx(true, SeatWhere::OnFoot, 0, 3), 1000000);
     check(ev.windowOpened && std::string(ev.why) == "disembarked" && m.classifyReset(1003000) == SeatResetDecision::ReplaceWithSeat,
@@ -519,6 +617,7 @@ int wmain(int argc, wchar_t** argv) {
     picking();
     stillness();
     runtimeRecentre();
+    retroWindow();
     meter();
     bookText();
     files();
