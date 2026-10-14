@@ -185,6 +185,10 @@ struct CallInputs {
     uint32_t width = 0, height = 0;  // the stack arguments
     uint64_t renderer = 0;           // *a2
     JitterSnap jitter;               // EDVR's current jitter (the probe only)
+    // Derives the same inputs again (the glue's reading of the view block, as it is now). The self-check calls it when the game's stored key differs from the derived one, to tell a
+    // view block that changed under the call (a race with whoever writes it) from a derivation that is wrong.
+    bool (*rederive)(const void* user, CallInputs* out) = nullptr;
+    const void* rederiveUser = nullptr;
 };
 
 inline void put64(uint8_t* p, uint64_t v) noexcept { std::memcpy(p, &v, 8); }
@@ -213,6 +217,53 @@ inline bool buildKey(const CallInputs& in, uint8_t out[kKeyBytes]) noexcept {
     put64(out + 0x68, in.height);
     put64(out + 0x70, in.tile);
     return true;
+}
+
+// What differs between the key built from the inputs and the key the game stored, in words and numbers, for the line that turns the cache off: the field (row.column of the sixteen
+// row floats, near, far, or one of the six quadwords), what was derived and what was stored. At most eight fields are written; the rest are counted. One line, never longer than cap.
+inline size_t describeKeyDiff(const uint8_t* derived, const uint8_t* stored, char* out, size_t cap) noexcept {
+    static const char* const qnames[6] = {"grid x", "grid y", "slices", "width", "height", "tile"};
+    size_t used = 0;
+    int total = 0, written = 0;
+    auto add = [&](const char* fmt, auto... args) {
+        if (used + 1 >= cap) return;
+        const int n = std::snprintf(out + used, cap - used, fmt, args...);
+        if (n > 0) used += static_cast<size_t>(n) < cap - used ? static_cast<size_t>(n) : cap - used - 1;
+    };
+    out[0] = '\0';
+    auto floatField = [&](const char* name, int index) {
+        const uint8_t* a = derived + 4 * index;
+        const uint8_t* b = stored + 4 * index;
+        if (std::memcmp(a, b, 4) == 0) return;
+        ++total;
+        if (written >= 8) return;
+        ++written;
+        uint32_t ba, bb;
+        std::memcpy(&ba, a, 4);
+        std::memcpy(&bb, b, 4);
+        float fa, fb;
+        std::memcpy(&fa, a, 4);
+        std::memcpy(&fb, b, 4);
+        add("%s%s derived %.9g (0x%08x) stored %.9g (0x%08x)", written > 1 ? "; " : "", name, static_cast<double>(fa), ba, static_cast<double>(fb), bb);
+    };
+    for (int e = 0; e < 16; ++e) {
+        char name[16];
+        std::snprintf(name, sizeof(name), "row %d.%d", e / 4, e % 4);
+        floatField(name, e);
+    }
+    floatField("near", 16);
+    floatField("far", 17);
+    for (int q = 0; q < 6; ++q) {
+        const uint8_t* a = derived + 0x48 + 8 * q;
+        const uint8_t* b = stored + 0x48 + 8 * q;
+        if (std::memcmp(a, b, 8) == 0) continue;
+        ++total;
+        if (written >= 8) continue;
+        ++written;
+        add("%s%s derived %llu stored %llu", written > 1 ? "; " : "", qnames[q], static_cast<unsigned long long>(load64(a)), static_cast<unsigned long long>(load64(b)));
+    }
+    if (total > written) add("; and %d more", total - written);
+    return used;
 }
 
 inline uint64_t hashKey(const uint8_t* key) noexcept {
@@ -316,7 +367,7 @@ struct Stats {
     uint64_t byReason[kReasons] = {};
     double missMs = 0.0, hitMs = 0.0, missOverheadMs = 0.0, refreshMs = 0.0, deriveMs = 0.0;
     uint64_t verifyChecks = 0, verifyPadding = 0, verifyMismatches = 0;
-    uint64_t selfOk = 0, selfFail = 0, capacityMisses = 0;
+    uint64_t selfOk = 0, selfFail = 0, selfRace = 0, capacityMisses = 0;
     // the jitter probe
     uint64_t jNeighbour = 0, jOnly02 = 0, jOther = 0;
     uint64_t jDiffers[16] = {};
@@ -336,7 +387,7 @@ inline size_t formatMainLine(char* out, size_t cap, const Stats& s, uint64_t sec
         "cache hits %llu (%.1f%% of calls), misses %llu (%.3f ms each); rows derived ahead %llu times (%.4f ms each), dirty view refreshed ahead %llu times (%.4f ms each); "
         "forwarded whole %llu (first call %llu, dirty view %llu, rows not derivable %llu, forced rebuild %llu, unbuildable %llu, no template %llu, renderer change %llu, "
         "other thread %llu, contexts full %llu, unreadable %llu, swap fault %llu); estimated saving %.2f ms (%.3f ms a frame, from %.3f ms a miss); "
-        "swap cost %.4f ms a hit, %.4f ms a miss; verify %llu checks, %llu padding-only, %llu mismatches; key self-check %llu ok, %llu failed; "
+        "swap cost %.4f ms a hit, %.4f ms a miss; verify %llu checks, %llu padding-only, %llu mismatches; key self-check %llu ok, %llu failed, %llu with the view block changing under the call; "
         "misses on a key evicted lately %llu; %u slots in use, %u contexts.",
         u(seconds), u(s.calls), u(frames), static_cast<double>(s.calls) / fr, u(s.pathOverride), u(s.pathPlain), u(s.gameMemo), u(s.hits),
         100.0 * static_cast<double>(s.hits) / calls, u(s.misses), s.misses ? s.missMs / static_cast<double>(s.misses) : 0.0, u(s.derived),
@@ -344,7 +395,7 @@ inline size_t formatMainLine(char* out, size_t cap, const Stats& s, uint64_t sec
         u(s.byReason[kFirst]), u(s.byReason[kDirtyView]), u(s.byReason[kNoRows]), u(s.byReason[kForceRebuild]), u(s.byReason[kUnbuildable]), u(s.byReason[kNoTemplate]),
         u(s.byReason[kRendererChange]), u(s.byReason[kOtherThread]), u(s.byReason[kContextsFull]), u(s.byReason[kUnreadable]), u(s.byReason[kSwapFault]), saved, saved / fr,
         estMissMs, s.hits ? s.hitMs / static_cast<double>(s.hits) : 0.0, s.misses ? s.missOverheadMs / static_cast<double>(s.misses) : 0.0, u(s.verifyChecks),
-        u(s.verifyPadding), u(s.verifyMismatches), u(s.selfOk), u(s.selfFail), u(s.capacityMisses), slotsInUse, contexts);
+        u(s.verifyPadding), u(s.verifyMismatches), u(s.selfOk), u(s.selfFail), u(s.selfRace), u(s.capacityMisses), slotsInUse, contexts);
     return n < 0 ? 0 : static_cast<size_t>(n);
 }
 
@@ -419,7 +470,7 @@ class Cache {
 public:
     Stats stats;
     bool disabled = false;
-    char disabledWhy[256] = {};
+    char disabledWhy[1024] = {};
     uint64_t hitsSeen = 0;
     unsigned noTemplateNoted = 0;
 
@@ -711,16 +762,42 @@ inline Result serve(Cache& c, uint8_t* ctx, const CallInputs& in, Fwd&& fwd, Clo
     st.missMs += t2 - t1;
     st.missOverheadMs += (t1 - t0);
     res.served = Served::kMiss;
-    // The key self-check: after the game's build its stored key must be the one built from the inputs.
+    // The key self-check: after the game's build its stored key must be the one built from the inputs. On a difference the inputs are derived once more: if THEY have changed, the
+    // view block moved under the call (the game read one thing and the cache another) and nothing is wrong with the derivation; the call counts apart and the cache goes on. If they
+    // have not, the derivation is wrong and the cache turns itself off, naming the fields.
     uint8_t after[kKeyBytes];
     if (Mem::read(after, ctx, kKeyBytes)) {
         if (std::memcmp(after, key, kKeyBytes) == 0) {
             ++st.selfOk;
         } else {
-            ++st.selfFail;
+            bool moved = false;
+            if (in.rederive != nullptr) {
+                CallInputs again = in;
+                uint8_t key2[kKeyBytes];
+                moved = in.rederive(in.rederiveUser, &again) && buildKey(again, key2) && std::memcmp(key2, key, kKeyBytes) != 0;
+            }
             grp.ctxExtra = kExtraUnknown;
-            disable(c, "the key built from the call's inputs differs from the one the game stored");
-            res.disableNow = true;
+            if (moved) {
+                ++st.selfRace;
+            } else {
+                ++st.selfFail;
+                char diff[600];
+                describeKeyDiff(key, after, diff, sizeof(diff));
+                uint8_t post[kStateBytes];
+                unsigned long long n0 = 0, n1 = 0, n2 = 0;
+                if (gather<Mem>(ctx, post)) {
+                    n0 = stateVecSize(post, 0);
+                    n1 = stateVecSize(post, 1);
+                    n2 = stateVecSize(post, 2);
+                }
+                char why[900];
+                std::snprintf(why, sizeof(why),
+                              "the key built from the call's inputs differs from the one the game stored (%s); a second derivation after the call gave the same key, so the view "
+                              "block did not move; after the build the vectors hold %llu/%llu/%llu elements; override path %u, extra near 0x%08x",
+                              diff, n0, n1, n2, static_cast<unsigned>(in.overridePath), in.extraNearBits);
+                disable(c, why);
+                res.disableNow = true;
+            }
         }
     }
     if (verify && hit >= 0 && !c.disabled) {

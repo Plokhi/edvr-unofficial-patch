@@ -219,8 +219,23 @@ struct Rig {
     Heap h;
     Knobs k;
     Clock clock;
+    bool moveNext = false;   // the next call: the view block changes under the call (the game builds from a different row than the cache derived)
     lg::Result call(Ctx& ctx, const lg::CallInputs& in) {
-        return lg::serve<lg::PlainMem>(cache, ctx.p(), in, [&] { fakeBuild(h, k, ctx.p(), in); clock.t += 0.3; }, clock);
+        // A second derivation gives what the view block holds NOW: the same inputs, or (a race) the inputs the game built from.
+        lg::CallInputs seen = in;
+        lg::CallInputs moved = in;
+        float f;
+        std::memcpy(&f, moved.rows, 4);
+        f += 0.25f;
+        std::memcpy(moved.rows, &f, 4);
+        const bool move = moveNext;
+        moveNext = false;
+        const lg::CallInputs& gameSees = move ? moved : in;
+        seen = gameSees;
+        lg::CallInputs withRederive = in;
+        withRederive.rederive = [](const void* user, lg::CallInputs* out) { *out = *static_cast<const lg::CallInputs*>(user); return true; };
+        withRederive.rederiveUser = &seen;
+        return lg::serve<lg::PlainMem>(cache, ctx.p(), withRederive, [&] { fakeBuild(h, k, ctx.p(), gameSees); clock.t += 0.3; }, clock);
     }
 };
 
@@ -704,6 +719,65 @@ void testAlreadyBuilt() {
     check(auditOwnership(q, {&four[0], &four[1], &four[2], &four[3]}), "and share no pointer");
 }
 
+void testSelfCheckDiagnosis() {
+    // The line that turns the cache off names the fields, what was derived and what the game stored.
+    uint8_t a[lg::kKeyBytes], b[lg::kKeyBytes];
+    lg::buildKey(mk(0, 1), a);
+    std::memcpy(b, a, sizeof(a));
+    char line[700];
+    check(lg::describeKeyDiff(a, b, line, sizeof(line)) == 0 && line[0] == '\0', "equal keys describe nothing");
+    float f = 2.5f;
+    std::memcpy(b + 4 * 8, &f, 4);     // row 2 column 0
+    std::memcpy(b + 0x44, &f, 4);      // far
+    st64(b + 0x70, 64);                // tile
+    lg::describeKeyDiff(a, b, line, sizeof(line));
+    float row20;
+    std::memcpy(&row20, a + 32, 4);
+    check(contains(line, "row 2.0 derived 0 (0x00000000) stored 2.5 (0x40200000)") && contains(line, "far derived 10000 (0x461c4000) stored 2.5 (0x40200000)") &&
+              contains(line, "tile derived 16 stored 64") && !contains(line, "near") && !contains(line, "row 0."),
+          "the description names row.column, near or far, and the quadword, with both values");
+    check(row20 == 0.0f, "(the derived row 2 column 0 of the test inputs is 0)");
+    // more than eight differing fields: eight are written, the rest counted, and it fits any cap
+    uint8_t c[lg::kKeyBytes];
+    std::memset(c, 0x7F, sizeof(c));
+    lg::describeKeyDiff(a, c, line, sizeof(line));
+    check(contains(line, " more") && std::strlen(line) < sizeof(line), "past eight fields the rest are counted");
+    char tiny[40];
+    lg::describeKeyDiff(a, c, tiny, sizeof(tiny));
+    check(std::strlen(tiny) < sizeof(tiny), "and the text never passes its cap");
+
+    // A real mismatch (the game stores a key the inputs do not give, and a second derivation agrees with the first) turns the cache off with those words.
+    {
+        Rig r;
+        Ctx c1;
+        r.call(c1, mk(0, 0));
+        r.k.wrongKey = true;
+        const lg::Result res = r.call(c1, mk(0, 1));
+        check(res.disableNow && r.cache.disabled && r.cache.stats.selfFail == 1 && r.cache.stats.selfRace == 0, "a mismatch the view block did not cause turns the cache off");
+        check(contains(r.cache.disabledWhy, "row 2.0 derived") && contains(r.cache.disabledWhy, "stored") && contains(r.cache.disabledWhy, "did not move") &&
+                  contains(r.cache.disabledWhy, "vectors hold 256/4/256 elements") && contains(r.cache.disabledWhy, "override path 0"),
+              "and the reason names the field, both values, the second derivation and the vector sizes");
+    }
+    // The view block moved under the call: the game built from a different row. Counted apart, the cache goes on, and nothing wrong is parked as matchable.
+    {
+        Rig r;
+        Ctx c1;
+        r.call(c1, mk(0, 0));
+        r.call(c1, mk(0, 1));
+        r.moveNext = true;
+        const lg::Result res = r.call(c1, mk(0, 2));
+        check(!res.disableNow && !r.cache.disabled && r.cache.stats.selfRace == 1 && r.cache.stats.selfFail == 0, "a key that differs because the view block moved counts apart and does not disable");
+        for (int round = 0; round < 6; ++round) {
+            for (int ph = 0; ph < 4; ++ph) r.call(c1, mk(0, ph));
+        }
+        check(!r.cache.disabled && r.cache.stats.hits > 0 && coherent(c1) && auditOwnership(r, {&c1}), "and the cache goes on serving, coherent and singly owned");
+        Oracle o;
+        o.build(mk(0, 3));
+        r.call(c1, mk(0, 3));
+        check(sameTables(c1.mem, o.c.mem), "with exact states");
+    }
+}
+
 void testNoTemplate() {
     // a context met as constructed with the first-call flag clear is cached from its first call
     Rig q;
@@ -934,12 +1008,12 @@ void testLines() {
     check(main == "light grid cache: last 30 s: 4400 calls in 2000 frames (2.20 a frame); rows by the override path 4400, by the plain path 0; the game's own memo 12, cache hits 4000 (90.9% of calls), misses 60 (0.290 ms each); "
                   "rows derived ahead 4400 times (0.0005 ms each), dirty view refreshed ahead 0 times (0.0000 ms each); forwarded whole 28 (first call 2, dirty view 26, rows not derivable 0, forced rebuild 0, unbuildable 0, no template 0, renderer change 0, other thread 0, "
                   "contexts full 0, unreadable 0, swap fault 0); estimated saving 1140.00 ms (0.570 ms a frame, from 0.285 ms a miss); swap cost 0.0002 ms a hit, 0.0010 ms a miss; "
-                  "verify 67 checks, 0 padding-only, 0 mismatches; key self-check 60 ok, 0 failed; misses on a key evicted lately 3; 17 slots in use, 1 contexts.",
+                  "verify 67 checks, 0 padding-only, 0 mismatches; key self-check 60 ok, 0 failed, 0 with the view block changing under the call; misses on a key evicted lately 3; 17 slots in use, 1 contexts.",
           "the 30 s line has exactly this text");
     if (main != "light grid cache: last 30 s: 4400 calls in 2000 frames (2.20 a frame); rows by the override path 4400, by the plain path 0; the game's own memo 12, cache hits 4000 (90.9% of calls), misses 60 (0.290 ms each); "
                 "rows derived ahead 4400 times (0.0005 ms each), dirty view refreshed ahead 0 times (0.0000 ms each); forwarded whole 28 (first call 2, dirty view 26, rows not derivable 0, forced rebuild 0, unbuildable 0, no template 0, renderer change 0, other thread 0, "
                 "contexts full 0, unreadable 0, swap fault 0); estimated saving 1140.00 ms (0.570 ms a frame, from 0.285 ms a miss); swap cost 0.0002 ms a hit, 0.0010 ms a miss; "
-                "verify 67 checks, 0 padding-only, 0 mismatches; key self-check 60 ok, 0 failed; misses on a key evicted lately 3; 17 slots in use, 1 contexts.") {
+                "verify 67 checks, 0 padding-only, 0 mismatches; key self-check 60 ok, 0 failed, 0 with the view block changing under the call; misses on a key evicted lately 3; 17 slots in use, 1 contexts.") {
         std::printf("  got: %s\n", main.c_str());
     }
     s.jNeighbour = 40;
@@ -995,6 +1069,7 @@ int main(int argc, char** argv) {
     testForwardReasons();
     testExtraNear();
     testAlreadyBuilt();
+    testSelfCheckDiagnosis();
     testNoTemplate();
     testVerifyDisables();
     testFaults();
