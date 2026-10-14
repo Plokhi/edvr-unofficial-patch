@@ -629,7 +629,10 @@ struct RouteSlot {
     uint64_t seq = 0;
     UiRouteCoverageFlags coverage;
 };
-constexpr uint32_t kRouteRing = 512;  // live timer slots; one interval each. 64 covered the
+constexpr uint32_t kRouteRing = 1024; // live timer slots; one interval each (2026-10-14: 512 -> 1024: the
+                                      // flight's 130-160 pairs a frame, read four to five frames
+                                      // later, are 600-800 in flight; the lease table is 512 a frame,
+                                      // gpu_disjoint_clock.h). 64 covered the
                                       // pre-crisp route (~8/eye-frame); the crisp take adds a
                                       // seed and a write-back per HUD draw-group (tens a frame
                                       // at 0.5-quality), and a full ring silently drops whole

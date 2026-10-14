@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "../../src/common/gpu_disjoint_clock.h"
 #include "../../src/common/system_d3d11.h"
 #include "../../src/common/log.h"
 
@@ -1543,12 +1544,12 @@ HRESULT scriptedData(void* user, ID3D11DeviceContext*, ID3D11Asynchronous* q, vo
 }
 void scriptedRelease(void*, ID3D11Query* q) noexcept { q->Release(); }
 
-struct FailureRate { uint64_t timed = 0, failed = 0, routeTimed = 0; unsigned disjointBegins = 0; unsigned sectionsTimed = 0; };
+struct FailureRate { uint64_t timed = 0, failed = 0, routeTimed = 0, routeIssued = 0, routeRefused = 0; unsigned disjointBegins = 0; unsigned sectionsTimed = 0; };
 
 // One simulated run of `frames` presented frames. appClockLive models the build: true = advanced.app_gpu_timing on and its frame clock open
 // (the old default: the shared scope is held by the application frame, which this rig does not open, so true here means NOTHING owns a scope -- the
 // flight's failure, produced without touching the census); false = the clock off, so the census opens its own scope (the fix).
-FailureRate simulateCensus(Device& d, ScriptedBackend& backend, unsigned frames, bool appClockLive) {
+FailureRate simulateCensus(Device& d, ScriptedBackend& backend, unsigned frames, bool appClockLive, unsigned routePairsPerFrame = 3) {
     for (auto& s : g_section) { s.sampler.reset(d.ctx.Get()); s.nullSampler.reset(d.ctx.Get()); s = SectionState{}; }
     gpuTimingCensusScopeEnd(d.ctx.Get(), GetTickCount64());
     g_activeSection = 0;
@@ -1568,7 +1569,14 @@ FailureRate simulateCensus(Device& d, ScriptedBackend& backend, unsigned frames,
     };
     // Timer pairs that are not the census's but share its clock: the HUD route's per-draw spans (ui_layer.cpp, g_hdrDrawTimingOn = true in the
     // flight build) were taking three or more records a frame between them in the flight, so the census found fewer still.
-    GpuIntervals<8> route;
+    // The route's own ring (ui_layer.cpp g_route, kRouteRing): a FIFO of GpuTimers, one begun per pair in the order issued and read oldest first,
+    // stopping at the first not ready. This is what the moved HDR HUD draws' per-draw timers (g_hdrDrawTimingOn) are.
+    constexpr unsigned kRing = 2048;
+    static GpuTimer ring[kRing];
+    unsigned ringHead = 0, ringTail = 0;
+    uint64_t routeIssued = 0, routeRefused = 0, routeRead = 0;
+    Microsoft::WRL::ComPtr<ID3D11Device> routeDev;
+    d.ctx->GetDevice(&routeDev);
     const struct { GpuCensusSection section; unsigned perFrame; } inFrame[] = {
         {GpuCensusSection::FrameHologramPasses, 4}, {GpuCensusSection::FrameUiDepthCoverage, 3}, {GpuCensusSection::FramePlanet, 1},
         {GpuCensusSection::FrameEngineVelocity, 6}, {GpuCensusSection::FrameUiLayerReissues, 60}, {GpuCensusSection::FrameUiLayerHdrSeed, 6},
@@ -1590,14 +1598,29 @@ FailureRate simulateCensus(Device& d, ScriptedBackend& backend, unsigned frames,
             span(GpuCensusSection::DoorMenu);
             span(GpuCensusSection::DoorUiLayerComposite);
         }
-        for (unsigned i = 0; i < 3; ++i) { route.begin(d.ctx.Get()); route.end(d.ctx.Get()); }
+        // The route's pairs come first in the frame (the HUD layer's draws), the door's at its end.
+        for (unsigned i = 0; i < routePairsPerFrame; ++i) {
+            GpuTimer& slot = ring[ringHead % kRing];
+            if (ringHead - ringTail < kRing && slot.begin(routeDev.Get(), d.ctx.Get())) {
+                slot.end(d.ctx.Get());
+                ++ringHead;
+                ++routeIssued;
+            } else ++routeRefused;
+        }
         for (const auto& item : inFrame) for (unsigned i = 0; i < item.perFrame; ++i) span(item.section);
         gpuCensusFrame(d.ctx.Get());
-        route.poll(d.ctx.Get());
+        while (ringTail != ringHead) {
+            double ms = 0.0;
+            if (ring[ringTail % kRing].poll(d.ctx.Get(), ms) == GpuTimerPoll::Pending) break;
+            ++routeRead;
+            ++ringTail;
+        }
     }
     FailureRate out;
-    out.routeTimed = route.totals.samples;
-    route.reset(d.ctx.Get());
+    out.routeTimed = routeRead;
+    out.routeIssued = routeIssued;
+    out.routeRefused = routeRefused;
+    for (unsigned i = ringTail; i != ringHead; ++i) ring[i % kRing].reset(d.ctx.Get());
     for (const auto& s : g_section) {
         out.timed += s.sampler.totals.samples;
         out.failed += s.skippedThisWindow + s.sampler.totals.invalid;
@@ -1638,6 +1661,23 @@ void failureRateCases() {
     check(owned.sectionsTimed == 17, "failure rate: all 17 sections the run drives (the whole, nine door parts, the six in-frame ones) took samples");
     // One disjoint scope a frame at most (a frame whose turn times nothing opens none), not one per span.
     check(owned.disjointBegins <= frames + 1, "failure rate: one disjoint scope a frame, not one per span");
+    // ---- the 2026-10-14 flight: the clock owned, but 130-160 timer pairs a frame on ONE record (g_hdrDrawTimingOn's per-draw HUD timers) ----
+    // 33% of the spans failed there ("timed 4792, failed 2309"), the whole door among them: the pairs of a frame are leases on the frame's one
+    // record, and the record held 128. The door runs at the frame's end, after the HUD draws had taken the leases. The load is the flight's peak:
+    // 90 route pairs a frame issued and 25-35 more refused, plus the seeds, price timers and census spans.
+    constexpr unsigned kFlightPeakPairs = 160;
+    static_assert(DisjointClock::kLeases >= 3 * kFlightPeakPairs, "a record holds three times the flight's peak of timer pairs a frame");
+    const FailureRate heavy = simulateCensus(d, backend, frames, false, kFlightPeakPairs);
+    std::printf("failure rate, the census owning its scope, %u route pairs a frame (the flight's peak): spans timed %llu, failed %llu; route pairs issued %llu, refused %llu, read %llu\n",
+                kFlightPeakPairs, static_cast<unsigned long long>(heavy.timed), static_cast<unsigned long long>(heavy.failed),
+                static_cast<unsigned long long>(heavy.routeIssued), static_cast<unsigned long long>(heavy.routeRefused),
+                static_cast<unsigned long long>(heavy.routeTimed));
+    check(heavy.failed == 0 && heavy.timed >= 1900, "route load: with 160 other timer pairs a frame no census span fails, the door's included");
+    check(heavy.routeRefused == 0 && heavy.routeTimed + 3000 >= heavy.routeIssued, "route load: every route pair gets a lease and is read");
+    // Over the record's capacity the late spans are the ones lost: the shape of the flight's failure, produced by the load alone.
+    const FailureRate over = simulateCensus(d, backend, frames, false, DisjointClock::kLeases + 40);
+    check(over.failed > 0 && over.routeRefused > 0, "route load: more pairs a frame than a record has leases makes spans fail (the limit is real and is what the flight hit)");
+
     // simulateCensus ended on a boundary: the scope is open for the next frame's spans, and closes when asked (yield, shutdown, the clock turning on).
     check(gpuTimingCensusScopeOpen(), "failure rate: the boundary leaves the next frame's scope open");
     gpuTimingCensusScopeEnd(d.ctx.Get(), GetTickCount64());
