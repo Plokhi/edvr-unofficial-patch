@@ -220,6 +220,18 @@ bool refreshView(void* view) noexcept {
     }
 }
 
+// The self-check's second derivation (CallInputs::rederive): the inputs of this call, read again as the view block is now.
+struct Redo {
+    const void* a2;
+    const void* a4;
+    uint32_t width, height;
+};
+bool redoInputs(const void* user, lg::CallInputs* out) noexcept {
+    const Redo& r = *static_cast<const Redo*>(user);
+    if (!readInputs(r.a2, r.a4, r.width, r.height, out)) return false;
+    return out->overridePath == 0 || deriveOverride(r.a4, out);
+}
+
 lg::JitterSnap readJitter() noexcept {
     lg::JitterSnap j;
     for (int attempt = 0; attempt < 3; ++attempt) {
@@ -294,7 +306,7 @@ void sayFirstSight(void* self, void* view, uint32_t width, uint32_t height, cons
 void turnOff(const char* why) noexcept {
     g_gate.store(0, std::memory_order_release);
     g_detour.status.store("off for this session (the log says why)", std::memory_order_release);
-    char line[400];
+    char line[1300];
     std::snprintf(line, sizeof(line), "light grid cache: OFF for this session: %s. Every call now goes to the game.", why);
     say(line);
 }
@@ -340,6 +352,9 @@ __declspec(noinline) uintptr_t __fastcall builderDetour(void* self, void* a2, vo
         }
     }
     in.jitter = readJitter();
+    const Redo redo{a2, a4, width, height};
+    in.rederive = &redoInputs;
+    in.rederiveUser = &redo;
     const double now = nowMs();
     if (!g_windowOpen) {
         g_windowOpen = true;
