@@ -67,6 +67,15 @@ static std::vector<Variant> siblingVariants() {
     };
 }
 
+// The UI layer composite in place (src/d3d11/fixed_shader_source.h kUiLayerCompositeInPlaceHlsl, docs/ui-layer-2026-09-23.md, "2026-10-13"): a
+// sibling of kUiLayerCompositeBytecode that read-modify-writes the frame's own UAV. New, so held to its own contract (symbol, source name,
+// entry, profile, the text it compiles, the 32x8 group the dispatch uses and the bindings it reads) rather than a former call's.
+static std::vector<Variant> compositeInPlaceVariants() {
+    return {
+        {"kUiLayerCompositeInPlaceBytecode", "ui_layer_composite_inplace_cs", "main", nullptr, {}, false, edvr::kUiLayerCompositeInPlaceHlsl, "cs_5_0"},
+    };
+}
+
 static std::vector<LegacyContract> coreLegacyContracts() {
     return {
         {"ui_layer_composite_cs", "main", "cs_5_0", nullptr, 0x237EEBB920BC9015ull},

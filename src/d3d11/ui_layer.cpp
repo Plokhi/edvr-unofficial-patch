@@ -333,6 +333,10 @@ struct Eye {
     void* frameRes = nullptr;
     Ptr<ID3D11ShaderResourceView> frameSrv;
     DXGI_FORMAT frameView = DXGI_FORMAT_UNKNOWN;
+    // The same frame as a UAV, for the in-place composite, cached on exactly that resource.
+    void* frameUavRes = nullptr;
+    Ptr<ID3D11UnorderedAccessView> frameUav;
+    DXGI_FORMAT frameUavView = DXGI_FORMAT_UNKNOWN;
     // The copy-through, for a frame that refuses a shader view.
     Ptr<ID3D11Texture2D> copy;
     Ptr<ID3D11ShaderResourceView> copySrv;
@@ -484,7 +488,7 @@ struct Window {
     uint64_t redirected = 0, refusedAtIssue = 0;
     uint64_t viewportRemaps = 0, scissorRemaps = 0, jitterCancels = 0, clears = 0;
     uint64_t multiplies = 0, writeBacks = 0, dsTested = 0, seeds = 0, seedFailures = 0;
-    uint64_t lostLayers = 0, doors = 0, treated = 0, composites = 0, overGameImage = 0;
+    uint64_t lostLayers = 0, doors = 0, treated = 0, composites = 0, overGameImage = 0, compositesInPlace = 0;
     uint64_t compositeRefused = 0, afterWrites = 0, afterReads = 0;
     // afterWrites' own breakdown: taken into the layer after the UI (kept
     // over it), left as a post pass (an eye-sized input), or refused at
@@ -956,7 +960,7 @@ void releaseLayerDs(LayerDs& l) {
 bool releaseLayers() {
     bool any = false;
     for (Eye& e : g_eye) {
-        any = any || e.tex || e.mTex || e.ds.tex || e.dsCopy || e.out || e.copy || e.frameSrv ||
+        any = any || e.tex || e.mTex || e.ds.tex || e.dsCopy || e.out || e.copy || e.frameSrv || e.frameUav ||
               e.hdrTex || e.hdrDs.tex;
         e.coverage.reset();
         e.tex.Reset();
@@ -996,6 +1000,9 @@ bool releaseLayers() {
         e.frameSrv.Reset();
         e.frameRes = nullptr;
         e.frameView = DXGI_FORMAT_UNKNOWN;
+        e.frameUav.Reset();
+        e.frameUavRes = nullptr;
+        e.frameUavView = DXGI_FORMAT_UNKNOWN;
         e.copy.Reset();
         e.copySrv.Reset();
         e.copyW = e.copyH = 0;
@@ -1881,11 +1888,19 @@ ID3D11ComputeShader* g_cs = nullptr;
 bool g_csTried = false;
 ID3D11Buffer* g_cb = nullptr;
 bool g_fmtChecked[2] = {}, g_fmtOk[2] = {};
+// The in-place twin of the composite (kUiLayerCompositeInPlaceBytecode), and whether the GPU loads typed
+// UAVs of each frame view (D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD: an optional capability for every format
+// but R32). Either missing and the in-place composite is simply not taken: the out-of-place one is.
+ID3D11ComputeShader* g_csInPlace = nullptr;
+bool g_loadChecked[2] = {}, g_loadOk[2] = {};
+unsigned g_inPlaceDeclinedNoted = 0;   // bit per reason, said once
+bool g_inPlaceNoted = false;
 
 void compileOnce(ID3D11DeviceContext* ctx) {
     if (g_cs || g_csTried || !ctx) return;
     g_csTried = true;
     g_cs = shaderSwapCreateCs(ctx,kUiLayerCompositeBytecode,sizeof(kUiLayerCompositeBytecode),"ui_layer_composite_cs","ui quality: layer");
+    g_csInPlace = shaderSwapCreateCs(ctx,kUiLayerCompositeInPlaceBytecode,sizeof(kUiLayerCompositeInPlaceBytecode),"ui_layer_composite_inplace_cs","ui quality: layer");
 }
 
 bool makeTex(ID3D11Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT texFmt, DXGI_FORMAT viewFmt,
@@ -1918,9 +1933,53 @@ bool makeTex(ID3D11Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT texFmt, DXGI
     return true;
 }
 
+// The UAV over `frame` for the in-place composite, or null with the reason said once: the caller did not
+// say the frame is EDVR's to rewrite, the region is not the whole of it, it was not made UAV-bindable, the GPU
+// does not load typed UAVs of its view, the in-place shader is missing, or the view could not be made.
+// A null is never an error: the out-of-place composite runs instead.
+ID3D11UnorderedAccessView* inPlaceUavFor(Eye& e, ID3D11Device* dev, ID3D11Texture2D* frame,
+                                         const D3D11_TEXTURE2D_DESC& fd, DXGI_FORMAT view,
+                                         const uint32_t region[4], int fi) {
+    auto decline = [&](unsigned bit, const char* reason) -> ID3D11UnorderedAccessView* {
+        if (!(g_inPlaceDeclinedNoted & bit)) {
+            g_inPlaceDeclinedNoted |= bit;
+            Log::get().note("ui quality: layer: the in-place composite is not taken (%s); the composite writes "
+                            "its own output texture instead.", reason);
+        }
+        return nullptr;
+    };
+    if (!g_csInPlace) return decline(1u, "its shader did not load");
+    if (region[0] != 0 || region[1] != 0 || region[2] != fd.Width || region[3] != fd.Height)
+        return decline(2u, "the frame's region is not the whole texture, and the frame handed on would not be the frame composited");
+    if (!(fd.BindFlags & D3D11_BIND_UNORDERED_ACCESS))
+        return decline(4u, "the frame was not made unordered-access bindable");
+    if (!g_loadChecked[fi]) {
+        g_loadChecked[fi] = true;
+        D3D11_FEATURE_DATA_FORMAT_SUPPORT2 fs{view, 0};
+        g_loadOk[fi] = SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &fs, sizeof(fs))) &&
+                       (fs.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+    }
+    if (!g_loadOk[fi]) return decline(8u, "this GPU does not load typed unordered-access views of the frame's format");
+    if (e.frameUavRes != static_cast<void*>(frame) || !e.frameUav || e.frameUavView != view) {
+        e.frameUav.Reset();
+        e.frameUavRes = nullptr;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = view;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        if (SUCCEEDED(dev->CreateUnorderedAccessView(frame, &ud, &e.frameUav)) && e.frameUav) {
+            e.frameUavRes = frame;
+            e.frameUavView = view;
+        } else {
+            e.frameUav.Reset();
+            return decline(16u, "the frame refused an unordered-access view in the composite's format");
+        }
+    }
+    return e.frameUav.Get();
+}
+
 ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
                                 const uint32_t region[4], const float layerUv[4], bool useMult,
-                                const char** why) {
+                                bool ownedFrame, const char** why) {
     D3D11_TEXTURE2D_DESC fd{};
     frame->GetDesc(&fd);
     const DXGI_FORMAT view = uiLayerFrameView(fd.Format);
@@ -1999,11 +2058,17 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
             return nullptr;
         }
     }
+    // In place, when the caller says the frame is EDVR's own, rewritten in full every frame (the RCAS
+    // output; the temporal pass's output when it is what arrived at the door), and everything the
+    // in-place shader needs is there. Then there is no view for reading the frame, no copy and no
+    // output texture: the one view is the frame as a UAV, which the shader loads and stores through.
+    ID3D11UnorderedAccessView* inPlaceUav =
+        ownedFrame ? inPlaceUavFor(e, dev.Get(), frame, fd, view, region, fi) : nullptr;
     // The frame's view: over it directly when it allows one, else its region
     // copied out first (the sharpen's rule, for the same reason).
     ID3D11ShaderResourceView* frameSrv = nullptr;
     bool viaCopy = false;
-    if (fd.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
+    if (!inPlaceUav && (fd.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
         if (e.frameRes != static_cast<void*>(frame) || !e.frameSrv || e.frameView != view) {
             e.frameSrv.Reset();
             e.frameRes = nullptr;
@@ -2018,7 +2083,7 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
         }
         frameSrv = e.frameSrv.Get();
     }
-    if (!frameSrv) {
+    if (!inPlaceUav && !frameSrv) {
         viaCopy = true;
         if (!e.copy || e.copyW != rw || e.copyH != rh || e.copyFmt != fd.Format) {
             e.copyW = e.copyH = 0;
@@ -2035,7 +2100,7 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
         }
         frameSrv = e.copySrv.Get();
     }
-    if (!e.out || e.outW != rw || e.outH != rh || e.outFmt != fd.Format) {
+    if (!inPlaceUav && (!e.out || e.outW != rw || e.outH != rh || e.outFmt != fd.Format)) {
         e.outW = e.outH = 0;
         e.out.Reset();
         e.outUav.Reset();
@@ -2099,13 +2164,20 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
     ID3D11UnorderedAccessView* nullUav = nullptr;
     ctx->CSSetShaderResources(0, 3, nullSrv);
     ctx->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
-    ctx->CSSetShader(g_cs, nullptr, 0);
+    ctx->CSSetShader(inPlaceUav ? g_csInPlace : g_cs, nullptr, 0);
     ctx->CSSetConstantBuffers(0, 1, &g_cb);
-    ID3D11ShaderResourceView* srvs[3] = {frameSrv, e.srv.Get(), useMult ? e.mSrv.Get() : nullptr};
+    // In place the frame is bound ONLY as the UAV: slot 0 stays null, so the one texture is never an
+    // SRV and a UAV in the same dispatch (the hazard D3D11 resolves by silently dropping a binding).
+    ID3D11ShaderResourceView* srvs[3] = {inPlaceUav ? nullptr : frameSrv, e.srv.Get(),
+                                         useMult ? e.mSrv.Get() : nullptr};
     ctx->CSSetShaderResources(0, 3, srvs);
-    ID3D11UnorderedAccessView* uav = e.outUav.Get();
+    ID3D11UnorderedAccessView* uav = inPlaceUav ? inPlaceUav : e.outUav.Get();
     ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-    ctx->Dispatch((rw + 7) / 8, (rh + 7) / 8, 1);
+    if (inPlaceUav)
+        ctx->Dispatch((rw + kUiLayerInPlaceGroupX - 1) / kUiLayerInPlaceGroupX,
+                      (rh + kUiLayerInPlaceGroupY - 1) / kUiLayerInPlaceGroupY, 1);
+    else
+        ctx->Dispatch((rw + 7) / 8, (rh + 7) / 8, 1);
     routeEnd(ctx.Get(), qs);
     gpuCensusEnd(ctx.Get(), GpuCensusSection::DoorUiLayerComposite);
 
@@ -2122,6 +2194,21 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
     if (savedCb) savedCb->Release();
 
     ++g_win.composites;
+    if (inPlaceUav) {
+        ++g_win.compositesInPlace;
+        if (!g_inPlaceNoted) {
+            g_inPlaceNoted = true;
+            Log::get().note(
+                "ui quality: layer: first in-place composite -- the %s eye's layer blended into the %ux%u "
+                "%s frame itself (a typed read-modify-write through its UAV, %ux%u threads a group; the "
+                "texels the layer leaves alone are neither read nor written), so this eye has no output "
+                "texture. Same arithmetic as the out-of-place composite, byte for byte "
+                "(ui_holo_pass_test). The layer line counts the in-place composites; a line that never "
+                "says 'in place' is the out-of-place path.",
+                eye == 0 ? "left" : "right", rw, rh, viewName(view), kUiLayerInPlaceGroupX,
+                kUiLayerInPlaceGroupY);
+        }
+    }
     if (!e.doorFromPass) ++g_win.overGameImage;
     if (!g_compositeNoted) {
         g_compositeNoted = true;
@@ -2134,9 +2221,11 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
             eye == 0 ? "left" : "right", e.w, e.h, rw, rh, viewName(view),
             static_cast<double>(uv[0]), static_cast<double>(uv[2]), static_cast<double>(uv[1]),
             static_cast<double>(uv[3]),
-            "");
+            inPlaceUav ? ", in place on the frame itself (no output texture)" : "");
     }
-    ID3D11Texture2D* out = e.out.Get();
+    // In place the result is the frame: the caller already holds the texture it passed in, and gets
+    // its own reference to it, as it gets one to the output texture otherwise.
+    ID3D11Texture2D* out = inPlaceUav ? frame : e.out.Get();
     out->AddRef();
     return out;
 }
@@ -2676,7 +2765,8 @@ void logTotals(double seconds) {
         "ui quality: layer: %.0f s, %llu frames, %ux%u per eye + composite output %ux%u; %.2f draws "
         "a frame redirected (%s), %.2f multiplies, %.2f depth/stencil write-backs, %.2f tested "
         "against a seeded copy (%llu seeds, %llu failed, %llu stale); per frame %.2f viewport remaps, "
-        "%.2f scissor remaps, %.2f jitter cancels; %llu composites (%llu over the game's own image); "
+        "%.2f scissor remaps, %.2f jitter cancels; %llu composites (%llu over the game's own image, "
+        "%llu in place on the frame, with no output texture); "
         "GPU ms per eye-frame, median/p95 (eye-frames): %s.",
         seconds, static_cast<unsigned long long>(g_win.frames), l.w, l.h, l.outW, l.outH,
         static_cast<double>(g_win.redirected) / frames, taken.empty() ? "none" : taken.c_str(),
@@ -2690,7 +2780,8 @@ void logTotals(double seconds) {
         static_cast<double>(g_win.scissorRemaps) / frames,
         static_cast<double>(g_win.jitterCancels) / frames,
         static_cast<unsigned long long>(g_win.composites),
-        static_cast<unsigned long long>(g_win.overGameImage), price.c_str());
+        static_cast<unsigned long long>(g_win.overGameImage),
+        static_cast<unsigned long long>(g_win.compositesInPlace), price.c_str());
     std::string moved, combined;
     const size_t movedStage = static_cast<size_t>(UiRouteStage::kHdrMovedDraw);
     appendPrice(moved, movedStage);
@@ -4575,8 +4666,12 @@ void uiLayerNoteSubmitted(uint64_t sequence, uint32_t eye, const void* submitted
     g_eye[eye].submittedSeq = sequence;
 }
 
+bool uiLayerDoorFromPass(uint32_t eye) {
+    return eye <= 1 && g_eye[eye].doorFromPass;
+}
+
 ID3D11Texture2D* uiLayerComposite(uint64_t sequence, uint32_t eye, ID3D11Texture2D* frame,
-                                  const uint32_t region[4], const float layerUv[4]) {
+                                  const uint32_t region[4], const float layerUv[4], bool ownedFrame) {
     if (eye > 1 || !frame || !region || !layerUv) return nullptr;
     g_seedCensus.door(eye, sequence);
     Eye& e = g_eye[eye];
@@ -4616,7 +4711,7 @@ ID3D11Texture2D* uiLayerComposite(uint64_t sequence, uint32_t eye, ID3D11Texture
     ID3D11Texture2D* result = nullptr;
     const char* why = nullptr;
     const bool ran = guardedBudget(g_compositeBudget, [&] {
-        result = compositeInner(e, eye, frame, region, layerUv, useMult, &why);
+        result = compositeInner(e, eye, frame, region, layerUv, useMult, ownedFrame, &why);
     });
     if (!result) {
         ++g_win.compositeRefused;
@@ -4826,8 +4921,12 @@ void releaseDeviceObjects() {
         g_cs->Release();
         g_cs = nullptr;
     }
+    if (g_csInPlace) {
+        g_csInPlace->Release();
+        g_csInPlace = nullptr;
+    }
     g_csTried = false;
-    for (int i = 0; i < 2; ++i) g_fmtChecked[i] = g_fmtOk[i] = false;
+    for (int i = 0; i < 2; ++i) g_fmtChecked[i] = g_fmtOk[i] = g_loadChecked[i] = g_loadOk[i] = false;
 }
 }  // namespace
 
