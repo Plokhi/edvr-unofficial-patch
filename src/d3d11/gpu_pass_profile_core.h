@@ -30,8 +30,12 @@ constexpr uint32_t kPassScopeSlotCount = 128;
 constexpr uint32_t kMaxStartWaits = 240;
 // probe_cube (GPU pass profile v3): a colour target that is square and at most kProbeMaxSide on a side, or a cube array of kCubeArraySlices or
 // more slices. Squareness alone is not a probe: the eye render is square too (2016x2016 in the v2 flight).
+constexpr uint32_t kProbeMinSide = 256;     // v4: a probe's square side is at least this (the 252x252 exposure passes are below it)
 constexpr uint32_t kProbeMaxSide = 1024;
 constexpr uint32_t kCubeArraySlices = 6;
+// v4: the exposure reduction chain's target (Elite's, measured: three 252x252 post passes per eye, with two compute shaders; audit
+// reviews\vr-view-caches-2026-10-13.md candidate 1). Not a probe, whatever its shape rule says.
+constexpr uint32_t kExposureSide = 252;
 
 // The hotkey's value is "KEY" or "KEY COUNT" (or "Ctrl+KEY COUNT"). A trailing whole number after whitespace is the frame count, clamped
 // to 1..kMaxCaptureFrames; without one the count is kDefaultCaptureFrames. The number is not taken when nothing precedes it, so a key
@@ -75,12 +79,13 @@ enum class PassClass : uint8_t {
     PostSmaller,      // draws into a colour target smaller than the eye (downsampled post chains)
     HudOverlay,       // Built v13.7: one to kHudMaxDraws draws whose most-drawn VS is a known HUD, holo or UI family (the caller's families)
     LightingVolume,   // instanced light volumes drawn into the eye-size target (the caller's lighting family, most-drawn VS)
+    Exposure,         // v4: Elite's exposure reduction chain: the 252x252 single-target passes, and the dispatches whose top compute shader is the caller's exposure family
     Other,
     Count
 };
 inline constexpr const char* kPassClassNames[] = {
     "edvr", "compute", "clear", "shadow", "probe_cube", "scene_gbuffer",
-    "fullscreen_at_eye", "forward_at_eye", "post_smaller", "hud_overlay", "lighting_volume", "other"};
+    "fullscreen_at_eye", "forward_at_eye", "post_smaller", "hud_overlay", "lighting_volume", "exposure", "other"};
 static_assert(sizeof(kPassClassNames) / sizeof(kPassClassNames[0]) == static_cast<size_t>(PassClass::Count),
               "one name for each pass class");
 
@@ -109,6 +114,7 @@ struct PassFacts {
     TargetShape depth;
     uint32_t draws = 0, dispatches = 0, clears = 0;
     uint64_t topVs = 0;         // Built v13.7: the segment's most-drawn vertex shader (its content hash); 0 when it drew nothing
+    uint64_t topCs = 0;         // v4: the segment's most-dispatched compute shader (its content hash); 0 when it dispatched nothing
 };
 
 // A set of vertex shader hashes a class is known by, taken by the caller from the game headers (eye_draw_snapshot.h, holo_material.h,
@@ -140,10 +146,13 @@ struct EyeSize {
 // The eye size is the headset's eye texture (vscreen's eyeW and eyeH, from openvr_api.dll when it is there). A target at that size is never
 // a probe, whatever its shape.
 inline bool atEye(const TargetShape& t, EyeSize eye) { return eye.w != 0 && t.w == eye.w && t.h == eye.h; }
+// v4: a square of kProbeMinSide..kProbeMaxSide on a side, or a cube array (kCubeArraySlices or more slices).
 inline bool isProbeShape(const TargetShape& t, EyeSize eye) {
     if (!t.square() || atEye(t, eye)) return false;
-    return t.w <= kProbeMaxSide || t.slices >= kCubeArraySlices;
+    return (t.w >= kProbeMinSide && t.w <= kProbeMaxSide) || t.slices >= kCubeArraySlices;
 }
+// v4: the exposure chain's single-target pass (the 252x252 post passes).
+inline bool isExposureShape(const TargetShape& t) { return t.square() && t.w == kExposureSide && t.h == kExposureSide; }
 
 // The largest colour target whose depth is the same size, over one frame's segments: the eye render in the usual frame. {0,0} when none.
 // Reported beside the eye size, so a flight can see when they disagree.
@@ -162,11 +171,15 @@ inline std::string targetText(const TargetShape& t) {
 }
 
 // The class of one segment. Order matters: the first rule that holds wins.
+// exposure: the compute shaders of the exposure chain (a VsFamily, read as a set of content hashes; PassFacts::topCs is checked against it).
 inline PassClass classifyPass(const PassFacts& f, EyeSize eye, const VsFamily& hud = VsFamily{},
-                              const VsFamily& lighting = VsFamily{}) {
+                              const VsFamily& lighting = VsFamily{}, const VsFamily& exposure = VsFamily{}) {
     if (f.edvr) return PassClass::Edvr;
-    if (f.draws == 0 && f.dispatches > 0) return PassClass::Compute;
+    if (f.draws == 0 && f.dispatches > 0)
+        return isVsFamily(f.topCs, exposure) ? PassClass::Exposure : PassClass::Compute;
     if (f.draws == 0) return f.clears > 0 ? PassClass::Clear : PassClass::Other;
+    // v4: a single 252x252 target is the exposure chain's post pass, not a probe (the 2026-10-13 flights: 24 per capture).
+    if (f.colours == 1 && isExposureShape(f.colour)) return PassClass::Exposure;
     const bool eyeColour = eye.w != 0 && f.colour.w == eye.w && f.colour.h == eye.h;
     if (f.colours == 0 && f.hasDepth) {
         // Built v13.7 (2): a depth-only map that is not at the eye size is a shadow map, square or not, large or small (the 2048x1024 D16 pair and

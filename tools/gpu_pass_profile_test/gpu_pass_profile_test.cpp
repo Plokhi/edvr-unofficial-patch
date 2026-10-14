@@ -510,6 +510,40 @@ void testV3Classes() {
     check(matchedEye(noDepth).w == 0, "with no matching depth the matched eye is unknown (0x0)");
 }
 
+// GPU pass profile v4: the exposure chain's 252x252 passes and its compute dispatches are exposure, never probe_cube; probe_cube's square
+// lower bound is 256.
+void testV4Exposure() {
+    const EyeSize eye{2016, 2016};
+    VsFamily exposure;
+    exposure.vs[0] = 0xB8E727E94D44D891ull;
+    exposure.vs[1] = 0xF1FB2EEFB662F3AAull;
+    exposure.n = 2;
+    PassFacts post;
+    post.draws = 1;
+    post.colours = 1;
+    post.colour = shape(252, 252);
+    post.topVs = 0xdef19b035d5ededcull;
+    check(classifyPass(post, eye, VsFamily{}, VsFamily{}, exposure) == PassClass::Exposure,
+          "a 252x252 one-draw pass is exposure, not probe_cube");
+    check(classifyPass(post, eye) == PassClass::Exposure, "the 252x252 pass is exposure without the families too");
+    check(!isProbeShape(shape(252, 252), eye), "252 is below probe_cube's square lower bound");
+    PassFacts p256 = post;
+    p256.colour = shape(256, 256);
+    check(classifyPass(p256, eye) == PassClass::ProbeCube, "a 256x256 one-draw pass is still a probe (the bound is inclusive)");
+    check(isProbeShape(shape(256, 256), eye) && isProbeShape(shape(1024, 1024), eye) && !isProbeShape(shape(255, 255), eye),
+          "probe_cube's square is 256 to 1024 on a side");
+    check(isProbeShape(shape(2048, 2048, true, 6), eye), "a cube array of 6 slices is a probe at any size");
+    PassFacts disp;
+    disp.dispatches = 3;
+    disp.topCs = 0xB8E727E94D44D891ull;
+    check(classifyPass(disp, eye, VsFamily{}, VsFamily{}, exposure) == PassClass::Exposure,
+          "a dispatch-only pass whose top compute shader is the exposure chain's is exposure");
+    PassFacts other = disp;
+    other.topCs = 0x6FE04AF836BB1DBAull;
+    check(classifyPass(other, eye, VsFamily{}, VsFamily{}, exposure) == PassClass::Compute, "any other compute shader stays compute");
+    check(std::string(passClassName(PassClass::Exposure)) == "exposure", "the class is named exposure in the CSV and the summary");
+}
+
 // GPU pass profile v3: the capture's frame starts, simulated at the boundaries. Census and application timing are refused by the yield
 // while a capture runs, so they hold the clock only before the press (the census timer that began before it) and the application frame
 // is ended by the yield at the boundary. Every scenario must give 30 of 30 frames unless a holder never ends.
@@ -607,6 +641,7 @@ int main(int argc, char** argv) {
     testV137();
     testV2();
     testV3Classes();
+    testV4Exposure();
     testCaptureStarts();
     std::printf("gpu_pass_profile_test: %u checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

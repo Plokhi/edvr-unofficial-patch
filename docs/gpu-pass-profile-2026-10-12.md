@@ -37,7 +37,7 @@ Changes in v2 (2026-10-13):
 v3 fixes (2026-10-13, after the six flights on cb712758; root causes in the Log):
 - Only 4 of 30 frames captured: 4 pass-scope slots for 30 frames. Now 128, and a boundary waits for another holder of the clock.
 - probe_cube on eye passes: squareness is not the rule any more. probe_cube = not at the eye size, and square up to 1024 or a cube array.
-- Check: 252x252 one-draw passes (post_smaller in v2) now count as probe_cube under the small-square rule.
+- v4: 252x252 one-draw passes and the dispatches whose top compute shader is B8E727E9 or F1FB2EEF are "exposure" (Elite's exposure chain; reviews\vr-view-caches-2026-10-13.md). probe_cube's square is now 256 to 1024 (or a cube array of 6+ slices).
 UI instruments (2026-10-13, TEMPORARY for this measurement build: g_hdrDrawTimingOn is on in ui_layer.cpp; turn it off after the flight):
 hologram resolve split into depth copy, near-light and resolve draw; moved HDR HUD draw as its own altered item; seeds by reason;
 reissues issued vs empty. Lines in the Log.
@@ -114,6 +114,33 @@ Still open: no flight yet; the overhead below is an estimate, not a measurement.
   Tests: gpu_census_test (instrumentCases: the sub-section order, the door count, the altered class, the issued counter) and
   ui_quality_test (testSeedReasonTally).
 
+- 2026-10-13, v4 (after the coordinator's correction): the 252x252 passes are Elite's exposure chain, not probes (candidate 1 of
+  reviews\vr-view-caches-2026-10-13.md: three 252x252 post passes per eye, with compute shaders B8E727E94D44D891 and
+  F1FB2EEFB662F3AA). New class "exposure": 252x252 single-target passes, and dispatch-only passes whose top compute shader is one
+  of those two. probe_cube's square now starts at 256 (kProbeMinSide). Rig: testV4Exposure. Offline table (ms a frame, 4 frames,
+  eye 2016x2016; the v2 mode still reproduces the CSVs' classes, 0 mismatches):
+
+  | class | planetary port, station on | planetary, off | supercruise | station, descending | station, on | station, off |
+  |---|---|---|---|---|---|---|
+  | edvr | 5.039 | 5.076 | 4.949 | 5.592 | 5.823 | 5.266 |
+  | hud_overlay | 0.746 | 0.615 | 0.668 | 1.722 | 1.249 | 1.218 |
+  | compute | 1.522 | 0.831 | 0.612 | 1.532 | 1.115 | 1.062 |
+  | fullscreen_at_eye | 0.843 | 0.977 | 1.485 | 0.843 | 0.558 | 0.594 |
+  | scene_gbuffer | 0.939 | 1.051 | 0.686 | 0.933 | 1.117 | 1.424 |
+  | post_smaller | 1.150 | 0.753 | 0.365 | 0.365 | 0.008 | 0.028 |
+  | clear | 0.235 | 0.272 | 1.111 | 0.350 | 0.275 | 0.220 |
+  | forward_at_eye | 0.261 | 0.265 | 0.356 | 0.683 | 0.342 | 0.999 |
+  | lighting_volume | 0.606 | 0.486 | 0.112 | 0.673 | 0.125 | 0.000 |
+  | exposure | 0.309 | 0.321 | 0.338 | 0.314 | 0.311 | 0.365 |
+  | other | 0.028 | 0.140 | 0.238 | 0.034 | 0.028 | 0.029 |
+  | probe_cube | 0.022 | 0.013 | 0.026 | 0.101 | 0.085 | 0.167 |
+  | shadow | 0.124 | 0.153 | 0.027 | 0.064 | 0.034 | 0.037 |
+  | total | 11.824 | 10.953 | 10.972 | 13.204 | 11.070 | 11.409 |
+
+  Two things in the table are not what they look like. (a) post_smaller's 1.150 in the first capture is one 2x2 cube-face pass
+  (frame 0: 3.244 ms, frame 2: 1.159 ms), which the 256 bound moved out of probe_cube. A 2x2 target cannot cost 3 ms, so those
+  milliseconds are most likely boundary-less GPU work between two stamps, not the pass. (b) Cube faces of 16 to 128 px (one draw,
+  cube resource) are now post_smaller under the spec's 256 bound; their own time is small (about 0.01 ms a frame together).
 ## What it does
 
 A press arms a batch of COUNT whole frames (the hotkey's value; default 30, capped at 120). At each frame boundary
@@ -151,7 +178,7 @@ Let E be the eye size (eyeW x eyeH, the same size vscreen publishes), and C be t
 5a. (v13.7) A colour target, at most four draws, and the most-drawn VS is a known HUD, holo or UI family: hud_overlay. The families are
    the game's: EyeDrawSnapshot::kHud (eye_draw_snapshot.h), kHoloGuiFxOffVs (holo_material.h) and kHoloTargetSphere (holo_families.h),
    matched by vertex shader hash; a pixel shader is not part of the match. Without them the same pass is fullscreen_at_eye.
-6. C is square and a cube resource: probe_cube.
+6. (v4) A 252x252 single-target pass, or a dispatch-only pass whose top compute shader is B8E727E9 or F1FB2EEF: exposure (checked after clear, before the depth rules). 6. (v3) probe_cube: C is square, 256 to 1024 on a side (or a cube array of 6+ slices), and not at the eye size.
 6a. (v2) C at E and the most-drawn VS is a light volume (0357BBB2DEE43C1F, 8289669D93A18C1D, 24DE25E496342EB8, A1B7CFCD0BE7493E,
    the instanced volumes of the lighting pass, from reviews\sealed-remaining-costs-2026-10-13.md): lighting_volume. Tested before
    rule 7, which would otherwise name the two-target lighting pass scene_gbuffer.

@@ -52,6 +52,16 @@ gpupass::VsFamily hudFamilies() {
     return f;
 }
 
+// v4: the exposure reduction chain's compute shaders (reviews\vr-view-caches-2026-10-13.md, candidate 1): B8E727E94D44D891 (24x24 groups,
+// the 8-byte structured UAV) and F1FB2EEFB662F3AA (the exposure shader, once per eye). Their 252x252 post passes are classed by shape.
+gpupass::VsFamily exposureFamily() {
+    gpupass::VsFamily f;
+    f.vs[0] = 0xB8E727E94D44D891ull;
+    f.vs[1] = 0xF1FB2EEFB662F3AAull;
+    f.n = 2;
+    return f;
+}
+
 // GPU pass profile v2: the light volume shapes of reviews\sealed-remaining-costs-2026-10-13.md (instanced into the eye-size target, the
 // lighting pass). Full hashes as the flat recipes name them (flat_projection_recipes.h): 0357BBB2DEE43C1F a 14-index box, 8289669D93A18C1D
 // an 84-index sphere or cone, 24DE25E496342EB8 and A1B7CFCD0BE7493E the smaller instanced volumes.
@@ -343,6 +353,8 @@ void buildRows(FrameRec& fr, uint32_t slot) {
         PassFacts pf = s.facts;
         const std::vector<HashTally> topPair = s.hashes.top();   // Built v13.7 (3): the most-drawn VS, for the HUD family rule
         pf.topVs = topPair.empty() ? 0 : topPair[0].vs;
+        const std::vector<HashTally> topCsPair = s.csHashes.top();   // v4: the most-dispatched compute shader, for the exposure rule
+        pf.topCs = topCsPair.empty() ? 0 : topCsPair[0].vs;
         facts.push_back(pf);
         ms.push_back(d + carry);
         carry = 0;
@@ -352,7 +364,8 @@ void buildRows(FrameRec& fr, uint32_t slot) {
     std::vector<PassClass> cls(facts.size());
     const VsFamily hud = hudFamilies();
     const VsFamily lighting = lightingFamilies();
-    for (size_t k = 0; k < facts.size(); ++k) cls[k] = classifyPass(facts[k], fr.eye, hud, lighting);
+    const VsFamily exposure = exposureFamily();
+    for (size_t k = 0; k < facts.size(); ++k) cls[k] = classifyPass(facts[k], fr.eye, hud, lighting, exposure);
     markCubeRuns(facts, cls, fr.eye);
     fr.matched = matchedEye(facts);
     uint32_t index = 0;
