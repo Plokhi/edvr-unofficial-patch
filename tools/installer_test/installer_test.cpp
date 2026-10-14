@@ -1131,6 +1131,83 @@ static void testShippedIni(const std::wstring& root) {
                   "a file without the six lines carries nothing: the new file stands as shipped");
         }
     }
+
+    // 2026-10-13: fix.transition_flash removed. The one-frame-flash hold is always on in the VR profile and has no setting; the key shipped LIVE
+    // as `1` in [fix] (so every install of the previous version has the line written out), with a menu row ("Stop the one-frame flash on jumps").
+    // A line somebody set (0 is the interesting one: it used to turn the hold off) is carried with its value under "this version no longer uses
+    // it", reported as retired, not adopted, and the DLL never reads it -- at run time the config audit names it as a line this build does not
+    // read. Nothing else in the file moves; a second merge adds no copy.
+    check(shipped.find("transition_flash") == std::string::npos,
+          "the shipped ini documents no fix.transition_flash line");
+    {
+        const std::string anchor = "\n# Stop the sun's glare riding your head";
+        const size_t at = shipped.find(anchor);
+        check(at != std::string::npos, "the shipped ini still has the line the removed-transition-flash fixture anchors on");
+        if (at != std::string::npos) {
+            std::string previous = shipped;
+            previous.insert(at + 1,
+                std::string("# Stop the one-frame flash of a wrong viewpoint when you jump, drop out of") + eol +
+                "# supercruise, or close the galaxy map. 1 on, 0 off. Needs a game restart." + eol +
+                "# ui: Stop the one-frame flash on jumps | menu" + eol +
+                "transition_flash = 1" + eol + eol);
+            const auto setLine = [&](std::string text, const std::string& oldLine, const std::string& newLine) {
+                const size_t p = text.find("\n" + oldLine + eol);
+                if (p != std::string::npos) text.replace(p + 1, oldLine.size(), newLine);
+                return text;
+            };
+            const auto copies = [](const std::string& text, const std::string& needle) {
+                size_t n = 0, from = 0;
+                while ((from = text.find(needle, from)) != std::string::npos) {
+                    ++n;
+                    from += 1;
+                }
+                return n;
+            };
+            const std::string carriedNote = "# carried over from your edvr.ini; this version no longer uses it";
+            const auto carriedAs = [&](const std::string& merged, const std::string& line) {
+                return merged.find(carriedNote + "\n" + line) != std::string::npos ||
+                       merged.find(carriedNote + "\r\n" + line) != std::string::npos;
+            };
+
+            // 1. The previous version's own file: the live `1` is carried.
+            {
+                MergeReport rep;
+                const std::string merged = mergeIni(shipped, previous, &previous, {}, &rep);
+                expectEq(iniValue(merged, "fix.transition_flash"), "1", "the previous version's own transition_flash line is carried, not eaten");
+                check(rep.retired.size() == 1 && rep.carried.empty(),
+                      "...reported as a retired setting, not as a key this version never shipped",
+                      std::to_string(rep.retired.size()) + " retired, " + std::to_string(rep.carried.size()) + " carried");
+                check(carriedAs(merged, "transition_flash = 1"), "...after a note saying this version no longer uses it");
+            }
+
+            // 2. A rig that had turned the hold off: the 0 is carried too, and is inert (nothing reads it).
+            {
+                const std::string off = setLine(previous, "transition_flash = 1", "transition_flash = 0");
+                MergeReport rep;
+                const std::string merged = mergeIni(shipped, off, &previous, {}, &rep);
+                expectEq(iniValue(merged, "fix.transition_flash"), "0", "a transition_flash = 0 line is carried with its value");
+                check(rep.retired.size() == 1 && rep.carried.empty(), "...and reported as retired");
+                check(carriedAs(merged, "transition_flash = 0"), "...after the note");
+                check(merged.find("Stop the one-frame flash") == std::string::npos,
+                      "the removed setting's documentation block and menu row are not resurrected");
+
+                MergeReport again;
+                const std::string twice = mergeIni(shipped, merged, &shipped, {}, &again);
+                check(copies(twice, "transition_flash = 0") == 1, "a second merge does not duplicate the carried line");
+
+                MergeReport bareRep;
+                const std::string bare = mergeIni(shipped, off, nullptr, {}, &bareRep);
+                check(iniValue(bare, "fix.transition_flash") == "0" && bareRep.carried.size() == 1 && bareRep.retired.empty(),
+                      "with no base copy it is still carried, reported as a key this version never shipped");
+            }
+
+            // A file with no such line carries nothing.
+            MergeReport freshRep;
+            const std::string fresh = mergeIni(shipped, shipped, &previous, {}, &freshRep);
+            check(fresh == shipped && freshRep.retired.empty() && freshRep.carried.empty(),
+                  "a file without the transition_flash line carries nothing: the new file stands as shipped");
+        }
+    }
 }
 
 // A shipped default that CHANGED, against the real edvr.ini: fix.ui_quality went

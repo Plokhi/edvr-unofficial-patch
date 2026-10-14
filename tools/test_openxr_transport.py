@@ -30,14 +30,13 @@ CASES = (("shared", "off"), ("private", "off"), ("live", "off"),
 
 
 def configuration(mode: str, probe: str, directory: Path, *, log: bool = False, hotkey: str | None = None) -> str:
-    # transition_flash=0 still observes camera history. Zero buffer bytes
-    # explicitly disables that observer in this fixture as well.
+    # The camera-buffer tap asks vScreen for its hooks whenever it observes a
+    # buffer, so zero buffer bytes is what makes this fixture transport-only.
     # `log` turns the DLL's log on (the Explorer Cam cases read it); `hotkey` adds
     # a [hotkey] explorer_cam line ("" is the empty value, None leaves it unsaid).
     text = f"""[fix]
 black_void = 0
 panel_distance = 1
-transition_flash = 0
 temporal_aa = off
 share_exposure = 0
 [advanced]

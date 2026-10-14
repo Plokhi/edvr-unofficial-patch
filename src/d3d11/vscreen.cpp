@@ -452,8 +452,7 @@ struct State {
     // loading screen's text quad on 2026-08-25; drawing the scanner's
     // body is the one thing only the scanner does.
     uint32_t fssBodyFrame = 0;
-    // The chrome tracker's stamp and the arrival-mono frame count, read
-    // by the glitch-frame side at its jump verdict.
+    // The chrome tracker's stamp and the arrival-mono frame count.
     uint32_t fssChromeFrame = 0;
     int      fssHealOn = 0;
     int      censusFssJump = 0;
@@ -710,17 +709,14 @@ struct State {
     void*    mappedData = nullptr;
     uint32_t mappedBytes = 0;
 
-    // A second mapped buffer, tracked only so the transition-flash detector can
-    // read the camera the game wrote. Separate from the pair above because the
+    // A second mapped buffer, tracked only so the transition-flash engine fix's
+    // tap can read the camera the game wrote. Separate from the pair above because the
     // panel transform and the scene camera live in different buffers and can be
     // mapped at the same time -- sharing one slot let whichever unmapped second
     // overwrite the other's record.
     void*    camResource = nullptr;
     void*    camData = nullptr;
     uint32_t camBytes = 0;
-    void* scenePoolResource = nullptr;
-    void* scenePoolData = nullptr;
-    uint32_t scenePoolBytes = 0;
 
     // More mapped-buffer shadows, separate from the two above for the reason
     // they are separate from each other: any pair of these buffers can be
@@ -742,9 +738,6 @@ struct State {
     // Frames since the hooks were installed. The per-frame instruments' log
     // lines use it to say which frame they mean.
     uint32_t frameNo = 0;
-    // Keep counting eye draws even when the panel distance fix is off, because
-    // the transition-flash detector cannot act without the count.
-    bool     countForFlashFix = false;
     uint64_t voidClears = 0;
     // Grey voids forced to black in one frame, and the smallest and largest
     // counts seen SINCE THE LAST REPORT.
@@ -853,7 +846,6 @@ struct State {
     // and only ever contributes its count. 0 when the published size is
     // doing its job, which is every ordinary rig.
     uint32_t sceneW = 0, sceneH = 0;
-    uint32_t sceneDrawsThisFrame = 0;
     bool     sceneSourceNoted = false;
     bool     renderAuto = true;        // advanced.eye_render_size
     bool     renderOffNoted = false;
@@ -946,8 +938,7 @@ struct State {
     uint64_t gameplayMs = 0;
     bool     recognitionLostNoted = false;
     // When the fixes were installed, for the starvation check. Frames are not
-    // a clock: a loading screen measured at 1790fps (see glitch_frame's
-    // validation note) passes 1800 frames in one second, so a frame count
+    // a clock: a loading screen measured at 1790fps passes 1800 frames in one second, so a frame count
     // alone cannot say "long enough that this is not startup".
     uint64_t installMs = 0;
 };
@@ -980,8 +971,7 @@ FaultBudget g_panelCbBudget("vScreen.panelBuffer", 5);  // reading the panel's t
 // reader that faults is a reader whose input was wrong; it is no evidence about the
 // others, and a diagnostic's fault must not stand down a feature's feed. The unit
 // is the CONSUMER: sunglareSceneRows reads two buffers and has one budget.
-FaultBudget g_glitchCameraBudget("vScreen.glitchCamera", 5);          // the flash detector's camera history
-FaultBudget g_glitchPoolBudget("vScreen.glitchPool", 5);              // ...and its scene instance pool
+FaultBudget g_glitchCameraBudget("vScreen.glitchCamera", 5);          // the transition-flash engine fix's camera tap
 FaultBudget g_sunglareRowsBudget("vScreen.sunglareRows", 5);          // ...and its live true-camera feed
 FaultBudget g_temporalCameraBudget("vScreen.temporalCamera", 5);      // the temporal pass's camera rows
 FaultBudget g_particleCaptureBudget("vScreen.particleCapture", 5);    // the particle billboards' constants
@@ -1200,8 +1190,8 @@ bool targetIsEyeSized(void* rtv, int* candOut = nullptr) {
             Log::get().note(
                 "vScreen: your eye textures and the on-foot panel are BOTH %ux%u, "
                 "so nothing here can tell one from the other by size. They are "
-                "being counted as eye textures, which keeps the black void, the "
-                "transition flash fix and Explorer Cam fed; the panel distance fix "
+                "being counted as eye textures, which keeps the black void and "
+                "Explorer Cam fed; the panel distance fix "
                 "may match a draw into the panel and place it wrongly. Set "
                 "fix.vscreen_res_width to a width your eye textures are not (the "
                 "height follows it at 16:9) if the panel sits at the wrong distance.",
@@ -1668,7 +1658,7 @@ __declspec(noinline) bool ensureOurCompositeCb(ID3D11DeviceContext* self, State*
 // objectProbeWantsDraws() below, so neither can be true while the gate is shut.
 // Narrow that probe's on-condition and both belong here.
 bool drawGateSubscribed(State* s) {
-    return s->distanceEnabled || s->countForFlashFix ||
+    return s->distanceEnabled ||
         s->censusSkipCount != 0 ||
         s->censusSkipRangeCount != 0 || s->censusSkipOffCount != 0 ||
         s->quadSkipArmed ||
@@ -1918,14 +1908,13 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // Counting eye draws is not part of the panel distance fix, even though it
     // happens here.
     //
-    // The transition-flash detector needs this count to tell a rendered scene
-    // from a menu, and it is the only place the count can be taken. It used to
-    // sit below the distanceEnabled test, so with panel_distance at its shipped
-    // default of 1.0 nothing counted, the count stayed 0, and the flash fix --
-    // which is on by default and asks the user to replace a file in their game
-    // install -- never withheld a single frame. It reported itself as armed
-    // throughout. Two features that have nothing to do with each other, and one
-    // silently switched the other off.
+    // The transition-flash detector (removed 2026-10-13) needed this count to
+    // tell a rendered scene from a menu, and this is the only place the count
+    // can be taken. It used to sit below the distanceEnabled test, so with
+    // panel_distance at its shipped default of 1.0 nothing counted, the count
+    // stayed 0, and the flash fix never withheld a single frame while it
+    // reported itself as armed. Two features that have nothing to do with each
+    // other, and one silently switched the other off.
     // Two subscribers learned this early return late.
     //
     // It predates the flash fix, and the flash fix hit the bug above: a
@@ -2071,7 +2060,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         if (s->rtv0Cand >= 0) {
             State::SceneCandidate& c = s->cands[s->rtv0Cand];
             ++c.thisFrame;
-            if (c.w == s->sceneW && c.h == s->sceneH) ++s->sceneDrawsThisFrame;
         }
         if(objectProbeLedgerActive()) {
             objectProbeNoteGuiSourceDraw(self,kind,count,instances,args.startInstance,args.start,args.base);
@@ -3141,7 +3129,6 @@ void STDMETHODCALLTYPE hookedExecuteCommandList(ID3D11DeviceContext* self,
         graphicsBridgeNoteUnknownExecution();
         motionResourceWritten(nullptr);
         if (celestialMotionAnyWatched()) celestialMotionConstantsUnknownWrite(nullptr);
-        glitchFrameInvalidatePool(nullptr);
     }
     s->realExecuteCommandList(self, list, restoreContextState);
     // After the call, and only when the context was not restored: with
@@ -3286,8 +3273,8 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
             s->shadowBytes = 0;
         }
     } else if (mapSub0 && res) {
-        // The scene camera buffer, for the transition-flash detector, recognised
-        // by size.
+        // The scene camera buffer, for the transition-flash engine fix's tap,
+        // recognised by size.
         //
         // GetType FIRST. Map is called on textures as well as buffers, and
         // ID3D11Buffer::GetDesc and ID3D11Texture2D::GetDesc occupy the same
@@ -3312,22 +3299,6 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
             s->camResource = res;
             s->camData = mapped->pData;
             s->camBytes = mm.byteWidth;
-        }
-    }
-    // glitchFrameObserving() (glitch_frame.h): glitchFrameWantsPool's own
-    // necessary first test is installed-and-observing; with either false it
-    // always returns 0.
-    if(mapData0 && res && glitchFrameObserving()){
-        const uint32_t bytes=glitchFrameWantsPool(res);
-        if(bytes){
-            // A resource address may be recycled. Verify the current mapping's
-            // extent instead of trusting the old nominated byte count.
-            UINT poolBytes=0,poolStride=0,poolMisc=0;
-            if(mapBufferDesc(res,&poolBytes,&poolStride,&poolMisc)){
-                if(poolStride==336 && (poolMisc&D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)){
-                    s->scenePoolResource=res;s->scenePoolData=mapped->pData;s->scenePoolBytes=poolBytes;
-                }
-            }
         }
     }
     // Engine-record velocity's watch on an open eye-frame's pool and scene
@@ -3387,15 +3358,6 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
     // The planet-patch shadow reads the write BEFORE the real Unmap, like every tee here: after it the memory is
     // no longer ours to look at.
     if (celestialMotionAnyWatched()) celestialMotionConstantsUnmapped(res);
-    // glitchFrameInvalidatePool's own and only test is "installed at all"
-    // (glitch_frame.h) -- unlike glitchFrameWantsPool, it does not also ask
-    // State::observing, so glitchFrameObserving() would be the wrong,
-    // narrower guard here.
-    if (glitchFrameInstalled()) glitchFrameInvalidatePool(res);
-    if(res==s->scenePoolResource && s->scenePoolData){
-        guardedBudget(g_glitchPoolBudget,[&]{glitchFrameObservePool(res,s->scenePoolData,s->scenePoolBytes);});
-        s->scenePoolResource=nullptr;s->scenePoolData=nullptr;s->scenePoolBytes=0;
-    }
     // The census CB watch reads the write BEFORE the real Unmap, exactly as
     // the tees below do and for the same reason: after it, the memory is no
     // longer ours to look at.
@@ -4270,7 +4232,7 @@ void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
     uiAtlasNoteWrite(dst, 2);
     if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteWrite(dst);   // a write into H after the resolve is the latch's
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
-    if (!foreignContext(self)) {motionResourceWritten(dst);if(celestialMotionAnyWatched())celestialMotionConstantsUnknownWrite(dst);glitchFrameInvalidatePool(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
+    if (!foreignContext(self)) {motionResourceWritten(dst);if(celestialMotionAnyWatched())celestialMotionConstantsUnknownWrite(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
     if (!foreignContext(self) && flatRuntimeActive()) {
         flatRuntimeSubstitution(self, FlatSubstEvent::kCopy);
         flatRuntimeOverlayResourceMutation(dst, FlatOverlayMutationOp::CopyResource,
@@ -4420,7 +4382,7 @@ void STDMETHODCALLTYPE hookedCopyStructureCount(ID3D11DeviceContext* self,
         detail.known=FlatMutationDetails::SourceView|FlatMutationDetails::DstXYZ;
         flatRuntimeOverlayResourceMutation(dst, FlatOverlayMutationOp::CopyStructureCount,detail);
     }
-    if(!foreignContext(self)){motionResourceWritten(dst,off,uint64_t(off)+4);glitchFrameInvalidatePool(dst);}
+    if(!foreignContext(self)){motionResourceWritten(dst,off,uint64_t(off)+4);}
     else engineVelocityResourceUnknown(dst);
     if (drawCensusArmed()) {
         drawCensusStructCount(dst, off, src, foreignContext(self));
@@ -4446,7 +4408,6 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
             motionResourceWritten(dst,dstX,uint64_t(dstX)+box->right-box->left);
         else motionResourceWritten(dst);
         if (celestialMotionAnyWatched()) celestialMotionConstantsUnknownWrite(dst);
-        glitchFrameInvalidatePool(dst);
         if (fssResActive()) fssResNoteCopyMaybeMismatched(dst, src);
         if (uiLayerWatching()) uiLayerNoteCopy(dst, src);
     }
@@ -4488,7 +4449,6 @@ void STDMETHODCALLTYPE hookedUpdateSubresource(ID3D11DeviceContext* self,
         if(box && box->right>=box->left)motionResourceWritten(dst,box->left,box->right);
         else motionResourceWritten(dst);
         if (celestialMotionAnyWatched()) celestialMotionConstantsWritten(dst, data, box);
-        glitchFrameInvalidatePool(dst);
     }
     if (drawCensusArmed()) {
         drawCensusCopy('U', dst, dstSub, box ? box->left : 0, box ? box->top : 0,
@@ -4630,29 +4590,6 @@ void STDMETHODCALLTYPE hookedRSSetViewports(ID3D11DeviceContext* self, UINT n,
 // and it advances only on sample frames -- an unsampled frame's draw still
 // pays exactly one inline load and no clock read at all.
 thread_local uint32_t t_drawClockOrdinal = 0;
-
-// The flash detector's scene instance pool, looked up from the draw that was
-// just sampled -- verbatim from hookedDrawIndexedInstanced's draw lambda, and
-// NOINLINE. It holds a D3D11_BUFFER_DESC, which /GS treats as a buffer (a
-// plain-data struct over eight bytes, filled by a COM call -- and the
-// GetType-first rule this file keeps is exactly what that cookie backs up),
-// so while it sat in the lambda every indexed draw carried a stack cookie for
-// a block that runs once a frame.
-__declspec(noinline) void noteSceneInstancePool(ID3D11DeviceContext* self) {
-    ID3D11ShaderResourceView* pool=nullptr;self->VSGetShaderResources(33,1,&pool);
-    if(pool){
-        ID3D11Resource* resource=nullptr;pool->GetResource(&resource);pool->Release();
-        if(resource){
-            D3D11_RESOURCE_DIMENSION kind{};resource->GetType(&kind);
-            if(kind==D3D11_RESOURCE_DIMENSION_BUFFER){
-                D3D11_BUFFER_DESC d{};static_cast<ID3D11Buffer*>(resource)->GetDesc(&d);
-                if(d.StructureByteStride==336 && (d.MiscFlags&D3D11_RESOURCE_MISC_BUFFER_STRUCTURED))
-                    glitchFrameNoteScenePool(resource,d.ByteWidth);
-            }
-            resource->Release();
-        }
-    }
-}
 
 struct DrawClock {
     bool    on;
@@ -4933,7 +4870,6 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             const bool eyeGeometry = g_state->rtv0Eye && perInstance && instances;
             const uint64_t sceneVs = eyeGeometry ? bindingShaderHash(BindSlot::Vs) : 0;
             const bool recognisedScene = eyeGeometry && glitchFrameIsSceneDraw(sceneVs);
-            const bool glitchWantsScene = recognisedScene && glitchFrameWantsSceneDraw(sceneVs);
             int temporalEye = -1;
             if (recognisedScene && (temporalPassWantsRigidDraw(0) ||
                                     temporalPassWantsRigidDraw(1))) {
@@ -4944,17 +4880,12 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             }
             const bool temporalWantsScene = recognisedScene &&
                 temporalPassWantsRigidDraw(temporalEye);
-            // At most one temporal VS-b1 query per identified eye/frame. The
-            // old flash diagnostic shares it when both want this draw. A null
+            // At most one temporal VS-b1 query per identified eye/frame. A null
             // binding is still recorded by the temporal provenance as a seen
             // draw with no mapped write, rather than silently retried later.
-            if (glitchWantsScene || temporalWantsScene) {
+            if (temporalWantsScene) {
                 ID3D11Buffer* scene=nullptr;self->VSGetConstantBuffers(1,1,&scene);
-                if (temporalWantsScene) temporalPassNoteRigidDraw(temporalEye, scene, sceneVs);
-                if(scene && glitchWantsScene){
-                    const bool sampled=glitchFrameNoteSceneDraw(scene);
-                    if(sampled) noteSceneInstancePool(self);
-                }
+                temporalPassNoteRigidDraw(temporalEye, scene, sceneVs);
                 if(scene)scene->Release();
             }
             // The VR camera census (vr_camera_census.h): at the 2D screen's composite, once an eye. g_vrWorldWants is true
@@ -5573,7 +5504,6 @@ static void vScreenRefreshConfigBody(bool forced) {
     s->distanceScale = cfg.getFloat("fix.panel_distance", 1.0f);
     s->distanceEnabled = s->distanceScale != 1.0f;
     s->distanceIndex = readDistanceIndex(cfg);
-    s->countForFlashFix = glitchFrameNeedsEyeDraws();
     readEyeRenderSize(cfg, s);
     readCensusSkip(cfg, s);
     fssResConfigure(cfg);
@@ -5598,10 +5528,10 @@ static void vScreenRefreshConfigBody(bool forced) {
     backdropConfigure(cfg);
     fssPanelConfigure(cfg);
     fssRevealConfigure(cfg);
-    // fix.transition_flash: the engine fix (transition_flash_eye_base.cpp). The
-    // first call installs its consumer hook when the key is on and reports
-    // Armed or Lost to the detector; later calls do nothing.
-    transitionFlashEyeBaseConfigure(cfg);
+    // The transition-flash engine fix (transition_flash_eye_base.cpp), always on.
+    // The first call in a VR profile installs its consumer hook and reports
+    // Armed or Lost to the camera-buffer tap; later calls do nothing.
+    transitionFlashEyeBaseInstall();
     // The settings menu: its own keys, then the reload's diff -- every row's
     // value, the restart snapshot, and a toast for what changed from outside.
     menuConfigure(cfg);
@@ -6012,12 +5942,6 @@ void vScreenFrameBoundary() {
     // wrong: this file kept pointers and dropped answers while exposure_fix
     // dropped pointers, and each had its own failure mode.
 
-    // Re-asked every frame, not on config reload. The answer changes when the
-    // detector gives up on itself, which is not something an ini edit causes --
-    // and vScreenRefreshConfig returns early unless the file's write time moved,
-    // so asking there would never see it. One bool call a frame.
-    s->countForFlashFix = glitchFrameNeedsEyeDraws();
-
     // Give up on a learned panel buffer that has stopped being used.
     //
     // 600 frames is about seven seconds at 90Hz -- long enough that walking
@@ -6078,8 +6002,8 @@ void vScreenFrameBoundary() {
                     "vScreen: the panel resolution you asked for (%ux%u) is EXACTLY the "
                     "size of your eye textures, so nothing here can tell one from the "
                     "other by size. The panel is no longer being excluded from the "
-                    "eye-draw count, which is what keeps the black void, the transition "
-                    "flash fix and Explorer Cam fed -- but the panel distance fix can now "
+                    "eye-draw count, which is what keeps the black void and "
+                    "Explorer Cam fed -- but the panel distance fix can now "
                     "match a draw INTO the panel and put it at the wrong distance. If the "
                     "panel sits wrong, set fix.vscreen_res_width to a width your eye "
                     "textures are not: 2880 is a safe pick at any headset resolution, "
@@ -6104,8 +6028,7 @@ void vScreenFrameBoundary() {
     // on the stated premise that 1800 frames is "twenty seconds at 90Hz". At
     // the three rates this mod has to work at that premise is wrong twice: 25
     // seconds at 72Hz, 15 at 120. During a loading screen it is not even close
-    // -- the flash detector's validation note records one measured at 1790fps,
-    // which reaches 1800 frames in a second and legitimately draws nothing
+    // -- a loading screen measured at 1790fps, which reaches 1800 frames in a second and legitimately draws nothing
     // eye-sized while it does, which is how this notice fired during startup.
     //
     // So the duration is a duration. The frame floor stays, because "twenty
@@ -6144,7 +6067,7 @@ void vScreenFrameBoundary() {
         // with them OFF is the settings -- and accusing a healthy
         // exposure-only install of being hooked over, with a solicited bug
         // report, is exactly the kind of lie this notice exists to end.
-        const bool perDrawAskers = s->distanceEnabled || s->countForFlashFix;
+        const bool perDrawAskers = s->distanceEnabled;
         char adviceBuf[1100];
         const char* advice;
         // The runtime paragraph goes on its own line AFTER the notice, not
@@ -6159,8 +6082,8 @@ void vScreenFrameBoundary() {
             // whether the clearing worked.
             advice =
                 "Eye draws are only counted when a fix that needs them per "
-                "draw is on, and none is: the panel distance is at 1.0 and the "
-                "flash detector is not counting. The black void fix does not "
+                "draw is on, and none is: the panel distance is at 1.0. "
+                "The black void fix does not "
                 "count draws -- the totals lines say whether it is clearing. This zero is those "
                 "settings, not a fault.";
         } else if (s->recogniserAsks == 0) {
@@ -6199,8 +6122,8 @@ void vScreenFrameBoundary() {
         }
         Log::get().note(
             "vScreen: NOT ONE eye-sized render target in %u frames over %u seconds. The black void, the "
-            "panel distance, the transition flash fix and Explorer Cam all read that "
-            "count, so all four are inert -- not broken, starved. They will say nothing "
+            "panel distance and Explorer Cam all read that "
+            "count, so all three are inert -- not broken, starved. They will say nothing "
             "further, which is why this line exists. Largest targets seen: %s. The panel "
             "is at %ux%u and its exclusion answered no %llu time(s); the headset %s. %s",
             s->frameNo, static_cast<uint32_t>((now - s->installMs) / 1000u),
@@ -6272,7 +6195,7 @@ void vScreenFrameBoundary() {
                 "guessed: it is the eye's own shape to within a percent, and one frame "
                 "put %u draws into it while the submitted size peaked at %u for the "
                 "whole session. It now counts as an eye texture as well, which is what "
-                "feeds the black void, Explorer Cam, the transition flash detector, the "
+                "feeds the black void, Explorer Cam, the "
                 "RemLok lines and the loading hologram -- all of "
                 "them inert until this line. If something now lands on the wrong pass, "
                 "set advanced.eye_render_size = off under [advanced] in %s and "
@@ -6297,8 +6220,8 @@ void vScreenFrameBoundary() {
             // whatever its shape -- one texture holding both eyes, a
             // non-uniform scale, a layout nobody here has seen. That answers
             // "is a scene being rendered", which is the only thing Explorer
-            // Cam, the transition flash detector and the camera scan ever
-            // wanted from this count, so they get it.
+            // Cam and the camera scan ever wanted from this count, so they
+            // get it.
             //
             // It does NOT make the target an eye texture. The black void, the
             // RemLok lines and the loading hologram
@@ -6328,9 +6251,9 @@ void vScreenFrameBoundary() {
                 "vScreen: the busiest render target on this rig is %ux%u -- %s. "
                 "One frame put %u draws into it while the submitted size peaked at %u "
                 "for the whole session, so that is where the world is being drawn. It "
-                "is now counted as the scene, which is what Explorer Cam, the "
-                "transition flash detector and the camera scan actually ask about, and "
-                "all three work again. It is NOT treated as an eye texture: the fixes "
+                "is now counted as the scene, which is what Explorer Cam and "
+                "the camera scan actually ask about, and "
+                "both work again. It is NOT treated as an eye texture: the fixes "
                 "that draw into one -- the black void, the RemLok lines, the loading "
                 "hologram -- need the real thing and stay off "
                 "rather than write to a target only its draw count vouches for. A "
@@ -6347,7 +6270,7 @@ void vScreenFrameBoundary() {
     // eye-draw peak of 18 and 20 for whole sessions of real play, against the
     // 975 and 1074 measured here on a Quest 3 and a Pimax. Twenty is what a
     // session that never reaches LoadGame produces. So every fix that reads
-    // the count was inert -- the gate needs 50, the flash detector 100 -- and
+    // the count was inert -- the gate needs 50 -- and
     // the recogniser reported itself healthy, because it had recognised
     // something. The list of sizes it REJECTED, which is the answer, was
     // collected all along and printed only in the zero case.
@@ -6474,8 +6397,7 @@ void vScreenFrameBoundary() {
             "in THIS window treated one eye and not the other. The eye-draw counts "
             "depend entirely on what you were doing: about 2 in HMD Cinema Mode, tens to "
             "hundreds on foot with the helmet HUD drawn, and a few hundred in flight. "
-            "They are NOT a fault indicator -- the flash detector needs the count above "
-            "100 to consider a frame at all. The fps is what the GAME produced, which is "
+            "They are NOT a fault indicator. The fps is what the GAME produced, which is "
             "not the headset's refresh rate: far above it on a loading screen, half of "
             "it when the runtime is reprojecting.",
             static_cast<unsigned long long>(s->panelOverrides),
@@ -6667,7 +6589,7 @@ void vScreenFrameBoundary() {
                 "vScreen: the eye-draw counts above are draws into the %ux%u eye "
                 "textures. On this rig the scene is drawn into %ux%u, so a small "
                 "number there is expected and is not the fix going quiet -- what "
-                "Explorer Cam, the transition flash detector and the camera scan read "
+                "Explorer Cam and the camera scan read "
                 "is the two added together. Said once.",
                 s->eyeW, s->eyeH, s->sceneW, s->sceneH);
         }
@@ -6710,21 +6632,10 @@ void vScreenFrameBoundary() {
         s->windowStartFrame = s->frameNo;
     }
 
-    // WHAT "A SCENE IS BEING RENDERED" IS COUNTED FROM, for the three
-    // features that ask only that and do not care which texture it landed in.
-    //
-    // Draws into the eye textures, plus draws into a target promoted to carry
-    // the count when the eye textures are not where the world goes. The
-    // second term is 0 on every rig whose game renders into what it submits,
-    // so this is the same number it has always been there -- which matters,
-    // because the thresholds these three turn on (20 for a menu, past 100 for
-    // gameplay) were measured against it and a quietly redefined counter
-    // would move all three at once with nothing saying so.
-    const uint32_t sceneDraws = s->eyeDrawsThisFrame + s->sceneDrawsThisFrame;
     s->eyeDrawsLastFrame = s->eyeDrawsThisFrame;
-    // The flash detector needs the count for the frame that just ended, to tell
-    // a rendered scene from a menu. It has to be told before the counter resets.
-    glitchFrameBoundary(sceneDraws);
+    // The camera-buffer tap's frame counter, which the engine fix's window
+    // tests count in.
+    glitchFrameBoundary();
     // The engine fix's per-frame service: publishes the frame number its
     // consumer hook reads (that hook can run on a scheduler job thread), logs
     // a held frame, closes its event window, and owes the temporal pass its
@@ -6732,7 +6643,6 @@ void vScreenFrameBoundary() {
     // glitchFrameBoundary, which closes the same frame.
     transitionFlashEyeBaseFrameBoundary(s->frameNo);
     s->eyeDrawsThisFrame = 0;
-    s->sceneDrawsThisFrame = 0;
     ++s->frameNo;
 
     // The draw path's subscriber gate for the frame about to start. Forty
@@ -6762,13 +6672,11 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     // for anyone who starts with both off.
     //
     // The flash fix is part of that test, not a bystander. These context hooks
-    // are its ONLY source of the camera it watches, the eye-draw count it gates
-    // on, and the frame boundary that drives its cooldowns -- it installs
-    // nothing itself. Consulting only the two panel fixes meant that turning
-    // both off, with panel_hooks_always = 0, silently took the flash fix with
-    // them: armed in the log, then nothing, and not even the give-up notice,
-    // because the frame counter it waits on also lives in here.
-    if (!wantVoid && scale == 1.0f && !glitchFrameNeedsEyeDraws() &&
+    // are its ONLY source of the camera it watches and the frame boundary that
+    // counts its event windows -- it installs nothing itself. Consulting only
+    // the two panel fixes meant that turning both off, with panel_hooks_always =
+    // 0, silently took the flash fix with them: armed in the log, then nothing.
+    if (!wantVoid && scale == 1.0f && !glitchFrameWantsHooks() &&
         !cfg.getBool("advanced.app_gpu_timing", true) &&
         !cfg.getBool("advanced.panel_hooks_always", true)) {
         // The optional fixes are deliberately dormant, but native discovery
@@ -6826,7 +6734,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     fssPanelConfigure(cfg);
     fssRevealConfigure(cfg);
     // The engine fix. See the other call site's comment above.
-    transitionFlashEyeBaseConfigure(cfg);
+    transitionFlashEyeBaseInstall();
     {
         g_state->censusFssJump =
             cfg.getInt("advanced.census_fss_jump", 0) ? 1 : 0;
@@ -6847,9 +6755,6 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     particleConfigure(cfg);
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
-    // installGlitchFrameFix is called before this, deliberately, so this is its
-    // settled answer rather than a guess about config it has not read yet.
-    g_state->countForFlashFix = glitchFrameNeedsEyeDraws();
 
     // The panel size is NOT read from config here.
     //
@@ -6994,9 +6899,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
                     "counting %s, hooking %s",
                     s.blackVoid ? "on" : "off",
                     s.distanceEnabled ? "on" : "off (1.0)",
-                    (s.distanceEnabled || s.countForFlashFix)
-                        ? "on"
-                        : "OFF -- the transition flash fix cannot act without it",
+                    s.distanceEnabled ? "on" : "off",
                     // WHAT the mode is, never WHY it was picked. This line used
                     // to explain the choice -- "the context is a wrapper's, e.g.
                     // ReShade" for in-place -- and advanced.context_hook_mode
