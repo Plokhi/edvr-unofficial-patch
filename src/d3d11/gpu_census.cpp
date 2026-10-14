@@ -2,6 +2,7 @@
 #include "gpu_interval.h"
 #include "gpu_frame_gap.h"
 #include "gpu_frame_timing.h"
+#include "frame_span_tile.h"   // kFrameSpanSlots: the overlay's frame GPU span (2026-10-14)
 #include "gpu_pass_profile.h"   // TEMPORARY pass profiler: an EDVR section's begin and end are pass boundaries
 #include "../common/log.h"
 #include <windows.h>
@@ -583,9 +584,61 @@ void gpuCensusEnd(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept {
     g_section[static_cast<size_t>(section)].sampler.end(ctx);
 }
 
+// The overlay's frame GPU WORK span (2026-10-14, reworked the same day). With the application-frame clock off, the overlay had no
+// GPU frame time. One timestamp pair a frame, inside the census's frame scope, from the frame's first GPU command to the end of
+// EDVR's door work:
+//   - the census opens its frame scope at gpuCensusFrame (presentFrameBoundary, device_hook.cpp, after the real Present) and arms
+//     g_frameWorkArmed there;
+//   - the first command the game issues on the owner context after that (gpuFrameCommandIfLive, every command thunk) begins the pair;
+//   - the door work ends in hookedPresent, just before the real Present (gpuCensusFrameWorkEnd), which is before the next
+//     gpuCensusFrame closes the scope.
+// So the pair lies in the one scope. Two queries a frame, read back four frames later (GpuIntervals). The span includes GPU idle
+// inside the frame, not the idle between frames: a boundary-to-boundary span reads the frame period on a GPU with slack.
+GpuIntervals<kFrameSpanSlots> g_frameSpan;
+std::atomic<bool> g_frameWorkOpenFlag{false};   // a pair is open (begun, not yet ended)
+uint64_t g_frameSpanCompleted = 0;   // pairs read back, all time
+double g_frameSpanLastMs = 0.0;      // the last pair read back
+
+namespace detail {
+std::atomic<bool> g_frameWorkArmed{false};
+}  // namespace detail
+
+void frameSpanEnd(ID3D11DeviceContext* ctx) {
+    // The fallback end, at the census's close: a pair the door end did not close (no Present through the hook) ends here, still in its scope.
+    if (!g_frameWorkOpenFlag.load(std::memory_order_relaxed)) return;
+    g_frameSpan.end(ctx);
+    g_frameWorkOpenFlag.store(false, std::memory_order_relaxed);
+}
+void frameWorkFirstCommand(ID3D11DeviceContext* ctx) noexcept {
+    // Only the owner's immediate context begins the pair; a command on another context leaves the arm for the owner's.
+    if (!ctx || !gpuTimingAccepts(ctx)) return;
+    detail::g_frameWorkArmed.store(false, std::memory_order_relaxed);
+    // Only inside the census's scope: without one open, GpuTimer::begin would open a scope of its own and hold a record of the clock's eight.
+    if (!gpuTimingCensusScopeOpen()) return;
+    if (g_frameSpan.begin(ctx)) g_frameWorkOpenFlag.store(true, std::memory_order_relaxed);
+}
+void gpuCensusFrameWorkEnd(ID3D11DeviceContext* ctx) noexcept {
+    if (!g_frameWorkOpenFlag.load(std::memory_order_relaxed)) return;
+    g_frameSpan.end(ctx);
+    g_frameWorkOpenFlag.store(false, std::memory_order_relaxed);
+}
+bool gpuCensusFrameWorkOpen() noexcept { return g_frameWorkOpenFlag.load(std::memory_order_relaxed); }
+void frameSpanPoll(ID3D11DeviceContext* ctx) {
+    const unsigned before = g_frameSpan.totals.samples;
+    const double beforeMs = g_frameSpan.totals.ms;
+    g_frameSpan.poll(ctx);
+    const unsigned got = g_frameSpan.totals.samples - before;
+    if (got == 0) return;
+    g_frameSpanLastMs = (g_frameSpan.totals.ms - beforeMs) / static_cast<double>(got);
+    g_frameSpanCompleted += got;
+}
+
 void gpuCensusFrame(ID3D11DeviceContext* ctx) noexcept {
+    const bool appClockOn = gpuFrameClockLive();
+    if (!appClockOn) frameSpanEnd(ctx);   // before the census closes its scope: the pair lies in that scope
     gpuTimingCensusScopeEnd(ctx, GetTickCount64());   // the frame's spans are all issued; closing lets their result be read
     for (auto& st : g_section) { st.sampler.poll(ctx); st.nullSampler.poll(ctx); }
+    if (!appClockOn) frameSpanPoll(ctx);
 
     ++g_windowFrames;
 
@@ -605,7 +658,13 @@ void gpuCensusFrame(ID3D11DeviceContext* ctx) noexcept {
     // The next frame's one frequency scope, opened here rather than at its first census span so that EVERY timer pair of the frame borrows it, the
     // census's and the others' (the HUD route's per-draw spans, the seed's): a pair that finds none open opens its own and holds a record of the
     // clock's eight for four-plus frames (gpu_timing.h, gpuTimingCensusScopeEnsure). The application-frame clock does this itself when it is on.
-    if (!gpuFrameClockLive()) gpuTimingCensusScopeEnsure(ctx, now);
+    if (!gpuFrameClockLive()) {
+        gpuTimingCensusScopeEnsure(ctx, now);
+        // The next frame's work span: armed now, begun by the first command in its scope (frameWorkFirstCommand).
+        detail::g_frameWorkArmed.store(gpuTimingCensusScopeOpen(), std::memory_order_relaxed);
+    } else {
+        detail::g_frameWorkArmed.store(false, std::memory_order_relaxed);   // the application clock's own frames: no work span
+    }
 
     GpuFrameSnapshot completions[32]{};
     uint64_t dropped = 0;
@@ -624,7 +683,15 @@ void gpuCensusNoteEyeRun() noexcept { ++g_windowEyeRuns; }
 
 void gpuCensusShutdown() noexcept {
     for (auto& st : g_section) { st.sampler.reset(); st.nullSampler.reset(); }
+    g_frameSpan.reset();
     resetSeedNotes();
+}
+
+bool gpuCensusFrameSpan(double* ms, unsigned* samples) noexcept {
+    if (g_frameSpanCompleted == 0) return false;
+    if (ms) *ms = g_frameSpanLastMs;
+    if (samples) *samples = static_cast<unsigned>(g_frameSpanCompleted > 0xFFFFFFFFull ? 0xFFFFFFFFull : g_frameSpanCompleted);
+    return true;
 }
 
 } // namespace edvr

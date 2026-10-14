@@ -2,6 +2,7 @@
 #include "ui_layer.h"
 #include "gpu_timing.h"
 #include "gpu_frame_timing.h"
+#include "gpu_census.h"   // gpuCensusFrameWorkOpen/End: the frame's GPU work span's door end (2026-10-14)
 #include "native_timing.h"
 #include "../common/native_present_trace.h"
 
@@ -1768,6 +1769,16 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     // reads below, which time the call alone. The gate is one relaxed load.
     const bool routeCrumbs = hdrCrumbPresentSide();
     if (routeCrumbs) hdrCrumbWrite("present", "begin");
+    // The frame's GPU work span ends here (2026-10-14, gpu_census.cpp): EDVR's door work is done and the real Present is next, on
+    // the game's own context. Before this call, so the pair is still inside the census scope that the boundary after the Present closes.
+    if (gpuCensusFrameWorkOpen()) {
+        ID3D11DeviceContext* workContext = nullptr;
+        g_state->device->GetImmediateContext(&workContext);
+        if (workContext) {
+            gpuCensusFrameWorkEnd(workContext);
+            workContext->Release();
+        }
+    }
     const int64_t presentT0 = qpcNow();
     const HRESULT hr = g_state->realPresent(self, syncInterval, flags);
     const int64_t presentT1 = qpcNow();
