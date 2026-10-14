@@ -7,7 +7,6 @@
 #include "../../src/d3d11/station_gather_core.h"
 #include "../../src/d3d11/station_lockfree_core.h"
 #include "../../src/d3d11/station_pass_core.h"
-#include "../../src/d3d11/sun_shadow_skip_core.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2219,66 +2218,84 @@ int main(int argc, char** argv) {
         check(sealedSeen >= 100 + 36 && sealedSeen <= 100 + 44, "v14.31 sampled gathers: a sealed ship swap is seen about forty ticks after it (ten readings, one in four)");
         check(unsealedSeen >= 100 + 72 && unsealedSeen <= 100 + 88, "v14.31 sampled gathers: an unsealed ship swap is seen about eighty ticks after it");
     }
+
+    // ---- Built v14.33: the mechanism release arms after the bay has been still for 60 informative passes (flight 1718577b: a port whose gate ramps were
+    // still closing when the game said r1 1) ---------------------------------------------------------------------------------------------------------
     {
-        namespace sk = edvr::sunskip;
-        check(sk::isCascadeMap(true, 2048, 1024, 53) && sk::isCascadeMap(true, 2048, 1024, 55), "v14.31 sun skip: a 2048x1024 R16 or D16 texture is the cascade map");
-        check(!sk::isCascadeMap(true, 256, 256, 53) && !sk::isCascadeMap(true, 2048, 1024, 40) && !sk::isCascadeMap(false, 2048, 1024, 53) &&
-                  !sk::isCascadeMap(true, 1024, 2048, 53),
-              "v14.31 sun skip: the 256x256 map, another format, a buffer and a swapped size are not");
-        // the window: idle, then scanning for kScanFrames frames, then skipping; a consumer stands the skip down
-        auto gate = std::make_unique<sk::SkipGate>();
-        check(gate->phase() == sk::Phase::kIdle && !gate->skipping(), "v14.31 sun skip: the gate starts idle");
-        bool changed = false;
-        for (uint32_t f = 0; f < sk::kScanFrames - 1; ++f) changed = changed || gate->frame(true);
-        check(gate->phase() == sk::Phase::kScanning && !gate->skipping() && !changed, "v14.31 sun skip: the draws still run while the window is scanned");
-        check(gate->frame(true) && gate->skipping(), "v14.31 sun skip: after kScanFrames frames with no consumer the gate skips, and says so once");
-        check(!gate->frame(true) && gate->skipping(), "v14.31 sun skip: and says so only once");
-        sk::Consumer c;
-        c.stage = sk::Stage::kCs;
-        c.slot = 2;
-        c.cs = 0xABCD;
-        check(gate->consumer(c) && gate->phase() == sk::Phase::kStoodDown && !gate->skipping() && gate->standDowns() == 1,
-              "v14.31 sun skip: a consumer found while skipping stands the skip down (fail-safe) and reports it once");
-        check(!gate->consumer(c) && gate->standDowns() == 1 && gate->consumers() == 2, "v14.31 sun skip: a second consumer in the window is counted, not reported again");
-        for (uint32_t f = 0; f < 200; ++f) gate->frame(true);
-        check(gate->phase() == sk::Phase::kStoodDown, "v14.31 sun skip: the stand-down lasts the rest of the sun-skip window");
-        gate->frame(false);
-        check(gate->phase() == sk::Phase::kIdle, "v14.31 sun skip: the sun coming back ends the window");
-        for (uint32_t f = 0; f < sk::kScanFrames; ++f) gate->frame(true);
-        check(gate->skipping(), "v14.31 sun skip: the next window scans afresh and skips again when clear");
-        // a consumer while scanning also stands it down, before any draw was skipped
-        auto g2 = std::make_unique<sk::SkipGate>();
-        for (uint32_t f = 0; f < 10; ++f) g2->frame(true);
-        check(g2->consumer(c) && g2->phase() == sk::Phase::kStoodDown, "v14.31 sun skip: a consumer found while scanning stands it down before the first skip");
-        for (uint32_t f = 0; f < sk::kScanFrames * 2; ++f) g2->frame(true);
-        check(!g2->skipping(), "v14.31 sun skip: a stood-down window never reaches skipping");
-        // the scan's stride reaches every position of the draw order over a window
-        std::vector<bool> reached(sk::kScanDrawStride, false);
-        for (uint32_t frame = 1; frame <= sk::kScanFrames; ++frame) {
-            for (uint32_t ord = 0; ord < 1400; ++ord) {
-                if (sk::takeScan(ord, frame, sk::drawStride(sk::Phase::kScanning))) reached[ord % sk::kScanDrawStride] = true;
-            }
+        const float ax0[3] = {1, 0, 0};
+        const float ax2[3] = {0, 0, 1};
+        se::LatchRec rec;
+        se::MechArm arm;
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::sealStep(inHangar(0), &st, &w);   // the seal is held from here on
+        float z = 0.0f;
+        uint32_t frame = 100;
+        int releasedDuring = 0;
+        int armedAt = -1;
+        auto tick = [&](float moveZ, int index, bool r1) {
+            z += moveZ;
+            const float rel[3] = {3.0f, 4.0f, z};
+            rec.step(++frame, rel, ax0, ax2, 1, 1, 1000 + frame);
+            const bool allStill = rec.stamp == frame && rec.movedRun == 0;
+            if (arm.step(allStill) && armedAt < 0) armedAt = index;
+            se::SealInputs in = inHangar(1000 + frame);
+            in.held = true;
+            in.inHangar = r1;
+            in.mechanismMoved = arm.armed && rec.movedRun >= 2;
+            return se::sealStep(in, &st, &w);
+        };
+        // the gates close for 2 s (180 passes) after r1 1: moving every pass; nothing releases and nothing arms
+        for (int i = 0; i < 180; ++i) {
+            if (tick(0.5f, i, true) == se::SealAction::kRelease) ++releasedDuring;
         }
-        bool all = true;
-        for (bool r : reached) all = all && r;
-        check(all && sk::dispatchStride(sk::Phase::kScanning) == 1 && sk::drawStride(sk::Phase::kSkipping) > sk::drawStride(sk::Phase::kScanning),
-              "v14.31 sun skip: the scan reaches every draw position over the window, every dispatch while scanning, and watches more sparsely once skipping");
-        auto g3 = std::make_unique<sk::SkipGate>();
-        for (uint32_t f = 0; f < sk::kScanFrames; ++f) g3->frame(true);
-        g3->addInto(250000);
-        g3->addSkipped(240000);
-        char line[1400];
-        const size_t n = g3->line(line, sizeof(line), 30);
-        check(n > 200 && std::strstr(line, "sun shadow map last 30 s") != nullptr && std::strstr(line, "state skipping") != nullptr &&
-                  std::strstr(line, "240000 skipped") != nullptr,
-              "v14.31 sun skip: the 30 s line carries the state, the draws seen and skipped, and the scan counts");
-        c.stage = sk::Stage::kPs;
-        c.vs = 0x11;
-        c.ps = 0x22;
-        g3->consumer(c);
-        g3->line(line, sizeof(line), 30);
-        check(std::strstr(line, "state stood down") != nullptr && std::strstr(line, "last consumer: pixel shader slot 2") != nullptr,
-              "v14.31 sun skip: a stood-down line names the stage, the slot and the shaders");
+        check(releasedDuring == 0 && !arm.armed, "v14.33 arm: gates still closing for 2 s after r1 1: no release, not armed");
+        // then still: it arms on the 60th still pass
+        for (int i = 0; i < 59; ++i) tick(0.0f, 180 + i, true);
+        check(!arm.armed, "v14.33 arm: 59 still passes do not arm");
+        tick(0.0f, 239, true);
+        check(arm.armed && armedAt == 239, "v14.33 arm: the 60th still pass arms (about 1 s)");
+        for (int i = 0; i < 100; ++i) {
+            if (tick(0.0f, 240 + i, true) == se::SealAction::kRelease) ++releasedDuring;
+        }
+        check(releasedDuring == 0, "v14.33 arm: armed and still, nothing releases");
+        // a launch after arming releases, on the second moving pass
+        bool released = false;
+        for (int i = 0; i < 4 && !released; ++i) released = tick(0.5f, 340 + i, true) == se::SealAction::kRelease && w == se::ReleaseWhy::kMechanism;
+        check(released, "v14.33 arm: a launch after arming releases by the mechanism");
+    }
+    {
+        // an r1 1 to 0 before the arm still releases: the arm gates only the mechanism
+        const float ax0[3] = {1, 0, 0};
+        const float ax2[3] = {0, 0, 1};
+        se::LatchRec rec;
+        se::MechArm arm;
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::sealStep(inHangar(0), &st, &w);
+        float z = 0.0f;
+        for (uint32_t f = 1; f <= 20; ++f) {
+            z += 0.5f;
+            const float rel[3] = {3.0f, 4.0f, z};
+            rec.step(f, rel, ax0, ax2, 1, 1, 1000 + f);
+            arm.step(rec.stamp == f && rec.movedRun == 0);
+        }
+        se::SealInputs in = inHangar(2000);
+        in.held = true;
+        in.inHangar = false;
+        in.mechanismMoved = arm.armed && rec.movedRun >= 2;
+        check(!arm.armed && !in.mechanismMoved && se::sealStep(in, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kInHangarLeft,
+              "v14.33 arm: an r1 1 to 0 before the arm still releases");
+        // a record not read this pass (or a hole) restarts the count; a reset starts it afresh
+        se::MechArm a2;
+        for (int i = 0; i < 40; ++i) a2.step(true);
+        a2.step(false);
+        for (int i = 0; i < 59; ++i) a2.step(true);
+        check(!a2.armed, "v14.33 arm: a pass with a record read late or moving restarts the count");
+        a2.step(true);
+        check(a2.armed, "v14.33 arm: and sixty clean passes after it arm");
+        a2.reset();
+        check(!a2.armed && a2.run == 0, "v14.33 arm: a new seal resets the arm");
     }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);

@@ -23,7 +23,6 @@
 #include "station_lockfree_core.h"
 #include "station_pass_core.h"
 #include "pad_state_probe.h"
-#include "sun_shadow_skip.h"
 #include "store_hook.h"
 #include "view_source.h"
 
@@ -1224,6 +1223,7 @@ float g_shellNow[3] = {};
 uint8_t g_shellNowSrc = 4;
 bool g_shellNowValid = false;
 bool g_mechanismMoved = false;             // built v14.14: a latched bay mechanism moved while sealed
+sealed::MechArm g_mechArm;                 // built v14.33: the mechanism release arms after the latched records were still for 60 informative passes
 bool g_flagPadMoved = false;               // promote saw the held pad move along the shaft against the shell: the tick releases on it
 char g_releaseWhy[160] = {};               // the release text for the flags above (the pad move or the hangar change, with its names)
 uint32_t g_settingPoll = 0;                // frames since the setting was last read
@@ -1328,6 +1328,7 @@ void releaseSeal(const char* why, uint32_t frame) noexcept {
     g_otherPicked = 0;
     g_engagePending = false;
     sealed::clearTrigger(&g_sealState);   // the pad's motion memory stays: a release by motion makes the next seal wait its delay (built v14.4)
+    g_mechArm.reset();
     g_sealedFlag.store(false, std::memory_order_release);
     // the latch is kept across a release (built v14.16): undock, a hangar change and a ship change clear it
 }
@@ -1650,9 +1651,6 @@ void summaryLine(uint64_t now) noexcept {
         g_rigTally.stale = 0;
         g_rigTally.asked = 0;
     }
-
-    // Built v14.31: the sun shadow skip's 30 s line (written only when the sun skip was on in the window).
-    sunShadowSkipReport((now - g_summaryStartMs) / 1000);
 
     g_prodStats.maxProbes.store(0, std::memory_order_relaxed);
     g_rigStats.maxProbes = g_collStats.maxProbes = 0;
@@ -2055,7 +2053,8 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
             pickOwnRecord(frame);
             g_heldCell = next;
             g_heldValid = true;
-            snapshotSealPose();              // built v14.24: each latched record's pose at the seal (the mechanism re-seal compares against it)
+            snapshotSealPose();              // built v14.24: each latched record's pose at the seal (v14.33: taken again when the mechanism release arms)
+            g_mechArm.reset();               // built v14.33: mechanism motion neither releases nor counts until 60 still passes
             setHeldFrame(g_heldCell, frame);
             g_engagePending = false;
             g_sealedFlag.store(true, std::memory_order_release);
@@ -2331,13 +2330,9 @@ bool optimizedStationGathers() noexcept { return g_setting.load(std::memory_orde
 bool optimizedStationSealed() noexcept { return g_sealedFlag.load(std::memory_order_acquire); }
 
 // The draw path asks: while sealed, the sun pair is not drawn.
-bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps, void* ctx) noexcept {
-    if (!g_sunOff.load(std::memory_order_acquire)) return false;
-    if (vs == kSunVs && ps == kSunPs) return true;   // the sun skip follows the pad, not the seal (built v14.13)
-    return sunShadowSkipDraw(ctx, vs, ps);           // built v14.31: the sun's shadow cascade map is not drawn while the sun is skipped (scan and fail-safe inside)
+bool optimizedStationSkipsDraw(uint64_t vs, uint64_t ps) noexcept {
+    return g_sunOff.load(std::memory_order_acquire) && vs == kSunVs && ps == kSunPs;   // the sun skip follows the pad, not the seal (built v14.13)
 }
-
-bool optimizedStationSunOff() noexcept { return g_sunOff.load(std::memory_order_acquire); }
 
 // The store calls this after it has written a record (bucket = the collection, record = its record). While sealed it judges the record; while
 // docked and unsealed it only gathers the frame's pads, explicit parts and camera for the seal trigger (built v14.1).
@@ -2487,7 +2482,6 @@ void optimizedStationFrameBody(uint32_t frame) {
     }
     if (g_summaryStartMs == 0) g_summaryStartMs = now;
     // Built v14.2: the frame advances here, once per tick. The observer's promote and view resolve run once per frame off this stamp.
-    sunShadowSkipFrame(g_sunOff.load(std::memory_order_acquire));   // built v14.31: the sun shadow skip's window
     g_frameStamp.fetch_add(1, std::memory_order_seq_cst);   // built v14.27: the callbacks that read the old stamp are the old pass's writers
     TimedStateLock lock;
     prodSync();   // built v14.26: the producer generation moves with the frame (the callbacks never move it)
@@ -2624,10 +2618,22 @@ void optimizedStationFrameBody(uint32_t frame) {
     g_latchPending = g_bayWatching && !g_latch.latched;
     if (g_latchPending && g_pickCell.has) latchNow(now);
     g_latchCandN = 0;
-    if (g_latch.latched && g_bayNoting && g_passInformative) latchRead(now);   // built v14.27: no sample from an empty or unfinished pass (the next sample re-bases)
+    if (g_latch.latched && g_bayNoting && g_passInformative) latchRead(now);
+    // Built v14.33: while sealed and not yet armed, every informative pass in which every latched record was read and none moved counts toward the arm.
+    if (g_sealedFlag.load(std::memory_order_acquire) && !g_mechArm.armed && g_passInformative && g_latch.latched) {
+        const uint32_t frameNow = g_frameStamp.load(std::memory_order_relaxed);
+        bool allStill = true;
+        for (size_t i = 0; i < g_latch.n; ++i) {
+            if (g_latch.recs[i].stamp != frameNow || g_latch.recs[i].movedRun != 0) allStill = false;
+        }
+        if (g_mechArm.step(allStill)) {
+            snapshotSealPose();   // the sealed poses are the poses of this still bay
+            Log::get().note("optimized station: mechanism release armed: %u records still for 1 s.", static_cast<unsigned>(g_latch.n));
+        }
+    }   // built v14.27: no sample from an empty or unfinished pass (the next sample re-bases)
     // Built v14.14: a latched mechanism record moved on two frames in a row while sealed: the launch releases the seal.
     g_mechanismMoved = false;
-    if (g_sealedFlag.load(std::memory_order_acquire)) {
+    if (g_sealedFlag.load(std::memory_order_acquire) && g_mechArm.armed) {   // built v14.33: only once the bay has been still for 60 passes
         const int mi = g_latch.movedIndex();
         if (mi >= 0) {
             if (mi == 0) std::snprintf(g_releaseWhy, sizeof(g_releaseWhy), "%s", "the pad started moving: launch");

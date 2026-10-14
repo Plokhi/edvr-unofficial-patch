@@ -121,6 +121,31 @@ struct CamHold {
     }
 };
 
+// Built v14.33: the mechanism release is armed only after the seal has seen every latched bay record still for kMechArmPasses informative passes in a row
+// (about 1 s). A planetary port reports r1 1 while the gate ramps are still closing: poses taken at the seal were mid-motion and the closing read as a
+// launch (flight 1718577b). Until it arms, mechanism motion neither releases nor counts; every other release works from the first frame. The sealed
+// poses the re-seal compares against are taken when it arms.
+constexpr uint32_t kMechArmPasses = 60;
+
+struct MechArm {
+    uint32_t run = 0;
+    bool armed = false;
+    void reset() noexcept {
+        run = 0;
+        armed = false;
+    }
+    // One informative pass while sealed. allStill: every latched record was read this pass and none moved. True on the pass it arms.
+    bool step(bool allStill) noexcept {
+        if (armed) return false;
+        run = allStill ? run + 1 : 0;
+        if (run >= kMechArmPasses) {
+            armed = true;
+            return true;
+        }
+        return false;
+    }
+};
+
 struct StableGate {
     uint32_t run = 0;
     // changed: this tick's value differs from the last tick's. True on the tick the new value has held for `need` ticks.
