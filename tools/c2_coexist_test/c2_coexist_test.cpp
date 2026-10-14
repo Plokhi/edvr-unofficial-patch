@@ -32,6 +32,7 @@
 #include "../c2_derive_test/c2_derive_model.h"
 #include "../../src/d3d11/flat_camera_ownership.h"
 #include "../../src/d3d11/flat_camera_phase.h"
+#include "../../src/d3d11/flat_camera_signature.h"
 #include "../../src/d3d11/flat_projection_ownership.h"
 
 namespace {
@@ -905,6 +906,146 @@ void testC16() {
           "C16 an Observed call does not flush a camera the set remembers, and leaves the set untouched");
 }
 
+// C17: the kind-3 camera signature instrument (src/d3d11/flat_camera_signature.h): the 1-in-16 sampler, the
+// quantisation, the first-eight bucketing, and the line that tells "never ran" from "ran, nothing sampled".
+void testC17() {
+    std::printf("C17 kind-3 camera signatures\n");
+
+    // The sampler: 1 in 16, deterministic, and no call order of small period can hide from it.
+    check(flatCameraSignatureSampled(0), "C17 the first kind-3 call is sampled");
+    {
+        uint64_t hits = 0, last = 0, maxGap = 0;
+        bool haveLast = false;
+        const uint64_t n = 16u * 4096u;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (!flatCameraSignatureSampled(i)) continue;
+            ++hits;
+            if (haveLast && i - last > maxGap) maxGap = i - last;
+            last = i; haveLast = true;
+        }
+        check(hits >= 4096 - 16 && hits <= 4096 + 16, "C17 the sampler picks one call in sixteen (4096 of 65536, within 16)");
+        check(maxGap <= 40, "C17 ...and never leaves a blind stretch (the longest gap between two samples is at most 40 calls)");
+        std::printf("  note  sampler: %llu of %llu, longest gap %llu\n", (unsigned long long)hits, (unsigned long long)n,
+                    (unsigned long long)maxGap);
+    }
+    {
+        // A camera at a fixed place in a repeating call order of P must still be sampled: every residue class is hit.
+        bool blind = false;
+        for (uint32_t period : {2u, 3u, 4u, 5u, 6u, 7u, 8u, 12u, 16u, 32u, 98u}) {
+            bool seen[128] = {};
+            for (uint64_t i = 0; i < 400000; ++i) if (flatCameraSignatureSampled(i)) seen[i % period] = true;
+            for (uint32_t r = 0; r < period; ++r) if (!seen[r]) blind = true;
+        }
+        check(!blind, "C17 a camera at any fixed place in a repeating order of 2..8, 12, 16, 32 or 98 calls is sampled (a stride of 16 would miss most places)");
+    }
+
+    // Quantisation: aspect and fov to 0.01, near and far to two significant digits.
+    auto num = [](float v) { return flatCameraSigNum(v); };
+    check(flatCameraSigHundredths(1.777778f) == 178 && flatCameraSigHundredths(1.7749f) == 177 && flatCameraSigHundredths(1.0f) == 100 &&
+          flatCameraSigHundredths(0.98f) == 98 && flatCameraSigHundredths(0.984f) == 98 && flatCameraSigHundredths(0.986f) == 99 &&
+          flatCameraSigHundredths(-0.5f) == -50 && flatCameraSigHundredths(0.0f) == 0,
+          "C17 aspect and fov quantise to hundredths");
+    check(flatCameraSigHundredths(NAN) == kFlatCameraSigNotFinite && flatCameraSigHundredths(INFINITY) == kFlatCameraSigNotFinite,
+          "C17 a value that is not finite has its own marker, distinct from every real value");
+    check(num(0.025f) == num(0.0251f) && num(0.025f) == num(0.0254f) && !(num(0.025f) == num(0.0256f)) &&
+          num(0.025f).m == 25 && num(0.025f).e == -3,
+          "C17 near 0.025 stays one bucket across 0.0251..0.0254 and splits at 0.0256 (two significant digits)");
+    check(num(50000.0f).m == 50 && num(50000.0f).e == 3 && num(50000.0f) == num(50400.0f) && !(num(50000.0f) == num(51000.0f)),
+          "C17 far 50000 is 50e3 and shares a bucket with 50400, not with 51000");
+    check(num(1000.0f).m == 10 && num(1000.0f).e == 2 && num(999.7f) == num(1000.0f) && num(99.6f) == num(100.0f),
+          "C17 an exact power of ten, and a value that rounds up into it, land in the same bucket");
+    check(num(0.0f).m == 0 && num(-0.025f).m == -25 && num(NAN).m == FlatCameraSigNum::kNotFinite && !num(INFINITY).finite() &&
+          std::fabs(num(50000.0f).value() - 50000.0) < 1e-6 && std::fabs(num(0.025f).value() - 0.025) < 1e-12,
+          "C17 zero, a negative value and a non-finite value are all representable, and a bucket converts back to its value");
+    {
+        const FlatCameraSignature scene = flatCameraSignatureOf(1.777778f, 0.98f, 0.025f, 50000.0f, 0x594E13);
+        check(scene == flatCameraSignatureOf(1.7777f, 0.9804f, 0.0252f, 50100.0f, 0x594E13),
+              "C17 the same camera one frame later (a hair of aspect, fov, near, far) is the same signature");
+        check(!(scene == flatCameraSignatureOf(1.0f, 0.98f, 0.025f, 50000.0f, 0x594E13)) &&
+              !(scene == flatCameraSignatureOf(1.777778f, 0.82f, 0.025f, 50000.0f, 0x594E13)) &&
+              !(scene == flatCameraSignatureOf(1.777778f, 0.98f, 0.1f, 50000.0f, 0x594E13)) &&
+              !(scene == flatCameraSignatureOf(1.777778f, 0.98f, 0.025f, 1000.0f, 0x594E13)) &&
+              !(scene == flatCameraSignatureOf(1.777778f, 0.98f, 0.025f, 50000.0f, 0x594EAB)),
+              "C17 a different aspect, fov, near, far or caller is a different signature");
+        check(flatCameraSignatureOf(1.0f, 1.0f, 1.0f, 1.0f, 0x1FFFFFFFFull).callerRva == 0xFFFFFFFFu,
+              "C17 a caller offset past 32 bits clamps instead of wrapping onto a real one");
+    }
+
+    // The table: the first eight distinct signatures are kept, a ninth is counted, repeats add up.
+    FlatCameraSignatureTable table;
+    for (int i = 0; i < 40; ++i) {
+        const bool sampled = table.noteKind3Call();
+        (void)sampled;
+    }
+    check(table.kind3Calls() == 40 && table.sampled() >= 1 && table.recorded() == 0,
+          "C17 the table counts every kind-3 call and every sampled one before anything is recorded");
+    table.reset();
+    check(table.kind3Calls() == 0 && table.sampled() == 0 && table.used() == 0 && table.overflow() == 0,
+          "C17 a reset empties the window");
+    for (int i = 0; i < 10; ++i) {
+        table.note(flatCameraSignatureOf(1.0f + i, 0.98f, 0.025f, 50000.0f, 0x594E13), (i % 2) == 0);
+    }
+    check(table.used() == 8 && table.overflow() == 2 && table.recorded() == 10,
+          "C17 ten distinct signatures: the first eight are kept and the other two are counted as overflow");
+    const FlatCameraSignature first = flatCameraSignatureOf(1.0f, 0.98f, 0.025f, 50000.0f, 0x594E13);
+    for (int i = 0; i < 5; ++i) table.note(first, true);
+    table.note(first, false);
+    check(table.at(0).sig == first && table.at(0).calls == 7 && table.at(0).injected == 6 && table.overflow() == 2 && table.recorded() == 16,
+          "C17 a signature already in the table still counts when the table is full: calls and injected add up");
+    check(table.at(1).calls == 1 && table.at(1).injected == 0 && table.at(7).calls == 1 && table.at(7).injected == 0,
+          "C17 the first call of a signature records whether it was injected");
+
+    // The sampler keeps its place across windows (a reset sequence would sample the same call numbers every window).
+    {
+        FlatCameraSignatureTable a, b;
+        uint64_t aHits = 0, bHits = 0;
+        for (int i = 0; i < 200; ++i) if (a.noteKind3Call()) ++aHits;
+        for (int i = 0; i < 100; ++i) if (b.noteKind3Call()) ++bHits;
+        b.reset();
+        for (int i = 0; i < 100; ++i) if (b.noteKind3Call()) ++bHits;
+        check(aHits == bHits && aHits > 0, "C17 a reset does not rewind the sampler: two windows sample what one long window does");
+    }
+
+    // The lines. A table that saw nothing still prints; the absent line is what "never ran" looks like.
+    char text[1400];
+    FlatCameraSignatureTable fresh;
+    flatCameraFormatSignatures(text, sizeof(text), fresh);
+    check(has(text, "flat camera signatures 5s: kind3-calls=0 sampled=0 (1 in 16;") && has(text, "distinct=0 overflow=0 sigs=[]"),
+          "C17 an empty window prints a line (kind3-calls=0 sampled=0 sigs=[]): only an ABSENT line means the code never ran");
+    {
+        FlatCameraSignatureTable ranEmpty;
+        ranEmpty.noteKind3Call();                      // call 0 is always sampled; take it out of the picture
+        ranEmpty.reset();
+        for (int i = 0; i < 3; ++i) ranEmpty.noteKind3Call();   // calls 1..3: none sampled
+        flatCameraFormatSignatures(text, sizeof(text), ranEmpty);
+        check(has(text, "kind3-calls=3 sampled=0") && has(text, "sigs=[]") && ranEmpty.sampled() == 0,
+              "C17 kind-3 calls with no sample prints kind3-calls=3 sampled=0 sigs=[], which is not the empty-window line");
+    }
+    {
+        FlatCameraSignatureTable t;
+        for (int i = 0; i < 4; ++i) t.note(flatCameraSignatureOf(1.777778f, 0.98f, 0.025f, 50000.0f, 0x594E13), true);
+        t.note(flatCameraSignatureOf(1.0f, 1.5708f, 0.025f, 50000.0f, 0x594EAB), false);
+        t.note(flatCameraSignatureOf(0.61f, 0.6607f, 0.025f, 1000.0f, 0), false);
+        t.note(flatCameraSignatureOf(NAN, NAN, NAN, NAN, 0x58DE73), false);
+        flatCameraFormatSignatures(text, sizeof(text), t);
+        check(has(text, "distinct=4 overflow=0 sigs=[aspect=1.78 fov=0.98 near=0.025 far=50000 rva=+0x594E13 calls=4 injected=4 | ") &&
+              has(text, "aspect=1.00 fov=1.57 near=0.025 far=50000 rva=+0x594EAB calls=1 injected=0") &&
+              has(text, "aspect=0.61 fov=0.66 near=0.025 far=1000 rva=unknown calls=1 injected=0") &&
+              has(text, "aspect=nan fov=nan near=nan far=nan rva=+0x58DE73 calls=1 injected=0"),
+              "C17 the line names each signature (aspect, fov, near, far, caller, sampled calls, injected) and marks an unread frustum nan");
+        std::printf("  note  %s\n", text);
+    }
+    {
+        FlatCameraSignatureTable full;
+        for (int i = 0; i < 8; ++i)
+            full.note(flatCameraSignatureOf(-1234.56f * (i + 1), -987.65f * (i + 1), 0.0000123f * (i + 1), 123456789.0f * (i + 1), 0x7FFFFFF0u + i), true);
+        for (int i = 0; i < 100; ++i) full.noteKind3Call();
+        const int len = flatCameraFormatSignatures(text, sizeof(text), full);
+        check(len > 0 && static_cast<size_t>(len) < 1100, "C17 the line with eight wide-valued signatures fits a log line (under 1100 bytes)");
+        std::printf("  note  %d bytes: %s\n", len, text);
+    }
+}
+
 int runSelfTest() {
     testC1();
     testC2();
@@ -922,6 +1063,7 @@ int runSelfTest() {
     testC14();
     testC15();
     testC16();
+    testC17();
     if (g_failures == 0) {
         std::printf("c2 coexist: PASS\n");
         return 0;

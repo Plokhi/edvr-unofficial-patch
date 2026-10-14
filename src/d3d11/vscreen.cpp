@@ -838,9 +838,10 @@ struct State {
     // turned down, and how many draws the busiest single frame put into each.
     // The draw count is what promotes one -- a post-process buffer shares the
     // eye's shape and never takes the scene's draws -- and `shaped` decides
-    // WHAT it may be promoted to: only a target of the eye's own shape at a
+    // WHETHER it may be promoted: only a target of the eye's own shape at a
     // scale is safe to treat AS an eye texture, because the fixes that draw
-    // into one would then draw into it.
+    // into one would then draw into it. A busy target of another shape is kept
+    // only so the low-peak notice can name it.
     struct SceneCandidate {
         uint32_t w = 0, h = 0;
         bool     shaped = false;  // the eye's shape at a plausible scale
@@ -849,13 +850,10 @@ struct State {
     };
     SceneCandidate cands[kCandidates];
     uint32_t candCount = 0;
-    // The target promoted to answer "is a scene being rendered this frame",
-    // when the published size cannot. Equal to renderW/H where the shape
-    // confirmed it; otherwise a target that is NOT treated as an eye texture
-    // and only ever contributes its count. 0 when the published size is
-    // doing its job, which is every ordinary rig.
-    uint32_t sceneW = 0, sceneH = 0;
-    bool     sceneSourceNoted = false;
+    // (There was a second promotion here, to a target of no particular shape that
+    // "counted as the scene" -- sceneW/sceneH. Nothing ever added its draws to
+    // the eye-draw count or read the size, so it only silenced a notice and
+    // printed a line; removed 2026-10-14.)
     bool     renderAuto = true;        // advanced.eye_render_size
     bool     renderOffNoted = false;
     bool     renderPinned = false;   // the size came from the ini, not a measurement
@@ -960,7 +958,7 @@ bool g_transportSelected = false;
 //
 // A budget that is exhausted stops running its body at all, so sharing one
 // across unrelated features means a fault in any of them switches off all of
-// them. That happened: a bad camera_buffer_offset faulted in the transition
+// them. That happened: a bad hand-set camera-buffer offset faulted in the transition
 // flash reader, burned the shared budget, and the black void fix -- which has
 // nothing to do with it -- stopped clearing, silently, with a log line naming
 // only "vScreen". Splitting them also makes the FEATURE-DISABLED line say which
@@ -1092,7 +1090,6 @@ void readEyeRenderSize(Config& cfg, State* s) {
         s->renderAuto = false;
         s->renderPinned = false;
         s->renderW = s->renderH = 0;
-        s->sceneW = s->sceneH = 0;
         return;
     }
     unsigned w = 0, h = 0;
@@ -1102,8 +1099,6 @@ void readEyeRenderSize(Config& cfg, State* s) {
         if (s->renderW != w || s->renderH != h) {
             s->renderW = w;
             s->renderH = h;
-            s->sceneW = w;
-            s->sceneH = h;
             Log::get().note(
                 "vScreen: advanced.eye_render_size pins the size this rig "
                 "renders an eye at to %ux%u, so nothing is measured. Clear it "
@@ -6240,7 +6235,9 @@ void vScreenFrameBoundary() {
     // what it submits is false within seconds of the load-in. So this can add
     // an answer where there was none; it cannot take one away.
     //
-    // Once per session. If the scale changes mid-session the adopted size
+    // Once per session: renderW stays zero in an auto session until the promotion
+    // below sets it (a pin or "off" turns renderAuto off, and clearing a pin zeroes
+    // it). If the scale changes mid-session the adopted size
     // stops matching and the log's totals say so in the usual way -- the
     // player's next launch measures it again, which is the same deal the
     // published size gets.
@@ -6250,31 +6247,21 @@ void vScreenFrameBoundary() {
         }
         s->cands[i].thisFrame = 0;
     }
-    if (s->renderAuto && !s->sceneW && pastStartup &&
+    if (s->renderAuto && !s->renderW && pastStartup &&
         s->eyeDrawsMax <= kSceneEyeDraws) {
-        // The busiest of each kind. A target of the eye's shape can be
-        // promoted all the way; anything else can only carry the count, so
-        // the two are found separately rather than by ranking them together
-        // -- a shape-confirmed target with fewer draws is still the better
-        // answer than a busier one nothing corroborates.
-        uint32_t best = 0, bestIdx = 0, bestShaped = 0, bestShapedIdx = 0;
+        // Only a target of the eye's shape can be promoted. (A busier target
+        // nothing corroborates used to be "counted as the scene" instead; that
+        // second promotion fed nothing and is gone, 2026-10-14.)
+        uint32_t best = 0, bestIdx = 0;
         for (uint32_t i = 0; i < s->candCount; ++i) {
-            if (s->cands[i].bestFrame > best) {
+            if (s->cands[i].shaped && s->cands[i].bestFrame > best) {
                 best = s->cands[i].bestFrame;
                 bestIdx = i;
             }
-            if (s->cands[i].shaped && s->cands[i].bestFrame > bestShaped) {
-                bestShaped = s->cands[i].bestFrame;
-                bestShapedIdx = i;
-            }
         }
-        if (bestShaped > kSceneEyeDraws) {
-            best = bestShaped;
-            bestIdx = bestShapedIdx;
+        if (best > kSceneEyeDraws) {
             s->renderW = s->cands[bestIdx].w;
             s->renderH = s->cands[bestIdx].h;
-            s->sceneW = s->renderW;
-            s->sceneH = s->renderH;
             const uint32_t pct = static_cast<uint32_t>(
                 (static_cast<uint64_t>(s->renderW) * 100u + s->eyeW / 2u) / s->eyeW);
             Log::get().note(
@@ -6303,53 +6290,6 @@ void vScreenFrameBoundary() {
                 vrss::formatLog(notice, sizeof(notice), s->renderW, s->renderH, s->eyeW, s->eyeH);
                 Log::get().note("%s", notice);
             }
-        } else if (best > kSceneEyeDraws) {
-            // THE SAME EVIDENCE, WITHOUT THE CORROBORATION, so it buys less.
-            //
-            // The busiest target in the frame is where the world went,
-            // whatever its shape -- one texture holding both eyes, a
-            // non-uniform scale, a layout nobody here has seen. That answers
-            // "is a scene being rendered", which is the only thing Explorer
-            // Cam and the camera scan ever wanted from this count, so they
-            // get it.
-            //
-            // It does NOT make the target an eye texture. The black void, the
-            // RemLok lines and the loading hologram
-            // WRITE to what they match, and a target that only dominance
-            // vouches for could be a shadow atlas on a frame with a light-
-            // heavy pass. Guessing wrong there is visible in a headset;
-            // guessing wrong about the count is not. So the two adoptions are
-            // different promotions, and this is the smaller one.
-            s->sceneW = s->cands[bestIdx].w;
-            s->sceneH = s->cands[bestIdx].h;
-            char handed[96];
-            // The headset's own size, where there is one to name. Without the
-            // openvr half there is not, and printing "not the 0x0" would be a
-            // line that reads as a bug in the line itself.
-            if (s->eyeW) {
-                _snprintf_s(handed, sizeof(handed), _TRUNCATE,
-                            "not the %ux%u the headset is handed, and not that shape "
-                            "at any scale either",
-                            s->eyeW, s->eyeH);
-            } else {
-                _snprintf_s(handed, sizeof(handed), _TRUNCATE,
-                            "and nothing has published what the headset is handed, so "
-                            "there is no shape to check it against -- install "
-                            "openvr_api.dll as well and this gets a second opinion");
-            }
-            Log::get().note(
-                "vScreen: the busiest render target on this rig is %ux%u -- %s. "
-                "One frame put %u draws into it while the submitted size peaked at %u "
-                "for the whole session, so that is where the world is being drawn. It "
-                "is now counted as the scene, which is what Explorer Cam and "
-                "the camera scan actually ask about, and "
-                "both work again. It is NOT treated as an eye texture: the fixes "
-                "that draw into one -- the black void, the RemLok lines, the loading "
-                "hologram -- need the real thing and stay off "
-                "rather than write to a target only its draw count vouches for. A "
-                "layout that reaches this line is one EDVR should learn to name, so "
-                "this log is worth reporting.",
-                s->sceneW, s->sceneH, handed, best, s->eyeDrawsMax);
         }
     }
 
@@ -6387,7 +6327,7 @@ void vScreenFrameBoundary() {
     // world is drawn at a render scale now says so in its own line, with the
     // answer in it; this one is for the case that is still unexplained, which
     // is the only case a reader has to do anything about.
-    if (!s->lowPeakNoted && s->eyeDrawsMax > 0 && !s->sceneW && s->gameplayMs &&
+    if (!s->lowPeakNoted && s->eyeDrawsMax > 0 && !s->renderW && s->gameplayMs &&
         (now - s->gameplayMs) >= kTotalsWindowMs &&
         s->eyeDrawsMax <= kSceneEyeDraws) {
         s->lowPeakNoted = true;
@@ -6411,11 +6351,24 @@ void vScreenFrameBoundary() {
                 shapedIdx = i;
             }
         }
-        uint32_t anyBest = 0;
+        uint32_t anyBest = 0, anyIdx = 0;
         for (uint32_t i = 0; i < s->candCount; ++i) {
-            if (s->cands[i].bestFrame > anyBest) anyBest = s->cands[i].bestFrame;
+            if (s->cands[i].bestFrame > anyBest) {
+                anyBest = s->cands[i].bestFrame;
+                anyIdx = i;
+            }
         }
-        if (haveShaped) {
+        if (!haveShaped && anyBest > kSceneEyeDraws) {
+            // The case the removed second promotion used to take: a busy target of
+            // no known shape. It is where the world is drawn, and it is NOT adopted
+            // as an eye texture (the fixes that draw into one need the real thing).
+            _snprintf_s(why, sizeof(why), _TRUNCATE,
+                        "The busiest of them is %ux%u, with %u draws in one frame, so that "
+                        "is probably where the world is drawn -- but it is not your eye "
+                        "textures' shape at any render scale, so it was not adopted. A "
+                        "layout EDVR should learn to name.",
+                        s->cands[anyIdx].w, s->cands[anyIdx].h, anyBest);
+        } else if (haveShaped) {
             _snprintf_s(why, sizeof(why), _TRUNCATE,
                         "%ux%u IS your eye textures' shape at a render scale, which is "
                         "the case this adapts to -- but the busiest frame put only %u "
@@ -6666,22 +6619,6 @@ void vScreenFrameBoundary() {
                 static_cast<unsigned long long>(s->censusSkipped),
                 s->censusSkipSpec);
             s->censusSkippedReported = s->censusSkipped;
-        }
-
-        // WHERE THE COUNT COMES FROM, on a rig where it is not the eye
-        // textures. The totals line above reports eye-sized draws, and on a
-        // promoted rig that number stays small and alarming for the whole
-        // session while everything is in fact working -- so the line that
-        // would otherwise read as a fault says which target is carrying it.
-        if (s->sceneW && !s->sceneSourceNoted) {
-            s->sceneSourceNoted = true;
-            Log::get().note(
-                "vScreen: the eye-draw counts above are draws into the %ux%u eye "
-                "textures. On this rig the scene is drawn into %ux%u, so a small "
-                "number there is expected and is not the fix going quiet -- what "
-                "Explorer Cam and the camera scan read "
-                "is the two added together. Said once.",
-                s->eyeW, s->eyeH, s->sceneW, s->sceneH);
         }
 
         // A window that recognised NOTHING, after one that did.

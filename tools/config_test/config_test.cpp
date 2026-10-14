@@ -1124,6 +1124,9 @@ static const char* const kRetiredKeys[] = {
     "cull_guard",
     // The scanned-body lend, 2026-10-09: fix.scanner_body is gone with the lend. The cause is fixed at the game's own flush (vertex_resync_hook.cpp, which has no key).
     "scanner_body",
+    // The camera-buffer geometry, 2026-10-14: the game's 5376-byte scene buffer with the camera origin at float 1100 are constants in glitch_frame.cpp now; a wrong
+    // pair could only switch the transition-flash hold off. The test rigs' switch for the tap is an environment variable (EDVR_TEST_NO_CAMERA_TAP), not a key.
+    "camera_buffer_bytes", "camera_buffer_offset",
 };
 static const int kRetiredKeyCount = int(sizeof(kRetiredKeys) / sizeof(kRetiredKeys[0]));
 
