@@ -211,6 +211,7 @@ struct Sim {
     jumpguard::Guard guard;
     bool nearOn = false, guardOn = false, eyeOn = false;
     uint32_t eyeW = 2016, eyeH = 2016;
+    camtag::Submit submit;   // none unless a case sets it: the size rule alone
     uint32_t guardReplaced = 0, nearReplaced = 0, cutWrites = 0, failOpen = 0;
     // Primed with the pick of the frame before the first (a chooser in steady flight; the first frame of a session has no previous pick and takes the latest).
     Sim() { rowsOf(-0.05, 0, 0, 0, prev); havePrev = true; }
@@ -218,13 +219,13 @@ struct Sim {
     // Returns the index of the applied write.
     int frame(const std::vector<Write>& w) {
         camtag::Filter verdict;
-        for (const auto& x : w) verdict.note(x.tag, eyeW, eyeH);
+        for (const auto& x : w) verdict.note(x.tag, eyeW, eyeH, submit);
         cutWrites += verdict.cut;
         if (verdict.failedOpen(eyeOn)) ++failOpen;
         const bool filter = verdict.active(eyeOn);
         std::vector<int> cont;
         for (int i = 0; i < int(w.size()); ++i) {
-            if (filter && camtag::rejects(w[i].tag, eyeW, eyeH)) continue;
+            if (filter && camtag::rejectsFor(w[i].tag, eyeW, eyeH, submit)) continue;
             if (!havePrev || campose::rotationDeg(prev, w[i].rows) < 3.0f) {
                 if (havePrev && std::memcmp(w[i].rows, prev, sizeof(prev)) == 0) continue;   // the twin
                 cont.push_back(i);
@@ -417,6 +418,114 @@ void caseChoosers() {
         if (arm == 1) check(first == 1, "C9 nearest vetoes the cut for one frame and takes it the frame it holds");
         if (arm == 2) check(first == 3, "C9 the jump guard replaces the cut for three frames and takes it on the fourth");
     }
+    // 11. The hangar flight of 2026-10-13 (reviews/flight-2026-10-14-analysis.md): the size rule cannot see the bad picks, because the probe's forward face
+    //     is tagged to a target of the EYE's size -- 2016x2016 format 27, R8G8B8A8_TYPELESS, the texture the game submits -- while the good picks of the same
+    //     burst frames are tagged 2016x2016 format 26 (R11G11B10_FLOAT, the scene's lit HDR). Outside bursts the normal pick is a late head-camera write that
+    //     is ALSO tagged 27 (418 of 456 frames in the log), on the same track as the scene writes to a millimetre.
+    {
+        camtag::Target hdr = eyeTag(); hdr.fmt = 26;            // the scene's lit HDR target
+        camtag::Target sub = eyeTag(); sub.fmt = 27;            // the submitted eye texture
+        camtag::Submit submit; submit.fmt = 27; submit.w = 2016; submit.h = 2016;   // the game submits R8G8B8A8_TYPELESS (27), 2016x2016 per eye
+        check(camtag::judge(hdr, 2016, 2016, submit) == camtag::Why::Keep, "C11 format 26 at the eye's size is the scene's: kept");
+        check(camtag::judge(sub, 2016, 2016, submit) == camtag::Why::SubmitTarget, "C11 format 27 at the eye's size is the submitted texture: rejected");
+        camtag::Target typed = sub; typed.fmt = 28;
+        camtag::Target other = sub; other.fmt = 39;
+        camtag::Target depthOnlySub = sub; depthOnlySub.src = 2;
+        check(camtag::judge(typed, 2016, 2016, submit) == camtag::Why::SubmitTarget && camtag::judge(depthOnlySub, 2016, 2016, submit) == camtag::Why::Keep &&
+              camtag::judge(faceTag(), 2016, 2016, submit) == camtag::Why::NotEyeSized && camtag::judge(sub, 2016, 2016, camtag::Submit{}) == camtag::Why::Keep &&
+              camtag::judge(camtag::Target{}, 2016, 2016, submit) == camtag::Why::Keep && camtag::judge(other, 2016, 2016, submit) == camtag::Why::Keep,
+              "C11 the R8G8B8A8 family is one format; a depth-only pass is not the submit texture; the faces are not eye-sized; without a submit identity or a tag nothing is rejected");
+
+        // The sequence: head track yaw 0.05 deg a frame at (-3.006, -1.774, -13.028); the scene write (tag 26) every frame, the late head write (tag 27, 1 mm
+        // off) on frames with no probe write at the end, the probe's faces in bursts (back, four sides tagged to the probe's small targets), and on burst
+        // offset 2 of both probes the forward face -- 2.5 deg from the head, 0.117 m away -- written last and tagged 27 (the 4 of 4 bad picks of the flight).
+        std::vector<std::vector<Write>> flight;
+        std::vector<uint32_t> badFrames;
+        uint32_t seq = 1;
+        for (uint32_t f = 0; f < 364; ++f) {
+            std::vector<Write> w;
+            Write scene{};
+            rowsOf(f * 0.05, -3.006, -1.774, -13.028, scene.rows);
+            scene.tag = hdr; scene.bound = true; scene.seq = seq++;
+            w.push_back(scene);
+            const uint32_t phase = f % 91;
+            const bool burst = (phase < 6) || (phase >= 11 && phase < 17);
+            const uint32_t offset = phase < 6 ? phase : phase - 11;
+            if (burst && offset == 2) {
+                Write face{};
+                rowsOf(f * 0.05 + 2.5, -2.940, -1.698, -12.968, face.rows);
+                face.tag = sub; face.bound = true; face.seq = seq++;
+                w.push_back(face);
+                badFrames.push_back(f);
+            } else if (burst) {
+                Write face{};
+                rowsOf(f * 0.05 + (offset == 0 ? 180.0 : 90.0), -2.940, -1.698, -12.968, face.rows);
+                face.tag = faceTag(); face.bound = true; face.seq = seq++;
+                w.push_back(face);
+            } else {
+                Write late{};
+                rowsOf(f * 0.05, -3.0059, -1.774, -13.028, late.rows);
+                late.tag = sub; late.bound = true; late.seq = seq++;
+                w.push_back(late);
+            }
+            flight.push_back(w);
+        }
+        check(badFrames.size() == 8, "C11 the sequence has the bad frames: offset 2 of both probes, four cycles");
+        Sim legacyFlight;
+        std::vector<int> legacyPick;
+        int badPicked = 0;
+        for (uint32_t f = 0; f < flight.size(); ++f) {
+            const int a = legacyFlight.frame(flight[f]);
+            legacyPick.push_back(a);
+            if (std::find(badFrames.begin(), badFrames.end(), f) != badFrames.end() && flight[f][a].tag.fmt == 27 && flight[f][a].rows[3] > -2.95f) ++badPicked;
+        }
+        check(badPicked == 8, "C11 the legacy chooser takes the probe's forward face on every bad frame (tagged format 27)");
+        Sim sizeOnly;
+        sizeOnly.eyeOn = true;
+        int sizeBad = 0;
+        for (uint32_t f = 0; f < flight.size(); ++f) {
+            const int a = sizeOnly.frame(flight[f]);
+            if (flight[f][a].rows[3] > -2.95f) ++sizeBad;
+        }
+        check(sizeBad == 8, "C11 the size rule alone does not catch them (the flight's finding): the same 8 bad picks");
+        Sim identity;
+        identity.eyeOn = true;
+        identity.submit = submit;
+        int identityBad = 0, picked26 = 0, picked27 = 0;
+        double maxDiffM = 0;
+        std::vector<camevents::Row> rows;
+        for (uint32_t f = 0; f < flight.size(); ++f) {
+            const int a = identity.frame(flight[f]);
+            if (flight[f][a].rows[3] > -2.95f) ++identityBad;
+            if (flight[f][a].tag.fmt == 26) ++picked26;
+            if (flight[f][a].tag.fmt == 27) ++picked27;
+            maxDiffM = std::max<double>(maxDiffM, campose::translationM(flight[f][a].rows, flight[f][legacyPick[f]].rows));
+            for (uint32_t e2 = 0; e2 < 2; ++e2) {
+                camevents::Row r; r.frame = f; r.eye = e2; r.qpc = int64_t(f) * 111111; r.valid = true;
+                std::memcpy(r.rows, flight[f][a].rows, sizeof(r.rows));
+                rows.push_back(r);
+            }
+        }
+        check(identityBad == 0 && picked27 == 0 && picked26 == int(flight.size()), "C11 the identity rule: no bad pick, every pick is the scene's format 26, none is format 27");
+        check(camevents::detectEvents(rows.data(), rows.size()).empty(), "C11 ...and the picked rows have no camera-row event");
+        check(maxDiffM < 0.15 && identity.cutWrites > 0, "C11 ...and where the filter changes a pick it moves to the scene write: a millimetre on normal frames, the probe's 0.117 m on the bad ones");
+        // Fail open: a game that draws its scene straight into the submitted texture has every write tagged 27: nothing is eligible, the filter stands down.
+        Sim straight;
+        straight.eyeOn = true;
+        straight.submit = submit;
+        Sim straightLegacy;
+        bool same2 = true;
+        for (uint32_t f = 0; f < 40; ++f) {
+            std::vector<Write> w;
+            Write a{};
+            rowsOf(f * 0.05, 0, 0, 0, a.rows);
+            a.tag = sub; a.bound = true; a.seq = f + 1;
+            w.push_back(a);
+            same2 = same2 && straight.frame(w) == straightLegacy.frame(w);
+        }
+        check(same2 && straight.failOpen == 40, "C11 every write drawn into the submitted texture: nothing is eligible, the filter stands down (fail open) every frame");
+    }
+
     // 10. The 30 s lines.
     camtag::Stats st;
     st.frames = 2700; st.writes = 250000; st.tagged = 249000; st.unknown = 1000; st.rejected = 2160; st.rejectFrames = 360; st.failOpen = 0; st.eyeW = 2016; st.eyeH = 2016;

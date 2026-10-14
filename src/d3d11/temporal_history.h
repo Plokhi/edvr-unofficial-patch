@@ -37,7 +37,8 @@ struct TemporalHistoryEntry {
     // The render target the selected write was drawn into (the first draw after the write), and the tagged eye draw's own
     // (docs/sky-flicker-2026-10-13.md). Unknown (src 0) when no draw followed the write.
     camtag::Target selectedTarget, drawTarget;
-    uint32_t rejectedWrites = 0;       // writes this frame's chooser rejected as not drawn into an eye-sized target (fix.camera_eye_target)
+    uint32_t selectedDraws = 0;        // the owner-context draws made between the selected write and the next write
+    uint32_t rejectedWrites = 0;      // writes this frame's chooser rejected as not drawn into an eye-sized target (fix.camera_eye_target)
 };
 
 template<uint32_t Capacity = 4096> class TemporalHistory {
