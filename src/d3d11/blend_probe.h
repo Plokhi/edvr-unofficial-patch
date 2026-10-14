@@ -19,8 +19,8 @@ struct ID3D11Texture2D;
 
 namespace edvr {
 
-// Once, at install: says what is armed.
-void blendProbeInstall(bool flatProfile);
+// Once, at install: one line saying whether hotkey.blend_probe is bound (key is the ini text it was bound from).
+void blendProbeInstall(bool flatProfile, bool keyBound, const char* key);   // the settings file's name comes from Config::iniName()
 // A press of hotkey.blend_probe: arms a capture at the next frame boundary. Refused (and said) while one runs, or in the flat profile.
 void blendProbeRequest(const char* trigger);
 // vScreenFrameBoundary: starts, advances and finishes the capture, and reads the answers back.
