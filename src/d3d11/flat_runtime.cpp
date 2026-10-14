@@ -2802,7 +2802,7 @@ void applyWork(State& s, FlatWork next) {
     const FlatWork was = s.work;
     s.work = next;
     if (was != next) flatTemporalSetPaused(next == FlatWork::Paused);
-    if (next != FlatWork::Full || was != FlatWork::Full) flatCameraInjectPause(next != FlatWork::Full);
+    if (next != FlatWork::Full || was != FlatWork::Full) flatCameraInjectPauseFlat(next != FlatWork::Full);
     if ((was == FlatWork::Paused) != (next == FlatWork::Paused)) {
         // The UAV tracker stops with the pause and starts again from unknown, the
         // state ExecuteCommandList leaves it in, so a stale binding never reads as live.
@@ -2991,6 +2991,8 @@ void flatRuntimePhaseState(float* x, float* y, uint32_t* w, uint32_t* h, uint32_
     if (applied) *applied = s.phase.applied;
 }
 void flatRuntimeNoteCameraApplied() { auto& s = state(); s.phase.noteApplied(); ++s.jitterDraws; }
+// The work tier is Full: the relay gate is meant to be open (applyWork). Read by the camera injector's takeover after a live profile switch.
+bool flatRuntimeWorkFull() { return state().work==FlatWork::Full; }
 bool flatRuntimeLegacyPlanExists() { const auto& s=state(); return s.work==FlatWork::Full && s.projection!=nullptr; }
 void flatRuntimeArmProjectionAudit(bool full) { if(runtimeFlatProfile()) projectionAuditRequested.request(full); }
 void flatRuntimeCreateBuffer(ID3D11Buffer* buffer, const void* initialData) {
