@@ -643,21 +643,69 @@ void testExtraNear() {
     check(!r.cache.disabled && r.cache.stats.selfFail == 0, "none of this trips the self-check");
 }
 
-void testNoTemplate() {
+void testAlreadyBuilt() {
+    // THE FLIGHT OF 2026-10-13: four contexts were met already built, with the first-call flag clear, a key set, vectors holding data and GPU objects present. The first
+    // version captured its template only from a constructed context and stood down for all four (0 hits in 36 windows).
     Rig r;
     Ctx c;
     Knobs k;
-    Heap& h = r.h;
-    // a context the hook meets after the game built it: no template, never swapped
-    fakeBuild(h, k, c.p(), mk(0, 0));
-    fakeBuild(h, k, c.p(), mk(0, 1));
-    uint8_t before[0x160];
-    std::memcpy(before, c.mem, sizeof(before));
-    for (int i = 0; i < 6; ++i) r.call(c, mk(0, i));
-    check(r.cache.stats.byReason[lg::kNoTemplate] == 6 && r.cache.stats.hits == 0 && r.cache.stats.misses == 0, "a context first seen already built is forwarded whole every time");
-    check(r.cache.slotsInUse() == 0, "and no slot is ever filled for it");
-    (void)before;
-    // a context met as constructed but with the first-call flag clear still gives its template at first sight and is cached from its first call
+    st64(c.mem + 0x88, 7);     // each vector's second header word (a floor the game may set)
+    st64(c.mem + 0xA8, 9);
+    st64(c.mem + 0x118, 11);
+    fakeBuild(r.h, k, c.p(), mk(0, 0));
+    fakeBuild(r.h, k, c.p(), mk(0, 1));
+    check(c.mem[lg::kCtxFirstFlag] == 0 && ld64(c.mem + 0x98) != 0 && ld64(c.mem + 0x130) != 0, "the context is built and its first-call flag is clear, as in the flight");
+    std::vector<lg::CallInputs> keys = {mk(0, 2), mk(0, 3), mk(0, 4)};
+    for (int round = 0; round < 8; ++round) {
+        for (const lg::CallInputs& in : keys) {
+            r.call(c, in);
+            check(coherent(c), "an already-built context stays coherent");
+        }
+        check(auditOwnership(r, {&c}), "and singly owned");
+    }
+    const lg::Stats& s = r.cache.stats;
+    check(s.byReason[lg::kNoTemplate] == 0 && r.cache.group(0).haveTemplate, "a context first seen already built gets its template");
+    check(s.hits > 0 && s.misses >= 3 && s.hits + s.misses + s.gameMemo == s.calls, "and is cached from its first call: hits and misses, no forwarding");
+    check(!r.cache.disabled && s.selfFail == 0 && s.verifyMismatches == 0, "without tripping a check");
+    for (const lg::CallInputs& in : keys) {
+        r.call(c, in);
+        Oracle o;
+        o.build(in);
+        check(sameTables(c.mem, o.c.mem), "the state it leaves is a fresh build of the same inputs");
+    }
+    // the template keeps each vector's own second header word
+    check(ld64(c.mem + 0x88) == 7 && ld64(c.mem + 0xA8) == 9 && ld64(c.mem + 0x118) == 11, "every state the context holds keeps the game's header words");
+    uint8_t cs[lg::kStateBytes], tpl[lg::kStateBytes];
+    lg::gather<lg::PlainMem>(c.p(), cs);
+    lg::makeEmptyTemplate(cs, tpl);
+    bool zeroed = true;
+    for (size_t i = 0; i < sizeof(tpl); ++i) {
+        const bool hintWord = (i >= lg::kVecOff[0] + 8 && i < lg::kVecOff[0] + 16) || (i >= lg::kVecOff[1] + 8 && i < lg::kVecOff[1] + 16) || (i >= lg::kVecOff[2] + 8 && i < lg::kVecOff[2] + 16);
+        if (!hintWord && tpl[i] != 0) zeroed = false;
+    }
+    check(zeroed && std::memcmp(tpl + lg::kVecOff[0] + 8, cs + lg::kVecOff[0] + 8, 8) == 0 && std::memcmp(tpl + lg::kVecOff[2] + 8, cs + lg::kVecOff[2] + 8, 8) == 0,
+          "the made template is all zero except each vector's own second header word");
+    check(lg::statePristine(tpl), "and it is an empty state: no key, no data, no GPU object");
+    char text[200];
+    lg::describeState(cs, 0, text, sizeof(text));
+    check(contains(text, "first-call flag 0, key set, vector sizes") && contains(text, "vector data set/set/set") && contains(text, "4 GPU objects"), "the first-seen description names what was found");
+    // four such contexts at once, as in the flight
+    Rig q;
+    Ctx four[4];
+    Knobs kk;
+    for (Ctx& x : four) {
+        fakeBuild(q.h, kk, x.p(), mk(0, 0));
+        fakeBuild(q.h, kk, x.p(), mk(0, 1));
+    }
+    for (int i = 0; i < 40; ++i) {
+        for (int ci = 0; ci < 4; ++ci) q.call(four[ci], mk(ci & 1, i % 4));
+    }
+    check(q.cache.contexts() == 4 && q.cache.stats.byReason[lg::kNoTemplate] == 0 && q.cache.stats.hits > 100, "four already-built contexts are all cached");
+    check(auditOwnership(q, {&four[0], &four[1], &four[2], &four[3]}), "and share no pointer");
+}
+
+void testNoTemplate() {
+    // a context met as constructed with the first-call flag clear is cached from its first call
     Rig q;
     Ctx p;
     p.mem[lg::kCtxFirstFlag] = 0;
@@ -946,6 +994,7 @@ int main(int argc, char** argv) {
     testTwoContexts();
     testForwardReasons();
     testExtraNear();
+    testAlreadyBuilt();
     testNoTemplate();
     testVerifyDisables();
     testFaults();
