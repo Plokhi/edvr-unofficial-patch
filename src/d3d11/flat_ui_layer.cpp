@@ -2,6 +2,7 @@
 // door and the composite are the VR layer's own (ui_layer.cpp), driven here as eye 0. The pure rules are
 // flat_ui_layer_math.h's.
 #include "flat_ui_layer.h"
+#include "flat_diagnostic.h"
 
 #include "flat_camera_phase.h"     // flatCameraMeasureRowShift: the jitter a draw's camera rows carry
 #include "flat_compute_readback.h" // FlatComputeInternalScope
@@ -126,7 +127,7 @@ uint64_t mapRefusedTotal(const Window& w, int slot, uint64_t atIssue) {
 
 }  // namespace
 
-bool flatUiLayerOn() { return runtimeFlatProfile() && uiLayerCrispOn(); }
+bool flatUiLayerOn() { return runtimeFlatProfile() && flatdiag::enabled(flatdiag::Composition) && uiLayerCrispOn(); }
 
 const char* flatUiLayerState() {
     if (!runtimeFlatProfile()) return "off (not the flat profile)";

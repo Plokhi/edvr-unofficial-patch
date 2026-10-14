@@ -105,6 +105,10 @@ void flatSiblingTests(ID3D11Device* dev,ID3D11DeviceContext* ctx,ID3D11ShaderRes
     const auto pollAll=[&](FlatForegroundMotion& motion,unsigned frame){motion.pollSibling(ctx,frame+8,true);};
     const unsigned countChange=unsigned(edvr::HistoryGap::CountChange);
     const float pr=.3f;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context1;ctx->QueryInterface(IID_PPV_ARGS(&context1));
+    D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+    const bool windows=context1 && SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS,&options,sizeof(options))) &&
+        options.ConstantBufferOffsetting;
     // The game's compute stage, as a sentinel in every slot the pass binds (t0..t10, u0, b0 and the shader): put back exactly, by identity.
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> sentinelCs;
     Microsoft::WRL::ComPtr<ID3D11Buffer> sentinelBuffer,sentinelUavBuffer,sentinelCb;
@@ -119,13 +123,19 @@ void flatSiblingTests(ID3D11Device* dev,ID3D11DeviceContext* ctx,ID3D11ShaderRes
         d.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;d.StructureByteStride=16;
         hr(dev->CreateBuffer(&d,nullptr,&sentinelBuffer));hr(dev->CreateShaderResourceView(sentinelBuffer.Get(),nullptr,&sentinelSrv));
         hr(dev->CreateBuffer(&d,nullptr,&sentinelUavBuffer));hr(dev->CreateUnorderedAccessView(sentinelUavBuffer.Get(),nullptr,&sentinelUav));
-        D3D11_BUFFER_DESC c{};c.ByteWidth=64;c.Usage=D3D11_USAGE_DEFAULT;c.BindFlags=D3D11_BIND_CONSTANT_BUFFER;hr(dev->CreateBuffer(&c,nullptr,&sentinelCb));
+        D3D11_BUFFER_DESC c{};c.ByteWidth=1024;c.Usage=D3D11_USAGE_DEFAULT;c.BindFlags=D3D11_BIND_CONSTANT_BUFFER;hr(dev->CreateBuffer(&c,nullptr,&sentinelCb));
     }
     const auto holdComputeState=[&] {
         ctx->CSSetShader(sentinelCs.Get(),nullptr,0);
         ID3D11ShaderResourceView* views[11];for(auto& v:views)v=sentinelSrv.Get();ctx->CSSetShaderResources(0,11,views);
         ID3D11UnorderedAccessView* uav=sentinelUav.Get();ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
-        ID3D11Buffer* cb=sentinelCb.Get();ctx->CSSetConstantBuffers(0,1,&cb);
+        ID3D11Buffer* cb=sentinelCb.Get();
+        if(windows) {
+            const UINT count=16,csFirst=16,vsFirst=32,psFirst=48;
+            context1->CSSetConstantBuffers1(0,1,&cb,&csFirst,&count);
+            context1->VSSetConstantBuffers1(0,1,&cb,&vsFirst,&count);
+            context1->PSSetConstantBuffers1(0,1,&cb,&psFirst,&count);
+        } else ctx->CSSetConstantBuffers(0,1,&cb);
     };
     const auto computeStateKept=[&] {
         Microsoft::WRL::ComPtr<ID3D11ComputeShader> shader;ctx->CSGetShader(&shader,nullptr,nullptr);
@@ -133,10 +143,20 @@ void flatSiblingTests(ID3D11Device* dev,ID3D11DeviceContext* ctx,ID3D11ShaderRes
         ID3D11UnorderedAccessView* uav=nullptr;ctx->CSGetUnorderedAccessViews(0,1,&uav);
         ID3D11Buffer* cb=nullptr;ctx->CSGetConstantBuffers(0,1,&cb);
         bool kept=shader.Get()==sentinelCs.Get() && uav==sentinelUav.Get() && cb==sentinelCb.Get();
+        if(windows) {
+            for(unsigned stage=0;stage<3;++stage) {
+                Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;UINT first=0,count=0;
+                if(stage==0)context1->CSGetConstantBuffers1(0,1,&buffer,&first,&count);
+                if(stage==1)context1->VSGetConstantBuffers1(0,1,&buffer,&first,&count);
+                if(stage==2)context1->PSGetConstantBuffers1(0,1,&buffer,&first,&count);
+                kept=kept && buffer.Get()==sentinelCb.Get() && first==(stage+1)*16 && count==16;
+            }
+        }
         for(auto* v:views){kept=kept && v==sentinelSrv.Get();if(v)v->Release();}
         if(uav)uav->Release();if(cb)cb->Release();
         ID3D11ShaderResourceView* none[11]{};ctx->CSSetShaderResources(0,11,none);ID3D11UnorderedAccessView* noUav=nullptr;ctx->CSSetUnorderedAccessViews(0,1,&noUav,nullptr);
         ctx->CSSetShader(nullptr,nullptr,0);ID3D11Buffer* noCb=nullptr;ctx->CSSetConstantBuffers(0,1,&noCb);
+        if(windows){ctx->VSSetConstantBuffers(0,1,&noCb);ctx->PSSetConstantBuffers(0,1,&noCb);}
         return kept;
     };
     const auto still=[](const Piece& c){return c.owned>300 && c.valid==c.owned && std::fabs(c.lo[0])<1.f/256 && std::fabs(c.hi[0])<1.f/256 &&
@@ -155,7 +175,7 @@ void flatSiblingTests(ID3D11Device* dev,ID3D11DeviceContext* ctx,ID3D11ShaderRes
         check(motion.stats().missBy[countChange]==1 && motion.stats().noCandidate==3,"S1: the swapped piece is a count-change miss with no candidate (the seed frame's two draws had none either)");
         holdComputeState();
         check(qualify(motion,5001,out) && out.qualified && motion.siblingRan(),"S1: the frame qualifies, and the sibling pass ran for it");
-        check(computeStateKept(),"S1: the game's compute stage (shader, t0-t10, u0, b0) is exactly as it was after the pass");
+        check(computeStateKept(),"S1: compute state and CS/VS/PS b0 windows are exactly as they were after the pass");
         const auto px=read(out);
         const Piece b=census(px,0),d=census(px,1);
         check(b.owned>300 && b.valid==b.owned && std::fabs(b.mean(0))>.5f,"S1: the sibling that matched has valid, real motion");

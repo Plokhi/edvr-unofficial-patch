@@ -2800,6 +2800,7 @@ void testFlatCpuWiring() {
         {&runtimeCpp, "flatcpu::kHdrRoute", 2, "the HDR route's trigger detector on every draw, and its selection at the trigger"},
         {&runtimeCpp, "flatcpu::kTrackers", 5, "the state trackers"},
         {&resolveCpp, "flatcpu::Scope backendScope(flatcpu::kBackend);", 1, "the backend evaluation inside the resolver"},
+        {&resolveCpp, "flatcpu::Scope preparation(flatcpu::kPreparation);", 1, "the temporal input preparation has its own CPU family"},
         {&injectCpp, "flatcpu::Scope timed(flatcpu::kInject);", 2, "the camera inject callback, both halves"},
         {&temporalCpp, "flatcpu::Scope timed(flatcpu::kDiscovery);", 16, "each discovery observer"},
         // The resolver's GPU span: the hooks, the guard around its dispatches, and the install.
@@ -2810,7 +2811,7 @@ void testFlatCpuWiring() {
         {&runtimeCpp, "if (!s.gpuFrameTried) gpuFrameOpen(s, context);", 1, "the whole-frame GPU span opens at the frame's first game draw"},
         {&runtimeCpp, "if (owner()) gpuFrameClose(state());", 1, "and closes just before the real Present"},
         {&runtimeCpp, "s.census.onFrame(censusNow, censusFreq, endedPaused);", 1, "the Present cuts the census once a frame"},
-        {&runtimeCpp, "s.census.idle();", 1, "and stops it when no temporal mode is selected"},
+        {&runtimeCpp, "s.census.idle();", 2, "and stops it when no temporal mode or no profiling is selected"},
         {&runtimeCpp, "const EngineVelocityWrapperCounts wrapper = engineVelocityTakeWrapperCounts();", 1, "the draw wrapper's counts are drained every frame"},
         {&runtimeCpp, "if (censusWasRunning) s.census.noteWrapper(", 1, "and handed to the census only while it runs: no backlog"},
         {&runtimeCpp, "const FlatQueryCounts queries = flatQueryCut().take();", 1, "the query shortcuts' counts are drained every frame too"},
@@ -2861,10 +2862,10 @@ void testFlatCpuWiring() {
     if (first != std::string::npos && last != std::string::npos && first < last)
         check(runtimeCpp.substr(first, last - first).find("census") == std::string::npos,
               "the stand-down never reads the census: it measures, it does not decide");
-    // The same for the numbers: the runtime touches the census in eleven places and no other -- the four
-    // GPU notes and the skipped one, idle, and the block at the Present (running, onFrame, noteWrapper,
+    // The same for the numbers: the runtime touches the census in twelve places and no other -- the four
+    // GPU notes and the skipped one, two idle paths, and the block at the Present (running, onFrame, noteWrapper,
     // noteQueries, take) -- and none of them reads a figure back into the runtime's state.
-    check(count(runtimeCpp, "s.census.") == 11,
+    check(count(runtimeCpp, "s.census.") == 12,
           "the runtime touches the census in exactly its known places (the GPU notes, idle, and the Present block)");
 }
 
@@ -3771,7 +3772,7 @@ void testFlatQueryCutWiring() {
         {&runtimeCpp, "if(coverageShadersMatch(ctx,k)) {", 2, "and both unchanged-shader branches ask for the shaders through it"},
         {&runtimeCpp, "flatQueryDepth(flatQueryCut(), ctx, k.depth, hold,", 1, "the depth question is the shared function's, with the draw key's depth as the shadow's answer"},
         {&runtimeCpp, "flatQueryShaders(flatQueryCut(), context, k.vs, k.ps,", 1, "and the shader question, with the key's hashes"},
-        {&runtimeCpp, "flatQueryCut().beginFrame(frame);", 1, "the Present tells the policy which frame starts (one in 64 checks)"},
+        {&runtimeCpp, "flatQueryCut().beginFrame(frame);", 2, "both profiling branches of Present start the policy frame (one in 64 checks), independently of profiling"},
         {&runtimeCpp, "(s.projectionFrames != 0 || !flatCameraInjectUpstreamOwns());", 1,
          "the coverage reads that still ask the context (an F10 audit, the legacy route) put the game's state back first, and nothing else does"},
         {&runtimeCpp, "if (owner()) engineVelocityFlatFrameEnd();", 1, "the frame's end lets go of what the bracket kept"},

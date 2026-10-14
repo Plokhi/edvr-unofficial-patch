@@ -1410,6 +1410,18 @@ if exist "%OBJ%\flattemporaltest\never_written.log" ( echo [edvr] ERROR: flat_te
 "%BUILD%\flat_temporal_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_edvr_perf_test
+echo [edvr] === edvr_perf_test.exe ===
+if not exist "%OBJ%\edvrperf" mkdir "%OBJ%\edvrperf"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\edvrperf"\ ^
+    /Fe"%BUILD%\edvr_perf_test.exe" "tools\edvr_perf_test\edvr_perf_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: performance policy test build failed & exit /b 1 )
+"%BUILD%\edvr_perf_test.exe" --dry-run || exit /b 1
+"%BUILD%\edvr_perf_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_vr_world_route_test
 echo [edvr] === vr_world_route_test.exe ===
 REM The VR on-foot world route (design doc section 82): the pure half, the detector's glue on the census retake's chain, the

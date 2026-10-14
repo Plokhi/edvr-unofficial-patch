@@ -27,8 +27,8 @@
 // one and forget to say so, and the rig (tools\flat_temporal_test\flat_camera_table_tests.h) holds the
 // table to today's algorithm over long random sequences and breaks each bump in turn to see it noticed.
 //
-// The algorithm itself is the one flat_runtime.cpp always had, moved here unchanged so that it can be
-// tested: the linear search of the first `count` entries, the replacement of the first entry of an
+// The record algorithm is the one flat_runtime.cpp always had. Identity lookup now uses validated
+// slot hints, with a linear fallback over the first `count` entries; replacement is the first entry of an
 // earlier frame that is not mapped when all 64 are taken, capture's three assignments, the lookup's
 // "valid and captured this frame" rule. The produced record is byte for byte the one it produced.
 #pragma once
@@ -38,6 +38,7 @@
 #include <utility>
 
 #include "flat_temporal_model.h"
+#include "resource_slot_cache.h"
 
 namespace edvr {
 
@@ -81,10 +82,7 @@ public:
     uint32_t count() const noexcept { return count_; }
     const Entry& entry(uint32_t i) const noexcept { return entries_[i]; }
     const Entry* find(const void* identity) const noexcept {
-        if (!identity) return nullptr;
-        for (uint32_t i = 0; i < count_; ++i)
-            if (entries_[i].identity == identity) return &entries_[i];
-        return nullptr;
+        return lookup_.find(entries_, identity, [](const Entry& e) { return e.identity; }, count_);
     }
 
     // ---- changing: each says so ----------------------------------------------------------------------
@@ -145,6 +143,7 @@ public:
     void clear() noexcept {
         for (uint32_t i = 0; i < kCapacity; ++i) entries_[i] = Entry{};
         count_ = 0;
+        lookup_.reset();
         bump<Faults::skipBumpClear>();
     }
 
@@ -205,6 +204,7 @@ private:
         FlatCameraRows rows;
     };
     Entry entries_[kCapacity];
+    mutable ResourceSlotCache<kCapacity> lookup_;
     uint32_t count_ = 0;
     uint64_t generation_ = 1;
     uint64_t refreshes_ = 0;

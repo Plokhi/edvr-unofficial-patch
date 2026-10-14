@@ -3,9 +3,10 @@
 // the preflight accepts the FP16 view and allocates FP16 resources, and EDVR's
 // own TAA -- which needs no SDK -- resolves a render-below-output frame and
 // hands back an FP16 output with values above 1.0 intact (a UNORM trip would
-// clamp them to 1.0). TAA only, so this runs on any Windows device; the SDK
-// backends take the same HDR colour mode by construction (hdrColor).
+// clamp them to 1.0). Also checks direct FP16 input for MFX3/4 against the rig
+// backend seam; no native MetalFX implementation is required on Windows.
 #pragma once
+#include "../../src/d3d11/flat_diagnostic.h"
 
 inline void fp16CopyGpuTests(ID3D11Device* device, ID3D11DeviceContext* context) {
     using edvr::FlatMonoResolveMode;
@@ -125,5 +126,128 @@ inline void fp16CopyGpuTests(ID3D11Device* device, ID3D11DeviceContext* context)
     expectedJx = f.jitterX; expectedJy = f.jitterY;
     check(edvr::flatMonoResolve(device, context, f, &output, &reason) && reason == nullptr && output,
           "copy route: the next FP16 frame continues, same resources, no reallocation refusal");
+    // MetalFX now reads the original FP16 view in prep/finish. Poison the
+    // private copy through the preceding TAA frames, then change the input on
+    // continuation: stale private-color use must fail the complete-image check.
+    std::vector<uint8_t> coverage(size_t(w)*h);
+    for(UINT y=0;y<h;++y)for(UINT x=0;x<w/2;++x)coverage[size_t(y)*w+x]=255;
+    auto coverageTex=texture(device,w,h,DXGI_FORMAT_R8_UNORM,D3D11_BIND_SHADER_RESOURCE,coverage.data(),w);
+    auto coverageView=view(device,coverageTex.Get());f.untrustedCameraCoverage=coverageView.Get();
+    captureMfxColor=true;
+    for(auto mode : {FlatMonoResolveMode::Mfx,FlatMonoResolveMode::Mfx4}) {
+        f.mode=mode;f.frame+=100;f.jitterX=.25f;f.jitterY=-.125f;
+        f.previousJitterX=f.jitterX;f.previousJitterY=f.jitterY;
+        for(unsigned step=0;step<2;++step) {
+            const uint16_t value=step?0x4300:0x4100; // 3.5 / 2.5, both above 1
+            for(size_t i=0;i<colorBytes.size();i+=2)std::memcpy(colorBytes.data()+i,&value,2);
+            context->UpdateSubresource(colorTex.Get(),0,nullptr,colorBytes.data(),w*8,0);
+            f.reset=step==0;++f.frame;output.Reset();reason="unset";
+            expectedJx=f.jitterX;expectedJy=f.jitterY;
+            const int calls=mfxCalls;
+            check(edvr::flatMonoResolve(device,context,f,&output,&reason) && output && !reason,
+                  "FP16 MetalFX reset and continuation resolve with jitter and mixed rejection");
+            check(mfxCalls==calls+1 && backendReset==(step==0) &&
+                  observedMfxGeneration==(mode==FlatMonoResolveMode::Mfx?edvr::mfx::FxGeneration::Metal3:edvr::mfx::FxGeneration::Metal4),
+                  "FP16 MetalFX generation, one backend call and history reset preserved");
+            bool equal=observedMfxColor.size()==colorBytes.size();
+            for(size_t i=0;equal && i<observedMfxColor.size();i+=2) {
+                uint16_t v=0;std::memcpy(&v,observedMfxColor.data()+i,2);
+                equal &= v==((i%8==6)?0x3c00:value);
+            }
+            check(equal && observedMfxColorResource!=colorTex.Get(),
+                  "complete MetalFX input has unchanged FP16 RGB, alpha one, and private storage");
+            ComPtr<ID3D11Resource> outputResource;if(output)output->GetResource(&outputResource);
+            ComPtr<ID3D11Texture2D> outputTex;if(outputResource)outputResource.As(&outputTex);
+            D3D11_TEXTURE2D_DESC outputDesc{};if(outputTex)outputTex->GetDesc(&outputDesc);
+            check(outputTex && outputDesc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                  outputDesc.Width==outW && outputDesc.Height==outH && outputResource.Get()!=colorTex.Get(),
+                  "MetalFX finish returns a private FP16 output at the evaluation size");
+            std::vector<unsigned char> result,source;
+            check(readWhole(context,outputTex.Get(),result,8) && result.size()==size_t(outW)*outH*8,
+                  "complete MetalFX output is readable at the expected size");
+            if(result.size()==size_t(outW)*outH*8) {
+                uint16_t rejected=0,accepted=0;
+                std::memcpy(&rejected,result.data()+(size_t(outH/2)*outW+outW/4)*8,2);
+                std::memcpy(&accepted,result.data()+(size_t(outH/2)*outW+3*outW/4)*8+2,2);
+                check(rejected==value && accepted==(step?0x3c00:value),
+                      "rejected pixels retain HDR values from original, trusted pixels use backend green");
+            }
+            check(readWhole(context,colorTex.Get(),source,8) && source==colorBytes,
+                  "MetalFX prep and finish leave every source FP16 component unchanged");
+        }
+    }
+    captureMfxColor=false;
+    // Real resolver execution for every independent selector combination. The rig's SDK seam
+    // records calls and reads inputs; Windows runs the production shaders/restore guard on WARP.
+    for(const auto mode:{FlatMonoResolveMode::Taa,FlatMonoResolveMode::Fsr,FlatMonoResolveMode::Mfx,FlatMonoResolveMode::Mfx4}) {
+        edvr::flatMonoResolveReset();
+        f.mode=mode;f.frame=90000;f.jitterX=f.jitterY=f.previousJitterX=f.previousJitterY=0;
+        f.engine={};f.reset=false;f.steadyDetail=true;expectedJx=expectedJy=0;expectedNear=f.camera[3][2];
+        for(unsigned bits=0;bits<16;++bits) {
+            edvr::flatdiag::publish(edvr::flatdiag::selection(true,!(bits&1),!(bits&2),!(bits&4),!(bits&8)));
+            edvr::flatdiag::clearCounts();
+            const int calls=backendCalls;
+            for(unsigned step=0;step<2;++step) {
+                ++f.frame;output.Reset();reason="unset";
+                check(edvr::flatMonoResolve(device,context,f,&output,&reason) && output && !reason,
+                      "diagnostic FP16 combinations keep the actual resolver active");
+                const bool backendOn=!(bits&8);
+                check(backendCalls==calls+(mode!=FlatMonoResolveMode::Taa && backendOn?int(step+1):0),
+                      "diagnostic backend selection matches actual SDK calls without disabling prep");
+                if(mode!=FlatMonoResolveMode::Taa && backendOn)check(backendReset,"diagnostic SDK history reset on every frame");
+                ComPtr<ID3D11Resource> resource;if(output)output->GetResource(&resource);
+                ComPtr<ID3D11Texture2D> tex;if(resource)resource.As(&tex);
+                uint16_t red=0;
+                check(tex && readPixel(context,tex.Get(),&red,sizeof(red),outW/2,outH/2) && red==0x4300,
+                      "diagnostic output retains current-frame FP16 HDR 3.5, including spatial bypass");
+                std::vector<unsigned char> unchanged;
+                check(readWhole(context,colorTex.Get(),unchanged,8) && unchanged==colorBytes,
+                      "diagnostic bypass never overwrites original FP16 source");
+            }
+            const auto* counts=edvr::flatdiag::counts;
+            check(counts[edvr::flatdiag::Resolve]==2 && counts[edvr::flatdiag::Finished]==2 &&
+                  counts[edvr::flatdiag::Prepared]==((bits&2)?0u:2u) &&
+                  counts[edvr::flatdiag::Evaluated]==((bits&8)?0u:2u) &&
+                  counts[edvr::flatdiag::Spatial]==((bits&8)?2u:0u),
+                  "diagnostic counters prove actual prep/evaluation/spatial independence");
+            check(counts[edvr::flatdiag::Neutral]<=1,"prepared input seed never repeats each frame");
+        }
+        // Deliberately cold preparation-off: no previous output may be reused uninitialized.
+        edvr::flatMonoResolveReset();edvr::flatdiag::publish(edvr::flatdiag::selection(true,true,false,true,true));
+        ++f.frame;output.Reset();reason="unset";
+        check(edvr::flatMonoResolve(device,context,f,&output,&reason) && output && !reason,
+              "cold preparation bypass initializes finite inputs without a preceding prepared frame");
+        if(mode!=FlatMonoResolveMode::Taa)check(std::isfinite(observedDepth) && observedDepth==.5f &&
+            observedMotion==0 && observedMotionY==0,"cold backend depth/motion initialized to finite neutral values");
+    }
+    // A warmed freeze must use the depth plane most recently written, not an allocated but stale sibling.
+    edvr::flatMonoResolveReset();f.mode=FlatMonoResolveMode::Mfx;f.steadyDetail=true;
+    edvr::flatdiag::publish(edvr::flatdiag::selection(true,true,true,true,true));
+    ++f.frame;output.Reset();check(edvr::flatMonoResolve(device,context,f,&output,&reason),"warm prepared input before freeze");
+    std::fill(depthBytes.begin(),depthBytes.end(),.25f);
+    context->UpdateSubresource(depthTex.Get(),0,nullptr,depthBytes.data(),w*4,0);
+    const uint16_t fresh=0x4100;for(size_t i=0;i<colorBytes.size();i+=2)std::memcpy(colorBytes.data()+i,&fresh,2);
+    context->UpdateSubresource(colorTex.Get(),0,nullptr,colorBytes.data(),w*8,0);
+    edvr::flatdiag::publish(edvr::flatdiag::selection(true,true,false,true,true));
+    captureMfxColor=true;edvr::flatdiag::clearCounts();
+    for(unsigned step=0;step<2;++step) {
+        ++f.frame;output.Reset();reason="unset";
+        check(edvr::flatMonoResolve(device,context,f,&output,&reason) && output,"freeze resolves after scene changes");
+        uint16_t seed=0;if(observedMfxColor.size()>=2)std::memcpy(&seed,observedMfxColor.data(),2);
+        check(observedDepth==.5f && seed==0x4300,"frozen backend reads previously prepared depth and complex colour, not current or undefined data");
+        ComPtr<ID3D11Resource> resource;if(output)output->GetResource(&resource);
+        ComPtr<ID3D11Texture2D> tex;if(resource)resource.As(&tex);uint16_t red=0;
+        check(tex && readPixel(context,tex.Get(),&red,2,outW/2,outH/2) && red==fresh,"freeze finish still displays the current game image");
+    }
+    check(edvr::flatdiag::counts[edvr::flatdiag::Neutral]==1,"freeze initialized once, not every resolve");
+    captureMfxColor=false;
+    edvr::flatdiag::publish(0);edvr::flatdiag::clearCounts();
+    f.engine={fp16SlotView.Get(),fp16PoolView.Get(),fp16Now.Get(),fp16Old.Get()};
+    for(unsigned step=0;step<2;++step) {
+        ++f.frame;output.Reset();reason="unset";
+        check(edvr::flatMonoResolve(device,context,f,&output,&reason) && output && backendReset==(step==0),
+              "leaving diagnostics resets once, then resumes normal MetalFX history");
+    }
+    captureMfxColor=false;observedMfxColor.clear();observedMfxColorResource=nullptr;
     edvr::flatMonoResolveReset();
 }

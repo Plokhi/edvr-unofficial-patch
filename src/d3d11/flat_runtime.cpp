@@ -1,4 +1,5 @@
 #include "flat_runtime.h"
+#include "flat_diagnostic.h"
 #include "flat_sdk_bench_probe.h"
 #include "flat_capture_policy.h"
 #include "flat_runtime_model.h"
@@ -588,7 +589,7 @@ struct State {
     // the whole frame, first game draw to Present, and the resolver's dispatches plus
     // backend call. A timer is owned until its sample is read; with none free the
     // frame is skipped and counted.
-    flatcpu::Census census{flatcpu::kRenderPeriod, flatcpu::clocksWanted()};
+    flatcpu::Census census{emcpu::samplePeriodWanted() / 2, flatcpu::clocksWanted(), emcpu::samplePeriodWanted()};
     static constexpr int kGpuFrameTimers = 4, kGpuResolveTimers = 2;
     GpuTimer gpuFrameTimer[kGpuFrameTimers];
     GpuTimer gpuResolveTimer[kGpuResolveTimers];
@@ -2163,8 +2164,14 @@ ResourceInfo view(BindSlot slot, uint32_t cache) {
     auto& v = state().views[cache]; const auto generation = bindingGeneration(slot);
     void* identity = bindingGet(slot);
     if (v.identity != identity || v.generation != generation) {
-        v.held.Reset(); v.identity = identity; v.generation = generation; v.info = {};
-        if (identity && bindingResolve(identity, &v.info)) v.held = static_cast<IUnknown*>(identity);
+        v.generation = generation;
+        // A held view pins its immutable resource and description. Identical
+        // game rebinds and frame-generation bumps do not require COM queries.
+        // Unresolved identities still retry on the next binding generation.
+        if (!identity || v.held.Get() != identity) {
+            v.held.Reset(); v.identity = identity; v.info = {};
+            if (identity && bindingResolve(identity, &v.info)) v.held = static_cast<IUnknown*>(identity);
+        }
     }
     return v.info;
 }
@@ -2341,6 +2348,8 @@ bool depthView(ID3D11Texture2D* depth) {
 // span costs one timestamp pair.
 void gpuFrameOpen(State& s, ID3D11DeviceContext* ctx) {
     s.gpuFrameTried = true;
+    // The profile switch is latched: disabled profiling needs no further attempts.
+    if (!emcpu::profileWanted()) return;
     for (int i = 0; i < State::kGpuFrameTimers; ++i) {
         if (s.gpuFrameBusy[i]) continue;
         if (s.gpuFrameTimer[i].begin(s.device.Get(), ctx)) { s.gpuFrameBusy[i] = true; s.gpuFrameOpen = i; return; }
@@ -2388,6 +2397,7 @@ void gpuReset(State& s) {
 // The resolver's hooks (flat_mono_resolve.h): a timestamp pair around its own dispatches and
 // backend call. Called on the thread that resolves, inside the treatment scope.
 void resolveSpanBegin(ID3D11DeviceContext* ctx) noexcept {
+    if (!emcpu::profileWanted()) return;
     auto& s = state();
     if (s.gpuResolveOpen >= 0) return;
     for (int i = 0; i < State::kGpuResolveTimers; ++i) {
@@ -2490,6 +2500,11 @@ void endStandDown(State& s, uint64_t frame, const char* why) {
 // chain, the state machine's verdict, and the mode of the frame that starts now.
 // Runs once per Present, before anything else in it reads s.work.
 void standDownFrame(State& s, uint64_t frame) {
+    // Deliberately missing image contracts must not silently turn an isolation experiment into passthrough.
+    if(flatdiag::active()) {
+        s.frameLive=false;s.frameSeen=FlatFrameSeen::None;s.frameReason=FlatMonoReason::NoOutputCopy;
+        applyWork(s,FlatWork::Full);publishRefusal(s,false);return;
+    }
     const uint64_t now = GetTickCount64();
     const bool watched = s.frameLive;
     const FlatFrameSeen seen = s.frameSeen;
@@ -2837,6 +2852,12 @@ static bool qualifiedUntrustedSource(const FlatContractRecord& record,
                                      const unsigned char* worldCamera,void* user) {
     auto* s=static_cast<State*>(user);
     if(!s)return false;
+    // Only the pixel-coverage proof is bypassed; the selector still proves source/depth/camera structure.
+    if(!flatdiag::enabled(flatdiag::Motion)) {
+        s->untrustedQualificationCalled=true;
+        s->untrustedLastQualification="DIAGNOSTIC-motion-coverage-bypassed";
+        return true;
+    }
     FlatUntrustedQualification diagnostic{};
     const bool qualified=s->untrusted.qualifies(record,worldCamera,
         s->phase.currentX,s->phase.currentY,&diagnostic);
@@ -3081,7 +3102,7 @@ static void hdrSelectAtTrigger(State& s) {
                 selectedScale?sp0:0.0,selectedScale?sp1:0.0,s.worldReference.nearPlane);
         }
     }
-    if(sel.selected()) {
+    if(sel.selected() && flatdiag::enabled(flatdiag::Motion)) {
         const auto* worldBytes=reinterpret_cast<const unsigned char*>(sel.camera);
         bool alternateObserved=false, missingCamera=false;
         if(s.unclassifiedPoolOverflow) {
@@ -3300,6 +3321,39 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // Present that returns early below (mode off, no device, no swap buffer)
     // can never leave the previous frame's phase injecting.
     flatCameraInjectDisarm();
+    {
+        static uint32_t diagnosticGeneration=~0u;
+        auto& cfg=Config::get();const uint32_t generation=cfg.generation();
+        if(generation!=diagnosticGeneration) {
+            diagnosticGeneration=generation;
+            const uint32_t next=flatdiag::selection(
+                cfg.getBool("diagnostic.flat_session",false),
+                cfg.getBool("diagnostic.flat_motion",true),
+                cfg.getBool("diagnostic.flat_preparation",true),
+                cfg.getBool("diagnostic.flat_composition",true),
+                cfg.getBool("diagnostic.flat_backend",true));
+            if(flatdiag::publish(next)) {
+                FlatComputeInternalScope internal;
+                engineVelocityFlatFlush(s.context.Get(),EngineVelocityFlushCause::kPresent);
+                engineVelocityFlatFrameEnd();
+                s.overlay.reset();s.untrusted.reset();flatUiLayerRelease();
+                s.foregroundRoute.clear();for(auto& candidate:s.foregroundCandidates)retireDomainCandidate(s,candidate);
+                s.foregroundDomainFrame=~0ull;s.foregroundSelectedDepth=nullptr;s.foregroundHRefusal=nullptr;
+                s.foreground.reset();foregroundProbeActive.store(false,std::memory_order_release);
+                foregroundDomainActive.store(false,std::memory_order_release);
+                untrustedCoverageActive.store(false,std::memory_order_release);
+                overlaySuffixActive.store(false,std::memory_order_release);
+                reset();s.phase.resetHistory();s.temporalAccepted=false;
+                s.census.idle();gpuReset(s);flatdiag::clearCounts();
+                endStandDown(s,frame,"diagnostic selection changed");
+                Log::get().note("flat isolation: epoch=%u frame=%llu ini=%s session=%s motion=%s preparation=%s composition=%s backend=%s; %s",
+                    flatdiag::epoch.load(),(unsigned long long)frame,cfg.iniName(),(next&flatdiag::Session)?"on":"off",
+                    flatdiag::enabled(flatdiag::Motion)?"on":"off",flatdiag::enabled(flatdiag::Preparation)?"on":"off",
+                    flatdiag::enabled(flatdiag::Composition)?"on":"off",flatdiag::enabled(flatdiag::Backend)?"on":"off",
+                    next?"DIAGNOSTIC: zero jitter; reset every resolve; history invalid; missing coverage deliberately admitted; backend-off uses one spatial dispatch; preparation-off freezes initialized inputs (neutral fallback if unwarmed; quality invalid)":"normal rendering/history restored");
+            }
+        }
+    }
     // The camera producer probe's per-Present cadence (config-gated inside).
     flatCameraProducerProbeFrame(frame);
     // Account for the completed frame before mode/resize changes or the next
@@ -3331,7 +3385,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.mode = mode; reset();
         // A new mode is a new question for the stand-down: everything restarts.
         endStandDown(s, frame, "the anti-aliasing mode changed");
-        engineVelocityConfigure(enabled);
+        engineVelocityConfigure(enabled && flatdiag::enabled(flatdiag::Motion));
         s.phase.resetHistory();
         s.engine = _stricmp(mode.c_str(), "fsr") == 0 ? FlatMonoResolveMode::Fsr :
             _stricmp(mode.c_str(), "dlss") == 0 ? FlatMonoResolveMode::Dlss :
@@ -3349,7 +3403,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // Engine motion follows the stand-down (s.enginePaused); the mode of the frame that
     // starts now is decided below, and a change of it is handed over there.
     const bool enginePausedThen = s.enginePaused;
-    engineVelocityConfigure(enabled && !enginePausedThen);
+    engineVelocityConfigure(enabled && !enginePausedThen && flatdiag::enabled(flatdiag::Motion));
     // No temporal mode selected: the census stops (its gates close, a scope costs a load and a compare).
     if (!enabled) {
         s.census.idle();if(s.device || s.output || s.cameras.count())flatRuntimeResize();
@@ -3393,7 +3447,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     const auto syncEngine = [&] {
         if (s.enginePaused == engineConfiguredPaused) return;
         engineConfiguredPaused = s.enginePaused;
-        engineVelocityConfigure(enabled && !s.enginePaused);
+        engineVelocityConfigure(enabled && !s.enginePaused && flatdiag::enabled(flatdiag::Motion));
     };
     // The HDR route's breadcrumbs are DXMT's alone (flat_hdr_crumbs.h, THE GATE): the markers decide, once, here, with the device
     // in hand and before the key's first read arms the trail. Only the detection decides, so a Windows device writes no crumb. The 5 s line's step counts below do not depend on it.
@@ -3416,7 +3470,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // the GPU spans that finished are read (never waited for), and every 5 s the window is
     // printed, zeros included. Instrument only: nothing below reads any of it.
     if (!s.censusHooked) { flatMonoResolveSetSpanHooks(&resolveSpanBegin, &resolveSpanEnd); s.censusHooked = true; }
-    {
+    if (emcpu::profileWanted()) {
         static const int64_t censusFreq = flatcpu::qpcFrequency();
         const int64_t censusNow = EDVR_FLATCPU_NOW();
         const bool censusWasRunning = s.census.running();
@@ -3433,11 +3487,16 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         gpuPoll(s);
         flatcpu::WindowReport window;
         if (s.census.take(censusNow, s.standDown.standing, window)) {
+            if(flatdiag::active())Log::get().note("flat isolation timing: epoch=%u mask=%u; CPU/dispatch/Present and GPU frame/resolve window follows (not additive)",flatdiag::epoch.load(),flatdiag::mask.load());
             flatcpu::Lines lines;
             flatcpu::formatWindow(window, &lines);
             for (int i = 0; i < lines.count; ++i) Log::get().note("%s", lines.line[i]);
         }
         s.gpuFrameTried = false;
+    } else {
+        s.census.idle();
+        // State verification is independent of profiling and still checks shortcuts.
+        flatQueryCut().beginFrame(frame);
     }
     // The completed frame is a draw-capture sample only if it was live: the resolver did not reset
     // it, and it ran at a nonzero phase unless the jitter is off on purpose. The two frames after an
@@ -3454,7 +3513,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     foregroundProbeActive.store(s.foreground.active(),std::memory_order_release);
     flatMonoResolvePollPixels(s.context.Get(),frame);
     if(s.phase.applied)++s.jitteredFrames;
-    s.phase.finish(s.temporalAccepted && SUCCEEDED(hr),s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));
+    s.phase.finish(!flatdiag::active() && s.temporalAccepted && SUCCEEDED(hr),s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));
     // The camera injector closes the frame that just ended with the phase
     // machine's own verdict on it: previousAcceptedValid is exactly finish's
     // "clean" (backend acceptance, complete coverage, no phase failure). The
@@ -3649,7 +3708,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // The frame's one GuiFocus read (flatRuntimeMapFocusFrame) comes first: on the Galaxy Map and the Orrery temporal AA is off, and
     // this frame's phase is zero (no jitter, the history restarts). A frame that would have jittered is counted jitter-zeroed.
     flatRuntimeMapFocusFrame();
-    const bool phaseWanted = flatCameraPhaseEnabled(phaseRoute,true,s.observing,s.projection!=nullptr);
+    const bool phaseWanted = !flatdiag::active() && flatCameraPhaseEnabled(phaseRoute,true,s.observing,s.projection!=nullptr);
     const bool temporalOff = flatRuntimeMapTemporalOff();
     flatUiLayerMapAaFrame(temporalOff, phaseWanted);
     s.phase.beginFrame(phaseWanted && !temporalOff,
@@ -3665,7 +3724,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // frames for an F10 dump instead of filling with empty ones.
     if (s.work != FlatWork::Paused) s.prefix = FlatRuntimePrefix{};
     s.prefix.frame = frame + 1;
-    if(s.engine!=FlatMonoResolveMode::Taa && s.work==FlatWork::Full) {
+    if(flatdiag::enabled(flatdiag::Motion) && s.engine!=FlatMonoResolveMode::Taa && s.work==FlatWork::Full) {
         s.foregroundDomainFrame=s.prefix.frame;s.foregroundSelectedDepth=nullptr;
         s.foregroundHRefusal=nullptr;
         s.foregroundRoute.beginFrame(s.prefix.frame);
@@ -3716,6 +3775,16 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.cameras.newFrame();
     const auto now = GetTickCount64();
     if (now - s.lastReport >= 5000) {
+        if(flatdiag::active()) {
+            const auto* c=flatdiag::counts;
+            Log::get().note("flat isolation work 5s: epoch=%u mask=%u resolve=%llu prepared=%llu evaluated=%llu spatial=%llu producer=%llu coverage=%llu domain=%llu replay=%llu foreground=%llu finished=%llu seed-init=%llu; compare timings only if resolves/finished remain active",
+                flatdiag::epoch.load(),flatdiag::mask.load(),(unsigned long long)c[flatdiag::Resolve],
+                (unsigned long long)c[flatdiag::Prepared],(unsigned long long)c[flatdiag::Evaluated],
+                (unsigned long long)c[flatdiag::Spatial],(unsigned long long)c[flatdiag::Producer],
+                (unsigned long long)c[flatdiag::Coverage],(unsigned long long)c[flatdiag::Domain],
+                (unsigned long long)c[flatdiag::Replay],(unsigned long long)c[flatdiag::Foreground],(unsigned long long)c[flatdiag::Finished],(unsigned long long)c[flatdiag::Neutral]);
+            flatdiag::clearCounts();
+        }
         reportDrawIngress("progress", false);
         reportMapBounce(frame,now,true);
         reportPhaseCensus(s,"5s");
@@ -4503,7 +4572,7 @@ static bool domainDrawPreservesSurface(ID3D11DeviceContext* context) {
 // Sets f.foregroundRequired and, when that is true, the map, its qualification, frame, reset request and depth convention.
 static void foregroundContractAtH(State& s,ID3D11DeviceContext* ctx,const FlatMonoFrame& selected,FlatMonoResolveFrame& f,
                                   FlatForegroundMotion::Output& foregroundOutput) {
-    f.foregroundRequired=f.mode!=FlatMonoResolveMode::Taa && selected.mixedCamera;
+    f.foregroundRequired=flatdiag::foregroundEnabled() && f.mode!=FlatMonoResolveMode::Taa && selected.mixedCamera;
     if(!f.foregroundRequired)return;
     FlatComputeInternalScope internal;
     s.foregroundSelectedDepth=selected.depth;
@@ -4543,6 +4612,7 @@ static void foregroundContractAtH(State& s,ID3D11DeviceContext* ctx,const FlatMo
     Ptr<ID3D11ShaderResourceView> domainOwners;
     if(!engineVelocityFlatDomainSlots(static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)),&domainOwners))
         failH("foreground-current-owner-plane-unavailable");
+    if(candidate)flatdiag::note(flatdiag::Foreground);
     if(candidate)candidate->motion.prepareH(ctx,domainOwners.Get(),s.depthView.Get(),selected.camera,
         static_cast<unsigned>(s.prefix.frame),f.renderWidth,f.renderHeight,foregroundOutput);
     if(candidate && !foregroundOutput.qualified)failH(foregroundOutput.refusal);
@@ -4642,7 +4712,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     drawPacketJitterBefore=s.jitterRefusals;drawPacketOverlayBefore=s.overlayRefusedWindow;
     weaponDrawKind=kind;weaponDrawCount=count;weaponDrawStart=start;weaponDrawBase=base;
     weaponDrawInstances=instances;weaponDrawStartInstance=startInstance;
-    if(s.engine!=FlatMonoResolveMode::Taa && s.work==FlatWork::Full && s.foregroundDomainFrame!=s.prefix.frame) {
+    if(flatdiag::enabled(flatdiag::Motion) && s.engine!=FlatMonoResolveMode::Taa && s.work==FlatWork::Full && s.foregroundDomainFrame!=s.prefix.frame) {
         s.foregroundDomainFrame=s.prefix.frame;s.foregroundSelectedDepth=nullptr;
         s.foregroundHRefusal=nullptr;
         s.foregroundRoute.beginFrame(s.prefix.frame);
@@ -4912,7 +4982,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                     ++s.copyWeaponWindow.alternateDraws;
                 } else {
                     d.overlayProtected=true;
-                    overlayPlanned=true;
+                    overlayPlanned=flatdiag::enabled(flatdiag::Composition);
                     ++s.overlayPlannedWindow;
                     overlayHdr=static_cast<ID3D11Texture2D*>(const_cast<void*>(k.color));
                     overlayDsv=static_cast<ID3D11DepthStencilView*>(const_cast<void*>(k.dsv));
@@ -5096,7 +5166,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         }
     }
     const bool alternateNominee=alternate.candidate && !inertSource;
-    if(alternateNominee) {
+    if(alternateNominee && flatdiag::enabled(flatdiag::Motion)) {
         // Before H names its world camera, retain every structural scene draw
         // in a camera bucket. The consumer discards the world bucket. A motion
         // source whitelist cannot know which original colour PS owns a pixel.
@@ -5188,7 +5258,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         s.namedDepth=k.depth;s.namedConstants=k.b1;s.namedWorldQ=s.prefix.sequence;s.namedVs=k.vs;s.namedPs=k.ps;
         std::memcpy(s.namedCamera,d.camera,sizeof(d.camera));
         {float namedRows[6][4];std::memcpy(namedRows,d.camera,sizeof(namedRows));s.worldReference=flatDomainWorldReference(namedRows);}
-        engineVelocityNoteSource(static_cast<ID3D11Texture2D*>(const_cast<void*>(k.depth)),static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)));
+        if(flatdiag::enabled(flatdiag::Motion))engineVelocityNoteSource(static_cast<ID3D11Texture2D*>(const_cast<void*>(k.depth)),static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)));
     }
     const bool foregroundGap=s.foreground.needsPreWorldState(
         static_cast<ID3D11Texture2D*>(const_cast<void*>(k.depth)));
@@ -5244,7 +5314,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                 } else if(!plan.admitted())domainFail(s,"planning",plan.refusal,k);
                 else {
                     // A first-person depth writer: capture its geometry and mark it.
-                    domainPlanned=true;domainDepth=candidate->depth.Get();domainVs=k.vs;domainPs=k.ps;
+                    domainPlanned=flatdiag::enabled(flatdiag::Motion);domainDepth=candidate->depth.Get();domainVs=k.vs;domainPs=k.ps;
                     domainBeforeWorld=domainWasBeforeWorld;domainSameWorld=false;
                     domainCameraHash=k.cameraHash;domainFormat=k.format;domainHdrWriter=k.format==26;
                     if(domainHdrWriter) {
@@ -5273,7 +5343,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         std::memcpy(evidence.camera,d.camera,sizeof(evidence.camera));
         evidence.phaseX=s.phase.currentX;evidence.phaseY=s.phase.currentY;
     }
-    if(foregroundCandidate && !alternateNominee) {
+    if(flatdiag::foregroundEnabled() && foregroundCandidate && !alternateNominee) {
         foregroundPlanned=s.foreground.plan(s.prefix.frame,s.prefix.sequence,
             static_cast<ID3D11Texture2D*>(const_cast<void*>(k.color)),
             static_cast<ID3D11Texture2D*>(const_cast<void*>(k.depth)),
@@ -5369,7 +5439,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             }
         }
     }
-    if (continuesRun) {
+    if (continuesRun && flatdiag::enabled(flatdiag::Motion)) {
         FlatComputeInternalScope guard;
         // Engine motion's draw wrapper, lazy form (engine_velocity.h): the game's render targets saved once per binding, then
         // BeforeDraw (the shader substitution, MRT6, the blend state), and EDVR's state stays bound for the next producer
@@ -5377,6 +5447,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         // wrapper's D3D state calls are counted where they are made.
         flatcpu::Scope engine(flatcpu::kEngineDraw);
         producer = engineVelocityFlatBeginDraw(ctx, &gameHadTarget6);
+        if(producer)flatdiag::note(flatdiag::Producer);
     }
     // The earlier capture preserves original game CBs and shader identities.
     // Motion is sampled only after the producer has attached its actual MRT6,
@@ -5684,12 +5755,12 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     if(s.phase.needsSpatialFallback()) {s.reason="incomplete-jitter-frame";recover(s.reason);refuse(s);return;}
     // A scene with no pool-family draw has no views a draw made: they are made from nothing for the camera term
     // (engineVelocityPrepareSourceFree). A refusal there leaves the views unprepared, and the request below declines as ever.
-    if (selected.sourceFree) {
+    if (selected.sourceFree && flatdiag::enabled(flatdiag::Motion)) {
         float sourceFreeRows[6][4]; std::memcpy(sourceFreeRows, selected.camera, sizeof(sourceFreeRows));
         engineVelocityPrepareSourceFree(ctx, static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)),
             static_cast<ID3D11Buffer*>(const_cast<void*>(selected.sceneConstants)), sourceFreeRows);
     }
-    if (!engineVelocitySourceViews(static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)), &f.engine)) {
+    if (flatdiag::enabled(flatdiag::Motion) && !engineVelocitySourceViews(static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)), &f.engine)) {
         s.reason="engine-source-not-ready";if(s.phase.applied)recover(s.reason);refuse(s);return;
     }
     Ptr<ID3D11ShaderResourceView> engineSlots, enginePool, outputView, engineSkin; Ptr<ID3D11Buffer> nowCb, prevCb;
@@ -5885,8 +5956,8 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
         auto& target=s.prefix.targets[i];
         if(target.resource!=selected.hdr || !target.overlayOpen)continue;
         Ptr<ID3D11Texture2D> hdrTexture;
-        if(FAILED(hdrResource.As(&hdrTexture)) ||
-           !s.overlay.ready(s.prefix.frame,hdrTexture.Get())) {
+        if(flatdiag::enabled(flatdiag::Composition) && (FAILED(hdrResource.As(&hdrTexture)) ||
+           !s.overlay.ready(s.prefix.frame,hdrTexture.Get()))) {
             overlayFail(s,s.overlay.refusal()?s.overlay.refusal():"overlay-not-ready-at-consumer",selected.hdr);
             decline("overlay-not-ready-at-consumer");
             return;
@@ -5901,7 +5972,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
         }
         overlaySuffixActive.store(false,std::memory_order_release);
         flatTraceMark(s.traceRing,kFlatTraceEventOverlaySeal,selected.hdr);
-        protectedOverlay=true;
+        protectedOverlay=flatdiag::enabled(flatdiag::Composition);
         break;
     }
     if (nonzeroPhase(s) && !s.phase.applied) failPhase(s, "no-raster-application");
@@ -5933,7 +6004,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     f.refusalView = 0u;
     f.refusalCensus = s.refusalCensusFrames > 0;
     if (s.refusalCensusFrames) --s.refusalCensusFrames;
-    if(selected.mixedCamera) {
+    if(selected.mixedCamera && flatdiag::enabled(flatdiag::Motion)) {
         f.untrustedCameraCoverage=s.untrusted.view();
         if(!f.untrustedCameraCoverage) {
             decline("untrusted-camera-coverage-unavailable");return;
@@ -6011,12 +6082,12 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     }
     // A scene with no pool-family draw has no views a draw made: they are made from nothing for the camera term
     // (engineVelocityPrepareSourceFree). A refusal there leaves the views unprepared, and the request below declines as ever.
-    if (selected.sourceFree) {
+    if (selected.sourceFree && flatdiag::enabled(flatdiag::Motion)) {
         float sourceFreeRows[6][4]; std::memcpy(sourceFreeRows, selected.camera, sizeof(sourceFreeRows));
         engineVelocityPrepareSourceFree(ctx, static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)),
             static_cast<ID3D11Buffer*>(const_cast<void*>(selected.sceneConstants)), sourceFreeRows);
     }
-    if (!engineVelocitySourceViews(static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)), &f.engine)) {
+    if (flatdiag::enabled(flatdiag::Motion) && !engineVelocitySourceViews(static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)), &f.engine)) {
         s.reason = "engine-source-not-ready";
         if (s.phase.applied && recoverHdr(s.reason, f)) refuse(s); else decline("engine-source-not-ready");
         return;
@@ -6089,6 +6160,7 @@ static const char* replayDrawGuard(ID3D11DeviceContext* ctx, const FlatRuntimeDr
     return nullptr;
 }
 static void issueExactReplayDraw(ID3D11DeviceContext* ctx,const FlatRuntimeDrawScope& draw) {
+    flatdiag::note(flatdiag::Replay);
     const UINT count=draw.weaponDrawCount, instances=draw.weaponDrawInstances;
     switch(draw.weaponDrawKind) {
     case 'D': ctx->Draw(count,static_cast<UINT>(draw.weaponDrawBase)); break;
@@ -6101,6 +6173,7 @@ static void issueExactReplayDraw(ID3D11DeviceContext* ctx,const FlatRuntimeDrawS
 }
 static void __stdcall foregroundOriginalDraw(ID3D11DeviceContext* ctx,UINT count,UINT instances,
     UINT start,INT base,UINT startInstance) {
+    flatdiag::note(flatdiag::Replay);
     ctx->DrawIndexedInstanced(count,instances,start,base,startInstance);
 }
 void FlatRuntimeDrawScope::beginActualDraw(ID3D11Buffer* indirectArgs,UINT indirectOffset) {
@@ -6127,6 +6200,7 @@ void FlatRuntimeDrawScope::beginActualDraw(ID3D11Buffer* indirectArgs,UINT indir
     if(untrustedPlanned) {
         untrustedStarted=state().untrusted.beginDraw(ctx,state().prefix.frame,
             [](void* shader) { return lookupShaderHash(shader); });
+        if(untrustedStarted)flatdiag::note(flatdiag::Coverage);
     }
     if(domainPlanned) {
         auto& s=state();FlatComputeInternalScope internal;
@@ -6231,7 +6305,7 @@ void FlatRuntimeDrawScope::beginActualDraw(ID3D11Buffer* indirectArgs,UINT indir
                 projection.projectionRow,projection.projectionLayout,s.phase.currentX,s.phase.currentY,
                 domainWidth,domainHeight,domainCamera[3][2],&phaseReason);
             if(!phaseKnown)failDomain("projection-phase",phaseReason);
-            if(domainForeign && domainPool && phaseKnown) {
+            if(flatdiag::enabled(flatdiag::Composition) && domainForeign && domainPool && phaseKnown) {
                 FlatForegroundMotion::Inputs inputs{};std::memcpy(inputs.camera,domainCamera,sizeof(inputs.camera));
                 inputs.phaseX=s.phase.currentX;inputs.phaseY=s.phase.currentY;
                 inputs.writerToken=domainWriterToken;
@@ -6251,6 +6325,7 @@ void FlatRuntimeDrawScope::beginActualDraw(ID3D11Buffer* indirectArgs,UINT indir
                 domainStarted=engineVelocityFlatDomainBeginDraw(ctx,domainDepth,vsBytes,vsSize,psBytes,psSize,
                     domainForeign?FlatEngineDomain::ForeignPool:domainPool?FlatEngineDomain::WorldPool:FlatEngineDomain::World,&reason,untrustedStarted,
                     domainWriterToken,weaponDrawCount/3);
+                if(domainStarted)flatdiag::note(flatdiag::Domain);
                 if(!domainStarted)failDomain("marker",reason);
                 if(!domainStarted)++s.foregroundCounts.markerRefused;
                 else if(!domainPs)++s.foregroundCounts.nullMarkers;

@@ -13,6 +13,7 @@
 // owner, which may open a frame -- is only read, under native_temporal's own
 // lock, through nativeTemporalDrawJitter.
 #include "ui_layer.h"
+#include "flat_cpu.h"
 
 #include "ui_layer_math.h"
 #include "ui_scene_composites.h"  // the census of the interface composites left in the scene, and its line
@@ -4577,6 +4578,7 @@ void uiLayerNoteSubmitted(uint64_t sequence, uint32_t eye, const void* submitted
 
 ID3D11Texture2D* uiLayerComposite(uint64_t sequence, uint32_t eye, ID3D11Texture2D* frame,
                                   const uint32_t region[4], const float layerUv[4]) {
+    flatcpu::Scope composition(flatcpu::kUiComposition);
     if (eye > 1 || !frame || !region || !layerUv) return nullptr;
     g_seedCensus.door(eye, sequence);
     Eye& e = g_eye[eye];

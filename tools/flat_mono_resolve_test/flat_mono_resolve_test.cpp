@@ -39,6 +39,8 @@ float expectedNear=.025f;
 // Descriptor jitter recorded at the MetalFX seam.
 float observedMfxJx=0,observedMfxJy=0;bool observedMfxAutoExposure=false;int mfxCalls=0;
 edvr::mfx::FxGeneration observedMfxGeneration=edvr::mfx::FxGeneration::Metal3;
+bool captureMfxColor=false;std::vector<unsigned char> observedMfxColor;
+ID3D11Texture2D* observedMfxColorResource=nullptr;
 float observedMotion=0,observedMotionY=0,observedDepth=0;unsigned observedReject=0;
 // The whole motion texture the SDK was handed, decoded, and a hash over its raw bits: the shader's complete
 // output for the frame, so "bit-identical" can be asserted rather than sampled at one pixel.
@@ -217,6 +219,10 @@ bool mfxEvaluate(ID3D11DeviceContext* c,ID3D11Texture2D* colour,ID3D11Texture2D*
     ID3D11Texture2D* out,uint32_t w,uint32_t h,uint32_t outW,uint32_t outH,float jx,float jy,bool reset,
     const char** why,bool hdr, edvr::mfx::FxGeneration generation) {
     observedMfxGeneration=generation;
+    if(captureMfxColor) {
+        observedMfxColorResource=colour;
+        check(readWhole(c,colour,observedMfxColor,8),"MetalFX complete FP16 input readback");
+    }
     ++mfxCalls;backendSlots.push_back(-1);
     observedInW=w;observedInH=h;observedOutW=outW;observedOutH=outH;
     observedHdr=hdr;observedColourFormat=DXGI_FORMAT_UNKNOWN;observedOutFormat=DXGI_FORMAT_UNKNOWN;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "flat_projection_scope.h"
+#include "resource_slot_cache.h"
 #include <d3d11_1.h>
 #include <wrl/client.h>
 #include <cstdint>
@@ -156,6 +157,7 @@ private:
     };
     FlatProjectionShadowBank<kBuffers> shadows_;
     Tracked tracked_[kBuffers]{};
+    ResourceSlotCache<kBuffers> trackedHint_;
     CachedPlan plans_[kPlans]{};
     CachedPlan livePlan_{}; // one allocation-free, retargetable late topology
     ColdReadback cold_[kColdPending]{};

@@ -289,11 +289,14 @@ inline int flatSiblingWiringTests() {
     const auto runValid = [&](const std::string& text) {
         return ordered(text, {"if(!siblingPassEnabled())returnfalse;", "bool receiver=frame<=siblingArmedUntil_;",
                               "for(const auto&d:current_)if(d.inputs.gpuIdentity&&d.priorCount==0)receiver=true;", "if(!receiver)returnfalse;",
-                              "CsStageSavesaved;saved.save(ctx);", "ctx->ClearUnorderedAccessViewUint(donorsUav_.Get(),zero);",
-                              "if(!d.inputs.gpuIdentity||!d.priorCount)continue;", "ctx->Dispatch(1,1,1);",
+                              "CsStageSavesaved;saved.save(ctx);", "context1->CSGetConstantBuffers1(0,1,&oldCb,&oldFirst,&oldCount);",
+                              "ctx->CopySubresourceRegion(receivers_.Get(),0,i*16,0,0,identity.Get(),0,&box);",
                               "limits.limits[0]=kFlatSiblingSpreadPixels;limits.limits[1]=float(kFlatSiblingMinVertices);",
+                              "ctx->UpdateSubresource(fitSettings_.Get(),0,nullptr,&limits,0,0);",
+                              "ctx->ClearUnorderedAccessViewUint(donorsUav_.Get(),zero);",
+                              "if(!d.inputs.gpuIdentity||!d.priorCount)continue;", "ctx->Dispatch(1,1,1);",
                               "ctx->CSSetUnorderedAccessViews(0,1,&noUav,nullptr);ctx->CSSetShaderResources(0,2,noViews);", "saved.restore(ctx);",
-                              "siblingOk_=true;returntrue;"}) &&
+                              "context1->CSSetConstantBuffers1(0,1,oldCb.GetAddressOf(),&oldFirst,&oldCount);", "siblingOk_=true;returntrue;"}) &&
             count(text, "ctx->Dispatch(") == 2;
     };
     expect(runValid(run), "the pass runs for a draw with no prior or while armed, saves and restores the compute stage, clears the donors, dispatches once a draw with priors and once over all, and unbinds the fit");
@@ -304,14 +307,19 @@ inline int flatSiblingWiringTests() {
     expect(!runValid(replaced(run, "limits.limits[0]=kFlatSiblingSpreadPixels;", "limits.limits[0]=100.f;")), "mutation control: a limit that is not the policy's constant fails the pin");
     expect(!runValid(without(run, "ctx->CSSetUnorderedAccessViews(0,1,&noUav,nullptr);ctx->CSSetShaderResources(0,2,noViews);")),
            "mutation control: a fit still bound as a UAV when the map reads it fails the pin");
+    expect(!runValid(without(run,"ctx->CopySubresourceRegion(receivers_.Get(),0,i*16,0,0,identity.Get(),0,&box);")),
+           "mutation control: missing receiver identity transfers fail the pin");
+    expect(!runValid(without(run,"context1->CSSetConstantBuffers1(0,1,oldCb.GetAddressOf(),&oldFirst,&oldCount);")),
+           "mutation control: a lost game constant-buffer window fails the pin");
     const auto prepareValid = [&](const std::string& text) {
-        return ordered(text, {"previousNear_=commonNear;", "constboolsiblings=runSibling(ctx,width,height,commonNear,frame);",
+        return ordered(text, {"previousNear_=commonNear;", "constboolsiblings=runSibling(ctx,context1.Get(),width,height,commonNear,frame);",
+                              "constboolbatched=uploadSettings(ctx,context1.Get(),width,height,commonNear,false,siblings);",
                               "ctx->OMSetRenderTargets(1,target_.GetAddressOf(),nullptr);",
                               "c.sibling[0]=(siblings&&d.inputs.gpuIdentity)?1u:0u;c.sibling[1]=drawIndex;c.sibling[2]=d.capture.geometry.count;",
                               "if(siblings)vsViews[11]=fitSrv_.Get();"});
     };
     expect(prepareValid(motion), "prepareH runs the pass before it binds the map's state, tells the map which draw and whether the pass ran, and binds the fit at t11");
-    expect(!prepareValid(replaced(motion, "constboolsiblings=runSibling(ctx,width,height,commonNear,frame);", "constboolsiblings=false;")),
+    expect(!prepareValid(replaced(motion, "constboolsiblings=runSibling(ctx,context1.Get(),width,height,commonNear,frame);", "constboolsiblings=false;")),
            "mutation control: a map told the pass never ran fails the pin");
     expect(!prepareValid(without(motion, "if(siblings)vsViews[11]=fitSrv_.Get();")), "mutation control: a map with no fit bound fails the pin");
     expect(!prepareValid(replaced(motion, "c.sibling[0]=(siblings&&d.inputs.gpuIdentity)?1u:0u;", "c.sibling[0]=1u;")),

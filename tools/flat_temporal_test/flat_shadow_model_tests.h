@@ -1346,7 +1346,7 @@ inline int flatShadowWiringTests() {
            "mutation control: a second call to the shadow's run in that function fails the pin");
     expect(count(motion, "shadow_.run(") == 1 && count(compact(runtimeSource), "rigShadow") == 0 && count(motion, "voidrunShadow(") == 1 && count(motion, "runShadow(ctx,width,height,commonNear,frame);") == 1,
            "runShadow is the only caller of the shadow's run, called once, from one place, and the runtime never drives the shadow itself");
-    const std::string sibling = "constboolsiblings=runSibling(ctx,width,height,commonNear,frame);", call = "runShadow(ctx,width,height,commonNear,frame);";
+    const std::string sibling = "constboolsiblings=runSibling(ctx,context1.Get(),width,height,commonNear,frame);", call = "runShadow(ctx,width,height,commonNear,frame);";
     expect(ordered(motion, {sibling, call}), "prepareH runs the shadow after the sibling pass (compute only, before the map's state is bound)");
     expect(!ordered(without(motion, call.c_str()), {sibling, call}), "mutation control: a prepareH that never runs the shadow fails the pin");
     expect(!ordered(replaced(without(motion, call.c_str()), sibling.c_str(), (call + sibling).c_str()), {sibling, call}), "mutation control: the shadow run before the sibling pass fails the pin");

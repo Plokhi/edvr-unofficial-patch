@@ -444,7 +444,7 @@ std::atomic<bool> g_diagnosticsWanted{false};
 
 // --- Draw-side and pixel counters (owner thread) -------------------------------
 struct DrawStats {
-    uint64_t slowPaths = 0, slowTicks = 0, quickPaths = 0;
+    uint64_t slowPaths = 0, slowTicks = 0, slowClocked = 0, quickPaths = 0;
     uint64_t eyeFrames = 0, eyeFramesBound = 0;
     // Item 2: eye-frames with a pool family draw (the old order prepared all
     // of these) and with a substitution; eyeFrames above is those prepared.
@@ -617,7 +617,9 @@ const char* verifyEngine(uintptr_t) noexcept { return nullptr; }
 void observeEmit(uintptr_t record, uintptr_t owner, int32_t before, int32_t after) noexcept {
     if (!live.load(std::memory_order_acquire) || !g_table) return;
     const uint64_t n = g_emit.calls.load(std::memory_order_relaxed);
-    const bool sample = (n & 63u) == 0;
+    const bool sample = (n & 63u) == 0 &&
+        (g_diagnosticsWanted.load(std::memory_order_relaxed) ||
+         emcpu::gateClocks(emcpu::g_gate.load(std::memory_order_relaxed)));
     const int64_t t0 = sample ? qpcNow() : 0;
     // The census (a hash, a pose read and a lock even on zero-item calls) is
     // a diagnostic: off unless engine motion's diagnostics want it.
@@ -2240,13 +2242,18 @@ void summaryLocked(uint64_t now, ID3D11DeviceContext* ctx) {
     // of the immediate context (engineVelocityNoteStateCalls), so a slow half that costs little of its
     // own but issues eleven driver calls a draw shows here.
     const uint64_t stateCallsWindow = g_stateCalls - g_stateCallsAtWindow;
-    Log::get().note("engine motion: draw side over %.0f s, %.0f frames: draw hook slow half %llu calls, %.2f us each, "
-                    "~%.3f ms/frame on the caller thread (plus %llu lock-free looks); restores %llu; shader setters "
+    char timing[160] = "timing off or no sampled calls (EDVR_CPU_PROFILE=1 enables sampling)";
+    if (g_draw.slowClocked && freq > 0) {
+        const double us = double(g_draw.slowTicks) * 1e6 / freq / double(g_draw.slowClocked);
+        std::snprintf(timing, sizeof timing, "%.2f us each, estimated %.3f ms/frame (%llu sampled calls)",
+            us, us * double(g_draw.slowPaths) / frames / 1000.0, u(g_draw.slowClocked));
+    }
+    Log::get().note("engine motion: draw side over %.0f s, %.0f frames: draw hook slow half %llu calls, %s "
+                    "(plus %llu lock-free looks); restores %llu; shader setters "
                     "issued %llu, skipped %llu (ours still bound); D3D context calls the draw wrapper made %llu, "
                     "%.0f a frame.",
                     seconds, double(g_draw.frames), u(g_draw.slowPaths),
-                    g_draw.slowPaths ? double(g_draw.slowTicks) * 1e6 / freq / double(g_draw.slowPaths) : 0.0,
-                    double(g_draw.slowTicks) * 1e3 / freq / frames, u(g_draw.quickPaths), u(g_draw.restores),
+                    timing, u(g_draw.quickPaths), u(g_draw.restores),
                     u(g_draw.settersIssued), u(g_draw.settersSkipped), u(stateCallsWindow),
                     double(stateCallsWindow) / frames);
     // The flat draw bracket's lazy form (engine_velocity.h): how many substituted draws there were, how many runs of
@@ -2904,7 +2911,6 @@ void noteSkinDrawSlow(ID3D11DeviceContext* ctx, uint32_t startInstance, uint32_t
 
 void beforeDrawSlow(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     if (!ctx) return;
-    const int64_t t0 = qpcNow();
     cache.vs = bindingGeneration(BindSlot::Vs);
     cache.ps = bindingGeneration(BindSlot::Ps);
     cache.rtv = bindingGeneration(BindSlot::Rtv0);
@@ -2927,9 +2933,13 @@ void beforeDrawSlow(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // shader patch inside it taken out as their own parts. The quick path above
     // is a few compares and is not clocked.
     emcpu::Scope drawSide(emcpu::kDraw);
+    const int64_t t0 = drawSide.clocked() ? qpcNow() : 0;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (live.load(std::memory_order_acquire)) slowPath(ctx, rtv0Eye);
-    g_draw.slowTicks += static_cast<uint64_t>(qpcNow() - t0);
+    if (drawSide.clocked()) {
+        g_draw.slowTicks += static_cast<uint64_t>(qpcNow() - t0);
+        ++g_draw.slowClocked;
+    }
 }
 
 // The six tees below are engine motion's CPU on the game's Map/Unmap/write and

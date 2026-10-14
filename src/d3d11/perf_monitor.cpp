@@ -103,7 +103,7 @@ struct Frame {
 // Engine motion's CPU instrument (engine_motion_cpu.h): cut once a frame at the
 // Present hook's edge, folded and logged every 30 s. Static: its window holds a
 // few hundred KB of per-frame samples.
-emcpu::Recorder g_engineMotion;
+emcpu::Recorder g_engineMotion{emcpu::samplePeriodWanted()};
 
 // The 30 s report: four lines, each short of the log line's limit
 // (tools\engine_motion_cpu_test holds the worst case): the scheme and the totals,
@@ -1027,7 +1027,7 @@ void perfMonitorFrame(ID3D11Device* dev) {
     // Engine motion's hooks, cut at the same edge (engine_motion_cpu.h): this
     // thread is the render thread, the one that calls Present. The figures are
     // this frame's own, every call clocked -- what the LONG FRAME line reads.
-    {
+    if (emcpu::profileWanted()) {
         const emcpu::Figures em = g_engineMotion.onFrame(qpcFrequency(), nowMs());
         f.emMeasured = em.measured;
         f.emMs = static_cast<float>(em.renderMs);

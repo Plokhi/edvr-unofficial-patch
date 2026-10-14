@@ -162,6 +162,7 @@ void FlatProjectionRuntime::reset() {
         entry.mutationSerial = 1; entry.mutationOverflow = false;
         entry.mapBytes = nullptr;
     }
+    trackedHint_.reset();
     shadows_.reset(); context_.Reset(); owner_ = 0; nextGeneration_ = 1;
     coldEnabled_ = false; coldAttempts_ = 0; planCapabilityReady_ = false;
     status_ = {};
@@ -260,11 +261,13 @@ void FlatProjectionRuntime::pollColdReadbacks() {
     }
 }
 FlatProjectionRuntime::Tracked* FlatProjectionRuntime::find(ID3D11Resource* resource) {
-    if (!resource) return nullptr;
-    for (auto& entry : tracked_) if (entry.buffer.Get() == resource) return &entry;
-    return nullptr;
+    return trackedHint_.find(tracked_, resource, [](const Tracked& entry) {
+        return entry.buffer.Get();
+    });
 }
 void FlatProjectionRuntime::discard(Tracked& entry) {
+    // Hints validate current slot identities. Retiring one entry keeps the
+    // other retained buffers warm, without clearing the whole index.
     if (entry.buffer) shadows_.releaseBuffer(entry.buffer.Get(), entry.generation);
     entry.privateBuffer.initialize(nullptr, nullptr, 0);
     entry.buffer.Reset(); entry.generation = 0; entry.width = 0; entry.dynamicWrite = false;

@@ -6,6 +6,7 @@
 #include "flat_foreground_sibling.h"
 #include "flat_foreground_shadow_gpu.h"
 #include "cs_stage_save.h"
+#include "flat_constant_batch.h"
 #include <d3d11_1.h>
 #include <array>
 #include <cmath>
@@ -397,14 +398,15 @@ public:
         previousNear_=commonNear;
         // The sibling pass (flat_foreground_sibling.h): the draws with no history of their own take their siblings' motion. Compute only: the
         // map's state is bound after it, so nothing of it needs undoing but the compute stage, which the pass saves and restores itself.
-        const bool siblings=runSibling(ctx,width,height,commonNear,frame);
+        Ptr<ID3D11DeviceContext1> context1;ctx->QueryInterface(IID_PPV_ARGS(&context1));
+        const bool siblings=runSibling(ctx,context1.Get(),width,height,commonNear,frame);
         runShadow(ctx,width,height,commonNear,frame);
+        const bool batched=uploadSettings(ctx,context1.Get(),width,height,commonNear,false,siblings);
         // H is bracketed independently of original geometry capture. Restore
         // every binding touched here, including all eight OM render targets.
         Ptr<ID3D11VertexShader> oldVs;Ptr<ID3D11PixelShader> oldPs;Ptr<ID3D11InputLayout> oldLayout;
         Ptr<ID3D11RasterizerState> oldRaster;Ptr<ID3D11BlendState> oldBlend;Ptr<ID3D11DepthStencilState> oldDepth;
         Ptr<ID3D11Buffer> oldVsCb,oldPsCb;UINT oldVsFirst=0,oldVsCount=4096,oldPsFirst=0,oldPsCount=4096;
-        Ptr<ID3D11DeviceContext1> context1;ctx->QueryInterface(IID_PPV_ARGS(&context1));
         UINT oldRef=0,oldMask=0;float oldFactors[4]{};
         ID3D11RenderTargetView* oldTargets[8]{};ID3D11DepthStencilView* oldDsv=nullptr;
         ID3D11ShaderResourceView* oldVsViews[15]{},*oldPsViews[2]{};D3D11_PRIMITIVE_TOPOLOGY oldTopology;
@@ -424,13 +426,19 @@ public:
         float empty[4]={0,0,gpuFrame?-1.0f:0.0f,0};ctx->ClearRenderTargetView(target_.Get(),empty);
         ctx->VSSetShader(vs_.Get(),nullptr,0);ctx->PSSetShader(ps_.Get(),nullptr,0);ctx->IASetInputLayout(nullptr);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx->VSSetConstantBuffers(0,1,settings_.GetAddressOf());ctx->PSSetConstantBuffers(0,1,settings_.GetAddressOf());
+        if(!batched){ctx->VSSetConstantBuffers(0,1,settings_.GetAddressOf());ctx->PSSetConstantBuffers(0,1,settings_.GetAddressOf());}
         ID3D11ShaderResourceView* psViews[2]={owners,rawDepth};ctx->PSSetShaderResources(0,2,psViews);
         for(unsigned drawIndex=0;drawIndex<current_.size();++drawIndex) {
             const Draw& d=current_[drawIndex];
-            Settings c=settingsFor(d,width,height,commonNear);
-            c.sibling[0]=(siblings && d.inputs.gpuIdentity)?1u:0u;c.sibling[1]=drawIndex;c.sibling[2]=d.capture.geometry.count;
-            ctx->UpdateSubresource(settings_.Get(),0,nullptr,&c,0,0);
+            if(batched) {
+                const UINT first=SettingsBatch::first(drawIndex),count=SettingsBatch::count;
+                context1->VSSetConstantBuffers1(0,1,batchedSettings_.GetAddressOf(),&first,&count);
+                context1->PSSetConstantBuffers1(0,1,batchedSettings_.GetAddressOf(),&first,&count);
+            } else {
+                Settings c=settingsFor(d,width,height,commonNear);
+                c.sibling[0]=(siblings && d.inputs.gpuIdentity)?1u:0u;c.sibling[1]=drawIndex;c.sibling[2]=d.capture.geometry.count;
+                ctx->UpdateSubresource(settings_.Get(),0,nullptr,&c,0,0);
+            }
             ID3D11ShaderResourceView* vsViews[15]{};
             vsViews[0]=d.capture.currentPositions.Get();
             // t1-t4 the priors' positions, t5 the draw's identity, t6-t9 the priors' identities, t10 the draw's own raw instance index. The
@@ -604,10 +612,42 @@ private:
         }
         shadow_.run(ctx,shadowInputs_.data(),n,frame);
     }
+    using SettingsBatch=FlatConstantBatch<Settings,kSiblingDraws>;
+    // An immediate context avoids the offset-only rebinding bug in emulated
+    // deferred command lists. Unsupported drivers and failed uploads keep the
+    // original per-draw DEFAULT buffer path, with identical payloads.
+    bool uploadSettings(ID3D11DeviceContext* ctx,ID3D11DeviceContext1* context1,
+                        unsigned width,unsigned height,float commonNear,bool donor,bool siblings) {
+        if(current_.empty() || current_.size()>kSiblingDraws || !context1 ||
+           ctx->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;
+        if(donor && std::none_of(current_.begin(),current_.end(),[](const Draw& d){return d.inputs.gpuIdentity && d.priorCount;}))return false;
+        if(!batchChecked_) {
+            Ptr<ID3D11Device> dev;ctx->GetDevice(&dev);
+            D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+            batchSupported_=SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS,&options,sizeof(options))) &&
+                options.ConstantBufferOffsetting;
+            if(batchSupported_) {
+                D3D11_BUFFER_DESC d{};d.ByteWidth=SettingsBatch::bytes;d.Usage=D3D11_USAGE_DYNAMIC;
+                d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;d.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
+                batchSupported_=SUCCEEDED(dev->CreateBuffer(&d,nullptr,&batchedSettings_));
+            }
+            batchChecked_=true;
+        }
+        if(!batchSupported_)return false;
+        D3D11_MAPPED_SUBRESOURCE map{};
+        if(FAILED(ctx->Map(batchedSettings_.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&map)))return false;
+        const bool packed=SettingsBatch::pack(map.pData,unsigned(current_.size()),[&](unsigned i) {
+            const Draw& d=current_[i];Settings c=settingsFor(d,width,height,commonNear);
+            c.sibling[0]=(!donor && siblings && d.inputs.gpuIdentity)?1u:0u;
+            c.sibling[1]=i;c.sibling[2]=d.capture.geometry.count;return c;
+        });
+        ctx->Unmap(batchedSettings_.Get(),0);
+        return packed;
+    }
     // The pass, once a frame and only when a draw needs it: a draw with no prior (the CPU knows), or any draw for a while after the identity
     // sampler saw one that had priors and no match (only the GPU knows). The first shader runs once for each draw that has priors; the
     // second once over every draw. Returns whether the fit table is the frame's.
-    bool runSibling(ID3D11DeviceContext* ctx,unsigned width,unsigned height,float commonNear,unsigned frame) {
+    bool runSibling(ID3D11DeviceContext* ctx,ID3D11DeviceContext1* context1,unsigned width,unsigned height,float commonNear,unsigned frame) {
         const unsigned n=unsigned(current_.size());
         if(!n || n>kSiblingDraws)return false;
         if(!siblingPassEnabled())return false;
@@ -625,12 +665,13 @@ private:
             d.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;d.StructureByteStride=16;
             if(FAILED(dev->CreateBuffer(&d,nullptr,&slot->stage)))slot=nullptr;
         }
+        const bool batched=uploadSettings(ctx,context1,width,height,commonNear,true,false);
         CsStageSave saved;saved.save(ctx);
-        const UINT zero[4]{};ctx->ClearUnorderedAccessViewUint(donorsUav_.Get(),zero);
-        ctx->CSSetShader(donorCs_.Get(),nullptr,0);
-        ctx->CSSetConstantBuffers(0,1,settings_.GetAddressOf());
-        ID3D11UnorderedAccessView* uav=donorsUav_.Get();ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
-        unsigned dispatches=0;
+        // The generic saver holds whole buffers; b0 also needs its window.
+        Ptr<ID3D11Buffer> oldCb;UINT oldFirst=0,oldCount=4096;
+        if(context1)context1->CSGetConstantBuffers1(0,1,&oldCb,&oldFirst,&oldCount);
+        // Donors never read Receivers or FitSettings. Complete these transfers
+        // before compute starts instead of alternating copies and dispatches.
         for(unsigned i=0;i<n;++i) {
             const Draw& d=current_[i];
             if(d.capture.currentIdentity) {
@@ -638,10 +679,25 @@ private:
                 const D3D11_BOX box{0,0,0,16,1,1};
                 if(identity)ctx->CopySubresourceRegion(receivers_.Get(),0,i*16,0,0,identity.Get(),0,&box);
             }
+        }
+        FitSettings limits{};limits.counts[0]=n;limits.limits[0]=kFlatSiblingSpreadPixels;limits.limits[1]=float(kFlatSiblingMinVertices);
+        ctx->UpdateSubresource(fitSettings_.Get(),0,nullptr,&limits,0,0);
+        const UINT zero[4]{};ctx->ClearUnorderedAccessViewUint(donorsUav_.Get(),zero);
+        ctx->CSSetShader(donorCs_.Get(),nullptr,0);
+        if(!batched)ctx->CSSetConstantBuffers(0,1,settings_.GetAddressOf());
+        ID3D11UnorderedAccessView* uav=donorsUav_.Get();ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
+        unsigned dispatches=0;
+        for(unsigned i=0;i<n;++i) {
+            const Draw& d=current_[i];
             if(!d.inputs.gpuIdentity || !d.priorCount)continue;
-            Settings c=settingsFor(d,width,height,commonNear);
-            c.sibling[1]=i;c.sibling[2]=d.capture.geometry.count;
-            ctx->UpdateSubresource(settings_.Get(),0,nullptr,&c,0,0);
+            if(batched) {
+                const UINT first=SettingsBatch::first(i),count=SettingsBatch::count;
+                context1->CSSetConstantBuffers1(0,1,batchedSettings_.GetAddressOf(),&first,&count);
+            } else {
+                Settings c=settingsFor(d,width,height,commonNear);
+                c.sibling[1]=i;c.sibling[2]=d.capture.geometry.count;
+                ctx->UpdateSubresource(settings_.Get(),0,nullptr,&c,0,0);
+            }
             ID3D11ShaderResourceView* views[11]{};
             views[0]=d.capture.currentPositions.Get();
             for(unsigned k=0;k<d.priorCount;++k){views[1+k]=d.priors[k].positions.Get();views[6+k]=d.priors[k].identity.Get();}
@@ -651,8 +707,6 @@ private:
         }
         ID3D11ShaderResourceView* noViews[11]{};ctx->CSSetShaderResources(0,11,noViews);
         ID3D11UnorderedAccessView* noUav=nullptr;ctx->CSSetUnorderedAccessViews(0,1,&noUav,nullptr);
-        FitSettings limits{};limits.counts[0]=n;limits.limits[0]=kFlatSiblingSpreadPixels;limits.limits[1]=float(kFlatSiblingMinVertices);
-        ctx->UpdateSubresource(fitSettings_.Get(),0,nullptr,&limits,0,0);
         ctx->CSSetShader(fitCs_.Get(),nullptr,0);
         ctx->CSSetConstantBuffers(0,1,fitSettings_.GetAddressOf());
         ID3D11ShaderResourceView* inputs[2]={donorsSrv_.Get(),receiversSrv_.Get()};ctx->CSSetShaderResources(0,2,inputs);
@@ -660,6 +714,7 @@ private:
         ctx->Dispatch((n+63)/64,1,1);++dispatches;
         ctx->CSSetUnorderedAccessViews(0,1,&noUav,nullptr);ctx->CSSetShaderResources(0,2,noViews);
         saved.restore(ctx);
+        if(context1)context1->CSSetConstantBuffers1(0,1,oldCb.GetAddressOf(),&oldFirst,&oldCount);
         stats_.siblingDispatches+=dispatches;++stats_.siblingFrames;
         if(slot) {
             // Each draw filed under what the history gave it: the pattern for a draw with no prior, the draw's own candidates for one the adapter
@@ -689,7 +744,8 @@ private:
     unsigned siblingFrame_=~0u,siblingDraws_=~0u,siblingArmedUntil_=0;bool siblingOk_=false;
     AnimatedVertexHistory history_;std::vector<Draw> current_,previous_;unsigned frame_=0,width_=0,height_=0;
     const char* refusal_=nullptr,*drawRefusal_=nullptr;float previousNear_=0;unsigned covered_=0;bool gpuAttempted_=false;
-    Ptr<ID3D11VertexShader> vs_;Ptr<ID3D11PixelShader> ps_;Ptr<ID3D11Buffer> settings_;
+    Ptr<ID3D11VertexShader> vs_;Ptr<ID3D11PixelShader> ps_;Ptr<ID3D11Buffer> settings_,batchedSettings_;
+    bool batchChecked_=false,batchSupported_=false;
     Ptr<ID3D11BlendState> blend_;Ptr<ID3D11DepthStencilState> depth_;
     Ptr<ID3D11Texture2D> texture_;Ptr<ID3D11RenderTargetView> target_;Ptr<ID3D11ShaderResourceView> view_;
 };

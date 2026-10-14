@@ -587,7 +587,7 @@ void KinematicEvalProbe::writeJson(std::ostringstream& j) const {
         j<<"{\"rva\":\"0x"<<std::hex<<vtables_[i].rva<<std::dec<<"\",\"first_frame\":"<<vtables_[i].firstFrame
          <<",\"hits\":"<<vtables_[i].hits<<'}';
     }
-    j<<"],\"jobs\":[";
+    j<<"],\"job_timing_scope\":\"explicit capture only\",\"jobs\":[";
     for(uint32_t i=0;i<kJobCount;++i) {
         if(i)j<<',';
         // Seqlocked read: a job bracket commits calls/totalNs/maxNs between

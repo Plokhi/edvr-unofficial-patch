@@ -80,6 +80,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include "cpu_profile_policy.h"
 
 #ifndef EDVR_EMCPU_NOW
 #define EDVR_EMCPU_NOW() (::edvr::emcpu::qpcNow())
@@ -87,6 +88,25 @@
 
 namespace edvr {
 namespace emcpu {
+
+inline bool profileWanted() noexcept {
+    static const bool on = [] {
+        char profile[16]{}, flat[16]{};
+        const DWORD p = GetEnvironmentVariableA("EDVR_CPU_PROFILE", profile, sizeof profile);
+        const DWORD f = GetEnvironmentVariableA("EDVR_FLAT_CPU_CLOCKS", flat, sizeof flat);
+        return cpuProfilePolicy(p ? (p < sizeof profile ? profile : "") : nullptr,
+                                f ? (f < sizeof flat ? flat : "") : nullptr);
+    }();
+    return on;
+}
+inline unsigned samplePeriodWanted() noexcept {
+    static const unsigned period = [] {
+        char value[16]{};
+        const DWORD n = GetEnvironmentVariableA("EDVR_CPU_SAMPLE_FRAMES", value, sizeof value);
+        return cpuSamplePeriodPolicy(n < sizeof value ? value : nullptr);
+    }();
+    return period;
+}
 
 inline int64_t qpcNow() noexcept {
     LARGE_INTEGER t{};
@@ -170,7 +190,8 @@ inline uint64_t makeGate(bool sampled, uint32_t renderTid) noexcept {
     return (sampled ? kSampledBit : uint64_t(0)) | renderTid;
 }
 inline bool gateClocks(uint64_t gate) noexcept {
-    return (gate & kSampledBit) != 0 || static_cast<uint32_t>(gate) == currentThreadId();
+    return (gate & kSampledBit) != 0 ||
+        (cpuGateHasThread(gate) && static_cast<uint32_t>(gate) == currentThreadId());
 }
 // The gates the calibration runs through: one that clocks this thread, one that skips it
 // (not sampled, and a render thread id no thread has). The sink keeps the skipped loop's
@@ -362,6 +383,7 @@ public:
     int64_t resume() noexcept { return emcpu::resume(k_); }
     void pauseAt(int64_t now) noexcept { emcpu::pauseAt(k_, now); }
     void resumeAt(int64_t now) noexcept { emcpu::resumeAt(k_, now); }
+    bool clocked() const noexcept { return k_.live; }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 
