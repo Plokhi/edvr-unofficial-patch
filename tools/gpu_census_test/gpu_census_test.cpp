@@ -1475,7 +1475,7 @@ void instrumentCases() {
           "instruments: the hologram sub-sections sit between the resolve umbrella and UI resolve");
     check(isDoorSection(GpuCensusSection::DoorHoloNearLight), "instruments: the hologram sub-sections are door sections (K=4)");
     check(occurrenceCapFor(GpuCensusSection::DoorHoloResolveDraw) == 4, "instruments: a hologram sub-section caps at the door's 4");
-    check(kDoorBreakdownCount == 11, "instruments: eleven door items after the temporal whole");
+    check(kDoorBreakdownCount == 12, "instruments: twelve door items after the temporal whole (the profiler's eleven, then the sky ring)");
     check(GpuCensusSection::AlteredHdrHud > GpuCensusSection::AlteredUiLayer && GpuCensusSection::AlteredHdrHud < GpuCensusSection::AlteredFixFirst,
           "instruments: the moved HDR draw is an altered class, before the fix sections");
     check(kAlteredClassSections == 3 && std::strstr(kAlteredNames[2], "HDR HUD") != nullptr, "instruments: the altered class has its name");
