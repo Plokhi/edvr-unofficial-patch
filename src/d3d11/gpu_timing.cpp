@@ -138,6 +138,10 @@ void gpuTimingSetYield(bool on) noexcept { g_yieldOn.store(on, std::memory_order
 bool gpuTimingYielding() noexcept { return g_yieldOn.load(std::memory_order_acquire); }
 uint64_t gpuTimingTakeYieldRefusals() noexcept { return g_yieldRefusals.exchange(0, std::memory_order_acq_rel); }
 
+bool gpuTimingPassScopeHeld() noexcept {
+    auto d = current();
+    return d && d->clock.scopeOpen();
+}
 bool gpuTimingPassScopeOpen(ID3D11DeviceContext* ctx, unsigned slot, uint64_t now) noexcept {
     auto d = current();
     if (!d || slot >= kPassScopeSlots || g_passLease[slot] || !d->owns(ctx) ||

@@ -22,6 +22,16 @@ constexpr uint32_t kHashSlots = 8;             // distinct VS/PS pairs (or CS ha
 constexpr uint32_t kTopHashes = 3;             // shader pairs listed per pass
 constexpr uint32_t kTopPasses = 20;            // passes in the summary's top list, by median
 constexpr uint32_t kCubeRun = 6;               // consecutive same-size square passes read as one cube map
+// GPU pass profile v3: the scope slots the profiler's frames take (one per captured frame, slot = frame index). Must equal gpu_timing.h's
+// kPassScopeSlots; gpu_pass_profile.cpp static_asserts it. v2 had 4 here and every frame from the fifth was refused.
+constexpr uint32_t kPassScopeSlotCount = 128;
+// A boundary that finds the shared clock held by another scope waits for it, up to this many boundaries (about 2.7 s at 90 Hz), then the
+// batch ends with a note. A holder that ends in time is not a failure: the frame starts at the boundary after it ends.
+constexpr uint32_t kMaxStartWaits = 240;
+// probe_cube (GPU pass profile v3): a colour target that is square and at most kProbeMaxSide on a side, or a cube array of kCubeArraySlices or
+// more slices. Squareness alone is not a probe: the eye render is square too (2016x2016 in the v2 flight).
+constexpr uint32_t kProbeMaxSide = 1024;
+constexpr uint32_t kCubeArraySlices = 6;
 
 // The hotkey's value is "KEY" or "KEY COUNT" (or "Ctrl+KEY COUNT"). A trailing whole number after whitespace is the frame count, clamped
 // to 1..kMaxCaptureFrames; without one the count is kDefaultCaptureFrames. The number is not taken when nothing precedes it, so a key
@@ -58,7 +68,7 @@ enum class PassClass : uint8_t {
     Compute,          // dispatches and no draws
     Clear,            // clears and no draws
     Shadow,           // depth only, square, >= 512 or an array of slices
-    ProbeCube,        // a square colour target of a cube resource, or one of kCubeRun face passes in a row
+    ProbeCube,        // v3: a colour target that is square and at most 1024, or a cube array (6+ slices), not at the eye size; or one of kCubeRun such face passes in a row
     SceneGBuffer,     // two or more colour targets at the eye size, or a depth-only pass at the eye size
     FullscreenAtEye,  // one colour target at the eye size with one or two draws (a full-screen triangle or quad)
     ForwardAtEye,     // one colour target at the eye size with three or more draws
@@ -127,6 +137,25 @@ struct EyeSize {
     uint32_t w = 0, h = 0;
 };
 
+// The eye size is the headset's eye texture (vscreen's eyeW and eyeH, from openvr_api.dll when it is there). A target at that size is never
+// a probe, whatever its shape.
+inline bool atEye(const TargetShape& t, EyeSize eye) { return eye.w != 0 && t.w == eye.w && t.h == eye.h; }
+inline bool isProbeShape(const TargetShape& t, EyeSize eye) {
+    if (!t.square() || atEye(t, eye)) return false;
+    return t.w <= kProbeMaxSide || t.slices >= kCubeArraySlices;
+}
+
+// The largest colour target whose depth is the same size, over one frame's segments: the eye render in the usual frame. {0,0} when none.
+// Reported beside the eye size, so a flight can see when they disagree.
+inline EyeSize matchedEye(const std::vector<PassFacts>& facts) {
+    EyeSize best{};
+    for (const PassFacts& f : facts) {
+        if (!f.colours || !f.hasDepth || f.colour.w != f.depth.w || f.colour.h != f.depth.h) continue;
+        if (static_cast<uint64_t>(f.colour.w) * f.colour.h > static_cast<uint64_t>(best.w) * best.h) best = EyeSize{f.colour.w, f.colour.h};
+    }
+    return best;
+}
+
 inline std::string targetText(const TargetShape& t) {
     if (!t.w) return "-";
     return std::to_string(t.w) + "x" + std::to_string(t.h);
@@ -150,7 +179,7 @@ inline PassClass classifyPass(const PassFacts& f, EyeSize eye, const VsFamily& h
     // Built v13.7 (3): a few draws whose most-drawn vertex shader is a known HUD, holo or UI family: its own class, so the HUD and holo cost is
     // not counted as fullscreen_at_eye.
     if (f.colours >= 1 && f.draws <= kHudMaxDraws && isVsFamily(f.topVs, hud)) return PassClass::HudOverlay;
-    if (f.colours >= 1 && f.colour.square() && f.colour.cube) return PassClass::ProbeCube;
+    if (f.colours >= 1 && isProbeShape(f.colour, eye)) return PassClass::ProbeCube;
     // The light volumes are instanced draws into the eye-size target, so the lighting family is tested before the
     // two-target rule that would otherwise name the lighting pass scene_gbuffer.
     if (eyeColour && isVsFamily(f.topVs, lighting)) return PassClass::LightingVolume;
@@ -165,15 +194,17 @@ inline PassClass classifyPass(const PassFacts& f, EyeSize eye, const VsFamily& h
 // A cube map drawn face by face is kCubeRun or more consecutive passes, each
 // one colour target, square, drawn into, all the same size. Relabels those
 // runs ProbeCube in place. cls[i] is the class of facts[i].
-inline bool cubeCandidate(const PassFacts& f) {
-    return !f.edvr && f.colours == 1 && f.colour.square() && f.draws > 0;
+// v3: a candidate must be a probe shape (not at the eye size, square and small or a cube array). The v2 rule took any square single-target
+// pass, so six eye passes in a row (2016x2016, square) were relabelled probe_cube.
+inline bool cubeCandidate(const PassFacts& f, EyeSize eye) {
+    return !f.edvr && f.colours == 1 && f.draws > 0 && isProbeShape(f.colour, eye);
 }
-inline void markCubeRuns(const std::vector<PassFacts>& facts, std::vector<PassClass>& cls) {
+inline void markCubeRuns(const std::vector<PassFacts>& facts, std::vector<PassClass>& cls, EyeSize eye = EyeSize{}) {
     size_t i = 0;
     while (i < facts.size()) {
-        if (!cubeCandidate(facts[i])) { ++i; continue; }
+        if (!cubeCandidate(facts[i], eye)) { ++i; continue; }
         size_t j = i + 1;
-        while (j < facts.size() && cubeCandidate(facts[j]) && facts[j].colour.w == facts[i].colour.w) ++j;
+        while (j < facts.size() && cubeCandidate(facts[j], eye) && facts[j].colour.w == facts[i].colour.w) ++j;
         if (j - i >= kCubeRun)
             for (size_t k = i; k < j; ++k) cls[k] = PassClass::ProbeCube;
         i = j;
@@ -435,5 +466,18 @@ inline Summary summarise(const std::vector<Row>& rows, const std::vector<double>
 // Built v13.6: the shared clock is yielded to the profiler from the press until the batch's last frame is closed: wanted while a capture is armed
 // (requested) or has a batch open. The yield flag (gpuTimingSetYield) follows this state; the frame driver and the timers test the flag.
 inline bool yieldWanted(bool requested, bool batch) noexcept { return requested || batch; }
+
+// GPU pass profile v3: what a frame boundary does while a batch is starting frames. started frames have begun; waits is the count of
+// consecutive boundaries that found the shared clock held by another scope (the caller counts them: Wait increments it, Begin resets it).
+// Begin: start the next frame now. Wait: another scope holds the clock (a census timer begun before the press, say); retry at the next
+// boundary. Abort: no slot for the frame, or the holder did not end within kMaxStartWaits; the batch ends with a note. Done: all frames
+// have begun.
+enum class StartAction : uint8_t { Begin, Wait, Abort, Done };
+inline StartAction startAction(uint32_t started, uint32_t total, uint32_t slots, bool scopeHeld, uint32_t waits) noexcept {
+    if (started >= total) return StartAction::Done;
+    if (scopeHeld) return waits >= kMaxStartWaits ? StartAction::Abort : StartAction::Wait;
+    if (started >= slots) return StartAction::Abort;
+    return StartAction::Begin;
+}
 
 }  // namespace edvr::gpupass

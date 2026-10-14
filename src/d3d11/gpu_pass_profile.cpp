@@ -28,6 +28,10 @@ bool g_gpuPassCapturing = false;
 namespace {
 using namespace gpupass;
 
+// One scope slot per captured frame: the timing module's slots must cover the profiler's (v2 had 4 and refused frame 5 on).
+static_assert(kPassScopeSlotCount == kPassScopeSlots, "the profiler's slot count must equal gpu_timing.h's kPassScopeSlots");
+static_assert(kPassScopeSlots >= kMaxCaptureFrames, "every capture frame needs its own pass scope slot");
+
 // Boundaries a pending frame may wait for its result before it is said to be not ready. At 90 Hz, 240 is about 2.7 s.
 constexpr uint32_t kMaxPolls = 240;
 
@@ -92,7 +96,8 @@ struct FrameRec {
     uint32_t polls = 0;
     uint64_t frequency = 0;
     double frameMs = 0;
-    EyeSize eye;
+    EyeSize eye;                 // the headset's eye texture (vscreen): the size passes are classified against
+    EyeSize matched;             // the largest colour target with a matching depth in this frame (reported beside eye)
     std::vector<SegRec> segs;    // segs[i] is the segment that starts at stamp i and ends at stamp i + 1
     std::vector<uint64_t> ticks;
     std::vector<Row> rows;
@@ -109,6 +114,7 @@ bool g_batch = false;       // a batch is starting frames
 bool g_haveBatch = false;   // a batch is not yet written
 uint32_t g_frameCount = kDefaultCaptureFrames;      // the frames of the batch in progress (or last written)
 uint32_t g_started = 0;     // frames of the batch begun so far
+uint32_t g_waits = 0;       // consecutive boundaries that found the shared clock held by another scope (startAction)
 int g_active = -1;          // the frame open now, or -1
 std::vector<FrameRec> g_frames = std::vector<FrameRec>(kMaxCaptureFrames);
 Bound g_bound;              // the targets bound now, as the segments see them
@@ -250,7 +256,10 @@ bool unresolved() {
     return false;
 }
 
-bool beginFrame(ID3D11DeviceContext* ctx, uint32_t slot, EyeSize eye, uint64_t now) {
+enum class BeginResult : uint8_t { Begun, Held, Failed };
+
+// Held: another scope holds the shared clock right now. The frame is not begun and the boundary retries it (not a failure).
+BeginResult beginFrame(ID3D11DeviceContext* ctx, uint32_t slot, EyeSize eye, uint64_t now) {
     FrameRec& fr = g_frames[slot];
     fr.state = FrameState::Idle;
     fr.failure = "";
@@ -265,12 +274,13 @@ bool beginFrame(ID3D11DeviceContext* ctx, uint32_t slot, EyeSize eye, uint64_t n
     if (!ensurePool(ctx, g_frameCount)) {
         fr.state = FrameState::Failed;
         fr.failure = "the timestamp query pool could not be created";
-        return false;
+        return BeginResult::Failed;
     }
     if (!gpuTimingPassScopeOpen(ctx, slot, now)) {
+        if (gpuTimingPassScopeHeld()) return BeginResult::Held;
         fr.state = FrameState::Failed;
-        fr.failure = "the shared GPU timing scope was already open (a census timer, or the application-frame timing, holds it)";
-        return false;
+        fr.failure = "the frame's GPU timing scope could not open (its slot still holds a lease, or the clock is unavailable)";
+        return BeginResult::Failed;
     }
     g_ctx = ctx;
     g_active = static_cast<int>(slot);
@@ -289,7 +299,7 @@ bool beginFrame(ID3D11DeviceContext* ctx, uint32_t slot, EyeSize eye, uint64_t n
     fr.state = FrameState::Open;
     stamp(fr, slot, 1);   // the frame's start, the first stamp of a fresh budget
     fr.segs.push_back(newSeg());
-    return true;
+    return BeginResult::Begun;
 }
 
 void failFrame(ID3D11DeviceContext* ctx, uint32_t slot, uint64_t now, const char* why) {
@@ -343,7 +353,8 @@ void buildRows(FrameRec& fr, uint32_t slot) {
     const VsFamily hud = hudFamilies();
     const VsFamily lighting = lightingFamilies();
     for (size_t k = 0; k < facts.size(); ++k) cls[k] = classifyPass(facts[k], fr.eye, hud, lighting);
-    markCubeRuns(facts, cls);
+    markCubeRuns(facts, cls, fr.eye);
+    fr.matched = matchedEye(facts);
     uint32_t index = 0;
     for (size_t k = 0; k < facts.size(); ++k) {
         const PassFacts& f = facts[k];
@@ -435,10 +446,17 @@ void emitBatch() {
     std::vector<double> frameMs;
     std::vector<bool> ok;
     uint32_t overflow = 0;
+    bool eyeNoted = false;
     for (uint32_t i = 0; i < g_started; ++i) {
         const FrameRec& fr = g_frames[i];
         overflow += fr.budget.overflow;
         if (fr.state == FrameState::Ready) {
+            if (!eyeNoted) {
+                eyeNoted = true;
+                const bool agree = fr.matched.w == fr.eye.w && fr.matched.h == fr.eye.h;
+                Log::get().note("gpu pass profile: eye %ux%u (the headset's eye texture); the largest colour target with a matching depth "
+                                "%ux%u%s", fr.eye.w, fr.eye.h, fr.matched.w, fr.matched.h, agree ? "" : " -- DIFFERENT, check the eye size");
+            }
             frameMs.push_back(fr.frameMs);
             ok.push_back(true);
             rows.insert(rows.end(), fr.rows.begin(), fr.rows.end());
@@ -608,20 +626,38 @@ void gpuPassProfileFrameBoundary(ID3D11DeviceContext* ctx, uint32_t frameNo, uin
         g_batch = true;
         g_haveBatch = true;
         g_started = 0;
+        g_waits = 0;
         Log::get().note("gpu pass profile: capturing %u frames from frame %u", g_frameCount, frameNo);
     }
     if (g_batch) {
-        if (g_started < g_frameCount) {
+        // v3: a held clock is waited for at the boundary (the holder's scope ends and the frame starts on a later boundary); only a frame
+        // that genuinely faults is skipped, and the batch goes on past it.
+        const StartAction a = startAction(g_started, g_frameCount, kPassScopeSlotCount, gpuTimingPassScopeHeld(), g_waits);
+        if (a == StartAction::Begin) {
             const uint32_t slot = g_started;
-            const bool begun = beginFrame(ctx, slot, EyeSize{eyeW, eyeH}, now);
-            ++g_started;
-            if (!begun) {
-                Log::get().note("gpu pass profile: frame %u not captured: %s", slot + 1, g_frames[slot].failure);
-                g_batch = false;
-                endYield();
+            const BeginResult r = beginFrame(ctx, slot, EyeSize{eyeW, eyeH}, now);
+            if (r == BeginResult::Held) {
+                ++g_waits;   // taken between the check and the open: wait like any other holder
+            } else {
+                g_waits = 0;
+                ++g_started;
+                if (r == BeginResult::Failed)
+                    Log::get().note("gpu pass profile: frame %u not captured: %s", slot + 1, g_frames[slot].failure);
             }
+        } else if (a == StartAction::Wait) {
+            ++g_waits;
+        } else if (a == StartAction::Abort) {
+            if (g_started < g_frameCount && gpuTimingPassScopeHeld())
+                Log::get().note("gpu pass profile: frame %u could not start: another GPU timing scope held the shared clock for %u "
+                                "boundaries; the batch ends with %u of %u frames",
+                                g_started + 1, g_waits, g_started, g_frameCount);
+            else
+                Log::get().note("gpu pass profile: frame %u could not start: no scope slot; the batch ends with %u of %u frames",
+                                g_started + 1, g_started, g_frameCount);
+            g_batch = false;
+            endYield();
         } else {
-            // The last frame's scope was closed at the top of this boundary: the capture holds the clock no longer (Built v13.6).
+            // Done: the last frame's scope was closed at the top of this boundary: the capture holds the clock no longer (Built v13.6).
             g_batch = false;
             endYield();
         }

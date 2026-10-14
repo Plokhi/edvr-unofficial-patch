@@ -46,8 +46,12 @@ public:
 // The GPU pass profiler's own frequency scopes (gpu_pass_profile.cpp): one per captured frame, held in its slot from open until
 // its result is read and released. Open refuses while ANY scope is open (a census timer, the application-frame ring, or another
 // slot), so the profiler never borrows a scope it did not open and each frame's stamps lie inside exactly that frame's scope.
-constexpr unsigned kPassScopeSlots = 4;
+// GPU pass profile v3: one slot per captured frame (slot = frame index), so this must be at least the profiler's kMaxCaptureFrames;
+// gpu_pass_profile.cpp static_asserts it. v2 had 4, and every frame from the fifth was refused as "already open".
+constexpr unsigned kPassScopeSlots = 128;
 bool gpuTimingPassScopeOpen(ID3D11DeviceContext*, unsigned slot, uint64_t now) noexcept;
+// True while any scope on the shared clock is open (not necessarily the profiler's): the profiler waits at the boundary for it to end.
+bool gpuTimingPassScopeHeld() noexcept;
 bool gpuTimingPassScopeClose(ID3D11DeviceContext*, unsigned slot, uint64_t now) noexcept;
 enum class GpuPassScopeStatus { Pending, Ready, Failed };
 struct GpuPassScopeResult {

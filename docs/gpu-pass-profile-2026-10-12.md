@@ -34,6 +34,11 @@ Changes in v2 (2026-10-13):
   top 5 compute shaders by all dispatches per frame.
 - Memory: each frame's segments are freed once its rows are built (a 120-frame capture holds rows, not segments).
 
+v3 fixes (2026-10-13, after the six flights on cb712758; root causes in the Log):
+- Only 4 of 30 frames captured: 4 pass-scope slots for 30 frames. Now 128, and a boundary waits for another holder of the clock.
+- probe_cube on eye passes: squareness is not the rule any more. probe_cube = not at the eye size, and square up to 1024 or a cube array.
+- Check: 252x252 one-draw passes (post_smaller in v2) now count as probe_cube under the small-square rule.
+
 Flight plan (one press each; the hangar trial is off for all three):
 1. Sealed hangar, seated: press the key once (default 30 frames), wait for the summary lines.
 2. Sealed hangar, seated, with Optimized station off: press once. Compare lighting_volume and the top passes with step 1.
@@ -51,6 +56,42 @@ Still open: no flight yet; the overhead below is an estimate, not a measurement.
   parse. The yield (v13.6) is unchanged: it yields whenever the profiler holds the clock. The app GPU timing default: main's
   code reads advanced.app_gpu_timing with default on (getBool(..., true)). claude/aa-off-tax changes that default to off and
   is not on main. With it off there are no application-frame leases to yield, so the yield is a no-op there.
+- 2026-10-13, v3 (the fixes after the six flights of cb712758, both reproduced from the logs):
+  1. Frames 1 to 4 captured, then "frame 5 not captured: the shared GPU timing scope was already open". Root cause:
+     gpu_timing.h kPassScopeSlots = 4, and the profiler opens frame k in slot k (gpu_pass_profile.cpp, beginFrame). Frame 5 is
+     slot 4, which gpuTimingPassScopeOpen refuses (gpu_timing.cpp, the slot check), and the batch ended on that refusal. The text
+     named the census and the application frame, which were not the cause. Both already refuse new leases while the yield is on:
+     GpuTimer::beginImpl (gpu_timing.cpp:240) and GpuTimingFrameDriver::begin (gpu_timing.cpp:413). The application frame open at
+     the press is ended by gpuFrameYieldBegin (gpu_frame_timing.cpp:272) before the first boundary's decision. Nothing else opens a
+     standalone scope: acquireInterval is called from GpuTimer::beginImpl (gpu_timing.cpp:256) and the profiler (gpu_pass_profile.cpp).
+     Fix: kPassScopeSlots = 128 (static_assert against kMaxCaptureFrames in gpu_pass_profile.cpp). A boundary that finds another
+     scope holding the clock waits (startAction) for it to end, up to kMaxStartWaits = 240 boundaries, then the batch ends with a note.
+     A faulted frame is skipped and the batch goes on. The rig simulates census and application holders (testCaptureStarts).
+  2. Six eye passes in a row (2016x2016, square, single target) were relabelled probe_cube by markCubeRuns, which took any square
+     single-target pass. Fix: probe_cube needs a target not at the eye size that is square and at most 1024 on a side, or a cube
+     array (6+ slices). The eye size is vscreen's eye texture. The summary logs "eye WxH (the headset's eye texture); the largest
+     colour target with a matching depth WxH" so a mismatch shows in a flight.
+  3. Offline re-classification (scratchpad reclassify_v3.py): the port reproduces all 5,848 v2 rows first, then applies the v3
+     rules. Per capture, ms per frame (4 frames), sum over rows = frame ms:
+
+     | class | planetary port, station on | planetary, off | supercruise | station, descending | station, on | station, off |
+     |---|---|---|---|---|---|---|
+     | edvr | 5.039 | 5.076 | 4.949 | 5.592 | 5.823 | 5.266 |
+     | compute | 1.808 | 1.129 | 0.934 | 1.826 | 1.403 | 1.405 |
+     | hud_overlay | 0.746 | 0.615 | 0.668 | 1.722 | 1.249 | 1.218 |
+     | fullscreen_at_eye | 0.843 | 0.977 | 1.485 | 0.843 | 0.558 | 0.594 |
+     | scene_gbuffer | 0.939 | 1.051 | 0.686 | 0.933 | 1.117 | 1.424 |
+     | probe_cube | 1.161 | 0.037 | 0.043 | 0.120 | 0.109 | 0.189 |
+     | clear | 0.235 | 0.272 | 1.111 | 0.350 | 0.275 | 0.220 |
+     | forward_at_eye | 0.261 | 0.265 | 0.356 | 0.683 | 0.342 | 0.999 |
+     | post_smaller | 0.035 | 0.753 | 0.365 | 0.365 | 0.008 | 0.028 |
+     | lighting_volume | 0.606 | 0.486 | 0.112 | 0.673 | 0.125 | 0.000 |
+     | other | 0.028 | 0.140 | 0.238 | 0.034 | 0.028 | 0.029 |
+     | shadow | 0.124 | 0.153 | 0.027 | 0.064 | 0.034 | 0.037 |
+     | total | 11.824 | 10.953 | 10.972 | 13.204 | 11.070 | 11.409 |
+
+     Probe_cube in the first capture is 1.161 ms, of which 24 one-draw 252x252 passes are the bulk (the rule the spec gives counts
+     them as probes; see Status). Only 4 frames per capture: these are not 30-frame figures.
 
 ## What it does
 

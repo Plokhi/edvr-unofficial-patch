@@ -455,6 +455,120 @@ void testV2() {
     check(splitCaptureSpec("", key) == 30 && key.empty(), "an empty value: the default count and no key (the hotkey is unbound)");
 }
 
+// GPU pass profile v3: probe_cube is a small square or a cube array, never a target at the eye size; the eye size is the eye texture.
+void testV3Classes() {
+    const EyeSize eye{2016, 2016};   // the square eye render of the v2 flight
+    // An eye pass with depth at the eye size: scene or fullscreen or forward, never probe_cube (v2 labelled 28-draw ones probe_cube).
+    PassFacts forward;
+    forward.draws = 28;
+    forward.colours = 1;
+    forward.colour = shape(2016, 2016);
+    forward.hasDepth = true;
+    forward.depth = shape(2016, 2016);
+    check(classifyPass(forward, eye) == PassClass::ForwardAtEye, "a 2016x2016 eye pass with depth and 28 draws is forward_at_eye, not probe_cube");
+    PassFacts fullscreen = forward;
+    fullscreen.draws = 2;
+    check(classifyPass(fullscreen, eye) == PassClass::FullscreenAtEye, "a 2016x2016 eye pass with 2 draws is fullscreen_at_eye, not probe_cube");
+    PassFacts gbuf = forward;
+    gbuf.colours = 2;
+    check(classifyPass(gbuf, eye) == PassClass::SceneGBuffer, "a 2016x2016 two-target eye pass is scene_gbuffer, not probe_cube");
+
+    // Six of them in a row (the v2 cube-run rule's trigger): still not probe_cube with the eye size known.
+    std::vector<PassFacts> eyeRun(6, forward);
+    std::vector<PassClass> cls;
+    for (const PassFacts& f : eyeRun) cls.push_back(classifyPass(f, eye));
+    markCubeRuns(eyeRun, cls, eye);
+    bool anyProbe = false;
+    for (PassClass c : cls) anyProbe = anyProbe || c == PassClass::ProbeCube;
+    check(!anyProbe, "six eye-size passes in a row are not a cube map");
+
+    // probe_cube's shape: a small square (up to 1024) or a cube array (6+ slices). A larger square that is not a cube array is not one.
+    PassFacts small;
+    small.draws = 10;
+    small.colours = 1;
+    small.colour = shape(1024, 1024);
+    check(classifyPass(small, eye) == PassClass::ProbeCube, "a 1024x1024 square target is a probe");
+    PassFacts big;
+    big.draws = 10;
+    big.colours = 1;
+    big.colour = shape(1566, 1566);
+    check(classifyPass(big, eye) != PassClass::ProbeCube, "a 1566x1566 square target is not a probe (squareness is not the rule)");
+    PassFacts array;
+    array.draws = 10;
+    array.colours = 1;
+    array.colour = shape(2048, 2048, true, 6);
+    check(classifyPass(array, eye) == PassClass::ProbeCube, "a cube array (6 slices) is a probe at any size");
+    check(!isProbeShape(shape(2016, 2016), eye), "a target at the eye size is never a probe shape");
+    check(isProbeShape(shape(2016, 2016), EyeSize{}) == false, "a 2016 square with no eye size known is not a probe either (over 1024)");
+
+    // The matched eye: the largest colour target whose depth is the same size, when there is one.
+    std::vector<PassFacts> frame = {forward, fullscreen};
+    frame[1].hasDepth = false;
+    check(matchedEye(frame).w == 2016 && matchedEye(frame).h == 2016, "the matched eye is the eye-size target with its depth");
+    std::vector<PassFacts> noDepth = {fullscreen};
+    noDepth[0].hasDepth = false;
+    check(matchedEye(noDepth).w == 0, "with no matching depth the matched eye is unknown (0x0)");
+}
+
+// GPU pass profile v3: the capture's frame starts, simulated at the boundaries. Census and application timing are refused by the yield
+// while a capture runs, so they hold the clock only before the press (the census timer that began before it) and the application frame
+// is ended by the yield at the boundary. Every scenario must give 30 of 30 frames unless a holder never ends.
+struct StartRun {
+    uint32_t captured = 0, waits = 0, boundaries = 0;
+    StartAction last = StartAction::Done;
+};
+template <class HeldAt>
+StartRun runStarts(uint32_t total, uint32_t slots, HeldAt heldAt) {
+    StartRun r;
+    uint32_t started = 0, waits = 0;
+    for (uint32_t b = 0; b < 2000; ++b) {
+        r.boundaries = b + 1;
+        const StartAction a = startAction(started, total, slots, heldAt(b), waits);
+        r.last = a;
+        if (a == StartAction::Begin) {
+            ++started;
+            waits = 0;
+            ++r.captured;
+        } else if (a == StartAction::Wait) {
+            ++waits;
+            ++r.waits;
+        } else {
+            break;
+        }
+    }
+    return r;
+}
+
+void testCaptureStarts() {
+    const uint32_t total = kDefaultCaptureFrames;   // 30
+    check(total == 30 && kMaxCaptureFrames == 120 && kPassScopeSlotCount >= kMaxCaptureFrames,
+          "the default capture is 30 frames and the scope slots cover the largest capture");
+
+    // Scenario 1: a census timer began before the press holds the clock for three boundaries; the application frame is ended by the yield.
+    const StartRun census = runStarts(total, kPassScopeSlotCount, [](uint32_t b) { return b <= 2; });
+    check(census.captured == total && census.last == StartAction::Done, "a census scope held before the press delays the start; all 30 of 30 frames are captured");
+    check(census.waits == 3, "the three boundaries the census scope held the clock are waits, not failures");
+
+    // Scenario 2: the application frame is open at the press; the yield ends it at the first boundary, so nothing holds the clock.
+    const StartRun appFrame = runStarts(total, kPassScopeSlotCount, [](uint32_t) { return false; });
+    check(appFrame.captured == total && appFrame.waits == 0, "with nothing holding the clock, 30 of 30 frames start on the first boundaries");
+
+    // Scenario 3: the v2 regression. Four slots: frame 5 has no slot and the batch ends after 4 frames (what the flight logged).
+    const StartRun fourSlots = runStarts(total, 4, [](uint32_t) { return false; });
+    check(fourSlots.captured == 4 && fourSlots.last == StartAction::Abort,
+          "with 4 scope slots the capture stops at 4 frames: the v2 bug, kept as a regression case");
+
+    // Scenario 4: a holder that ends just in time (held for boundaries 0..239) still gives 30 of 30; one more boundary and the batch aborts.
+    const StartRun justInTime = runStarts(total, kPassScopeSlotCount, [](uint32_t b) { return b < kMaxStartWaits; });
+    check(justInTime.captured == total && justInTime.last == StartAction::Done, "a holder that ends within kMaxStartWaits boundaries still gives 30 of 30");
+    const StartRun tooLong = runStarts(total, kPassScopeSlotCount, [](uint32_t b) { return b <= kMaxStartWaits; });
+    check(tooLong.captured == 0 && tooLong.last == StartAction::Abort && tooLong.waits == kMaxStartWaits,
+          "a holder that never ends aborts the batch after kMaxStartWaits boundaries, with a note");
+
+    // Scenario 5: frames already begun are not restarted: Done is reported the moment every frame has begun, held or not.
+    check(startAction(total, total, kPassScopeSlotCount, true, 0) == StartAction::Done, "done wins over a held clock once every frame has begun");
+}
+
 // Built v13.6: the yield follows the capture. Wanted from the press (armed), through every batch frame, and not after the batch's last frame is
 // closed; never wanted idle. The application frame is refused while it is wanted, and admitted once it is not (modelled by the flag).
 void testYield() {
@@ -492,6 +606,8 @@ int main(int argc, char** argv) {
     testYield();
     testV137();
     testV2();
+    testV3Classes();
+    testCaptureStarts();
     std::printf("gpu_pass_profile_test: %u checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
