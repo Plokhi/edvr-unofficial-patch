@@ -8,6 +8,7 @@
 #include "holo_families.h"       // kHoloTargetSphere, the holo target sphere family
 #include "skin_ledger.h"         // Built v13.7 (1): skin::kChainHash and skin::kClearHash, the named compute shaders
 #include "exposure_fix.h"        // lookupShaderHash: a compute shader's content hash at its dispatch (bindingShaderHash(Cs) is never set)
+#include "gpu_pass_delay_shader.h"   // v5: the front-loaded delay's HLSL (compiled at the first capture that asks for a delay)
 #include "gpu_timing.h"
 #include "gpu_frame_timing.h"   // Built v13.6: the application-frame yield (gpuFrameYieldBegin, gpuFrameTakeYieldSkips)
 #include "../common/config.h"
@@ -40,6 +41,7 @@ struct SegRec {
     PassHashes hashes;      // the VS:PS pairs of the segment's draws
     PassHashes csHashes;    // Built v13.7 (1): the compute shaders bound at its dispatches (the pixel half is 0)
     uint64_t tris = 0;
+    bool delay = false;     // v5: this segment is the front-loaded delay at the frame's start (excluded from every class and total)
 };
 
 // Built v13.7 (3): the HUD, holo and UI families, read from the game's headers (EyeDrawSnapshot::kHud, kHoloGuiFxOffVs, kHoloTargetSphere).
@@ -108,6 +110,8 @@ struct FrameRec {
     double frameMs = 0;
     EyeSize eye;                 // the headset's eye texture (vscreen): the size passes are classified against
     EyeSize matched;             // the largest colour target with a matching depth in this frame (reported beside eye)
+    bool delayed = false;        // v5: the delay was placed at this frame's start
+    double gapMs = 0, delayMs = 0, busyMs = 0;   // v5: this frame's no-work gap, delay, and busy time (segmentTotals)
     std::vector<SegRec> segs;    // segs[i] is the segment that starts at stamp i and ends at stamp i + 1
     std::vector<uint64_t> ticks;
     std::vector<Row> rows;
@@ -125,6 +129,12 @@ bool g_haveBatch = false;   // a batch is not yet written
 uint32_t g_frameCount = kDefaultCaptureFrames;      // the frames of the batch in progress (or last written)
 uint32_t g_started = 0;     // frames of the batch begun so far
 uint32_t g_waits = 0;       // consecutive boundaries that found the shared clock held by another scope (startAction)
+// v5 (delay): the delay the press asked for, the delay of the batch in progress, the iteration count calibrated for it (0: no delay), and
+// the flag that keeps the delay dispatch out of the pass notes (its segment is the delay, not a pass).
+uint32_t g_requestDelayMs = kDefaultDelayMs;
+uint32_t g_batchDelayMs = 0;
+uint32_t g_delayIters = 0;
+bool g_delayIssuing = false;
 int g_active = -1;          // the frame open now, or -1
 std::vector<FrameRec> g_frames = std::vector<FrameRec>(kMaxCaptureFrames);
 Bound g_bound;              // the targets bound now, as the segments see them
@@ -177,6 +187,168 @@ bool ensurePool(ID3D11DeviceContext* ctx, uint32_t frames) {
                     "hitch at the first capture of this size",
                     want, g_pool.size(), ms);
     return true;
+}
+
+// ---- v5: the front-loaded delay (TEMPORARY). One compute dispatch, one thread, `iterations` dependent multiply-adds; it puts the GPU
+// the whole frame's work behind it so the passes that follow run without waiting on the CPU's submission. Measurement only.
+ID3D11Device* g_delayDevice = nullptr;             // the device the objects below belong to (one reference held)
+ID3D11ComputeShader* g_delayCs = nullptr;
+ID3D11Buffer* g_delayCb = nullptr;
+ID3D11Buffer* g_delayUav = nullptr;
+ID3D11UnorderedAccessView* g_delayUavView = nullptr;
+bool g_delayCompileFailed = false;                 // compile failed once: no further attempt in this session
+
+void releaseDelay() {
+    if (g_delayUavView) g_delayUavView->Release();
+    if (g_delayUav) g_delayUav->Release();
+    if (g_delayCb) g_delayCb->Release();
+    if (g_delayCs) g_delayCs->Release();
+    if (g_delayDevice) g_delayDevice->Release();
+    g_delayUavView = nullptr;
+    g_delayUav = nullptr;
+    g_delayCb = nullptr;
+    g_delayCs = nullptr;
+    g_delayDevice = nullptr;
+}
+
+// d3dcompiler_47.dll's D3DCompile, loaded once. Raw types: the macro and include arguments are null, so their pointer types are not needed.
+typedef HRESULT(WINAPI* PfnD3DCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+bool compileDelayShader(ID3DBlob** code) {
+    static PfnD3DCompile compile = nullptr;
+    if (!compile) {
+        HMODULE mod = LoadLibraryW(L"d3dcompiler_47.dll");
+        if (mod) compile = reinterpret_cast<PfnD3DCompile>(GetProcAddress(mod, "D3DCompile"));
+        if (!compile) return false;
+    }
+    ID3DBlob* errors = nullptr;
+    const HRESULT hr = compile(kGpuPassDelayHlsl, sizeof(kGpuPassDelayHlsl) - 1, "gpu_pass_delay", nullptr, nullptr, "main", "cs_5_0",
+                               0x8000u /* D3DCOMPILE_OPTIMIZATION_LEVEL3 */, 0, code, &errors);
+    if (errors) errors->Release();
+    return SUCCEEDED(hr) && *code;
+}
+
+// The shader and its buffers, created once per device. False when any of them could not be made (noted once).
+bool ensureDelayObjects(ID3D11DeviceContext* ctx) {
+    if (g_delayCompileFailed) return false;
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    if (!dev) return false;
+    if (g_delayDevice && g_delayDevice != dev) releaseDelay();
+    if (!g_delayDevice) g_delayDevice = dev;
+    else dev->Release();
+    if (g_delayCs && g_delayCb && g_delayUav && g_delayUavView) return true;
+    if (!g_delayCs) {
+        ID3DBlob* code = nullptr;
+        if (!compileDelayShader(&code)) {
+            g_delayCompileFailed = true;
+            Log::get().note("gpu pass profile: the delay shader did not compile (d3dcompiler_47.dll missing or refused it); no delay this session");
+            return false;
+        }
+        const HRESULT hr = g_delayDevice->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_delayCs);
+        code->Release();
+        if (FAILED(hr) || !g_delayCs) {
+            g_delayCompileFailed = true;
+            Log::get().note("gpu pass profile: the delay shader compiled but did not create (0x%08X); no delay this session", static_cast<unsigned>(hr));
+            return false;
+        }
+    }
+    D3D11_BUFFER_DESC cbd{};
+    cbd.ByteWidth = 16;
+    cbd.Usage = D3D11_USAGE_DEFAULT;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_BUFFER_DESC ud{};
+    ud.ByteWidth = 16;
+    ud.Usage = D3D11_USAGE_DEFAULT;
+    ud.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uvd{};
+    uvd.Format = DXGI_FORMAT_R32_FLOAT;
+    uvd.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uvd.Buffer.FirstElement = 0;
+    uvd.Buffer.NumElements = 4;
+    if (!g_delayCb && FAILED(g_delayDevice->CreateBuffer(&cbd, nullptr, &g_delayCb))) return false;
+    if (!g_delayUav && FAILED(g_delayDevice->CreateBuffer(&ud, nullptr, &g_delayUav))) return false;
+    if (!g_delayUavView && FAILED(g_delayDevice->CreateUnorderedAccessView(g_delayUav, &uvd, &g_delayUavView))) return false;
+    return true;
+}
+
+// One delay dispatch on ctx. The game's compute bindings (CS, CB0, UAV0) are read first and put back after, through the context's own
+// methods, so the binding shadow sees the same calls it would for a game. Notes from the dispatch are suppressed (g_delayIssuing).
+void runDelayDispatch(ID3D11DeviceContext* ctx, uint32_t iterations) {
+    ID3D11ComputeShader* prevCs = nullptr;
+    ID3D11Buffer* prevCb = nullptr;
+    ID3D11UnorderedAccessView* prevUav = nullptr;
+    ctx->CSGetShader(&prevCs, nullptr, nullptr);
+    ctx->CSGetConstantBuffers(0, 1, &prevCb);
+    ctx->CSGetUnorderedAccessViews(0, 1, &prevUav);
+    const UINT data[4] = {iterations, 0, 0, 0};
+    ctx->UpdateSubresource(g_delayCb, 0, nullptr, data, 0, 0);
+    ctx->CSSetShader(g_delayCs, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &g_delayCb);
+    ID3D11UnorderedAccessView* uav = g_delayUavView;
+    const UINT keepCounts = 0xFFFFFFFFu;
+    ctx->CSSetUnorderedAccessViews(0, 1, &uav, &keepCounts);
+    g_delayIssuing = true;
+    ctx->Dispatch(1, 1, 1);
+    g_delayIssuing = false;
+    ctx->CSSetShader(prevCs, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &prevCb);
+    ctx->CSSetUnorderedAccessViews(0, 1, &prevUav, &keepCounts);
+    if (prevCs) prevCs->Release();
+    if (prevCb) prevCb->Release();
+    if (prevUav) prevUav->Release();
+}
+
+// The iteration count for delayMs, from a timestamp-bracketed trial dispatch: one blocking read-back, once per capture at the batch start
+// (before any frame scope opens). The trial's length grows until it is measurable (at least 0.5 ms). 0 when the calibration fails; the
+// reason is noted and the capture runs with no delay.
+uint32_t calibrateDelay(ID3D11DeviceContext* ctx, uint32_t delayMs) {
+    if (!ensureDelayObjects(ctx)) return 0;
+    D3D11_QUERY_DESC dq{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+    D3D11_QUERY_DESC tq{D3D11_QUERY_TIMESTAMP, 0};
+    ID3D11Query *disjoint = nullptr, *q0 = nullptr, *q1 = nullptr;
+    if (FAILED(g_delayDevice->CreateQuery(&dq, &disjoint)) || FAILED(g_delayDevice->CreateQuery(&tq, &q0)) ||
+        FAILED(g_delayDevice->CreateQuery(&tq, &q1))) {
+        if (disjoint) disjoint->Release();
+        if (q0) q0->Release();
+        if (q1) q1->Release();
+        Log::get().note("gpu pass profile: the delay calibration could not create its queries; no delay this capture");
+        return 0;
+    }
+    auto readBlocking = [&](ID3D11Query* q, void* out, UINT size) {
+        const uint64_t deadline = GetTickCount64() + 2000;
+        for (;;) {
+            const HRESULT hr = ctx->GetData(q, out, size, 0);
+            if (hr == S_OK) return true;
+            if (FAILED(hr) || GetTickCount64() > deadline) return false;
+        }
+    };
+    uint64_t trial = 1000000;
+    double msPerIteration = 0.0;
+    for (int attempt = 0; attempt < 3 && msPerIteration <= 0.0; ++attempt) {
+        ctx->Begin(disjoint);
+        ctx->End(q0);
+        runDelayDispatch(ctx, static_cast<uint32_t>(trial));
+        ctx->End(q1);
+        ctx->End(disjoint);
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dd{};
+        UINT64 t0 = 0, t1 = 0;
+        if (!readBlocking(disjoint, &dd, sizeof dd) || !readBlocking(q0, &t0, sizeof t0) || !readBlocking(q1, &t1, sizeof t1)) break;
+        if (dd.Disjoint || !dd.Frequency) continue;
+        const double ms = static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(dd.Frequency);
+        if (ms < 0.5 && attempt < 2) {
+            trial *= 4;
+            continue;
+        }
+        msPerIteration = ms / static_cast<double>(trial);
+        Log::get().note("gpu pass profile: delay calibration: a trial of %llu iterations took %.3f ms (%.2f ns an iteration)",
+                        static_cast<unsigned long long>(trial), ms, msPerIteration * 1.0e6);
+    }
+    disjoint->Release();
+    q0->Release();
+    q1->Release();
+    const uint32_t iterations = delayIterations(msPerIteration, delayMs);
+    if (!iterations) Log::get().note("gpu pass profile: the delay calibration did not measure a trial; no delay this capture");
+    return iterations;
 }
 
 // The size and format of the view's own mip, and whether its resource is a cube map. A view is read once per capture.
@@ -281,6 +453,8 @@ BeginResult beginFrame(ID3D11DeviceContext* ctx, uint32_t slot, EyeSize eye, uin
     fr.segs.clear();
     fr.ticks.clear();
     fr.rows.clear();
+    fr.delayed = g_delayIters > 0 && slot > 0;   // v5: frame 0 of a batch is the reference frame (no delay); the rest carry the delay
+    fr.gapMs = fr.delayMs = fr.busyMs = 0;
     if (!ensurePool(ctx, g_frameCount)) {
         fr.state = FrameState::Failed;
         fr.failure = "the timestamp query pool could not be created";
@@ -309,6 +483,13 @@ BeginResult beginFrame(ID3D11DeviceContext* ctx, uint32_t slot, EyeSize eye, uin
     fr.state = FrameState::Open;
     stamp(fr, slot, 1);   // the frame's start, the first stamp of a fresh budget
     fr.segs.push_back(newSeg());
+    if (fr.delayed) {
+        // v5: the delay is the frame's first segment: one dispatch, then a boundary, so the delay has its own stamps and the passes start
+        // after it. Its notes are suppressed (g_delayIssuing), and the segment is excluded from every class and total.
+        fr.segs.back().delay = true;
+        runDelayDispatch(ctx, g_delayIters);
+        boundary(slot);
+    }
     return BeginResult::Begun;
 }
 
@@ -342,14 +523,27 @@ void buildRows(FrameRec& fr, uint32_t slot) {
     std::vector<PassFacts> facts;
     std::vector<double> ms;
     std::vector<const SegRec*> kept;
+    std::vector<double> gapAfter;             // v5: parallel to facts: the no-work time directly after each pass
+    std::vector<double> segMs;                // v5: every segment's time, with its kind, for segmentTotals
+    std::vector<SegKind> segKind;
     double carry = 0;
     for (size_t i = 0; i < segCount; ++i) {
         const double d = static_cast<double>(fr.ticks[i + 1] - fr.ticks[i]) * toMs;
         const SegRec& s = fr.segs[i];
-        if (!s.facts.draws && !s.facts.dispatches && !s.facts.clears) {
-            carry += d;
+        if (s.delay) {   // v5: the delay is not a pass: no class, no row; its time is reported on its own
+            segMs.push_back(d);
+            segKind.push_back(SegKind::Delay);
             continue;
         }
+        if (!s.facts.draws && !s.facts.dispatches && !s.facts.clears) {
+            carry += d;
+            segMs.push_back(d);
+            segKind.push_back(SegKind::Empty);
+            if (!gapAfter.empty()) gapAfter.back() += d;
+            continue;
+        }
+        segMs.push_back(d);
+        segKind.push_back(SegKind::Work);
         PassFacts pf = s.facts;
         const std::vector<HashTally> topPair = s.hashes.top();   // Built v13.7 (3): the most-drawn VS, for the HUD family rule
         pf.topVs = topPair.empty() ? 0 : topPair[0].vs;
@@ -357,10 +551,15 @@ void buildRows(FrameRec& fr, uint32_t slot) {
         pf.topCs = topCsPair.empty() ? 0 : topCsPair[0].vs;
         facts.push_back(pf);
         ms.push_back(d + carry);
+        gapAfter.push_back(0.0);
         carry = 0;
         kept.push_back(&s);
     }
     if (carry > 0 && !ms.empty()) ms.back() += carry;
+    const SegTotals totals = segmentTotals(segMs, segKind);
+    fr.delayMs = totals.delay;
+    fr.gapMs = totals.gap;
+    fr.busyMs = totals.busy;
     std::vector<PassClass> cls(facts.size());
     const VsFamily hud = hudFamilies();
     const VsFamily lighting = lightingFamilies();
@@ -382,6 +581,7 @@ void buildRows(FrameRec& fr, uint32_t slot) {
         r.dispatches = f.dispatches;
         r.clears = f.clears;
         r.tris = s.tris;
+        r.gapAfterMs = gapAfter[k];
         r.colours = f.colours;
         r.rt = f.colours ? targetText(f.colour) : "-";
         r.rtFormat = f.colours ? f.colour.format : 0;
@@ -460,6 +660,8 @@ void emitBatch() {
     std::vector<bool> ok;
     uint32_t overflow = 0;
     bool eyeNoted = false;
+    // v5 (delay): per-frame gap, busy and delay, for the delayed frames and the reference frame(s) (not delayed, in a batch with a delay).
+    std::vector<double> dGap, dBusy, dDelay, rGap, rBusy;
     for (uint32_t i = 0; i < g_started; ++i) {
         const FrameRec& fr = g_frames[i];
         overflow += fr.budget.overflow;
@@ -473,12 +675,21 @@ void emitBatch() {
             frameMs.push_back(fr.frameMs);
             ok.push_back(true);
             rows.insert(rows.end(), fr.rows.begin(), fr.rows.end());
+            if (fr.delayed) {
+                dGap.push_back(fr.gapMs);
+                dBusy.push_back(fr.busyMs);
+                dDelay.push_back(fr.delayMs);
+            } else if (g_batchDelayMs > 0) {
+                rGap.push_back(fr.gapMs);
+                rBusy.push_back(fr.busyMs);
+            }
         } else {
             Log::get().note("gpu pass profile: frame %u not captured: %s", i + 1, fr.failure);
             frameMs.push_back(0);
             ok.push_back(false);
         }
     }
+    const size_t suspects = markSuspects(rows);   // v5: flags each row (the CSV's suspect column)
     const Summary s = summarise(rows, frameMs, ok);
     std::string csvName;
     if (writeCsv(rows, csvName))
@@ -492,6 +703,21 @@ void emitBatch() {
     Log::get().note("gpu pass profile: means over %u frames: frame %.3f ms = elite %.3f ms + edvr %.3f ms "
                     "(unattributed %.3f ms)",
                     s.frames, s.frameMs, s.eliteMs, s.edvrMs, s.frameMs - s.eliteMs - s.edvrMs);
+    // v5 (delay): the summary the flight reads. Medians over the delayed frames; the reference frame's own line below.
+    if (!dDelay.empty()) {
+        Log::get().note("gpu pass profile: delay %u ms (measured %.3f ms) placed at frame start; inter-pass gaps median %.3f ms per frame; "
+                        "frame busy %.3f ms",
+                        g_batchDelayMs, medianOf(dDelay), medianOf(dGap), medianOf(dBusy));
+    } else if (g_batchDelayMs > 0) {
+        Log::get().note("gpu pass profile: delay %u ms requested but not placed (%s)", g_batchDelayMs,
+                        g_delayIters == 0 ? "the calibration failed; the note above says why" : "no delayed frame was read");
+    }
+    if (!rGap.empty())
+        Log::get().note("gpu pass profile: reference frame (no delay): inter-pass gaps %.3f ms per frame; frame busy %.3f ms",
+                        medianOf(rGap), medianOf(rBusy));
+    if (g_batchDelayMs > 0)
+        Log::get().note("gpu pass profile: %zu suspect passes (over %.0f times their median and followed by a gap over %.2f ms); "
+                        "marked suspect in the CSV", suspects, kSuspectFactor, kLargeGapMs);
     for (size_t c = 0; c < static_cast<size_t>(PassClass::Count); ++c) {
         const ClassMean& m = s.cls[c];
         if (m.passes > 0)
@@ -542,23 +768,21 @@ void gpuPassProfileRequest() {
         return;
     }
     // GPU pass profile v2: the count comes from the hotkey's value ("KEY COUNT"), read at the press.
-    std::string key;
-    g_requestFrames = splitCaptureSpec(Config::get().getString("hotkey.gpu_pass_profile", ""), key);
+    const CaptureSpec spec = parseCaptureSpec(Config::get().getString("hotkey.gpu_pass_profile", ""));
+    g_requestFrames = spec.frames;
+    g_requestDelayMs = spec.delayMs;
     g_requested = true;
     // Built v13.6: from the press until the last profiled frame's scope is closed, the application-frame timing and the census timers yield the
     // shared clock (gpu_timing.h); the profiler's frame scopes then open. Cleared by endYield at the batch's end.
     gpuTimingSetYield(true);
-    Log::get().note("gpu pass profile: armed. The next %u whole frames are measured from the next frame boundary; "
-                    "the lines follow once the GPU has reported them. The application GPU timing and the census timers pause "
-                    "until the capture's last frame is closed.",
-                    g_requestFrames);
+    Log::get().note("gpu pass profile: armed. The next %u whole frames are measured from the next frame boundary, with a %u ms "
+                    "delay placed at the start of each frame after the first (the first is the reference frame); the lines follow "
+                    "once the GPU has reported them. The application GPU timing and the census timers pause until the capture's "
+                    "last frame is closed.",
+                    g_requestFrames, g_requestDelayMs);
 }
 
-std::string gpuPassProfileKeyPart(const std::string& value) {
-    std::string key;
-    splitCaptureSpec(value, key);
-    return key;
-}
+std::string gpuPassProfileKeyPart(const std::string& value) { return parseCaptureSpec(value).key; }
 
 void gpuPassProfileNoteOm(ID3D11DeviceContext* ctx, uint32_t n, ID3D11RenderTargetView* const* rtvs,
                           ID3D11DepthStencilView* dsv) {
@@ -594,7 +818,7 @@ void gpuPassProfileNoteDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
 }
 
 void gpuPassProfileNoteDispatch(ID3D11DeviceContext* ctx, uint32_t, uint32_t, uint32_t) {
-    if (!live(ctx)) return;
+    if (!live(ctx) || g_delayIssuing) return;   // v5: the delay's own dispatch is not a pass
     boundary(static_cast<uint32_t>(g_active));
     if (SegRec* s = curSeg()) {
         ++s->facts.dispatches;
@@ -636,6 +860,9 @@ void gpuPassProfileFrameBoundary(ID3D11DeviceContext* ctx, uint32_t frameNo, uin
             Log::get().note("gpu pass profile: the timestamp query pool could not be created; nothing was captured");
             return;
         }
+        // v5 (delay): the iteration count for this capture, calibrated once here (the batch starts with no frame scope open).
+        g_batchDelayMs = g_requestDelayMs;
+        g_delayIters = g_batchDelayMs > 0 ? calibrateDelay(ctx, g_batchDelayMs) : 0;
         g_batch = true;
         g_haveBatch = true;
         g_started = 0;
@@ -692,6 +919,7 @@ void gpuPassProfileShutdown() {
     detail::g_gpuPassCapturing = false;
     gpuTimingSetYield(false);   // Built v13.6: no yield outlives the profiler
     releasePool();
+    releaseDelay();   // v5: the delay's shader and buffers
 }
 
 }  // namespace edvr

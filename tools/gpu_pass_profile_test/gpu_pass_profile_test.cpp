@@ -510,6 +510,61 @@ void testV3Classes() {
     check(matchedEye(noDepth).w == 0, "with no matching depth the matched eye is unknown (0x0)");
 }
 
+// GPU pass profile v5: the hotkey's "KEY COUNT DELAY_MS" value, the calibrated iteration count, the segment totals with the delay excluded
+// from busy time, the no-work gap, and the suspect flag.
+void testV5Delay() {
+    CaptureSpec s = parseCaptureSpec("F9");
+    check(s.key == "F9" && s.frames == 30 && s.delayMs == 6, "F9 alone: 30 frames and the default 6 ms delay");
+    s = parseCaptureSpec("F9 60");
+    check(s.key == "F9" && s.frames == 60 && s.delayMs == 6, "F9 60: 60 frames, the default delay");
+    s = parseCaptureSpec("F9 60 8");
+    check(s.key == "F9" && s.frames == 60 && s.delayMs == 8, "F9 60 8: 60 frames and an 8 ms delay");
+    s = parseCaptureSpec("Ctrl+F9 500 20");
+    check(s.key == "Ctrl+F9" && s.frames == 120 && s.delayMs == 12, "the frame count caps at 120 and the delay at 12");
+    s = parseCaptureSpec("F9 60 1");
+    check(s.delayMs == 2, "a delay below 2 ms is raised to 2");
+    s = parseCaptureSpec("1 2 3");
+    check(s.key == "1" && s.frames == 2 && s.delayMs == 3, "a digit key still binds, with a count and a delay after it");
+    s = parseCaptureSpec("1");
+    check(s.key == "1" && s.frames == 30 && s.delayMs == 6, "a bare digit is the key, not a count");
+    s = parseCaptureSpec("F9 abc 8");
+    check(s.key == "F9 abc" && s.frames == 8 && s.delayMs == 6, "a non-number between the key and the count is part of the key");
+    s = parseCaptureSpec("");
+    check(s.key.empty() && s.frames == 30 && s.delayMs == 6, "an empty value is unbound with the defaults");
+
+    check(delayIterations(0.005, 6) == 1200 && delayIterations(0.0, 6) == 0 && delayIterations(1.0, 12) == 12,
+          "the iterations for a delay: delay over the measured cost per iteration; 0 when the cost is unknown");
+    check(kDefaultDelayMs == 6 && kMinDelayMs == 2 && kMaxDelayMs == 12, "the delay's default and clamp");
+
+    // Segments: the delay is neither work nor gap; busy is the rest (work plus gaps); gap is the empty time alone.
+    const SegTotals t = segmentTotals({1.0, 2.0, 3.0, 0.5}, {SegKind::Work, SegKind::Delay, SegKind::Work, SegKind::Empty});
+    check(t.delay == 2.0 && t.busy == 4.5 && t.gap == 0.5, "the delay is excluded from busy time; the empty segment is the gap, and it is in busy");
+
+    // The suspect flag: over 3x the group's own median AND followed by a gap over kLargeGapMs.
+    std::vector<Row> rows;
+    for (int i = 0; i < 10; ++i) {
+        Row r;
+        r.ms = 1.0;
+        rows.push_back(r);
+    }
+    Row a;
+    a.ms = 5.0;
+    a.gapAfterMs = 0.5;
+    rows.push_back(a);
+    Row b;
+    b.ms = 2.5;
+    b.gapAfterMs = 0.5;
+    rows.push_back(b);
+    Row c;
+    c.ms = 5.0;
+    c.gapAfterMs = 0.1;
+    rows.push_back(c);
+    const size_t flagged = markSuspects(rows);
+    check(flagged == 1 && rows[10].suspect && !rows[11].suspect && !rows[12].suspect,
+          "a pass over 3x its median and followed by a large gap is suspect; 2.5x, or no large gap after, is not");
+    check(std::string(csvHeader()).find("gap_after_ms,suspect") != std::string::npos, "the CSV header carries the gap and suspect columns");
+}
+
 // GPU pass profile v4: the exposure chain's 252x252 passes and its compute dispatches are exposure, never probe_cube; probe_cube's square
 // lower bound is 256.
 void testV4Exposure() {
@@ -642,6 +697,7 @@ int main(int argc, char** argv) {
     testV2();
     testV3Classes();
     testV4Exposure();
+    testV5Delay();
     testCaptureStarts();
     std::printf("gpu_pass_profile_test: %u checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
