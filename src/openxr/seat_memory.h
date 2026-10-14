@@ -161,21 +161,6 @@ class SeatCapture {
 };
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
-// The runtime moved LOCAL's origin (a recentre in SteamVR's dashboard or Pimax Play). `newOriginInOld` is XrEventDataReferenceSpaceChangePending's
-// poseInPreviousSpace: where the new LOCAL sits in the old one. The chair has not moved, so the seat's coordinates in the new LOCAL are
-// P^-1 * S. (Gravity-aligned: a heading and a translation.)
-inline SeatPose seatInNewLocal(const SeatPose& s, const SeatPose& newOriginInOld) {
-  const double dx = s.x - newOriginInOld.x, dz = s.z - newOriginInOld.z;
-  const double c = std::cos(newOriginInOld.yaw), sn = std::sin(newOriginInOld.yaw);
-  SeatPose r;
-  r.x = c * dx - sn * dz;
-  r.z = sn * dx + c * dz;
-  r.y = s.y - newOriginInOld.y;
-  r.yaw = seatWrap(s.yaw - newOriginInOld.yaw);
-  return r;
-}
-
-// ---------------------------------------------------------------------------------------------------------------------------------------------
 // Persistence: text, one line per runtime key.
 //   edvr-seat 1
 //   <key> TAB <x m> TAB <y m> TAB <z m> TAB <heading degrees>
@@ -281,6 +266,16 @@ inline void seatBookErase(std::vector<SeatRecord>& book, const std::string& key)
 // The decision table.
 
 enum class SeatWhere { Unknown, OnFoot, Aboard };
+
+// THE RULE ON FOOT. Sean, 2026-10-14: "let's assume for now that on foot everyone is sitting". While this is true, on foot is a seat like a
+// cockpit: boarding and disembarking are both transitions that put the stored seat back, and a game reset on foot is decided exactly as one
+// aboard (replaced inside a window, otherwise the player's own recentre). Native on-foot VR (standing, room scale) changes this in this one
+// place: false makes on foot a place where the game's resets pass through and no seat is applied, as the first build had it. Read by
+// seatHolds() and nothing else; deliberately not a config key.
+constexpr bool kOnFootIsSeated = true;
+constexpr bool onFootIsSeated() { return kOnFootIsSeated; }
+// Is the commander somewhere the seat applies?
+constexpr bool seatHolds(SeatWhere w) { return w == SeatWhere::Aboard || (w == SeatWhere::OnFoot && onFootIsSeated()); }
 inline const char* seatWhereName(SeatWhere w) {
   return w == SeatWhere::Aboard ? "aboard" : w == SeatWhere::OnFoot ? "on_foot" : "unknown";
 }
@@ -288,8 +283,8 @@ inline const char* seatWhereName(SeatWhere w) {
 // What to do with a ResetSeatedZeroPose the game just made.
 enum class SeatResetDecision {
   GameMode,          // advanced.cockpit_centre = game, or the graphics half has not spoken: honoured, nothing remembered (today's behaviour)
-  PassThrough,       // on foot or in a menu: honoured, nothing remembered
-  ReplaceWithSeat,   // aboard, inside a transition window, a seat is stored: the stored seat replaces the head pose
+  PassThrough,       // in a menu or a load (or on foot, when onFootIsSeated() is false): honoured, nothing remembered
+  ReplaceWithSeat,   // aboard or on foot, inside a transition window, a seat is stored: the stored seat replaces the head pose
   HonourNoSeat,      // aboard, inside a window, nothing stored: honoured as today (an automatic reset is not evidence of where the player sits)
   HonourStore        // aboard, outside a window: the player's own recentre; honoured and remembered
 };
@@ -356,8 +351,10 @@ class SeatMemory {
   bool inWindow(uint64_t now) const { return windowOpen_ && now >= windowBegan_ && now - windowBegan_ <= kWindowMs; }
   uint64_t windowAgeMs(uint64_t now) const { return windowOpen_ && now >= windowBegan_ ? now - windowBegan_ : 0; }
   bool applyPending() const { return pendingApply_ && has_; }
-  // Put the stored seat back as soon as a frame allows (the runtime moved LOCAL under it). Only meaningful aboard; elsewhere the next boarding does it.
-  void requestApply() { if (has_ && where_ == SeatWhere::Aboard) { originIsSeat_ = false; pendingApply_ = true; } }
+  // A recentre the runtime made (SteamVR's dashboard, Pimax Play) is always the player's: the head as it is in the new LOCAL is the seat.
+  // `applied` true: the host has already made it the origin (it is then exactly HonourStore's outcome, and the caller says so with noteReset).
+  // This is the other case: the head could not be sampled, LOCAL's own origin is the seat, and it goes back as soon as a frame allows.
+  void storeAndApplyLater(const SeatPose& s) { seat_ = s; has_ = true; originIsSeat_ = false; pendingApply_ = true; }
   void applyDone() { pendingApply_ = false; }
 
   static SeatWhere whereOf(const SeatContext& c) {
@@ -373,21 +370,25 @@ class SeatMemory {
     if (!seen_) {
       seen_ = true;
       ctx_ = c; where_ = w;
-      if (w == SeatWhere::Aboard) return transition(ev, now, "seated_at_start", true);
+      if (seatHolds(w)) return transition(ev, now, w == SeatWhere::Aboard ? "seated_at_start" : "on_foot_at_start", true);
       return ev;
     }
     const SeatContext prev = ctx_;
     const SeatWhere prevWhere = where_;
     ctx_ = c; where_ = w;
     if (w != prevWhere) {
-      if (w == SeatWhere::Aboard) return transition(ev, now, prevWhere == SeatWhere::OnFoot ? "boarded" : "seated", true);
-      // Leaving the seat closes the window and cancels a pending apply: on foot the game's resets pass through.
+      if (seatHolds(w)) {
+        const char* why = w == SeatWhere::Aboard ? (prevWhere == SeatWhere::OnFoot ? "boarded" : "seated")
+                                                  : (prevWhere == SeatWhere::Aboard ? "disembarked" : "on_foot");
+        return transition(ev, now, why, true);
+      }
+      // Into a menu or a load: the window closes and a pending apply is cancelled, and the game's resets pass through.
       windowOpen_ = false; pendingApply_ = false;
       ev.why = w == SeatWhere::OnFoot ? "left_seat" : "unknown_state";
       return ev;
     }
-    if (w == SeatWhere::Aboard) {
-      if (c.seatKind != prev.seatKind) return transition(ev, now, "cockpit_changed", true);
+    if (seatHolds(w)) {
+      if (w == SeatWhere::Aboard && c.seatKind != prev.seatKind) return transition(ev, now, "cockpit_changed", true);
       if (prev.cameraOpen && !c.cameraOpen) return transition(ev, now, "camera_closed", true);
       if (!prev.cameraOpen && c.cameraOpen) return transition(ev, now, "camera_opened", false);
       if (c.transitions != prev.transitions) return transition(ev, now, "journal_event", false);
@@ -397,7 +398,7 @@ class SeatMemory {
 
   SeatResetDecision classifyReset(uint64_t now) const {
     if (!keep()) return SeatResetDecision::GameMode;
-    if (where_ != SeatWhere::Aboard) return SeatResetDecision::PassThrough;
+    if (!seatHolds(where_)) return SeatResetDecision::PassThrough;
     if (inWindow(now)) return has_ ? SeatResetDecision::ReplaceWithSeat : SeatResetDecision::HonourNoSeat;
     return SeatResetDecision::HonourStore;
   }

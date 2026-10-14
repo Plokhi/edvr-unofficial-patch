@@ -356,8 +356,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   const char* seatWhy="";                    // the last transition's reason, for the apply it triggers and the meter it schedules
   uint64_t seatMeterDueAt=0,seatMeterNextPeriodic=0;
   const char* seatTraceDecision="head";HeadCall seatTraceCall{};bool seatTraceHasCall=false;
-  struct LocalShift{bool valid=false;SeatPose pose;};
-  LocalShift localShifts[8]{};unsigned localShiftCount=0;uint64_t localNoted=0;bool localShiftOverflow=false;
+  uint64_t localNoted=0,localHandled=0;     // LOCAL reference-space changes the runtime announced / the seat memory has answered
   // Declared before boundary: boundary's constructor stores its address, and
   // it must already exist to be bound (native_frame's own reset() sequence
   // below binds it once the session that owns its xrWaitFrame exists).
@@ -1112,13 +1111,9 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       const auto& event=*reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&buffer);
       if(!host.changes.note(event))nativeTracePuts("error,reference_change_policy");
       else if(event.session==host.session&&event.referenceSpaceType==XR_REFERENCE_SPACE_TYPE_LOCAL) {
-        // The seat memory needs where the new LOCAL sits in the old one (the chair has not moved); applied once the change itself has.
+        // The runtime recentred (SteamVR's dashboard, Pimax Play): the seat memory counts it as the player's own recentre, answered once the
+        // change itself has taken effect (seatProcessRuntimeRecentre).
         ++host.localNoted;
-        if(host.localShiftCount<8) {
-          auto& shift=host.localShifts[host.localShiftCount++];
-          shift.valid=event.poseValid==XR_TRUE;
-          shift.pose=shift.valid?seatPoseYawOf(event.poseInPreviousSpace):SeatPose{};
-        } else host.localShiftOverflow=true;
       }
     }
     if(buffer.type==XR_TYPE_EVENT_DATA_PERF_SETTINGS_EXT && host.perfSettingsExtension) {
@@ -2545,8 +2540,8 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   }
   bool resetSeated(uint64_t generation) override {return resetSeatedFor(generation,HeadCall{});}
   // The game's ResetSeatedZeroPose. What the seat memory does with it is seat_memory.h's decision table (SeatMemory::classifyReset): in
-  // advanced.cockpit_centre = game, on foot, and in a menu it is honoured exactly as before; aboard inside a transition window the stored
-  // seat replaces the head pose; aboard outside a window it is the player's own recentre, honoured and remembered.
+  // advanced.cockpit_centre = game and in a menu or a load it is honoured exactly as before; aboard or on foot (onFootIsSeated, seat_memory.h)
+  // inside a transition window the stored seat replaces the head pose; outside a window it is the player's own recentre, honoured and remembered.
   bool resetSeatedFor(uint64_t generation,const HeadCall& call) override {
     if(!service.isOwner()) {bool result=false;return service.invoke([&]{result=resetSeatedFor(generation,call);})&&result;}
     if(GetCurrentThreadId()!=ownerThread)return false;
@@ -2653,12 +2648,6 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     nativeTracePrintf("seat_store,action=save,why=%s,ok=%u,key=%s,seat=%.3f/%.3f/%.3f/%.1f,file=%s\n",why,unsigned(ok),seatKeyText.c_str(),
         s.x,s.y,s.z,seatRadToDeg(s.yaw),seatFile.empty()?"(none)":seatUtf8(seatFile).c_str());
   }
-  void seatForget(const char* why) {
-    seat.clearSeat();
-    seatBookErase(seatBook,seatKeyText);
-    const bool ok=!seatFile.empty()&&seatBookSaveFile(seatFile,seatBook);
-    nativeTracePrintf("seat_store,action=forget,why=%s,ok=%u,key=%s\n",why,unsigned(ok),seatKeyText.c_str());
-  }
   // The head in natural LOCAL, as the heading-and-position pose a seat is. Samples only; touches no reset state.
   bool seatHeadLocal(SeatPose& out,bool requireTracked=true) {
     XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};XrTime exact=0;
@@ -2707,7 +2696,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       nativeTracePrintf("seat_event,why=%s,window_opened=%u,apply_wanted=%u,no_seat=%u,where=%s,seat_kind=0x%X,transitions=%u,camera=%u,stored=%u,origin_is_seat=%u,mode=%s\n",
           ev.why,unsigned(ev.windowOpened),unsigned(ev.applyWanted),unsigned(ev.noSeat),seatWhereName(seat.where()),c.seatKind,c.transitions,
           unsigned(c.cameraOpen),unsigned(seat.has()),unsigned(seat.originIsSeat()),seatModeName(c));
-      if(ev.windowOpened&&seat.where()==SeatWhere::Aboard&&c.published){seatMeterDueAt=now+2000;seatMeterNextPeriodic=now+30000;}
+      if(ev.windowOpened&&seatHolds(seat.where())&&c.published){seatMeterDueAt=now+2000;seatMeterNextPeriodic=now+30000;}
     }
   }
   // The misalignment meter: the head in the seated space, as a person reads it (offset, height, heading). Aligned and seated normally: about 0.
@@ -2762,27 +2751,38 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     } else nativeTracePrintf("stage_in_local,result=%d\n",int(r));
     api.destroySpace(stageSpace);
   }
-  // The runtime moved LOCAL (a recentre in SteamVR's dashboard or Pimax Play). The chair did not move: carry the stored seat into the new
-  // LOCAL, or forget it when the runtime did not say where the new origin is.
-  void seatProcessLocalShifts() {
-    if(!localShiftCount&&!localShiftOverflow)return;
-    if(referenceChanges<localNoted)return;     // the change itself has not been applied yet
-    for(unsigned i=0;i<localShiftCount;++i) {
-      const LocalShift& s=localShifts[i];
-      if(!seat.has())break;
-      if(!s.valid||localShiftOverflow) {
-        nativeTracePrintf("seat_local_changed,pose=%s,action=forget_seat\n",s.valid?"overflow":"absent");
-        seatForget("local_changed_no_pose");break;
-      }
-      const SeatPose before=seat.seat(),after=seatInNewLocal(before,s.pose);
-      seat.setSeat(after);
-      nativeTracePrintf("seat_local_changed,pose=valid,shift=%.3f/%.3f/%.3f/%.1f,seat_before=%.3f/%.3f/%.3f/%.1f,seat_after=%.3f/%.3f/%.3f/%.1f,action=compensate\n",
-          s.pose.x,s.pose.y,s.pose.z,seatRadToDeg(s.pose.yaw),before.x,before.y,before.z,seatRadToDeg(before.yaw),
-          after.x,after.y,after.z,seatRadToDeg(after.yaw));
+  // The runtime moved LOCAL (a recentre in SteamVR's dashboard or Pimax Play). That is always the player: the head as it is in the new LOCAL is
+  // honoured as the seated origin and stored as the seat, aboard or on foot, in a window or out of one. Acted on once the change has taken
+  // effect (the geometry refresh counted it), so the head is sampled in the new LOCAL. Head not tracked: LOCAL's own origin is the seat, applied
+  // when a frame allows. A frame in the way is a retry next poll. In game mode nothing changes (the origin keeps its offset as it always did).
+  void seatProcessRuntimeRecentre() {
+    if(localHandled>=localNoted||referenceChanges<localNoted)return;
+    if(!seat.keep()) {
+      nativeTracePrintf("seat_local_changed,events=%llu,action=ignored_game_mode\n",(unsigned long long)(localNoted-localHandled));
+      localHandled=localNoted;return;
     }
-    if(localShiftOverflow&&seat.has())seatForget("local_changed_overflow");
-    if(seat.has()) {seat.requestApply();seatSave("local_changed");}
-    localShiftCount=0;localShiftOverflow=false;
+    if(state.frameOpen()||!changes.active())return;
+    XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+    lastResetResult=HeadLocator{}.locate({api.convertTime,api.locateSpace},instance,view,local,0,head,&lastResetTime,counterNow,nullptr,boundary.estimateNow());
+    constexpr XrSpaceLocationFlags tracked=XR_SPACE_LOCATION_POSITION_TRACKED_BIT|XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+    XrPosef o{};
+    const bool headOk=lastResetResult==XR_SUCCESS&&(head.locationFlags&tracked)==tracked&&seatedOriginFromHead(head.pose,head.locationFlags,o);
+    const unsigned long long events=(unsigned long long)(localNoted-localHandled);
+    if(headOk) {
+      seatTraceDecision="honour_store";seatTraceHasCall=false;
+      if(!applySeatedReset(head,"runtime_recentre",true))return;     // retried next poll
+      seat.noteReset(SeatResetDecision::HonourStore,currentOrigin);
+      seatSave("runtime_recentre");
+      const SeatPose& s=seat.seat();
+      nativeTracePrintf("seat_local_changed,events=%llu,head=tracked,action=store_as_manual,where=%s,window=%u,seat=%.3f/%.3f/%.3f/%.1f\n",
+          events,seatWhereName(seat.where()),unsigned(seat.inWindow(GetTickCount64())),s.x,s.y,s.z,seatRadToDeg(s.yaw));
+    } else {
+      seat.storeAndApplyLater(SeatPose{});
+      seatSave("runtime_recentre_untracked");
+      nativeTracePrintf("seat_local_changed,events=%llu,head=untracked,action=store_as_manual,fallback=local_identity,where=%s,seat=0.000/0.000/0.000/0.0\n",
+          events,seatWhereName(seat.where()));
+    }
+    localHandled=localNoted;
   }
   // The stored seat becomes the origin. A retry is the caller's: this answers false when a frame is open, the head is not tracked, or the
   // reset-event queue is full, and the apply stays pending.
@@ -2804,7 +2804,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     const uint64_t now=GetTickCount64();
     if(!seatRefsTraced)seatTraceReferenceSpaces();
     seatSync(now);
-    seatProcessLocalShifts();
+    seatProcessRuntimeRecentre();
     bool moved=false;
     if(seat.keep()&&seat.applyPending()&&!state.frameOpen()&&changes.active()) {
       moved=applyStoredSeat("seat_transition","transition_seat",true);
