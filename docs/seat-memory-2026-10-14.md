@@ -28,16 +28,21 @@ the arc's status, the log lines the build writes, and the flight checklist.
   to 2 cm over 92 launches), so the seat is captured at the splash only after the head has been still for a window, and the capture's
   statistics are logged either way; (b) the 10 s transition window; (c) that seated zero is the cockpit's eye point, so a normally seated
   head reads about 0/0/0 after a good alignment; (d) Status.json flags arrive about a second late.
-- **The window reaches backward (8 s).** A reset outside any window is honoured but not believed: the seat it would replace is kept as
-  `previous`, and the disk is not written for 8 s (`seat_store,action=defer`). A transition inside those 8 s (boarding, disembarking, a
+- **The window reaches backward (5 s; one constant, `SeatMemory::kRetroMs`, was 8 s until Sean shortened it on 2026-10-14).** A reset
+  outside any window is honoured but not believed: the seat it would replace is kept as
+  `previous`, and the disk is not written for 5 s (`seat_store,action=defer`). A transition inside those 5 s (boarding, disembarking, a
   journal boundary, Explorer Cam, a change of cockpit) takes the reset back: the old seat stands and is applied
-  (`seat_store,action=discard_pending,why=transition_within_8s,age_ms=` and the apply's `seat_reset ... decision=replace_with_seat,retro=1,age_ms=`).
-  Eight quiet seconds commit it (`seat_store,action=save,why=manual_reset,deferred_ms=`). This is for the ramp's reset 2.6 to 4.4 s before the
+  (`seat_store,action=discard_pending,why=transition_within_5s,age_ms=` and the apply's `seat_reset ... decision=replace_with_seat,retro=1,age_ms=`).
+  Five quiet seconds commit it (`seat_store,action=save,why=manual_reset,deferred_ms=`). This is for the ramp's reset 2.6 to 4.4 s before the
   boarding flip. A runtime recentre is never held. With no seat stored there is nothing to go back to and a first recentre is written at once.
-- Known limits of the hold: a recentre of yours followed within 8 s by a boarding, a disembark or any journal event (an undock) is taken
-  back as if it were the ramp's; quitting the game within 8 s of one loses it (nothing flushes at shutdown); and a reset outside a window
-  more than 8 s before a transition is still believed (the 2026-10-14 logs have one 25 s after an embark, docked). The flight should look for
+- Known limits of the hold: a recentre of yours followed within 5 s by a boarding, a disembark or any journal event (an undock) is taken
+  back as if it were the ramp's; quitting the game within 5 s of one loses it (nothing flushes at shutdown); and a reset outside a window
+  more than 5 s before a transition is still believed (the 2026-10-14 logs have one 25 s after an embark, docked). The flight should look for
   `action=defer` lines no one earned and for a seat that moved at boarding.
+- 2026-10-14, flight 7116598f (8 s at the time): Sean's real recentre at 15:25:10 UTC was discarded by a `journal_event` transition 3.4 s
+  later. That transition was his disembark: the journal event runs about 2.4 s ahead of the on-foot flag in Status.json, so the hold saw it
+  first. 5 s would still discard that press (3.4 s is inside it). It is the documented limit above, not a bug; the shorter hold only
+  narrows how often it can happen.
 - Ruled out (review): STAGE as a seated centre (floor origin at the play-area centre; Sean's chair is 1.1 m and 28 degrees from LOCAL's
   origin on both runtimes); yaw-only or position-only handling as the primary fix; reading Elite's cockpit eye point as a prerequisite.
 - Next flight: the checklist at the end of this doc.
@@ -55,10 +60,10 @@ in `%LOCALAPPDATA%\EDVR\<leaf>-<store>\seat.txt` (`src\openxr\seat_store.h`; for
 - Boarding, disembarking, going on foot from a menu, a change of cockpit (Status.json seat kind: ship, fighter, SRV, taxi, multicrew),
   Explorer Cam closing: the seat becomes the origin if it is not already (a 10 s window opens at each, and at a journal boundary).
   Disembarking usually finds the origin still on the seat, so it opens the window and puts nothing back. Each of these also takes back a
-  recentre made in the 8 s before it (the Status block).
+  recentre made in the 5 s before it (the Status block).
 - A game ResetSeatedZeroPose: game mode or unpublished, or in a menu or a load: as before, nothing remembered. Aboard or on foot, inside
   a window: the stored seat replaces the head pose (nothing stored: as before). Outside a window: the player's own recentre, honoured and
-  stored, but held 8 s first (it commits then, or a transition takes it back).
+  stored, but held 5 s first (it commits then, or a transition takes it back).
 - The runtime recentres LOCAL (SteamVR dashboard, Pimax Play): see the Status block; the head in the new LOCAL becomes the seat.
 - The word that crosses from d3d11.dll to openvr_api.dll is one 32-bit value (`src\common\seat_context.h`, `publishSeatContext` in
   frame_flag.h; the slot was padding, `reservedPoseReader0`, so the mapping version is unchanged). Status.json's seat kind is new in the
@@ -80,8 +85,8 @@ in `%LOCALAPPDATA%\EDVR\<leaf>-<store>\seat.txt` (`src\openxr\seat_store.h`; for
 - `seat_meter,when=transition_2s|periodic,why=,where=,mode=,stored=,origin_was_seat=,offset_cm=,height_cm=,yaw_deg=,head_local=,origin=`
   (`head=untracked` when the headset is not tracked). 2 s after each window opens aboard and after each transition apply; every 30 s.
 - `seat_store,action=load|save,why=...,deferred_ms=,ok=,key=,seat=,file=` (`deferred_ms` is 0 unless a held recentre committed);
-  `seat_store,action=defer,why=manual_reset,prev=,new=,commit_after_ms=8000`;
-  `seat_store,action=discard_pending,why=transition_within_8s,age_ms=,transition=,discarded=,restored=`.
+  `seat_store,action=defer,why=manual_reset,prev=,new=,commit_after_ms=5000`;
+  `seat_store,action=discard_pending,why=transition_within_5s,age_ms=,transition=,discarded=,restored=` (the number in `why` is `kRetroMs` in seconds).
 - `seat_local_changed,events=,head=tracked,action=store_as_manual,where=,window=,seat=x/y/z/yawdeg` (the runtime recentred; the `seat_reset`
   line before it has `reason=runtime_recentre,decision=honour_store`); `seat_local_changed,events=,head=untracked,action=store_as_manual,fallback=local_identity,where=,seat=0.000/0.000/0.000/0.0`;
   `seat_local_changed,events=,action=ignored_game_mode`.
@@ -105,7 +110,7 @@ Pimax OpenXR first; SteamVR/OpenXR as a second launch if time allows (the key di
    any game reset in the window `decision=replace_with_seat`; `seat_meter,when=transition_2s,where=aboard` within 5 cm and 5 degrees (offset_cm, yaw_deg),
    height_cm within 5. Compare `game` mode's meter at the same step (H1 or H2: reset near the flip or not). Watch for the ramp's early reset:
    a `seat_reset ... where=on_foot,window=0,decision=honour_store` just before the flip is now held: `seat_store,action=defer`, then at the flip
-   `seat_store,action=discard_pending,why=transition_within_8s,age_ms=` (2000 to 8000) and the apply `seat_reset ... decision=replace_with_seat,retro=1`.
+   `seat_store,action=discard_pending,why=transition_within_5s,age_ms=` (2000 to 5000) and the apply `seat_reset ... decision=replace_with_seat,retro=1`.
    Pass: the seat in `seat_meter` after the boarding is the stored one, and no `action=save,why=manual_reset` for that reset.
 5. Disembark (docked, then out of the ship): `seat_event,why=disembarked,window_opened=1,where=on_foot` (`apply_wanted=1` if the origin had left the
    seat), any game reset in the window `where=on_foot,window=1,decision=replace_with_seat`; `seat_meter,when=transition_2s,where=on_foot` within 5 cm and
@@ -113,8 +118,8 @@ Pimax OpenXR first; SteamVR/OpenXR as a second launch if time allows (the key di
 6. Ship change in the hangar and back in: `seat_event,why=boarded` or `seated`; same meter.
 7. SRV launch and return if a planet fits (`why=cockpit_changed`; the `seat_kind` in `seat_context` goes 0x1 to 0x4 and back); if not flown, say so.
 8. Explorer Cam in and out, on foot and aboard: `camera_opened` then `camera_closed`, meter unchanged; no `seat_reset` that moves the origin off the seat.
-9. Manual: press the game's recentre aboard well after a window: `decision=honour_store`, `seat_store,action=defer`, then 8 s later
-   `seat_store,action=save,why=manual_reset,deferred_ms=8000` (a little over); the next boarding uses it. Press it again and board within 8 s:
+9. Manual: press the game's recentre aboard well after a window: `decision=honour_store`, `seat_store,action=defer`, then 5 s later
+   `seat_store,action=save,why=manual_reset,deferred_ms=5000` (a little over); the next boarding uses it. Press it again and board within 5 s:
    `discard_pending` and the old seat back (that is the known limit, not a bug). A runtime recentre is not held.
    Runtime recentre once (SteamVR dashboard or Pimax Play): `seat_reset ... reason=runtime_recentre,decision=honour_store,ok=1` then
    `seat_local_changed,head=tracked,action=store_as_manual`, `seat_store,action=save,why=runtime_recentre`; the head reads about 0 in the next `seat_meter`,

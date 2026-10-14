@@ -340,7 +340,7 @@ class SeatMemory {
  public:
   // The window also reaches BACKWARD: Elite's reset on the way up the ramp lands 2.6 to 4.4 s before the boarding flip is even visible, so a
   // reset outside any window is held for this long before it is believed to be the player's own (the disk is not written until then).
-  static constexpr uint64_t kRetroMs = 8000;
+  static constexpr uint64_t kRetroMs = 5000;     // 8 s until 2026-10-14 (Sean: shorter); the ONE place it is set
   static constexpr uint64_t kWindowMs = 10000;   // measured: game resets near an Embark fall between 4.4 s before and 4.2 s after its journal line
 
   // --- the stored seat

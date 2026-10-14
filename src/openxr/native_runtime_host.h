@@ -2705,8 +2705,8 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     }
     if(ev.discardedPending) {
       seatRetroPending=true;seatRetroAgeMs=ev.discardAgeMs;
-      nativeTracePrintf("seat_store,action=discard_pending,why=transition_within_8s,age_ms=%llu,transition=%s,discarded=%.3f/%.3f/%.3f/%.1f,restored=%.3f/%.3f/%.3f/%.1f\n",
-          (unsigned long long)ev.discardAgeMs,ev.why,ev.discardedSeat.x,ev.discardedSeat.y,ev.discardedSeat.z,seatRadToDeg(ev.discardedSeat.yaw),
+      nativeTracePrintf("seat_store,action=discard_pending,why=transition_within_%llus,age_ms=%llu,transition=%s,discarded=%.3f/%.3f/%.3f/%.1f,restored=%.3f/%.3f/%.3f/%.1f\n",
+          (unsigned long long)(SeatMemory::kRetroMs/1000),(unsigned long long)ev.discardAgeMs,ev.why,ev.discardedSeat.x,ev.discardedSeat.y,ev.discardedSeat.z,seatRadToDeg(ev.discardedSeat.yaw),
           ev.restoredSeat.x,ev.restoredSeat.y,ev.restoredSeat.z,seatRadToDeg(ev.restoredSeat.yaw));
     }
     if(ev.windowOpened||ev.applyWanted||ev.noSeat) {
@@ -2824,7 +2824,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     seatSync(now);
     seatProcessRuntimeRecentre();
     uint64_t deferredMs=0;
-    if(seat.takeCommit(now,deferredMs))seatSave("manual_reset",deferredMs);     // eight seconds and no transition: it was the player's
+    if(seat.takeCommit(now,deferredMs))seatSave("manual_reset",deferredMs);     // kRetroMs and no transition: it was the player's
     bool moved=false;
     if(seat.keep()&&seat.applyPending()&&!state.frameOpen()&&changes.active()) {
       moved=applyStoredSeat("seat_transition",seatRetroPending?"replace_with_seat":"transition_seat",true);
