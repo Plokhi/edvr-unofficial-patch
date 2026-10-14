@@ -962,7 +962,7 @@ void testFaults() {
         Heap& h = r.h;
         Knobs& k = r.k;
         Clock clock;
-        // the last call left phase 2 in the context, so phase 1 is a kept state and hitsSeen % 64 != 0 takes the plain hit path
+        // the last call left phase 2 in the context, so phase 1 is a kept state and hitsSeen % kVerifyEvery != 0 takes the plain hit path
         r.cache.hitsSeen = 1;
         lg::Result res;
         const lg::CallInputs in = mk(0, 1);

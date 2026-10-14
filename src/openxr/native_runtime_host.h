@@ -2541,7 +2541,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   }
   bool resetSeated(uint64_t generation) override {return resetSeatedFor(generation,HeadCall{});}
   // The game's ResetSeatedZeroPose. What the seat memory does with it is seat_memory.h's decision table (SeatMemory::classifyReset): in
-  // advanced.cockpit_centre = game and in a menu or a load it is honoured exactly as before; aboard or on foot (onFootIsSeated, seat_memory.h)
+  // in a menu or a load, or before the graphics half has spoken, it is honoured exactly as before; aboard or on foot (onFootIsSeated, seat_memory.h)
   // inside a transition window the stored seat replaces the head pose; outside a window it is the player's own recentre, honoured and remembered.
   bool resetSeatedFor(uint64_t generation,const HeadCall& call) override {
     if(!service.isOwner()) {bool result=false;return service.invoke([&]{result=resetSeatedFor(generation,call);})&&result;}
@@ -2933,8 +2933,8 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
         (unsigned long long)launchCentreSamples,double(head.pose.position.x),double(head.pose.position.y),double(head.pose.position.z),
         double(head.pose.orientation.x),double(head.pose.orientation.y),double(head.pose.orientation.z),double(head.pose.orientation.w),
         (unsigned long long)head.locationFlags);
-      // The seat memory (advanced.cockpit_centre = keep) puts a stored seat here instead of the head as it happens to be near the first
-      // tracked pose; with none stored, or in game mode, it is the head as it always was.
+      // The seat memory puts a stored seat here instead of the head as it happens to be near the first tracked pose; with none stored, or
+      // before the graphics half has spoken, it is the head as it always was.
       seatEnsureLoaded();seatSync(now);
       const SeatStartPlan startPlan=seatStartPlan(seat.keep(),seat.has());
       nativeTracePrintf("seat_start,plan=%s,mode=%s,stored=%u\n",seatStartPlanName(startPlan),seatModeName(seat.context()),unsigned(seat.has()));

@@ -2303,10 +2303,10 @@ int main(int argc, char** argv) {
 
     // ---- Built v14.34: the optimized station in the flat profile -----------------------------------------------------------------------------------------
     {
-        check(edvr::flatProfileReadsKey("fix.optimized_station"), "v14.34 flat: fix.optimized_station is on the flat key list (unlisted, getString answers off and the station never starts)");
+        check(edvr::flatProfileReadsKey("fix.optimized_stations"), "v14.34 flat: fix.optimized_stations is on the flat key list (unlisted, getString answers off and the station never starts)");
         check(!edvr::flatProfileReadsKey("fix.optimized_station_x") && !edvr::flatProfileReadsKey("fix.supercruise_dust") && !edvr::flatProfileReadsKey("fix.fss_mode_latch"),
               "v14.34 flat: only that key was added (a near name and other fixes stay off the list)");
-        check(edvr::flatPageHasRow("fix", "optimized_station"), "v14.34 flat: the F8 flat page has the Optimized station row");
+        check(edvr::flatPageHasRow("fix", "optimized_stations"), "v14.34 flat: the F8 flat page has the Optimized station row");
         const edvr::FlatPageRow* refused = edvr::flatPageFirstRefused([](const char* k) { return edvr::flatProfileReadsKey(k); });
         check(refused == nullptr, "v14.34 flat: every row of the flat page, the new one included, passes the flat key list");
         // the flat camera source: no temporal-pass rows and no explorer cam, so the position is the render context's view 0 origin

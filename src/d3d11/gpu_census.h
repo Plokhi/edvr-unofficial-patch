@@ -87,8 +87,8 @@ enum class GpuCensusSection : uint8_t {
     AlteredPoolFamily,        // a pool-family draw with EDVR's MRT6 slot target bound and its shaders substituted
     AlteredUiLayer,           // a UI draw redirected into EDVR's UI layer target (fix.ui_quality)
     AlteredHdrHud,            // a HUD draw moved into the HDR HUD layer (fix.ui_quality's crisp HUD, the layer at 4032^2): the game's shading
-                              // at the layer's size, timed by the route's moved-draw timer (ui_layer.cpp routeBegin/routeEnd). TEMPORARY with
-                              // g_hdrDrawTimingOn, which is on for the 2026-10-13 measurement build.
+                              // at the layer's size, timed by the route's moved-draw timer (ui_layer.cpp routeBegin/routeEnd). Only while
+                              // g_hdrDrawTimingOn is on (off since 2026-10-14; it was on for the 2026-10-13 measurement build).
     // A draw wrapped in another fix's state change (RemLok, the loading hologram, scrim,
     // particles, the panel ...): ONE SECTION PER FIX, kAlteredFixCount of them, in AlteredFix's
     // order. They share ONE turn in the rotation (the first owns it, turnOwnerOf), one K and one

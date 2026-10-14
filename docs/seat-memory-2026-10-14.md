@@ -5,12 +5,13 @@ the arc's status, the log lines the build writes, and the flight checklist.
 
 ## Status
 
-- State: BUILT on `claude/seat-memory` (off `claude/flight-2026-10-14`), NOT FLOWN, not merged. Instruments and behaviour ship together;
-  `advanced.cockpit_centre = game` is today's behaviour with the instruments still logging, so one install gives both halves of the A/B.
-- **Temporary flight key** (AGENTS.md: list it, propose removing it when the arc closes):
-  `advanced.cockpit_centre = keep | game`, default `keep`, VR profile only, live. Propose removing it, quoted, once the flight settles
-  which behaviour wins: the end state is `keep` as the only behaviour and no key. Not needed in the flat allow-list
-  (`src/common/flat_profile_keys.h`): the flat profile publishes no seat word, so the runtime reads game mode.
+- State: SHIPPED on `claude/flight-2026-10-14` (merged from `claude/seat-memory`), flown in part (the flight of 7116598f; see the dated
+  notes). Instruments and behaviour ship together.
+- **The flight key is RETIRED (2026-10-14, Sean: ship `keep`).** `advanced.cockpit_centre = keep | game` is deleted: no key, no ini entry, no
+  read. The seat memory is always on in the VR profile. The old behaviour no longer exists as a setting; in the log `mode=` is `keep`, or
+  `unpublished` while the graphics half has not written the word (the runtime then behaves as it always did). In the flat profile the word is
+  cleared and the runtime is inactive. The cross-DLL word keeps its "active" bit (always set), so its layout and the pure logic's inactive path
+  are unchanged; the `game_mode` decision survives only for that unpublished case and the rig.
 - **On foot is a seat (Sean, 2026-10-14: "assume for now that on foot everyone is sitting").** Game resets on foot are decided exactly as
   aboard, and disembarking is a seat transition like boarding. The rule is ONE named constant, `kOnFootIsSeated` / `onFootIsSeated()` in
   `src\openxr\seat_memory.h`, read through `seatHolds(where)` by the decision table, every transition, and the host's meter schedule.
@@ -19,11 +20,11 @@ the arc's status, the log lines the build writes, and the flight checklist.
 - **A runtime recentre is a manual recentre (Sean).** A LOCAL reference-space change (SteamVR's dashboard, Pimax Play) is always the player:
   once it has taken effect the head as it is in the new LOCAL is honoured as the seated origin and stored as the seat, aboard, on foot, in a
   window or out of one. Head untracked at that moment: LOCAL's own origin is the seat, applied when a frame allows. The compensate and
-  forget path (`poseInPreviousSpace`) is gone. In game mode nothing changes.
+  forget path (`poseInPreviousSpace`) is gone.
 - Open hypotheses (reviews\boarding-recentre-2026-10-14.md section 1): **H1** the game's reset lands while the head is standing or turned
   (seen 4.4 s before to 4.2 s after the journal Embark); **H2** most embarks (34 of 46) have no reset at all, so the origin left from the
   on-foot spawn reset is used in the cockpit; **H3** an internal game recentre with no runtime call. Discriminator: `seat_meter` at
-  `transition_2s` after a boarding in `game` mode (offset_cm, height_cm, yaw_deg far from 0 with or without a `seat_reset` near the flip).
+  `transition_2s` after a boarding (offset_cm, height_cm, yaw_deg far from 0 with or without a `seat_reset` near the flip).
 - Assumptions the first flight tests: (a) the first tracked pose at launch may be a headset on its stand, not a worn head (position repeated
   to 2 cm over 92 launches), so the seat is captured at the splash only after the head has been still for a window, and the capture's
   statistics are logged either way; (b) the 10 s transition window; (c) that seated zero is the cockpit's eye point, so a normally seated
@@ -52,7 +53,7 @@ the arc's status, the log lines the build writes, and the flight checklist.
 State kept: the seat, a position and a heading in the runtime's natural LOCAL space, per headset key (`headset_key`, runtime plus system),
 in `%LOCALAPPDATA%\EDVR\<leaf>-<store>\seat.txt` (`src\openxr\seat_store.h`; format `src\openxr\seat_memory.h`).
 
-- Start (`centreAtStartup`): stored seat present and mode keep: the seat is the origin (the same tracked-pose wait as before; no head sample
+- Start (`centreAtStartup`): stored seat present: the seat is the origin (the same tracked-pose wait as before; no head sample
   chooses the origin). Otherwise today's centre on the head.
 - Splash (`requestIntroRecentre`): seat stored and already the origin: no recentre. Seat stored but not applied: applied. None stored: sample
   the head until it has been still for 0.4 s (30+ samples, 2 cm and 4 degrees), at most 4 s; then the seat is that mean, or LOCAL's own
@@ -61,7 +62,7 @@ in `%LOCALAPPDATA%\EDVR\<leaf>-<store>\seat.txt` (`src\openxr\seat_store.h`; for
   Explorer Cam closing: the seat becomes the origin if it is not already (a 10 s window opens at each, and at a journal boundary).
   Disembarking usually finds the origin still on the seat, so it opens the window and puts nothing back. Each of these also takes back a
   recentre made in the 5 s before it (the Status block).
-- A game ResetSeatedZeroPose: game mode or unpublished, or in a menu or a load: as before, nothing remembered. Aboard or on foot, inside
+- A game ResetSeatedZeroPose: before the graphics half has spoken, or in a menu or a load: as before, nothing remembered. Aboard or on foot, inside
   a window: the stored seat replaces the head pose (nothing stored: as before). Outside a window: the player's own recentre, honoured and
   stored, but held 5 s first (it commits then, or a transition takes it back).
 - The runtime recentres LOCAL (SteamVR dashboard, Pimax Play): see the Status block; the head in the new LOCAL becomes the seat.
@@ -71,8 +72,8 @@ in `%LOCALAPPDATA%\EDVR\<leaf>-<store>\seat.txt` (`src\openxr\seat_store.h`; for
 
 ## Log lines (the runtime's `edvr_openxr_*.log`; none of them appear in a build without this code)
 
-- `seat_memory,init=1,mode=keep|game|unpublished,key=,stored=,seat=x/y/z/yawdeg,file=,file_exists=,read_ok=,records=,skipped_lines=`
-  once, at the first use. `mode=unpublished` means the graphics half has not written the word (treated as game).
+- `seat_memory,init=1,mode=keep|unpublished,key=,stored=,seat=x/y/z/yawdeg,file=,file_exists=,read_ok=,records=,skipped_lines=`
+  once, at the first use. `mode=unpublished` means the graphics half has not written the word (the old behaviour).
 - `seat_context,published=,mode=,gameplay=,seated=known/val,on_foot=known/val,camera=,seat_kind=0x,transitions=,where=aboard|on_foot|unknown`
   at every change of the word (at most 300).
 - `seat_event,why=boarded|disembarked|seated|on_foot|seated_at_start|on_foot_at_start|cockpit_changed|camera_opened|camera_closed|journal_event|left_seat|unknown_state,window_opened=,apply_wanted=,no_seat=,where=,...`
@@ -100,15 +101,15 @@ Read each log with `python tools\edvr_log.py --target <target> --expect-build HE
 Pimax OpenXR first; SteamVR/OpenXR as a second launch if time allows (the key differs, so each has its own seat).
 
 0. Install, check the build line. The first `seat_` line must be `seat_memory,init=1`; if there is none the code did not run.
-1. Launch 1, `game`: `mode=game` in `seat_memory`, `seat_start,plan=todays_centre`, `seat_reset ... decision=intro_head`; baseline for steps 4 to 6.
-2. Launch 2, `keep`, no seat file: `seat_start,plan=capture_late`, `seat_intro`/`seat_capture,state=begin` then `done`. Pass: `done` with
+1. Launch 1, no seat file: `mode=keep`, `stored=0` in `seat_memory`, `seat_start,plan=capture_late` (the start's centre is the head, as it was); the baseline comparison with the old behaviour is the earlier flights' logs.
+2. Same launch: `seat_intro`/`seat_capture,state=begin` then `done` at the splash. Pass: `done` with
    `spread_cm` under 2 and the splash in front at eye height; `seat_store,action=save,ok=1`. Record `dist_from_local_cm` and `snapped`.
    Fail: `gave_up` (the stats name why), or the splash is off.
-3. Launch 3, `keep`, seat stored: `seat_memory,init=1,...,stored=1`, `seat_start,plan=apply_seat`, `seat_reset ... decision=start_seat`,
+3. Next launch, seat stored: `seat_memory,init=1,...,stored=1`, `seat_start,plan=apply_seat`, `seat_reset ... decision=start_seat`,
    no `intro_head` line, `seat_intro,plan=skip_seat_in_place`; first `seat_meter` within 5 cm / 5 degrees when seated.
 4. Board from foot by the ramp, looking sideways; then by the interface: `seat_event,why=boarded,apply_wanted=1`, `seat_reset ... decision=transition_seat`,
    any game reset in the window `decision=replace_with_seat`; `seat_meter,when=transition_2s,where=aboard` within 5 cm and 5 degrees (offset_cm, yaw_deg),
-   height_cm within 5. Compare `game` mode's meter at the same step (H1 or H2: reset near the flip or not). Watch for the ramp's early reset:
+   height_cm within 5. Read H1 or H2 from whether a game reset sits near the flip. Watch for the ramp's early reset:
    a `seat_reset ... where=on_foot,window=0,decision=honour_store` just before the flip is now held: `seat_store,action=defer`, then at the flip
    `seat_store,action=discard_pending,why=transition_within_5s,age_ms=` (2000 to 5000) and the apply `seat_reset ... decision=replace_with_seat,retro=1`.
    Pass: the seat in `seat_meter` after the boarding is the stored one, and no `action=save,why=manual_reset` for that reset.

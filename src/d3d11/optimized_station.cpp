@@ -1,4 +1,4 @@
-// The optimized station (fix.optimized_station): inside a station, skip rendering what cannot be seen. While the ship sits in a sealed hangar
+// The optimized station (fix.optimized_stations): inside a station, skip rendering what cannot be seen. While the ship sits in a sealed hangar
 // (docked, the pad lowered and still, the hatch closed), everything outside the hangar is skipped, including the sun's light that leaks into it.
 // The rules and their geometry are in optimized_station_core.h. The seal, the release and the status lines are here. The engine hooks it uses:
 // store_hook.cpp (the store's record judgement, path A), kinematic_eval_hook.cpp (the producer-B and rig vetoes), vscreen.cpp (the sun pair).
@@ -1149,7 +1149,7 @@ bool cullCounted(uintptr_t record, bool containing) noexcept {
     return false;
 }
 // ---- The product's state: the setting, the seal, the release, the window counts ----------------------------------------------------------------
-std::atomic<bool> g_setting{false};        // fix.optimized_station is on (read at install and every kSettingPollFrames frames)
+std::atomic<bool> g_setting{false};        // fix.optimized_stations is on (read at install and every kSettingPollFrames frames)
 bool g_vetoesAttached = false;             // the producer and rig vetoes are attached (under g_installMutex-free single writer: the render tick)
 bool g_storeWanted = false;                // the store observer is wanted (the setting is on)
 std::atomic<bool> g_dockedNow{false};     // Status.json Flags bit 0 (Docked), read at each tick while known (the store thread reads it)
@@ -2314,14 +2314,14 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
 
 // ---- The engine's entry points (declared in optimized_station.h) -------------------------------------------------------------------------
 
-// Once, at install: reads fix.optimized_station (on in VR, off in flat; the flat profile does not read it).
+// Once, at install: reads fix.optimized_stations (on in VR, off in flat; the flat profile does not read it).
 void optimizedStationInstall(bool flatProfile) {
-    const std::string text = Config::get().getString("fix.optimized_station", "on");
+    const std::string text = Config::get().getString("fix.optimized_stations", "on");
     const bool on = text != "off";
     g_setting.store(on, std::memory_order_release);
     g_summaryStartMs = GetTickCount64();
     if (on) applySetting(true, 0);
-    Log::get().note("optimized station: fix.optimized_station = %s (%s).", on ? "on" : "off",
+    Log::get().note("optimized station: fix.optimized_stations = %s (%s).", on ? "on" : "off",
                     flatProfile ? "flat profile" : "VR profile");
 }
 
@@ -2470,7 +2470,7 @@ void optimizedStationFrame(uint32_t frame) {
 void optimizedStationFrameBody(uint32_t frame) {
     if (++g_settingPoll >= kSettingPollFrames) {
         g_settingPoll = 0;
-        const std::string text = Config::get().getString("fix.optimized_station", "on");   // on in VR and in flat (built v14.34)
+        const std::string text = Config::get().getString("fix.optimized_stations", "on");   // on in VR and in flat (built v14.34)
         const bool on = text != "off";
         if (on != g_setting.load(std::memory_order_acquire)) {
             g_setting.store(on, std::memory_order_release);

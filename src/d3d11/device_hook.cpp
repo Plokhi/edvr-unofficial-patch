@@ -43,7 +43,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "../common/hotkey.h"
 #include "fss_res.h"
 #include "journal_watch.h"
-#include "optimized_station.h"   // fix.optimized_station: the sealed-hangar station (install, the frame tick, the store and the sun skip)
+#include "optimized_station.h"   // fix.optimized_stations: the sealed-hangar station (install, the frame tick, the store and the sun skip)
 #include "explorer_cam.h"   // explorerCamFrameBoundary (the frame tick) and explorerCamShutdown (the avatar dither-fade global goes back at an unload)
 #include "ui_surfaces.h"   // the glyph atlas and sizing chain instruments
 #include "ui_panel_scale.h" // uiPanelScaleShutdown: the panel operands put back
@@ -2197,20 +2197,18 @@ State& ensureState() {
 
 }  // namespace
 
-// advanced.cockpit_centre and the commander's seat, for the runtime's seat memory (src/openxr/seat_memory.h). VR profile only; in the flat profile
-// the word is cleared to "nobody has written". Called at the first export call (so the runtime's start-up finds the setting, before any frame) and
-// from the journal's tick every frame; the setting is re-read every 30th call, the rest is a few atomic loads and one compare.
+// The commander's seat, for the runtime's seat memory (src/openxr/seat_memory.h), which is always on in the VR profile (the setting
+// advanced.cockpit_centre was retired 2026-10-14: keep shipped). In the flat profile the word is cleared to "nobody has written", which the
+// runtime reads as inactive. Called at the first export call (so the runtime's start-up finds it before any frame) and from the journal's tick
+// every frame: a few atomic loads and one compare.
 void seatContextPublish() {
     static uint32_t published = 0;
     static bool wrote = false;
-    static bool keep = true;
-    static uint32_t calls = 0;
     uint32_t word = 0;
     if (!runtimeFlatProfile()) {
-        if ((calls++ % 30u) == 0u) keep = Config::get().getString("advanced.cockpit_centre", "keep") != "game";
         SeatContext c;
         c.published = true;
-        c.keep = keep;
+        c.keep = true;     // the word's "active" bit; always set by this build
         c.gameplay = journalGameplay();
         c.seatedKnown = journalSeatedKnown();
         c.seated = c.seatedKnown && journalSeated();
@@ -2956,7 +2954,7 @@ void hookDevice(ID3D11Device* device) {
             // The terrain cull cover (terrain_cull_cover_hook.cpp; docs/terrain-culling.md): a CodeHook on the game's cull-plane builder, always on for a scope with VR (the flat
             // profile passes through per call). A build that is not 332841 is scanned for the call site; anything short of one match is one log line and nothing patched.
             terrainCullCoverInstall(!runtimeScopeIncludesVr());
-            // The optimized station (optimized_station.cpp): reads fix.optimized_station; its hooks attach while it is on (VR by default; flat off).
+            // The optimized station (optimized_station.cpp): reads fix.optimized_stations; its hooks attach while it is on (VR by default; flat off).
             optimizedStationInstall(runtimeFlatProfile());
             // The blend probe (TEMPORARY, blend_probe.cpp): armed by key only; nothing is observed until then. One line: whether the key is bound.
             blendProbeInstall(runtimeFlatProfile(), g_state->blendProbeKey.bound(), g_state->blendProbeKeyText.c_str());
