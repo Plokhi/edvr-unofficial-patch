@@ -293,7 +293,7 @@ so the rule cannot drift by accident.
 
 **Every row says when it takes effect.** Most settings are live — EDVR re-reads
 `edvr.ini` about once a second — and those that are not are marked *restart the
-game*: at present `share_exposure`, `openxr_resolution`,
+game*: at present `openxr_resolution`,
 and the two `vscreen_res_*` sizes. That fact is not a fourth list either: it
 comes from what the comment block in `edvr.ini` already says ("Live." or the
 sentence naming a restart), and a setting whose prose says neither fails the

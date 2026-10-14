@@ -1,4 +1,4 @@
-// Test rig for the exposure engine path (src/d3d11/exposure_chain.h, fix.share_exposure).
+// Test rig for the exposure engine path (src/d3d11/exposure_chain.h, the always-on exposure sharing).
 //
 // Three parts:
 //   1. The decision: which dispatches of the second eye's chain are skipped, when the engine engages, and every way it declines, falls back or
@@ -131,7 +131,7 @@ void testLearningAndSkip() {
 
 void testDeclines() {
     std::printf("decision: declines\n");
-    {   // fix.share_exposure off, or the fix rejected itself: stock
+    {   // the flat profile, or the fix rejected itself: stock
         ec::Chain c;
         for (int i = 0; i < 30; ++i) {
             const Frame fr = runFrame(c, false, true);
@@ -762,12 +762,11 @@ void testSourcePins(const std::string& root) {
     check(find(ex, "slot < exposurechain::kShareSlots") != std::string::npos, "the copy covers all five slots");
     check(find(ex, "g_state->uav[slot] = uavs[i];") != std::string::npos && find(ex, "for (void*& v : g_state->uav) v = nullptr;") != std::string::npos,
           "the UAV mirror follows the bind calls and ClearState");
-    check(countOf(ex, "getBool(\"fix.share_exposure\"") == 1, "fix.share_exposure is read exactly once, at install (restart-only)");
-    const size_t conf = find(ex, "void exposureConfigure(Config& cfg)");
-    const size_t confEnd = find(ex, "void registerShaderHash(", conf);
-    const size_t reread = find(ex, "share_exposure", conf);
-    check(conf != std::string::npos && confEnd != std::string::npos && (reread == std::string::npos || reread > confEnd),
-          "the live reload (exposureConfigure) never re-reads it");
+    check(find(ex, "share_exposure\"") == std::string::npos, "no source reads a share_exposure setting: the sharing is always on in VR");
+    check(find(ex, "g_state->enabled = !runtimeFlatProfile();") != std::string::npos,
+          "enabled is the VR profile and nothing else (flat never had it: its allow-list never listed the old key)");
+    check(countOf(ex, "enabled = !runtimeFlatProfile()") == 1 && countOf(ex, "enabled = true") == 0 && countOf(ex, "enabled = !") == 1,
+          "...and nothing else ever turns it on or flips it (no toggle)");
     check(find(ex, "copyMask") == std::string::npos && find(ex, "copyBtoA") == std::string::npos, "the old copy configuration is gone");
     check(find(ex, "share exposure: eye-1 chain skipped %llu dispatches (saved ~%.0f ms by the census), fallbacks %llu") != std::string::npos,
           "the 30 s line has the agreed words");
@@ -778,9 +777,8 @@ void testSourcePins(const std::string& root) {
     check(find(dh, "toggle_exposure") == std::string::npos && find(dh, "toggleKey") == std::string::npos, "device_hook no longer registers a toggle key");
     check(find(ini, "toggle_exposure") == std::string::npos, "the ini template no longer has the key");
     check(find(ini, "Scroll Lock hotkey") == std::string::npos, "...nor the comment that promised the hotkey");
-    const size_t shareKey = find(ini, "\nshare_exposure = 1");
-    check(shareKey != std::string::npos && find(ini, "needs a game restart", shareKey > 600 ? shareKey - 600 : 0) < shareKey,
-          "share_exposure is still shipped on, and its comment says a restart is needed");
+    check(find(ini, "share_exposure") == std::string::npos && find(ini, "Both eyes share one brightness") == std::string::npos,
+          "the retired setting, its comment and its menu row are gone from the template");
 }
 
 }  // namespace

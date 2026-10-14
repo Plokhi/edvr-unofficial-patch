@@ -4,20 +4,26 @@
 
 ## Status
 
-*Updated 2026-10-13. Branch `claude/exposure-engine`.*
+*Updated 2026-10-14. Branch `claude/retire-share-exposure`.*
 
-**State.** The engine path is BUILT, NOT FLOWN. With `fix.share_exposure` on, the
+**State.** The engine path is FLOWN CLEAN and the setting is RETIRED. In VR the
 second eye's two exposure dispatches (the bounds pass and the exposure shader) are
-not sent to the GPU; eye 0's result is copied into eye 1's five UAVs at the point
-where the second exposure dispatch would have run. The trace, the code and the
-tests are in "The engine path (2026-10-13)" at the end of this file. The Scroll
-Lock toggle (`hotkey.toggle_exposure`) is removed: `fix.share_exposure` is read
-at startup and a change needs a restart (the F8 menu row says so).
+not sent to the GPU, always; eye 0's result is copied into eye 1's five UAVs at the
+point where the second exposure dispatch would have run. The trace, the code and the
+tests are in "The engine path (2026-10-13)" at the end of this file. The Scroll Lock
+toggle (`hotkey.toggle_exposure`) went 2026-10-13.
 
-**Temporary key, to be retired.** `fix.share_exposure` ("Both eyes share one
-brightness", `share_exposure = 1`) goes after the flight confirms the engine
-path: the behaviour ships always on and the key is removed, quoted, the way the
-terrain cull cover's was. Nothing else about it changes until then.
+**Retired 2026-10-14: `fix.share_exposure`** (`share_exposure = 1` in `[fix]`, "Both
+eyes share one brightness"; 1 on, 0 off, read at startup; F8 menu row, restart).
+Flight evidence, build 57f5393e (`claude/flight-2026-10-14`), 19 min: the second
+eye's chain skipped at 2.00 a frame, 175,018 dispatches cumulative, 0 fallbacks, no
+stood-down, and both eyes matched near a star. The key, its template block, its menu
+row and its off-is-stock path are gone, the way the terrain cull cover's were. The
+fail-safe stays, because it is behaviour: a chain whose shape does not match what
+the engine path expects runs whole, then the copy. A stale `share_exposure =` line
+in someone's ini is harmless (config audit, once). Flat never read it: its key
+allow-list never listed it, so `getBool` answered false there and the flat dispatch
+hook returns before the exposure code runs. Flat is unchanged.
 
 **Open (each has a log signature in the flight check at the end).**
 - Readers of eye 1's `u0`, `u2`-`u4` and strip texels 1-5 other than the copy are
@@ -26,8 +32,7 @@ terrain cull cover's was. Nothing else about it changes until then.
 - The exposure shader must bind exactly UAV slots 0-4 when it runs. If the game
   leaves a stale UAV in slots 5-7 the engine never engages and says so after 300
   frames (`the exposure shader does not bind exactly UAV slots 0-4`).
-- The saving in the 30 s line is the 2026-10-13 pass-profile figure times the
-  count, not a live measurement. The live check is the frame GPU time.
+- The 30 s line's saving is the 2026-10-13 pass-profile figure times the count.
 
 **Ruled out.**
 - ruled out: re-pointing eye 1's consumers at eye 0's strip (a binding
@@ -40,13 +45,11 @@ terrain cull cover's was. Nothing else about it changes until then.
 - ruled out: eye 1's adaptation history needing its own coverage. The only history
   in the chain is strip texel 0, read and written by the exposure shader, and the
   old copy already overwrote it with eye 0's every frame.
-- ruled out: a live toggle. Bringing the second chain back mid-session would mean
-  re-seeding history; the request dropped the toggle instead.
+- ruled out: a live toggle, because bringing the second chain back mid-session
+  means re-seeding history; the toggle and then the setting were dropped instead.
 
-**Next flight.** Build with this branch, fly to a star with the eyes apart, read
-the log with `python tools\edvr_log.py --target steam --expect-build HEAD --grep
-"share exposure"`: the `engaged` line, then the 30 s lines with `fallbacks 0`.
-Compare the frame GPU time with and without (`fix.share_exposure = 0`, restart).
+**Next flight.** None needed. `edvr_log.py --grep "share exposure"` shows the
+`engaged` line and the 30 s lines (`fallbacks` stays 0), or one line naming a reason.
 
 A write-up of what causes the per-eye brightness difference in VR, how it was
 measured, and what a fix inside the game would be. Written for whoever might fix
@@ -173,8 +176,8 @@ Measured with a live toggle (since removed), on held poses (within 0.024 m and 3
 | Fix on | **−0.170** and **−0.610 stops** |
 
 The measurement above was taken with a Scroll Lock toggle that existed until
-2026-10-13. The setting is now read at startup; to compare against stock, set
-`fix.share_exposure = 0` and restart.
+2026-10-13. There is no switch now (the setting was retired 2026-10-14); stock is
+what an older build does.
 
 The pass is identified by **what it does** — the shader that writes the exposure
 parameters, found by its read/write magnitudes and confirmed by its disassembly —
@@ -281,12 +284,12 @@ second chain is always safe: the copy lands after it, as in stock.
 
 ### Toggle and reload
 
-`share_exposure` is read once, at install (`exposure_fix.cpp:1141`); `exposureConfigure`
-does not read it. The F8 menu row is flagged "restart" from the ini comment's own
-words, so a menu change takes effect on the next launch. A stale `toggle_exposure =`
-line in a user's ini is harmless: the build's config audit names it once in the log
-("lines name settings this build does not read"), nothing reads it, and the
-installer's merge carries a changed value to the end of its section with a note.
+Until 2026-10-14 `share_exposure` was read once, at install, and the F8 row was
+flagged restart. It is retired: `enabled` is now `!runtimeFlatProfile()`, set once at
+install. A stale `toggle_exposure =` or `share_exposure =` line in a user's ini is
+harmless: the build's config audit names it once in the log ("lines name settings
+this build does not read"), nothing reads it, and the installer's merge carries a
+changed value to the end of its section with a note.
 
 ### Tests (all in the build gate)
 

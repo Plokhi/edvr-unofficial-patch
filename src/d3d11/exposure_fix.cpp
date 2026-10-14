@@ -121,8 +121,9 @@ struct State {
     uint32_t thunkHits[kHitCount] = {};
     uint8_t  quietPasses[kHitCount] = {};
 
-    // fix.share_exposure, read ONCE at install (restart-only: the live Scroll Lock toggle was removed 2026-10-13, and exposureConfigure never
-    // re-reads it). Off is stock: both chains run and nothing is copied.
+    // Both eyes share one exposure in the VR profile, always: the setting that switched it off was retired 2026-10-14 after the engine path
+    // flew clean (docs/eye-brightness.md). Set once at install; false only in the flat profile, which has one eye and never shared (the flat
+    // key allow-list never listed the old setting, so it read false there). False is stock: both chains run and nothing is copied.
     bool     enabled = false;
     uint64_t targetHash = 0;      // pinned by config, or learned by detection
     bool     pinned = false;      // true if the hash came from config
@@ -383,7 +384,7 @@ uint32_t shareExposure(ID3D11DeviceContext* ctx, ID3D11UnorderedAccessView* cons
 }
 
 // One damping step, run right after the second eye's dispatch with the
-// pass's UAVs still bound and share_exposure's copy already landed:
+// pass's UAVs still bound and the share copy already landed:
 // queue this frame's strip readback, consume last frame's, filter, and
 // write the damped strip over both eyes' copies -- after the passes,
 // before the tonemaps at frame end that read it.
@@ -802,7 +803,7 @@ void STDMETHODCALLTYPE hookedDispatch(ID3D11DeviceContext* self, UINT x, UINT y,
     // there is nothing to keep alive separately.
     //
     // The engine path's decision is made in the same guarded region, from the same hash: the facts are the shader's content hash, whether it is
-    // the exposure shader, and the UAV slots as the game bound them. One lookup per dispatch, as before. Off (fix.share_exposure = 0, or the fix
+    // the exposure shader, and the UAV slots as the game bound them. One lookup per dispatch, as before. Off (the flat profile, or the fix
     // rejected itself) costs one branch and the chain is never consulted.
     bool isTarget = false;
     exposurechain::Decision dec;
@@ -1138,9 +1139,10 @@ void installExposureFix(ID3D11Device* device, HookMode mode) {
         g_state->targetHash = strtoull(hashText.c_str(), nullptr, 16);
         g_state->pinned = g_state->targetHash != 0;
     }
-    // Read here and nowhere else: a change needs a restart (the F8 menu row says so), and there is no live toggle -- the Scroll Lock key was
-    // removed 2026-10-13 with the engine path, because a live off would have to bring the second eye's chain back mid-session.
-    g_state->enabled = cfg.getBool("fix.share_exposure", true);
+    // Always on in VR, no setting and no live toggle (the Scroll Lock key went 2026-10-13, the setting 2026-10-14). The flat profile keeps what it
+    // always had: the old setting was not on its key allow-list, so Config::getBool answered false for it there, and the flat dispatch hook
+    // returns before any of this runs.
+    g_state->enabled = !runtimeFlatProfile();
 
     State& s = *g_state;
     s.ownerCtx = ctx;

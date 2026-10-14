@@ -1,4 +1,4 @@
-// The pure half of fix.share_exposure's engine path: which of the second eye's exposure dispatches are NOT sent to the GPU. No D3D, no game, no
+// The pure half of the exposure sharing's engine path: which of the second eye's exposure dispatches are NOT sent to the GPU. No D3D, no game, no
 // logging -- exposure_fix.cpp owns the hooks and the copy and feeds this one the facts of each compute dispatch; tools/exposure_chain_test drives it.
 //
 // WHAT THE CHAIN IS (disassembly of the two compute shaders, docs/eye-brightness.md "The engine path", 2026-10-13). Per eye, in this order:
@@ -44,7 +44,7 @@ enum class Action : uint8_t { Run, Skip };
 // Why the engine is not (or no longer) skipping. Each is said once by the caller.
 enum class Why : uint8_t {
     None = 0,            // engaged, or still learning
-    Disabled,            // fix.share_exposure is off (or the fix rejected itself): stock, both chains run
+    Disabled,            // not the VR profile, or the fix rejected itself: stock, both chains run
     Learning,            // not yet kLearnEyes whole chains
     TargetShape,         // the exposure shader does not bind exactly u0-u4
     NoPredecessor,       // the dispatch before the exposure shader does not share its u0
@@ -57,7 +57,7 @@ enum class Why : uint8_t {
 inline const char* whyText(Why w) {
     switch (w) {
         case Why::None:              return "engaged or counting";
-        case Why::Disabled:          return "fix.share_exposure is off or the fix rejected itself";
+        case Why::Disabled:          return "not the VR profile, or the fix rejected itself";
         case Why::Learning:          return "still learning the chain";
         case Why::TargetShape:       return "the exposure shader does not bind exactly UAV slots 0-4";
         case Why::NoPredecessor:     return "the dispatch before the exposure shader (or its u0) is not as learned";

@@ -31,7 +31,7 @@ brightness separately per eye, so near a star or a floodlight one eye stops down
 and the other does not. EDVR copies one eye's exposure into both. Measured at a
 held view of a star: about **1.5 stops** apart without it, **0.4** with — and
 what remains is the glow in the eye that can actually see the star, which is
-correct. `fix.share_exposure = 1` (on). *[eye-brightness.md](eye-brightness.md).*
+correct. Always on in VR, with no setting. *[eye-brightness.md](eye-brightness.md).*
 
 **The planet you are scanning going black in one eye.** In the surface and
 system scanners the body renders as a featureless black disc in the right eye

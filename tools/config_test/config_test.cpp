@@ -1143,6 +1143,9 @@ static const char* const kRetiredExactKeys[] = {
     // sources and the shipped file; a user's old line is carried over by the installer under "no longer used by this version", never read by the DLL, and
     // named in the log by the config audit as a line this build does not read.
     "fix.transition_flash",
+    // fix.share_exposure, removed 2026-10-14: both eyes always share one exposure in the VR profile (docs/eye-brightness.md). The flat profile never read it
+    // (its key allow-list never listed it), so nothing changed there.
+    "fix.share_exposure",
 };
 static const int kRetiredExactKeyCount = int(sizeof(kRetiredExactKeys) / sizeof(kRetiredExactKeys[0]));
 
@@ -1210,7 +1213,7 @@ static void retiredKeyScan(const std::wstring& root) {
         bool foundAll = true, passedAll = true;
         for (const std::string& t : retired) foundAll = foundAll && spellsRetiredKey(t) != nullptr && std::strcmp(spellsRetiredKey(t), kRetiredExactKeys[0]) == 0;
         for (const std::string& t : liveKeys) passedAll = passedAll && spellsRetiredKey(t) == nullptr;
-        if (foundAll && passedAll && kRetiredExactKeyCount == 4)
+        if (foundAll && passedAll && kRetiredExactKeyCount == 5)
             ok("the exact-name scan finds fix.explorer_cam in a read, a message, a comment and at the end of a sentence, and passes hotkey.explorer_cam, "
                "fix.explorer_cam_eye_*, the trims and the smoothing beside it");
         else
@@ -1582,11 +1585,13 @@ int main(int argc, char** argv) {
     // and its key retired 2026-09-24; the whole shading-rate feature, keys
     // and all, was removed 2026-09-29.
     expectStr("experimental.foveation_centre", "<unset>", "the retired foveation centre key is absent");
-    expectBool("fix.share_exposure", true, "a key in the first [fix] reads");
-    expectBool("fix.weapon_stability", true, "...and another beside it");
+    expectBool("fix.weapon_stability", true, "a key in the first [fix] reads");
+    // fix.share_exposure, retired 2026-10-14: both eyes always share one exposure in VR. Held out of the sources and the shipped file by
+    // kRetiredExactKeys; a stale line in a user's ini is carried over by the installer and named once by the config audit.
+    expectStr("fix.share_exposure", "<unset>", "the retired exposure-sharing key is absent from the template");
     expectStr("hotkey.dump_camera", "PAUSE",
               "a key in the first [hotkey] reads");
-    // The brightness fix's Scroll Lock toggle was removed 2026-10-13 (share_exposure is read at startup only).
+    // The brightness fix's Scroll Lock toggle was removed 2026-10-13.
     expectStr("hotkey.toggle_exposure", "<unset>", "the retired brightness-toggle key is absent from the template");
     // The eye-run depth instrument ships as a commented template like the
     // other developer instruments: the compiled default is what a user gets.
@@ -1779,7 +1784,7 @@ int main(int argc, char** argv) {
             "\xEF\xBB\xBF"          // BOM: the byte that used to eat [fix]
             "[fix]\r\n"
             "black_void = 1  # trailing comment, not part of the value\r\n"
-            "share_exposure = YES\r\n"
+            "fixture_flag = YES\r\n"
             "panel_distance = 2.5   ; semicolon comment\r\n"
             "[d3d11]\r\n"
             "inventory = no\r\n"
@@ -1799,7 +1804,7 @@ int main(int argc, char** argv) {
             fail("scratch ini", "could not write it");
         } else {
             Config::get().init(scratch);
-            expectBool("fix.share_exposure", true, "getBool accepts YES");
+            expectBool("fix.fixture_flag", true, "getBool accepts YES");
             expectBool("d3d11.inventory", false, "...and no");
             expectFloat("fix.panel_distance", 2.5f, "a ; comment is not part of the value");
             expectInt("fix.fixture_value", 3,
