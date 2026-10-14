@@ -38,7 +38,6 @@ def configuration(mode: str, probe: str, directory: Path, *, log: bool = False, 
 black_void = 0
 panel_distance = 1
 temporal_aa = off
-share_exposure = 0
 [advanced]
 app_gpu_timing = 0
 panel_hooks_always = 0

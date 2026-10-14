@@ -238,8 +238,7 @@ mouse still do. Every change is written to `edvr.ini` and applies the way a
 hand edit would, and a row that only takes effect at the next launch says so.
 
 EDVR's own keys have a page of their own, **Hotkeys**: the menu key, Explorer
-Cam's key (clear it and Explorer Cam is off), the brightness-fix key and the
-camera-history key. Pick a row, press Enter, then press the key you want, with
+Cam's key (clear it and Explorer Cam is off) and the camera-history key. Pick a row, press Enter, then press the key you want, with
 Ctrl, Shift or Alt for a chord, a gamepad button, or a button or hat on your
 HOTAS. Escape cancels and Delete clears (the menu key can be changed but never
 cleared from the menu). A choice that Elite also binds is flagged "also in

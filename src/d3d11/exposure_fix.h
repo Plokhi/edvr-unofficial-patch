@@ -14,9 +14,10 @@
 // what the copy then overwrote. Both eyes tonemap identically.
 //
 // Nothing is patched and nothing in the game is modified. The copy is a
-// Direct3D call this DLL makes on its own behalf. fix.share_exposure is read
-// at startup; off is stock (both chains run, nothing copied), and there is no
-// live toggle.
+// Direct3D call this DLL makes on its own behalf. It is always on in VR (the
+// setting that switched it off was retired 2026-10-14) and there is no toggle;
+// a chain whose shape does not match what the engine path expects runs whole,
+// then the copy, which is behaviour and not a switch.
 #pragma once
 
 #include <d3d11.h>

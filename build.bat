@@ -2172,7 +2172,7 @@ exit /b 0
 
 :rig_exposure_chain_test
 echo [edvr] === exposure_chain_test.exe ===
-REM The exposure engine path (src\d3d11\exposure_chain.h, fix.share_exposure): the pure decision (learning, the second-eye skip, every decline,
+REM The exposure engine path (src\d3d11\exposure_chain.h, the always-on exposure sharing): the pure decision (learning, the second-eye skip, every decline,
 REM fallback and latch), three pipelines of stand-in chain shaders on a WARP device with the debug layer (stock, the old share copy, the engine
 REM path: eye 0 and eye 1 must come out bit-identical frame by frame through engaging, a lost confirmation and a stand-down), and source pins on
 REM the hook's glue and on the removal of the Scroll Lock toggle. No DLL, no game, no window.
