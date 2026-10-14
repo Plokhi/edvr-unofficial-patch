@@ -50,6 +50,7 @@
 
 #include "../../src/common/config.h"
 #include "../../src/common/ini_name.h"
+#include "../../src/common/real_dll_choice.h"
 #include "../../src/common/runtime_profile.h"
 #include "../../src/common/temporal_mode.h"
 #include "../../src/common/log.h"
@@ -1009,6 +1010,71 @@ static void collectSources(const std::wstring& dir, const std::wstring& relative
             out->push_back(rel);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
+}
+
+// advanced.real_dll is one value for the install, kept in the shared file and read by both profiles
+// (src/common/real_dll_choice.h): the flat file's own value wins, `none` there turns the chain off for flat,
+// and otherwise the shared file's applies. The decision is a pure function of the two values and the
+// profile; held here on every row, with the log line each one writes, word for word.
+static void realDllChoiceCases(const std::wstring& root) {
+    struct Row {
+        const char* what;
+        bool flat;
+        const char* flatValue;
+        const char* sharedValue;
+        RealDllSource source;
+        const char* chains;   // the file name chained through, "" for none
+        const char* line;     // the log line, "" for no line
+    };
+    const Row rows[] = {
+        {"flat: the flat file names a mod, the shared file too: the flat override", true, "d3d11_reshade.dll", "d3d11_edhm.dll",
+         RealDllSource::FlatOverride, "d3d11_reshade.dll", "real dll: d3d11_reshade.dll (from edvr-flat.ini, the flat override)"},
+        {"flat: the flat file names a mod, the shared one nothing: the old layout, honoured", true, "d3d11_edhm.dll", "",
+         RealDllSource::FlatLegacy, "d3d11_edhm.dll",
+         "real dll: d3d11_edhm.dll (from edvr-flat.ini; the installer will move it to edvr.ini)"},
+        {"flat: the flat file says none: no chain for flat, the shared value or not", true, "none", "d3d11_edhm.dll",
+         RealDllSource::DisabledByFlat, "", "real dll: none: chain disabled for the flat profile by edvr-flat.ini"},
+        {"flat: none in any case, with blanks around it", true, "  NoNe ", "d3d11_edhm.dll", RealDllSource::DisabledByFlat, "",
+         "real dll: none: chain disabled for the flat profile by edvr-flat.ini"},
+        {"flat: the flat file empty: the shared value applies", true, "", "d3d11_edhm.dll", RealDllSource::Shared, "d3d11_edhm.dll",
+         "real dll: d3d11_edhm.dll (from edvr.ini, shared)"},
+        {"flat: neither names a mod: nothing to chain, nothing to say", true, "", "", RealDllSource::NoneSet, "", ""},
+        {"flat: the shared file says none, the flat file nothing: no chain", true, "", "none", RealDllSource::DisabledByShared, "",
+         "real dll: none: chain disabled for the flat profile by edvr.ini"},
+        {"flat: the shared file says none, the flat file names a mod: that override applies", true, "d3d11_edhm.dll", "none",
+         RealDllSource::FlatOverride, "d3d11_edhm.dll", "real dll: d3d11_edhm.dll (from edvr-flat.ini, the flat override)"},
+        {"VR: the shared value applies", false, "", "d3d11_edhm.dll", RealDllSource::Shared, "d3d11_edhm.dll",
+         "real dll: d3d11_edhm.dll (from edvr.ini, shared)"},
+        {"VR: a value only in the flat file is not VR's: no chain (the installer moves it)", false, "d3d11_edhm.dll", "",
+         RealDllSource::NoneSet, "", ""},
+        {"VR: the flat file's none or override changes nothing for VR", false, "none", "d3d11_edhm.dll", RealDllSource::Shared,
+         "d3d11_edhm.dll", "real dll: d3d11_edhm.dll (from edvr.ini, shared)"},
+        {"VR: the shared file says none", false, "", "none", RealDllSource::DisabledByShared, "",
+         "real dll: none: chain disabled for the VR profile by edvr.ini"},
+        {"VR: neither names a mod", false, "", "", RealDllSource::NoneSet, "", ""},
+    };
+    int bad = 0;
+    for (const Row& r : rows) {
+        const RealDllChoice c = chooseRealDll(r.flat, r.flatValue, r.sharedValue);
+        const std::string line = realDllLogLine(c, r.flat, kIniNameVr, kIniNameFlat);
+        if (c.source != r.source || c.value != r.chains || line != r.line) {
+            ++bad;
+            fail(r.what, "chose source " + std::to_string(static_cast<int>(c.source)) + ", chain \"" + c.value + "\", line \"" +
+                             line + "\"");
+        }
+    }
+    if (!bad) ok("advanced.real_dll resolves from the flat file's own value, else the shared file's, and logs the file that supplied it");
+
+    // The shipped edvr.ini says what the rule is, in the comment above the key: both profiles, and the flat override.
+    const std::string ini = readRepoFile(root, L"edvr.ini");
+    const size_t key = ini.find("\nreal_dll =");
+    const size_t above = key == std::string::npos ? std::string::npos : ini.rfind("\n\n", key - 1);
+    const std::string comment = above == std::string::npos ? std::string() : ini.substr(above, key - above);
+    if (comment.find("both") != std::string::npos && comment.find("edvr-flat.ini") != std::string::npos &&
+        comment.find("none") != std::string::npos)
+        ok("the shipped edvr.ini's real_dll comment says it applies to both profiles and what edvr-flat.ini can do with it");
+    else
+        fail("the shipped edvr.ini's real_dll comment", "it must say both profiles, edvr-flat.ini and none; got: " + comment);
 }
 
 static void iniNameScan(const std::wstring& root) {
@@ -2286,6 +2352,7 @@ int main(int argc, char** argv) {
     // Before the profile cases below: those switch g_runtimeProfile to flat and
     // invalid, under which these scratch keys would read as suppressed.
     iniNameScan(dir);
+    realDllChoiceCases(dir);
     retiredKeyScan(dir);
     if (argc >= 3) {
         const std::wstring scratch = widen(argv[2]);
