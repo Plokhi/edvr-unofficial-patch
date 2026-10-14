@@ -1554,8 +1554,10 @@ int main(int argc, char** argv) {
     expectStr("experimental.foveation_centre", "<unset>", "the retired foveation centre key is absent");
     expectBool("fix.share_exposure", true, "a key in the first [fix] reads");
     expectBool("fix.transition_flash", true, "...and another beside it");
-    expectStr("hotkey.toggle_exposure", "SCROLLLOCK",
+    expectStr("hotkey.dump_camera", "PAUSE",
               "a key in the first [hotkey] reads");
+    // The brightness fix's Scroll Lock toggle was removed 2026-10-13 (share_exposure is read at startup only).
+    expectStr("hotkey.toggle_exposure", "<unset>", "the retired brightness-toggle key is absent from the template");
     // The eye-run depth instrument ships as a commented template like the
     // other developer instruments: the compiled default is what a user gets.
     if (Config::get().getBool("advanced.eye_depth_capture", false) == false &&
@@ -2345,7 +2347,7 @@ int main(int argc, char** argv) {
     // says: no error, no log line, a row that does nothing.
     Config::get().set("fix.render_sharpness", "0.3");
     expectFloat("fix.render_sharpness", 0.3f, "flat scope permits the sharpening setting");
-    expectStr("hotkey.toggle_exposure", "", "flat menu exception leaves unrelated hotkeys suppressed");
+    expectStr("hotkey.dump_camera", "", "flat menu exception leaves unrelated hotkeys suppressed");
     const struct { const char* name; unsigned full, fovea; bool known; } presets[] = {
         {"auto",0,0,true},{"default",0,0,true},{"j",10,10,true},
         {"K",11,11,true},{"l",12,12,true},{"m",13,13,true},

@@ -7,13 +7,16 @@
 // result is one eye noticeably dimmer than the other, which is uncomfortable
 // and difficult to unsee once noticed.
 //
-// The fix intercepts the compute dispatch that writes the exposure state and,
-// after the second eye's has been computed, copies the first eye's over it.
-// Both eyes then tonemap identically.
+// Eye 0's result is copied over eye 1's (u0-u4 of the exposure shader, and
+// the tonemap's vertex shader reads strip[0] of whichever it is handed), and
+// since the engine path (exposure_chain.h, 2026-10-13) the second eye's own
+// two exposure dispatches are not sent to the GPU at all: they were computing
+// what the copy then overwrote. Both eyes tonemap identically.
 //
 // Nothing is patched and nothing in the game is modified. The copy is a
-// Direct3D call this DLL makes on its own behalf, and disabling it restores
-// stock behaviour on the very next frame.
+// Direct3D call this DLL makes on its own behalf. fix.share_exposure is read
+// at startup; off is stock (both chains run, nothing copied), and there is no
+// live toggle.
 #pragma once
 
 #include <d3d11.h>
@@ -94,9 +97,6 @@ void exposureFixReclaimHooks(bool sceneRendered);
 // other once a second and the runtime's rewrite leaves one of them out of the
 // table for up to a second while the other is already back in.
 void exposureFixReclaimTick();
-
-// Runtime toggle, for comparing against stock behaviour without restarting.
-void toggleExposureFix();
 
 // Whether the damper is configured on -- sunglare's matcher keeps running
 // while it is, because the train's last-seen stamp is what scopes the
