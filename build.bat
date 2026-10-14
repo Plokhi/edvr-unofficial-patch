@@ -1662,7 +1662,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     "src\d3d11\joy_watch.cpp" "src\common\iat_hook.cpp" "src\common\vtable_hook.cpp" ^
     "src\common\hotkey.cpp" "src\common\config.cpp" "src\common\log.cpp" ^
     "src\common\guard.cpp" "src\common\frame_flag.cpp" "src\common\proxy.cpp" ^
-    /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib dinput8.lib
+    /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib dinput8.lib xinput9_1_0.lib
 if errorlevel 1 ( echo [edvr] ERROR: input_gate_test build failed & exit /b 1 )
 "%BUILD%\input_gate_test.exe" || (
     echo [edvr] ERROR: the menu keyboard gate failed its device or release checks
