@@ -97,9 +97,9 @@ Still open: no flight yet; the overhead below is an estimate, not a measurement.
      them as probes; see Status). Only 4 frames per capture: these are not 30-frame figures.
 
 - 2026-10-13, the UI instruments (from reviews\ui-pass-costs-2026-10-13.md, section 5; census and UI layer lines, no new keys):
-  1. The hologram resolve census line now has its three parts as sub-items in brackets after "hologram resolve": "hologram depth copy"
+  1. The hologram resolve has its three parts on their own census line: "hologram depth copy"
     (ui_depth_layer.h acquire's CopyResource), "hologram near-light" (the near-light Dispatch), "hologram resolve draw" (the resolve draw).
-    They nest inside the umbrella: never added to a total. Door sections DoorHoloDepthCopy, DoorHoloNearLight, DoorHoloResolveDraw.
+    They print on their own line ("the hologram resolve's parts"), not on the main line, which is at the log's length; they nest inside the umbrella and are never added to a total. Door sections DoorHoloDepthCopy, DoorHoloNearLight, DoorHoloResolveDraw.
   2. The moved HDR HUD draw (the route's kHdrMovedDraw timer) is its own item on the altered line: "HUD draws moved into the HDR
     HUD layer (the game's shading at the layer size)", section AlteredHdrHud, opened with the route timer and closed with it.
     Not EDVR's cost; not in the EDVR total.

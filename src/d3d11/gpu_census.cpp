@@ -339,13 +339,6 @@ void logAndResetWindow(uint64_t now) {
             continue;
         const Snapshot s = snapshotOf(g_section[1 + i], frames);
         appendItem(doorItems, kDoorBreakdownNames[i], s);
-        if (section == GpuCensusSection::DoorHologramResolve) {
-            std::string sub;
-            appendItem(sub, kDoorBreakdownNames[3], holo[0]);
-            appendItem(sub, kDoorBreakdownNames[4], holo[1]);
-            appendItem(sub, kDoorBreakdownNames[5], holo[2]);
-            doorItems += " [" + sub + "]";
-        }
         if (section == GpuCensusSection::DoorSharpen || section == GpuCensusSection::DoorMenu ||
             section == GpuCensusSection::DoorUiLayerComposite || section == GpuCensusSection::DoorFssHeal) {
             doorTotal += s.msPerFrame;
@@ -463,6 +456,16 @@ void logAndResetWindow(uint64_t now) {
         char seedDetail[1024];
         formatSeedDetail(seedDetail, sizeof(seedDetail), seedSnap, g_seedNotes, g_seedMixed, g_seedFirst, g_seedOther);
         Log::get().note("%s", seedDetail);
+    }
+    // The hologram resolve's three parts (2026-10-13): their own line, because the main line's door items are at the log's length. They
+    // are inside the umbrella's figure, so they are a breakdown of it and never part of a total.
+    if (holo[0].occurred || holo[1].occurred || holo[2].occurred) {
+        std::string parts;
+        appendItem(parts, "depth copy", holo[0]);
+        appendItem(parts, "near-light", holo[1]);
+        appendItem(parts, "resolve draw", holo[2]);
+        Log::get().note("EDVR GPU census, the hologram resolve's parts (inside the door's \"hologram resolve\" figure above, not added to "
+                        "any total): %s; \"-\" means that part did not run this window.", parts.c_str());
     }
     // The second skin's own line, only when some of that work ran this window (a window with no skinned character prints nothing of it, as before F16).
     {

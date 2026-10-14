@@ -773,8 +773,8 @@ void alteredFixCases() {
         ++cycle;
         onlyOwners = onlyOwners && turnOwnerOf(static_cast<GpuCensusSection>(at)) == static_cast<GpuCensusSection>(at);
     } while (at != 0 && cycle < 200);
-    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 - static_cast<unsigned>(kWorldSections) - static_cast<unsigned>(kSkinSections) && cycle == 20,
-          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones and the idle world-route and second-skin ones (20: the 22 there were before the terrain's two sections went, 2026-10-01; the key off changes nothing)");
+    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 - static_cast<unsigned>(kWorldSections) - static_cast<unsigned>(kSkinSections) && cycle == 24,
+          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones and the idle world-route and second-skin ones (24: the 20 there were after the terrain's two sections went, 2026-10-01, plus the three hologram sub-sections and the moved HDR HUD draw, 2026-10-13; the key off changes nothing)");
     // The same cycle once the VR world route's three sections have been called this window: they take turns, 23.
     for (size_t i = kWorldFirst; i < kWorldFirst + kWorldSections; ++i) g_section[i].occurrences = 1;
     at = 0;
@@ -786,8 +786,8 @@ void alteredFixCases() {
         if (static_cast<size_t>(at) >= kWorldFirst && static_cast<size_t>(at) < kWorldFirst + kWorldSections)
             worldVisited[static_cast<size_t>(at) - kWorldFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 23 && worldVisited[0] && worldVisited[1] && worldVisited[2],
-          "turns: a world-route section that has been called this window takes its turn (23: the 20 and the three)");
+    check(cycle == 27 && worldVisited[0] && worldVisited[1] && worldVisited[2],
+          "turns: a world-route section that has been called this window takes its turn (27: the 20 and the three world ones, then 2026-10-13's four: the hologram sub-sections and the moved HDR HUD draw)");
     for (size_t i = kWorldFirst; i < kWorldFirst + kWorldSections; ++i) g_section[i].occurrences = 0;
     for (auto& s : g_section) s = SectionState{};
     g_section[kAlteredFixFirst + 2].occurrences = 7;
@@ -807,7 +807,7 @@ void alteredFixCases() {
     particle.occurrences = 100;
     owner.turns = 3;
     g_windowFrames = 9;        // gpuCensusFrame counts this frame first: 10
-    g_activeSection = static_cast<int>(GpuCensusSection::AlteredUiLayer);
+    g_activeSection = static_cast<int>(GpuCensusSection::AlteredHdrHud);   // the last class before the fix sections (2026-10-13)
     gpuCensusFrame(nullptr);
     check(g_activeSection == static_cast<int>(GpuCensusSection::AlteredFixFirst),
           "shared turn: the rotation lands on it after the last class");
@@ -1299,8 +1299,8 @@ void skinTurnCases() {
         const size_t a = static_cast<size_t>(at);
         if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) skinVisited[a - kSkinFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 20 && !skinVisited[0] && !skinVisited[1] && !skinVisited[2] && !skinVisited[3] && !skinVisited[4],
-          "second skin turns: with none called this window the rotation gives them no turn (the cycle is the 20 it was before they existed)");
+    check(cycle == 24 && !skinVisited[0] && !skinVisited[1] && !skinVisited[2] && !skinVisited[3] && !skinVisited[4],
+          "second skin turns: with none called this window the rotation gives them no turn (the cycle is the 24 it is now: the 20 before they existed and four added on 2026-10-13)");
     for (size_t i = 0; i < kSkinSections; ++i) skinSection(i).occurrences = 1;
     at = 0;
     cycle = 0;
@@ -1311,7 +1311,7 @@ void skinTurnCases() {
         const size_t a = static_cast<size_t>(at);
         if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) skinVisited[a - kSkinFirst] = true;
     } while (at != 0 && cycle < 200);
-    check(cycle == 25 && skinVisited[0] && skinVisited[1] && skinVisited[2] && skinVisited[3] && skinVisited[4],
+    check(cycle == 29 && skinVisited[0] && skinVisited[1] && skinVisited[2] && skinVisited[3] && skinVisited[4],
           "second skin turns: once called this window each takes its turn (25: the 20 and the five)");
     // one of them alone
     for (size_t i = 0; i < kSkinSections; ++i) skinSection(i).occurrences = 0;
@@ -1326,7 +1326,7 @@ void skinTurnCases() {
         if (a == kSkinFirst + 3) ++joinTurns;
         else if (a >= kSkinFirst && a < kSkinFirst + kSkinSections) ++otherSkin;
     } while (at != 0 && cycle < 200);
-    check(cycle == 21 && joinTurns == 1 && otherSkin == 0, "second skin turns: the join called alone has one turn a cycle and the others none");
+    check(cycle == 25 && joinTurns == 1 && otherSkin == 0, "second skin turns: the join called alone has one turn a cycle and the others none");
     for (auto& s : g_section) s = SectionState{};
 }
 
