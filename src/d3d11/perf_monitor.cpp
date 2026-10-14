@@ -1437,11 +1437,11 @@ int perfMonitorTiles(PerfTile* out, int max) {
         double spanLast = 0.0;
         const bool spanDone = gpuCensusFrameSpan(&spanLast, nullptr);
         const bool historyHas = nativeApplicationGpu.count != 0;
-        const bool appHave = clockOn && historyHas;
-        const bool workHave = !clockOn && (historyHas || spanDone);
-        const double workMs = historyHas ? nativeApplicationGpu.meanMs : spanLast;
+        // The same choice the fps overlay line makes (frame_span_tile.h chooseGpuTime): the tile's application test is the clock alone.
+        const GpuTimeChoice pick = chooseGpuTime(clockOn, clockOn, historyHas, nativeApplicationGpu.meanMs, spanDone, spanLast);
         const char* reason = clockOn ? noTiming : "frame GPU work span: no sample yet";
-        gpuTimeTileText(appHave, nativeApplicationGpu.meanMs, workHave, workMs, reason, v, sizeof(v), sub, sizeof(sub));
+        gpuTimeTileText(pick.source == GpuTimeSource::ApplicationRender, pick.ms, pick.source == GpuTimeSource::WorkSpan, pick.ms,
+                        reason, v, sizeof(v), sub, sizeof(sub));
         tile("GPU TIME", v, sub);
     }
     if (native && nativeApplicationCpu.count) {
@@ -1786,16 +1786,17 @@ void perfMonitorOverlayLine(char* buf, size_t bufLen) {
         const uint64_t now = GetTickCount64();
         const auto render = s.nativeHistory.applicationGpu(now, 200);
         const auto submit = s.nativeHistory.applicationCpu(now, 200);
-        const bool haveGpu = nativeApplicationGpuReady(timing, gpu) && render.count;
         const bool haveCpu = nativeApplicationCpuReady(timing) && submit.count;
-        char gpuValue[24] = "--", cpuValue[24] = "--";
-        if (haveGpu) snprintf(gpuValue, sizeof(gpuValue), "%.1f", render.meanMs);
-        if (haveCpu) snprintf(cpuValue, sizeof(cpuValue), "%.1f", submit.meanMs);
+        // The GPU figure is the tile's choice (frame_span_tile.h chooseGpuTime): with the application clock off it is the frame
+        // GPU work span, which this line did not read before 2026-10-14 and so showed "gpu -- ms" for any such flight.
+        double spanLast = 0.0;
+        const bool spanDone = gpuCensusFrameSpan(&spanLast, nullptr);
+        const GpuTimeChoice pick = chooseGpuTime(gpu.enabled, nativeApplicationGpuReady(timing, gpu), render.count != 0, render.meanMs,
+                                                 spanDone, spanLast);
         // "cpu" is the caller work per cycle, the line's width unchanged; an
         // older runtime's stand-in says what it is.
-        snprintf(buf, bufLen, "%.0f fps   gpu %s ms   %s %s ms",
-            perfFpsOf(ps.avgMs), gpuValue, nativeCpuPreSubmit(s.nativeHistory) ? "cpu (pre-submit)" : "cpu",
-            cpuValue);
+        overlayLineText(buf, bufLen, perfFpsOf(ps.avgMs), pick, nativeCpuPreSubmit(s.nativeHistory) ? "cpu (pre-submit)" : "cpu",
+                        haveCpu, submit.meanMs);
         return;
     }
     char times[120] = "";
