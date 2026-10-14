@@ -337,18 +337,100 @@ void testIdentityAndPin() {
     check(std::memcmp(refreshPin, lg::kRefreshPrologue, 16) == 0, "the refresh pin is the sixteen bytes read from the exe");
 }
 
+// The routine at 0x48AAAE8, transcribed instruction by instruction with the registers as variables (edx, eax, ecx, r8d), as an independent reading to hold the core's gameCeilf to.
+float asmCeilf(float xmm0) {
+    uint32_t r8d = 0, edx, eax, ecx;
+    std::memcpy(&edx, &xmm0, 4);   // movss [rsp+8], xmm0 / mov edx, [rsp+8]
+    eax = edx;
+    eax &= 0x7FFFFFFFu;            // btr eax, 0x1f
+    r8d = edx != eax ? 1u : 0u;    // cmp edx, eax / setne r8b
+    auto fromBits = [](uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; };
+    if (eax >= 0x4B800000u) return xmm0;               // jb not taken: 48AAB08 jbe 48AAB6E (infinity, NaN excepted) returns xmm0
+    if (eax < 0x3F800000u) {                           // 48AAB16 jae 48AAB40 not taken
+        if (eax == 0) return xmm0;                     // je 48AAB6E
+        if (r8d != 0) return fromBits(0x80000000u);    // 48AAB26
+        return 1.0f;                                   // 48AAB36: movss xmm0, [0x4DDE614]
+    }
+    eax = edx;                                         // 48AAB40
+    ecx = 0x96;
+    eax >>= 0x17;                                      // shr eax, 0x17
+    ecx -= eax;                                        // sub ecx, eax
+    eax = 0xFFFFFFFFu;                                 // or eax, -1
+    eax <<= (ecx & 31u);                               // shl eax, cl
+    eax &= edx;                                        // and eax, edx
+    xmm0 = fromBits(eax);                              // 48AAB53..57
+    if (r8d != 0) return xmm0;                         // test r8d, r8d / jne
+    if (edx == eax) return xmm0;                       // cmp edx, eax / je
+    return xmm0 + 1.0f;                                // addss xmm0, [0x4DDE614]
+}
+
+void testGridCeil() {
+    // Flight 3 (2026-10-14): the game's grid for 2016 / 120 was 17, not 16; 9248 elements = 17 x 17 x 32.
+    uint64_t g = 0;
+    check(lg::gridCells(2016, 120, &g) && g == 17, "2016 / 120 = 16.8 gives 17");
+    check(lg::gridCells(1920, 120, &g) && g == 16, "1920 / 120 = 16 exactly gives 16 (a width divisible by the tile is not rounded up)");
+    check(lg::gridCells(1921, 120, &g) && g == 17, "1921 / 120 gives 17");
+    check(lg::gridCells(2040, 120, &g) && g == 17 && lg::gridCells(2041, 120, &g) && g == 18, "2040 / 120 = 17 exactly gives 17, 2041 gives 18");
+    check(lg::gridCells(256, 120, &g) && g == 3 && lg::gridCells(612, 120, &g) && g == 6 && lg::gridCells(248, 120, &g) && g == 3, "the flight's other sizes: 256, 612 and 248 over 120 give 3, 6, 3");
+    check(lg::gridCells(1, 120, &g) && g == 1 && lg::gridCells(120, 120, &g) && g == 1 && lg::gridCells(121, 120, &g) && g == 2, "1, 120 and 121 over 120 give 1, 1 and 2");
+    check(lg::gridCells(3840, 120, &g) && g == 32 && lg::gridCells(2560, 120, &g) && g == 22 && lg::gridCells(1080, 120, &g) && g == 9, "flat sizes: 3840, 2560 and 1080 over 120 give 32, 22 and 9");
+    uint8_t key[lg::kKeyBytes];
+    lg::CallInputs in = mk(0, 0);
+    in.width = in.height = 2016;
+    in.tile = 120;
+    in.slices = 32;
+    check(lg::buildKey(in, key) && ld64(key + 0x48) == 17 && ld64(key + 0x50) == 17 && ld64(key + 0x48) * ld64(key + 0x50) * ld64(key + 0x58) == 9248,
+          "a 2016x2016 target with tile 120 and 32 slices is the flight's 17 x 17 x 32 = 9248 clusters");
+    // gameCeilf against the instruction-by-instruction transcription and against ceil, over every quotient a tile and a size can make, and a sweep of bit patterns
+    uint64_t compared = 0;
+    bool same = true, sameAsCeil = true;
+    const uint32_t tiles[] = {1, 2, 3, 8, 16, 24, 32, 48, 64, 100, 120, 128, 240, 256, 1000};
+    for (uint32_t tile : tiles) {
+        for (uint32_t n = 1; n <= 9000; ++n) {
+            const float q = static_cast<float>(static_cast<int64_t>(n)) / static_cast<float>(static_cast<int64_t>(tile));
+            const float a = lg::gameCeilf(q), b = asmCeilf(q);
+            uint32_t ba, bb;
+            std::memcpy(&ba, &a, 4);
+            std::memcpy(&bb, &b, 4);
+            same = same && ba == bb;
+            sameAsCeil = sameAsCeil && a == std::ceil(q);
+            ++compared;
+        }
+    }
+    uint32_t state = 12345u;
+    for (int i = 0; i < 400000; ++i) {
+        state = state * 1664525u + 1013904223u;
+        uint32_t bits = state;
+        if (i % 3 == 0) bits &= 0x7FFFFFFFu;   // positive
+        float x;
+        std::memcpy(&x, &bits, 4);
+        if (!std::isfinite(x)) continue;
+        const float a = lg::gameCeilf(x), b = asmCeilf(x);
+        uint32_t ba, bb;
+        std::memcpy(&ba, &a, 4);
+        std::memcpy(&bb, &b, 4);
+        same = same && ba == bb;
+        sameAsCeil = sameAsCeil && (a == std::ceil(x) || (a == 0.0f && std::ceil(x) == 0.0f));
+        ++compared;
+    }
+    check(compared > 100000 && same, "gameCeilf equals the transcription of 0x48AAAE8 on every quotient and 400000 bit patterns, bit for bit");
+    check(sameAsCeil, "and both equal ceilf (the routine is ceilf)");
+    check(lg::gameCeilf(0.5f) == 1.0f && lg::gameCeilf(16.0f) == 16.0f && lg::gameCeilf(16.0001f) == 17.0f && lg::gameCeilf(-0.5f) == 0.0f && lg::gameCeilf(0.0f) == 0.0f,
+          "spot values: 0.5 gives 1, 16 gives 16, 16.0001 gives 17, -0.5 gives -0, 0 gives 0");
+}
+
 void testKey() {
     lg::CallInputs in = mk(0, 3);
     uint8_t key[lg::kKeyBytes];
     check(lg::buildKey(in, key), "ordinary inputs build a key");
     check(std::memcmp(key, in.rows, 0x40) == 0, "the rows are the key's first 64 bytes");
     check(std::memcmp(key + 0x40, &in.nearBits, 4) == 0 && std::memcmp(key + 0x44, &in.farBits, 4) == 0, "near and far follow at +0x40 and +0x44");
-    check(ld64(key + 0x48) == 8 && ld64(key + 0x50) == 8, "the grid is floor(size / tile): 128 / 16 = 8");
+    check(ld64(key + 0x48) == 8 && ld64(key + 0x50) == 8, "the grid is ceil(size / tile): 128 / 16 = 8");
     check(ld64(key + 0x58) == 4 && ld64(key + 0x60) == 128 && ld64(key + 0x68) == 128 && ld64(key + 0x70) == 16, "slices, width, height and tile fill the six quadwords");
     in.width = 1000;
     in.height = 2016;
     in.tile = 16;
-    check(lg::buildKey(in, key) && ld64(key + 0x48) == 62 && ld64(key + 0x50) == 126, "the grid floors: 1000 / 16 = 62.5 gives 62, 2016 / 16 gives 126");
+    check(lg::buildKey(in, key) && ld64(key + 0x48) == 63 && ld64(key + 0x50) == 126, "the grid rounds up: 1000 / 16 = 62.5 gives 63, 2016 / 16 = 126 exactly gives 126");
     in.tile = 0;
     check(!lg::buildKey(in, key), "a zero tile is not built (the game's divide is the game's)");
     in = mk(0, 0);
@@ -356,7 +438,7 @@ void testKey() {
     check(!lg::buildKey(in, key), "a zero width is not built");
     in = mk(0, 0);
     in.tile = 0xFFFFFFFFu;
-    check(lg::buildKey(in, key) && ld64(key + 0x48) == 0, "a tile larger than the target gives a grid of 0, as the game's floor does");
+    check(lg::buildKey(in, key) && ld64(key + 0x48) == 1, "a tile larger than the target gives a grid of 1, as the game's ceil does");
     // The key a fake game stores for these inputs is the key the core builds (the self-check the hook runs on every miss)
     Oracle o;
     in = mk(1, 5);
@@ -1060,6 +1142,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     testIdentityAndPin();
+    testGridCeil();
     testKey();
     testRegions();
     testKeyCompareAndLru();

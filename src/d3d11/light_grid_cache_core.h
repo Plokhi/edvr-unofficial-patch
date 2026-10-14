@@ -14,7 +14,7 @@
 //   byte at 0x5E70F7E is 0, or, when it is set (it is 1 in the exe's data and nothing in .text writes it: the usual case), from a local copy of the block with the near and far
 //   replaced by the floats at 0x5E70F94 and 0x5E70F98 and the rows recomputed by 0x4F2FF0 (see kOverrideNearRva). Either way the rows are a function of the view block
 //   and those globals, and the glue reads them the way the build does.
-//   The grid x and y are floor((float)width / (float)tile) and the same for the height (58B353..58B3E0, floorf at 0x48AAAE8), the tile is the global u32 at 0x5E70F80 (120 in the
+//   The grid x and y are CEIL((float)width / (float)tile) and the same for the height (58B353..58B3E0, ceilf at 0x48AAAE8; gameCeilf transcribes it), the tile is the global u32 at 0x5E70F80 (120 in the
 //   exe's data; read at 58B33E and again at 58B4D0), the slice count the global u32 at 0x5E70F90 (32; 58B3A5): a 17 x 17 x 32 grid is 9248 clusters and 9280 elements of 32
 //   bytes, the 296,960 bytes the flight measured. The build's loops read ONE thing the key does not hold: the view block's own near plane, at 58B5E4 (a4+0x234, used for the
 //   first depth slice; on the plain path it IS the key's near, on the override path it is not), so the cache's key is the game's key plus that value. The two calls inside the
@@ -193,13 +193,44 @@ struct CallInputs {
 
 inline void put64(uint8_t* p, uint64_t v) noexcept { std::memcpy(p, &v, 8); }
 
-// floor((float)n / (float)tile) as the game computes it: cvtsi2ss from a zero-extended 64-bit value, divss, floorf, cvttss2si to 64 bits, then the low 32 bits.
+// The game's CEILING, a transcription of the routine at 0x48AAAE8 that 58B378 and 58B3A0 call on the quotient (float in xmm0, float out). It is ceilf, not floorf (flight 3,
+// 2026-10-14: 2016 / 120 is 16.8 and the game's grid is 17). Read instruction by instruction:
+//   48AAAF1..48AAAFD  edx = the bits; eax = the bits with the sign cleared; r8 = whether the sign was set.
+//   48AAB01           |x| >= 2^23 (0x4B800000): already integral (48AAB08: NaN and infinity leave to 0x48C5AB0 or return unchanged) -> return x.
+//   48AAB16           |x| < 1: zero returns itself (48AAB1F); a negative gives -0.0 (48AAB26); a positive gives +1.0 (48AAB36, the float at 0x4DDE614).
+//   48AAB40..48AAB53  1 <= |x| < 2^23: e = bits >> 23 (the sign bit is part of it), mask = 0xFFFFFFFF << (150 - e), truncated = bits & mask.
+//   48AAB5D..48AAB66  a negative returns the truncation; a positive returns it too when nothing was cut (edx == eax), else the truncation plus 1.0 (48AAB66, 0x4DDE614).
+inline float gameCeilf(float x) noexcept {
+    uint32_t bits;
+    std::memcpy(&bits, &x, 4);
+    const uint32_t mag = bits & 0x7FFFFFFFu;
+    const bool negative = mag != bits;
+    if (mag >= 0x4B800000u) return x;
+    if (mag < 0x3F800000u) {
+        if (mag == 0) return x;
+        if (negative) {
+            const uint32_t negZero = 0x80000000u;
+            float z;
+            std::memcpy(&z, &negZero, 4);
+            return z;
+        }
+        return 1.0f;
+    }
+    const uint32_t e = bits >> 23;
+    const uint32_t mask = 0xFFFFFFFFu << ((150u - e) & 31u);
+    const uint32_t cut = bits & mask;
+    float r;
+    std::memcpy(&r, &cut, 4);
+    if (negative || bits == cut) return r;
+    return r + 1.0f;
+}
+
+// ceil((float)n / (float)tile) as the game computes it: cvtsi2ss from a zero-extended 64-bit value, divss, gameCeilf, cvttss2si to 64 bits, then the low 32 bits.
 inline bool gridCells(uint32_t n, uint32_t tile, uint64_t* out) noexcept {
     if (n == 0 || tile == 0) return false;
     const float q = static_cast<float>(static_cast<int64_t>(n)) / static_cast<float>(static_cast<int64_t>(tile));
     if (!std::isfinite(q) || q < 0.0f || q >= 4294967296.0f) return false;
-    const float f = std::floor(q);
-    *out = static_cast<uint32_t>(static_cast<int64_t>(f));
+    *out = static_cast<uint32_t>(static_cast<int64_t>(gameCeilf(q)));
     return true;
 }
 
