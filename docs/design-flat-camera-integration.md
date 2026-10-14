@@ -51,8 +51,8 @@
   unkeyed census empty in all 60 ticks; row-pair mismatches 0. Open:
   main-versus-auxiliary camera grouping; c2_coexist C7's unbounded loop
   (a mutation hangs the rig instead of failing it). 2026-10-14, BUILT, NOT
-  FLOWN, log-only, no key: the `flat camera signatures 5s:` line samples 1 in
-  16 kind-3 calls to see whether auxiliary kind-3 cameras are jittered (end entry).
+  FLOWN, no key: the `flat camera signatures 5s:` line (1 in 16 kind-3 calls);
+  a live VR-to-flat switch no longer leaves the hook observe-only (last entry).
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable and
   build identities, backend versions, dimensions, formats and mod chain.
@@ -1415,3 +1415,46 @@ auxiliary cameras are jittered in flat, and the fix is a role test on the
 scene signature, as `flatCameraVrRole` does. Only the scene's signature means
 none are. `calls` and `injected` count sampled calls: multiply by 16 for the
 rate. Pair it with the free A/B (flat temporal AA off, sun behind a strut).
+
+## 2026-10-14: a live VR-to-flat switch left the hook observe-only (BUILT, NOT FLOWN)
+
+Evidence (reviews\flat-aa-toggle-2026-10-14.md, kept out of git; edvr_gfx_20261014_062117, Frontier, VR from 06:21:17, live switch to
+flat 06:22:39, 90 Hz, XeSS): flat AA "turned on and off in a fixed pattern". `flatCameraInjectObserveFrame()` (the VR camera census's
+frame step) stores `observeOnly = true` and nothing cleared it, so after the switch every kind-3 call was admitted as `Observed`
+(flat_camera_phase.h) and never injected (`injected=0 warming=0 not-upstream=0`, `flat camera signatures 5s: kind3-calls=0`
+beside a census counting 42,360 kind-3 calls a window). The ownership machine still offered Upstream (`begin()` set
+`upstreamCertified = true`), which failed three armed frames (`no-raster-application`), engaged the Legacy fallback, and the
+fallback released after 60 frames because `kind3Seen` was set before the observe-only return. 60 + 9 or 10 = a 69-frame cycle
+(1.3 Hz): two history resets, three failed phases and eight zero-jitter HDR-route frames per cycle, 13-14% of frames unjittered.
+Not the reflection-probe cycle (91 frames in VR) and not the scene picker (winner 3840x2160 in every window).
+
+What changed (both halves, each tested alone against the cycle):
+- Re-arm. `takeOverFromVr()` (flat_camera_inject.cpp), called once per flat frame from `flatCameraInjectFrame` ahead of the
+  ownership machine, clears `observeOnly` and the route's stale "driven, pass-through" word once `flatCameraFlatTakeover`
+  (flat_camera_vr.h, pure) says the VR side is out of the way: no census observer registered, and the word zero or quiet (nothing
+  injecting or observing, no camera waiting for its flush). It resets the ownership core, the census window and the signature table
+  (they describe the other profile) and logs once `flat camera inject: switched from observe-only (VR census) to injection after a
+  profile switch`. Re-arming is safe because the mode is read per call (`g_inject.observeOnly`), the post half keys off the
+  call's own TLS flag, and the census detaches in its own boundary on the first frame after the switch. While it cannot re-arm
+  the hook says once `flat camera inject: stays observe-only; legacy owns (...)` and retries every frame.
+- Legacy from the first flat frame. `FlatCameraFrameCore::begin(legacyPlan, observeOnly)` sets `upstreamCertified = !observeOnly`, so
+  an observe-only hook is never offered Upstream and there are no failed frames to count.
+- No cycling under any observe-only state. `flatCameraAdmitCountsForRelease` (flat_camera_phase.h): an Observed call is a miss for the
+  60-frame release; `kind3Seen` is now set after the admission and only for the four admissions the injector could inject on.
+- The signature sample moved ahead of the observe-only return (reads only; the observe-only exit reports it uninjected), so
+  `flat camera signatures 5s` measures in both modes.
+
+Tests: c2_coexist C18 (the old rules cycle every ~63 frames, resetting history each time; each half alone ends the cycle; after the
+re-arm Upstream owns every frame and every call injects); flat_camera_vr_test R8j-R8p (the takeover rule, exhaustive: never clears
+over an observer, an injecting or observing route or a pending flush; converges in one step) and the source pins R11aq-R11at (observe-only
+cleared in one place only, the takeover ahead of `core.begin`, the signature sample ahead of the observe return, `kind3Seen` after the
+admission); the `preFlat` and `flatFrame` goldens re-pinned.
+
+How to read the flight. Cold flat start: F8 opens "flat graphics panel open", `flat camera signatures 5s` has `kind3-calls>0`, `flat camera
+inject 5s` has `injected>0 owner=upstream`, `flat camera inject owner` shows no flips after the first. VR start then a switch to flat: the
+switch logs `switched from observe-only (VR census) to injection` (or `stays observe-only; legacy owns`, then Legacy treats every frame
+with no flips), `accepted-reset-5s` stays near 0 and there is no 69-frame cycle. If it still cycles with the hook re-armed, Upstream
+injection itself is failing, and the signature line names the frustum.
+
+ruled out: the reflection probe cycle as the cause of these resets, because the cadence is 69 frames against the probe's 91 and the edges
+are ownership flips logged at exact frames. ruled out: the scene picker, because the winner is on-shape in every window.
