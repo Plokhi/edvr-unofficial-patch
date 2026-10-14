@@ -2806,6 +2806,16 @@ bool uiDepthWantsReissue() {
     return detail::g_uiDepthMode == Mode::kReissue || detail::g_uiDepthMode == Mode::kReissueScene;
 }
 
+UiDepthDrawProbe uiDepthDrawProbe() {
+    UiDepthDrawProbe p;
+    p.coverage = uiDepthWantsReissue();
+    p.wantMask = g_wantMask && g_drawEye >= 0;
+    p.maskSlot = g_reissueMaskSlot;
+    p.drawEye = g_drawEye;
+    p.holoWorldMarker = g_holoIsWorldMarker;
+    return p;
+}
+
 void uiDepthEnd(ID3D11DeviceContext*) {
     // Also clear classification when the caller skipped or swallowed a draw.
     detail::g_uiDepthMode = Mode::kNone;

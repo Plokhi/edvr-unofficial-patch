@@ -4,6 +4,7 @@
 #include "gpu_frame_timing.h"
 #include "gpu_census.h"       // issue #38: the per-feature GPU cost census
 #include "gpu_pass_profile.h" // TEMPORARY GPU pass profiler (hotkey.gpu_pass_profile): one bool read per hook unarmed
+#include "blend_probe.h"      // TEMPORARY blend probe (hotkey.blend_probe): one relaxed load per eye draw unarmed
 #include "../common/d3d11_gpu_command_slots.h"
 #include "vr_runtime.h"
 
@@ -1533,6 +1534,30 @@ enum class DrawVerdict {
     kBackdrop
 };
 
+// The verdict's name for the blend probe's rows (blend_probe.h); one word, no spaces.
+const char* drawVerdictName(DrawVerdict v) {
+    switch (v) {
+        case DrawVerdict::kNone: return "none";
+        case DrawVerdict::kPanel: return "panel";
+        case DrawVerdict::kSkip: return "skip";
+        case DrawVerdict::kRemlok: return "remlok";
+        case DrawVerdict::kHolo: return "holo-pattern";
+        case DrawVerdict::kTargetSharp: return "target-sharp";
+        case DrawVerdict::kNightVision: return "night-vision";
+        case DrawVerdict::kIntroPanel: return "intro-panel";
+        case DrawVerdict::kGlareClamp: return "glare-clamp";
+        case DrawVerdict::kGlareSteady: return "glare-steady";
+        case DrawVerdict::kParticle: return "particle";
+        case DrawVerdict::kFssPanel: return "fss-panel";
+        case DrawVerdict::kFssReveal: return "fss-reveal";
+        case DrawVerdict::kQuadSkip: return "quad-skip";
+        case DrawVerdict::kLoaderPanel: return "loader-panel";
+        case DrawVerdict::kScrim: return "scrim";
+        case DrawVerdict::kBackdrop: return "backdrop";
+    }
+    return "?";
+}
+
 // THE SHADOW'S AUDIT (2026-09-09). The heat haze's skip went silent the
 // flight after the binding shadow replaced its VSGetShader -- 15:13, three
 // minutes beside a ship's drives, not one draw withheld; 14:52, the flight
@@ -1677,6 +1702,8 @@ bool drawGateSubscribed(State* s) {
         uiDepthWantsDraws() ||
         sunglareWantsDraws() ||
         drawCensusArmed() ||
+        blendProbeWantsDraws() ||   // TEMPORARY, the blend probe (blend_probe.h): it reads each eye draw's verdict and routing, so the ladder must run
+
         objectProbeWantsDraws() ||
         panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
@@ -3674,6 +3701,47 @@ __declspec(noinline) void pureDrawReissue(ID3D11DeviceContext* self, char kind, 
     }
 }
 
+// The blend probe's offer (blend_probe.h; TEMPORARY): one eye draw of a collecting capture, with everything its routing decided. Called
+// from forwardWithVerdict only while blendProbeWantsDraws(); NOINLINE so the draw path pays nothing else for it. The replay is the draw
+// again through the real entry point, below every hook (pureDrawReissue), which blend_probe.cpp issues with a scissor and no writes.
+struct BlendReplayArgs {
+    ID3D11DeviceContext* self;
+    char kind;
+    UINT count, instances;
+    const DrawArgs* args;
+};
+void blendReplay(void* p) {
+    const auto* a = static_cast<const BlendReplayArgs*>(p);
+    pureDrawReissue(a->self, a->kind, a->count, a->instances, *a->args);
+}
+__declspec(noinline) void blendProbeOfferDraw(ID3D11DeviceContext* self, DrawVerdict v, char kind, UINT count, UINT instances,
+                                              const DrawArgs& args, bool udOn, bool holoOn, UiLayerFamily family, bool uiTaken,
+                                              uint32_t decisionsBefore) {
+    BlendDrawInfo info;
+    info.kind = kind;
+    info.count = count;
+    info.instances = instances;
+    info.ordinal = g_state->eyeDrawsThisFrame;
+    info.gameFrame = g_state->frameNo;
+    info.verdict = drawVerdictName(v);
+    info.uiDecided = uiLayerDecisionCount() != decisionsBefore;
+    info.uiDecision = uiLayerLastDecision();
+    info.uiTaken = uiTaken;
+    // A decision with no family of its own is the after-the-UI retry's (uiLayerNoteOther).
+    info.uiFamily = static_cast<int>(family != UiLayerFamily::kNone ? family
+                                     : info.uiDecided                ? UiLayerFamily::kAfterUi
+                                                                     : UiLayerFamily::kNone);
+    const UiDepthDrawProbe ud = uiDepthDrawProbe();
+    info.udCoverage = udOn && ud.coverage;
+    info.udWantMask = udOn && ud.coverage && ud.wantMask;
+    info.udMaskSlot = ud.maskSlot;
+    info.holoMatched = holoOn;
+    info.holoWorld = holoOn && ud.holoWorldMarker;
+    info.engineSubstituted = engineVelocityDrawSubstituted();
+    BlendReplayArgs a{self, kind, count, instances, &args};
+    blendProbeDraw(self, info, &blendReplay, &a);
+}
+
 // the crisp-HUD half of fix.ui_quality's tonemap re-issue (ui_layer.h): the game's admitted tonemap
 // draw once more through pureDrawReissue, between uiLayerCrispToneBegin's
 // rebind (the HDR HUD layer at the admitted HDR slot, the eye's 8-bit layer
@@ -3872,6 +3940,10 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // re-comparing it at each of a dozen sites per draw.
     const bool owner = self == g_state->ownerCtx;
     if (owner && uiLayerIssueBlocked()) return;
+    // TEMPORARY, the blend probe (blend_probe.h): an eye draw of a collecting capture is offered once its routing is decided. One relaxed
+    // load for every draw while no capture runs.
+    const bool blendProbing = owner && g_state->rtv0Eye && blendProbeWantsDraws();
+    const uint32_t blendDecisionsBefore = blendProbing ? uiLayerDecisionCount() : 0;
     struct EffectCaptureScope {
         ID3D11DeviceContext* ctx;
         ~EffectCaptureScope(){if(ctx)objectProbeSourceDrawEnd(ctx);}
@@ -3904,6 +3976,9 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         // Clearing here rather than trusting the next draw to do it keeps the
         // flag's lifetime inside the one call that set it.
         g_state->curveThisDraw = false;
+        if (blendProbing)
+            blendProbeOfferDraw(self, v, kind, count, instances, args, uiDepthScope.on, uiDepthScope.holoOn, UiLayerFamily::kNone, false,
+                                blendDecisionsBefore);
         return;
     }
     // fix.ui_quality, the UI layer (ui_layer.h): decided once for this draw
@@ -4020,6 +4095,11 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
                                      static_cast<int>(compositeFamily));
         }
     }
+    // TEMPORARY, the blend probe: the verdict, the UI layer's decisions (the family's and the after-UI retry's) and the coverage and
+    // hologram classifications are all settled here, and the game's bindings are still its own: no verdict's Begin has run.
+    if (blendProbing)
+        blendProbeOfferDraw(self, v, kind, count, instances, args, uiDepthScope.on, uiDepthScope.holoOn, compositeFamily, uiLayer,
+                            blendDecisionsBefore);
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues
     // the surviving index ranges itself. Before the curve substitution
     // because both swallow, and two swallows would draw the quads twice.
@@ -4374,6 +4454,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
     if (drawCensusArmed()) {
         drawCensusDrawDirect(self, 'Z', 0, 0, foreignContext(self), args, off);
     }
+    if (blendProbeWantsDraws() && self == g_state->ownerCtx && g_state->rtv0Eye) blendProbeNoteIndirect();   // TEMPORARY: counted, not replayable
     if (!foreignContext(self)) {
         depthProbeNoteIndirectDraw(self, bindingGet(BindSlot::Dsv0));
         engineVelocityBeforeDraw(self, g_state->rtv0Eye);
@@ -4405,6 +4486,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
     if (drawCensusArmed()) {
         drawCensusDrawDirect(self, 'Y', 0, 0, foreignContext(self), args, off);
     }
+    if (blendProbeWantsDraws() && self == g_state->ownerCtx && g_state->rtv0Eye) blendProbeNoteIndirect();   // TEMPORARY: counted, not replayable
     if (!foreignContext(self)) {
         depthProbeNoteIndirectDraw(self, bindingGet(BindSlot::Dsv0));
         engineVelocityBeforeDraw(self, g_state->rtv0Eye);
@@ -5778,6 +5860,7 @@ EDVR_BOUNDARY_TICK(tkQuadProbe, "quad_probe");
 EDVR_BOUNDARY_TICK(tkDrawCensusTick, "draw_census_tick");
 EDVR_BOUNDARY_TICK(tkObjectProbe, "object_probe");
 EDVR_BOUNDARY_TICK(tkPixelProbe, "pixel_probe");
+EDVR_BOUNDARY_TICK(tkBlendProbe, "blend_probe");   // TEMPORARY (blend_probe.h): arms, advances and reports a capture
 EDVR_BOUNDARY_TICK(tkWakePulse, "wake_pulse");
 EDVR_BOUNDARY_TICK(tkUiDepth, "ui_depth");
 EDVR_BOUNDARY_TICK(tkUiLayer, "ui_layer");
@@ -5842,6 +5925,8 @@ void vScreenFrameBoundary() {
         tkDrawCensusTick.run([&] { drawCensusTick(g_state->ownerCtx); });
         tkObjectProbe.run([&] { objectProbeFrameBoundary(g_state->ownerCtx); });
         tkPixelProbe.run([&] { pixelProbeFrameBoundary(g_state->ownerCtx); });
+        // Before drawGateSet below re-samples the draw gate, so a capture that starts here is seen by the next frame's first draw.
+        tkBlendProbe.run([&] { blendProbeFrameBoundary(g_state->frameNo); });
         tkWakePulse.run([&] { wakePulseReport(); });
         tkUiDepth.run([&] { uiDepthFrameBoundary(g_state->ownerCtx); });
         // fix.ui_quality: the layer's warm compile, the surfaces' five-second

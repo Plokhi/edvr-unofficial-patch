@@ -209,6 +209,7 @@ struct FlatDraw {
 };
 FlatDraw g_flatDraw;
 int g_lastDecision = 0;  // the last uiLayerDecide's UiLayerDecision, for the flat adapter's refusal names
+uint32_t g_decisionCount = 0;  // decisions come to (uiLayerDecisionCount: the blend probe's before/after compare)
 
 bool layerDrawJitter(uint32_t eye, uint64_t* seq, float* jx, float* jy, uint32_t* w, uint32_t* h) {
     if (!runtimeFlatProfile()) return nativeTemporalDrawJitter(eye, seq, jx, jy, w, h);
@@ -3460,6 +3461,7 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
         if (dsv) dsv->Release();
     }
     g_lastDecision = static_cast<int>(d);
+    ++g_decisionCount;
     if (uiLayerWorldRouteMode(family, f.worldScreen, f.worldRoute)) {
         // The route's mode: never a take. A draw that passed every test is held for the re-issue after the game's
         // own issue (counted when it lands, as a re-issue -- not as "redirected": the layer took nothing from the
@@ -4910,6 +4912,7 @@ void uiLayerFlatSetDraw(uint64_t frame, float jx, float jy, uint32_t renderW, ui
 }
 
 int uiLayerLastDecision() { return g_lastDecision; }
+uint32_t uiLayerDecisionCount() { return g_decisionCount; }
 
 bool uiLayerFlatRelease() {
     const bool any = releaseLayers();

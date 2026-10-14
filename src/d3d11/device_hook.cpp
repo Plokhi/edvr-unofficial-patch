@@ -80,6 +80,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "flat_shader_capture.h"
 #include "perf_monitor.h"
 #include "gpu_pass_profile.h"   // TEMPORARY hotkey.gpu_pass_profile: the GPU pass profiler's request
+#include "blend_probe.h"       // TEMPORARY hotkey.blend_probe: the blend probe's install and request
 #include "stall_watch.h"     // stallWatchBeat: the stall sampler's heartbeat, once per owned Present
 #include "vram_tick.h"       // vramWatchTick: the graphics memory watch, once per owned Present
 #include "vertex_resync_hook.h"   // vertexResyncInstall at startup, vertexResyncPoll once a second: the f3d vertex-buffer cache repair (both profiles)
@@ -265,13 +266,14 @@ struct State {
     // the census costs nothing until this is both bound and pressed.
     Hotkey censusKey;
     Hotkey gpuPassKey;   // TEMPORARY (GPU pass profile, 2026-10-12): hotkey.gpu_pass_profile, default unbound
+    Hotkey blendProbeKey;   // TEMPORARY (blend probe, 2026-10-14): hotkey.blend_probe, default unbound
     // The eye dump key: both eyes as the headset receives them, to
     // edvr_logs\eyes as BMP (temporalPassArmEyeDump). Unbound by default.
     Hotkey eyesKey;
     // What each of those three was last bound from (the ini text), so a reload
     // that changes one re-resolves it and one that does not says nothing: the
     // settings menu's Hotkeys page writes them while the game runs.
-    std::string dumpKeyText, censusKeyText, eyesKeyText, gpuPassKeyText;
+    std::string dumpKeyText, censusKeyText, eyesKeyText, gpuPassKeyText, blendProbeKeyText;
     bool        diagnosticKeysBound = false;
     // The player's own FSS enter/quit keys, adopted from their Elite
     // bindings; they give the FSS mode latch its frame-exact edges.
@@ -1337,6 +1339,7 @@ void tickHotkeys() {
         }
     }
     if (g_state->gpuPassKey.pressed()) gpuPassProfileRequest();
+    if (g_state->blendProbeKey.pressed()) blendProbeRequest("hotkey.blend_probe");   // TEMPORARY (blend_probe.h)
     // The eye dump key: the next treated frame's two eyes to disk.
     if (g_state->eyesKey.pressed()) temporalPassArmEyeDump();
     if (g_state->missedCensusNotes < kMissedDumpNotes &&
@@ -2034,6 +2037,13 @@ void configureDiagnosticHotkeys() {
          "hotkey.gpu_pass_profile", "GPU pass profile",
          "hotkey: gpu_pass_profile is set but bound nothing, so the GPU pass profile cannot be armed this session.",
          " Measures the next 30 whole frames (or the COUNT after the key) to edvr_logs\\gpu_pass_profile_<stamp>.csv. Costs nothing until pressed."},
+        // TEMPORARY (blend probe, 2026-10-14; blend_probe.h, docs/dlss-blur-elements-2026-10-14.md): default unbound; a press captures 3 frames
+        // of the blend-enabled or no-depth-write eye draws that reach a window at the view centre, and a grid of the temporal pass's
+        // decisions over it, to the log. Remove with the arc.
+        {&s.blendProbeKey, &s.blendProbeKeyText, Config::get().getString("hotkey.blend_probe", ""),
+         "hotkey.blend_probe", "blend probe",
+         "hotkey: blend_probe is set but bound nothing, so the blend probe cannot be armed this session.",
+         " Captures 3 frames (the draws that blend or write no depth at the view centre, and the temporal pass's motion grid) to the log. Costs nothing until pressed."},
         // The eye dump key: both eyes as the headset receives them, to edvr_logs\eyes as BMP --
         // what the player sees, readable off the desk (asked for 2026-09-09, with a debug view
         // up). The census key's shape: empty is off, and a bind is said.
@@ -2905,6 +2915,8 @@ void hookDevice(ID3D11Device* device) {
             terrainCullCoverInstall(!runtimeScopeIncludesVr());
             // The optimized station (optimized_station.cpp): reads fix.optimized_station; its hooks attach while it is on (VR by default; flat off).
             optimizedStationInstall(runtimeFlatProfile());
+            // The blend probe (TEMPORARY, blend_probe.cpp): armed by key only; nothing is observed until then. Says what it is, once.
+            blendProbeInstall(runtimeFlatProfile());
 
             // AFTER BOTH INSTALLERS, and the order is the whole point. EDVR's
             // own commit writes two dozen entries of this table in the shared
