@@ -1005,6 +1005,59 @@ int main(int argc, char** argv) {
               "v14.24 rig: a table entry names its rig only while the rig still holds that collection");
     }
     {
+        // Release review 2026-10-14 finding 4: a rig's collection changed, so the rig's first record's name goes with its bounds (the own-ship prefix exemption reads the name).
+        struct RigModel {
+            bool cur = false, last = false, named = false;
+            uint8_t verdict = 0;
+            uint32_t run = 0;
+            char name[48] = {};
+            uintptr_t coll = 0;
+        };
+        auto note = [](RigModel& r, const char* recordName) {   // what applyRigNote does for one record: a bound, and the name while the slot has none
+            r.cur = true;
+            se::rigRecordName(&r.named, r.name, sizeof(r.name), recordName);
+        };
+        auto assoc = [](RigModel& r, uintptr_t coll) {   // what applyRigAssoc does
+            if (coll == r.coll) return;
+            se::rigReassociate(&r.cur, &r.last, &r.verdict, &r.run, &r.named, r.name, sizeof(r.name));
+            r.coll = coll;
+        };
+        auto exempt = [](const RigModel& r, const char* prefix) { return se::ownShipExempt(false, 0.0f, r.name, prefix); };
+        // the name is recorded once, while the slot has none
+        RigModel a;
+        note(a, "Cobra_Hull_01");
+        note(a, "Rock_02");
+        check(a.named && std::strcmp(a.name, "Cobra_Hull_01") == 0 && exempt(a, "Cobra_"), "release review 2026-10-14 rig name: the first record names the rig, a later record does not rename it");
+        assoc(a, 0x500);
+        a.verdict = 2;
+        a.last = true;
+        // own-ship prefix -> not: the old name must not exempt the new object
+        assoc(a, 0x600);
+        check(!a.named && a.name[0] == '\0' && !a.cur && !a.last && a.verdict == 0 && a.run == 0, "release review 2026-10-14 rig name: a change of collection forgets the name with the bounds and the verdict");
+        check(!exempt(a, "Cobra_"), "release review 2026-10-14 rig name: with no name yet the rig is not exempt by prefix");
+        note(a, "Rock_02");
+        check(a.named && std::strcmp(a.name, "Rock_02") == 0 && !exempt(a, "Cobra_"), "release review 2026-10-14 rig name: prefix to non-prefix, fresh bounds: the new object is classed by its own name (not exempt)");
+        // not -> own-ship prefix: the new object must be protected by its own name
+        RigModel b;
+        note(b, "Rock_02");
+        assoc(b, 0x500);
+        note(b, "Rock_02");
+        check(!exempt(b, "Cobra_"), "release review 2026-10-14 rig name: a non-prefix rig is not exempt");
+        assoc(b, 0x700);
+        note(b, "Cobra_Hull_01");
+        check(exempt(b, "Cobra_") && std::strcmp(b.name, "Cobra_Hull_01") == 0, "release review 2026-10-14 rig name: non-prefix to prefix, fresh bounds: the new object is exempt by its own name");
+        // the same collection again is not a change: the name stays
+        assoc(b, 0x700);
+        check(b.named && exempt(b, "Cobra_"), "release review 2026-10-14 rig name: the same collection again keeps the name");
+        // a record with no readable name, and a zero-size name buffer, are handled
+        RigModel c;
+        note(c, nullptr);
+        check(c.named && c.name[0] == '\0', "release review 2026-10-14 rig name: a null record name records an empty name");
+        bool named = false;
+        char tiny[1] = {'x'};
+        check(!se::rigRecordName(&named, tiny, 0, "abc") && !named && tiny[0] == 'x', "release review 2026-10-14 rig name: a zero-size buffer records nothing");
+    }
+    {
         // Item 3: the cost summary's percentiles, and the change-only gate.
         double v[100];
         for (int i = 0; i < 100; ++i) v[i] = static_cast<double>(100 - i);   // 100 down to 1
