@@ -3341,6 +3341,20 @@ cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNO
 if errorlevel 1 ( echo [edvr] ERROR: ui quality test build failed & exit /b 1 )
 "%BUILD%\ui_quality_test.exe" --dry-run || exit /b 1
 "%BUILD%\ui_quality_test.exe" --self-test || exit /b 1
+REM The AA-off draw path (draw_fast_path.h), the Map timer's sampler and its exact call counts (map_wait.h,
+REM map_wait_sample.h), and the GPU timing guard that keeps off-state draw thunks from calling it (gpu_frame_timing.h),
+REM 2026-10-13. The Map timer is linked from its own source; the GPU call is a counting stub.
+:rig_aa_off_test
+echo [edvr] === aa_off_test.exe ===
+if not exist "%OBJ%\aaofftest" mkdir "%OBJ%\aaofftest"
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\aaofftest\\" /Fe"%BUILD%\aa_off_test.exe" ^
+    "tools\aa_off_test\aa_off_test.cpp" "src\d3d11\map_wait.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: aa_off test build failed & exit /b 1 )
+"%BUILD%\aa_off_test.exe" --dry-run || exit /b 1
+"%BUILD%\aa_off_test.exe" --self-test || exit /b 1
 REM The layer's depth-stencil seed on its own (ui_layer_seed.h): the three
 REM depth formats, every stencil value class, a scale, a jitter and a reused
 REM seeder, read back texel for texel. Built outside build\ so its imported

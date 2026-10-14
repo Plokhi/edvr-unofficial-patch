@@ -3018,6 +3018,9 @@ void uiLayerConfigure(Config& cfg) {
     // The panels follow the same key -- one setting, both halves -- and the
     // instruments with them.
     uiSurfacesSetTarget(target);
+    // The panels' AA gate (2026-10-13): VR's temporal AA (the same reading as `temporal` here), set before the first
+    // configure with the key on can apply the patch.
+    if (!runtimeFlatProfile()) uiPanelScaleSetVrTemporal(temporalVr);
     uiPanelScaleSetTarget(target);
     // The flat profile's panel factor (ui_panel_scale.cpp) needs its anti-aliasing on too.
     if (runtimeFlatProfile()) uiPanelScaleSetFlatTemporal(flatAa);

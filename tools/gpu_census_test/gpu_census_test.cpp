@@ -560,7 +560,7 @@ void gapCases() {
     logAndResetWindow(start + 30000);
     detail = lineWith("EDVR GPU census, frame gap:");
     check(g_lastLog.find("frame gap - (no pairs);") != std::string::npos && g_lastLog.find("frame gap p50") == std::string::npos &&
-              detail && detail->find("no pairs this window (0 valid frames") != std::string::npos,
+              detail && detail->find("no valid frames this window (Application-render GPU timing is off") != std::string::npos,
           "gap: a window with no spans reads '-', not 0.00, on both lines");
     // One frame alone: valid, but no neighbour.
     freshWindow(start);

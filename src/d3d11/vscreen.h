@@ -118,6 +118,9 @@ bool vScreenRenderBelowEye(uint32_t* renderW, uint32_t* renderH, uint32_t* eyeW,
 // frame's submits come before its Present, so a door asked at Submit reads the whole frame's count. The on-foot maps gate's door
 // (ui_layer.cpp uiLayerDoorLayerOnly) compares it with the draws the layer took: when every one was taken the eye holds nothing else.
 uint32_t vScreenEyeDrawsThisFrame();
+// VR's temporal anti-aliasing reads off, as the draw path last took it from the config (the AA-off fast path,
+// draw_fast_path.h). For the draw hook CPU line only.
+bool vScreenAaOffForDraws();
 
 // The context's OMSetRenderTargets through the ORIGINAL entry, past the
 // hook and the binding shadow: for a fix that rebinds around one draw and
