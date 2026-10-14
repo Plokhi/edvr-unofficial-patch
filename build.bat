@@ -553,7 +553,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% %XESSFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\map_wait.cpp" ^
     "src\d3d11\native_render_settings.cpp" ^
     "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_frame_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
-    "src\d3d11\gpu_census.cpp" "src\d3d11\gpu_pass_profile.cpp" ^
+    "src\d3d11\gpu_census.cpp" "src\d3d11\gpu_pass_profile.cpp" "src\d3d11\blend_probe.cpp" ^
     "src\d3d11\d3d11_proxy.cpp" "src\d3d11\device_hook.cpp" ^
     "src\d3d11\format_support_log.cpp" ^
     "src\d3d11\graphics_bridge.cpp" ^
@@ -2312,6 +2312,18 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /link /INCREMENTAL:NO
 if errorlevel 1 ( echo [edvr] ERROR: GPU pass profile test build failed & exit /b 1 )
 "%OBJ%\gpupassprofile\gpu_pass_profile_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_blend_probe_test
+REM TEMPORARY blend probe (2026-10-14): the pure logic of src\d3d11\blend_probe_core.h -- the window, which draws are rows, the row and
+REM grid text and its line length against the log buffer, the refusal reasons and the grid indexing. No D3D11 here.
+if not exist "%OBJ%\blendprobe" mkdir "%OBJ%\blendprobe"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\blendprobe\\" ^
+    /Fe"%OBJ%\blendprobe\blend_probe_test.exe" "tools\blend_probe_test\blend_probe_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: blend probe test build failed & exit /b 1 )
+"%OBJ%\blendprobe\blend_probe_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_vr_world_mips_test

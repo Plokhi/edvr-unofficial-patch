@@ -38,6 +38,7 @@
 #include "object_probe.h"   // objectProbeArmLedger: the armed frame's draw ledger
 #include "pixel_probe.h"    // pixelProbeArm: who drew this pixel, the same armed frame
 #include "ui_depth.h"   // the interface's coverage mask and resolve tuning
+#include "blend_probe.h"   // TEMPORARY blend probe: asks for eye 0's per-pixel decisions, one relaxed load a frame unarmed
 #include "ui_resolve.h"
 #include "screen_motion.h"
 #include "weapon_motion.h"
@@ -3968,8 +3969,20 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                 }
             } else {
                 ID3D11ComputeShader* mvCs = motionShader(ctx, diagnostics);
-                const bool traceRequested = eye == 0 && g_eyeRunLeft > 0 &&
-                                            g_eyeRunTaken < kEyeRun && !amdEngine && !intelEngine;
+                const bool eyeRunTrace = eye == 0 && g_eyeRunLeft > 0 &&
+                                         g_eyeRunTaken < kEyeRun && !amdEngine && !intelEngine;
+                // TEMPORARY, the blend probe (blend_probe.h): a collecting capture wants eye 0's per-pixel decisions too. The same
+                // capture-only shader variant, which leaves the production motion output as it was.
+                const bool probeTrace = eye == 0 && blendProbeGridWanted();
+                if (probeTrace && (amdEngine || intelEngine))
+                    blendProbeGridRefuse("the upscaler path is not NVIDIA's: the capture-only decision shader runs only for DLSS");
+                const bool traceRequested = eyeRunTrace || (probeTrace && !amdEngine && !intelEngine);
+                // The blend probe's decision texture (65 MB at the DLAA size) is not kept past its capture; an eye run releases its own
+                // with its artifacts, so only a texture nobody is waiting for goes.
+                if (!traceRequested && eye == 0 && e.dlDecision && g_eyeRunLeft <= 0 && !g_eyeRunReady) {
+                    if (e.dlDecisionUav) { e.dlDecisionUav->Release(); e.dlDecisionUav = nullptr; }
+                    e.dlDecision->Release(); e.dlDecision = nullptr;
+                }
                 // The size to come back at: the frame's own, or the larger
                 // one asked for (DLSS proper).
                 const uint32_t oW = (outW && outH && (outW != w || outH != h)) ? outW : w;
@@ -4019,11 +4032,17 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     ID3D11ComputeShader* traceCs = motionTraceShader(ctx);
                     traceReady = traceCs && ensureDecisionTexture(dev, e, w, h);
                     if (traceReady) mvCs = traceCs;
-                    else g_eyeDecisions[g_eyeRunTaken].error = traceCs ? "decision_texture_unavailable"
-                                                                       : "decision_shader_unavailable";
+                    else {
+                        if (eyeRunTrace) g_eyeDecisions[g_eyeRunTaken].error = traceCs ? "decision_texture_unavailable"
+                                                                                       : "decision_shader_unavailable";
+                        if (probeTrace) blendProbeGridRefuse(traceCs ? "the decision texture could not be made"
+                                                                      : "the capture-only decision shader could not be created");
+                    }
                 } else if (eye == 0 && g_eyeRunLeft > 0 &&
                            g_eyeRunTaken < kEyeRun && (amdEngine || intelEngine)) {
                     g_eyeDecisions[g_eyeRunTaken].error = "non_nvidia_trace_unsupported";
+                } else if (probeTrace && !made) {
+                    blendProbeGridRefuse("the pass's own textures were not made this frame");
                 }
                 if (made && setParams(ctx, p)) {
                     if(uiTrack && e.dlSubmitUav && !g_csUiResolveTried) {
@@ -4151,7 +4170,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     }
                     ctx->CSSetShaderResources(0, srvCountM, nullSrvM);
                     ctx->CSSetUnorderedAccessViews(0, traceReady ? 8 : 7, nullUavM, nullptr);
-                    if (traceReady) {
+                    if (traceReady && eyeRunTrace) {
                         EyeDecisionFrame& decision = g_eyeDecisions[g_eyeRunTaken];
                         uint32_t cw=0,ch=0,cx=0,cy=0;
                         if (stageEyeCrop(ctx,e.dlDecision,&g_eyeDecisionStaging[g_eyeRunTaken],&cw,&ch,
@@ -4161,6 +4180,23 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             decision.decisionCrop[2]=cw;decision.decisionCrop[3]=ch;
                             decision.error="dlss_treatment_failed";
                         } else decision.error="decision_stage_failed";
+                    }
+                    // TEMPORARY, the blend probe: the window of this eye's decisions, depth, coverage and bias, staged for a read at the
+                    // next frame boundaries. Read-only copies of the pass's textures; nothing it binds or writes changes. The camera term is
+                    // the pass's own delta rotation (the trace of dR0..2) and the world translation (tvCam) for this frame.
+                    if (traceReady && probeTrace) {
+                        BlendGridIn gi;
+                        gi.decision = e.dlDecision;
+                        gi.depth = e.dlDepth;
+                        gi.coverage = coverageMask;
+                        gi.bias = e.dlMask;
+                        gi.w = w;
+                        gi.h = h;
+                        gi.sceneFrame = g_rowsFrame;
+                        gi.rotTrace = p.dR0[0] + p.dR1[1] + p.dR2[2];
+                        gi.transLen = std::sqrt(p.tvCam[0] * p.tvCam[0] + p.tvCam[1] * p.tvCam[1] + p.tvCam[2] * p.tvCam[2]);
+                        gi.transValid = p.tvCam[3] != 0.0f;
+                        blendProbeGridOffer(ctx, gi);
                     }
                     if (traceReady) {
                         ctx->CSSetUnorderedAccessViews(7,1,&savedTraceUav,nullptr);
