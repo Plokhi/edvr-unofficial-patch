@@ -146,7 +146,7 @@ struct Shared {
     // The overlay's head lock: bit 31 on, then yaw and pitch as tenths of a
     // degree, each biased into twelve bits (kHeadLockBias).
     volatile LONG     menuHeadLock;
-    // The detector's verdict on the last jump, d3d11 -> openvr: bits 0-1 say
+    // The transition-flash fix's verdict on the last jump, d3d11 -> openvr: bits 0-1 say
     // whether the camera came back (1, a glitch) or stayed (2, a change of
     // reference frame), and the bits above them count the verdicts, so a
     // reader that remembers the value at a withhold can tell a NEW verdict
@@ -224,7 +224,7 @@ struct Shared {
 // nothing native replaced it.
 // _v31 because the runtime's hidden-area-mesh triangle counts joined
 // (runtimeMaskTri), for fix.eye_mask's auto mode (frame_flag.h).
-// _v30 because the detector's verdict on a jump crosses to the openvr half
+// _v30 because the fix's verdict on a jump crosses to the openvr half
 // (jumpVerdict), which waits for it before restarting the history.
 // _v29 because the head lock's two angles are packed with a bias that fits
 // the field they are masked into; the old pair would read each other's
@@ -480,11 +480,6 @@ void markGlitchFrame() {
 bool glitchFrameMarked() {
     Shared* s = map();
     return s && InterlockedCompareExchange(&s->flag, 0, 0) != 0;
-}
-
-void unmarkGlitchFrame() {
-    Shared* s = map();
-    if (s) InterlockedExchange(&s->flag, 0);
 }
 
 void clearGlitchFrame() {

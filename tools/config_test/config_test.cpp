@@ -1138,6 +1138,11 @@ static const char* const kRetiredExactKeys[] = {
     // and the world route's switch (its _jitter and _steady_detail siblings went on 2026-10-01).
     "temporal_aa_jitter",
     "temporal_aa_on_foot_world",
+    // fix.transition_flash, removed 2026-10-13: the engine fix's hold is always on in the VR profile and has no setting (docs/transition-flash.md). The bare
+    // name is also the start of the engine fix's file and function names (transition_flash_eye_base.cpp), so only the qualified spelling is held out of the
+    // sources and the shipped file; a user's old line is carried over by the installer under "no longer used by this version", never read by the DLL, and
+    // named in the log by the config audit as a line this build does not read.
+    "fix.transition_flash",
 };
 static const int kRetiredExactKeyCount = int(sizeof(kRetiredExactKeys) / sizeof(kRetiredExactKeys[0]));
 
@@ -1205,11 +1210,36 @@ static void retiredKeyScan(const std::wstring& root) {
         bool foundAll = true, passedAll = true;
         for (const std::string& t : retired) foundAll = foundAll && spellsRetiredKey(t) != nullptr && std::strcmp(spellsRetiredKey(t), kRetiredExactKeys[0]) == 0;
         for (const std::string& t : liveKeys) passedAll = passedAll && spellsRetiredKey(t) == nullptr;
-        if (foundAll && passedAll && kRetiredExactKeyCount == 3)
+        if (foundAll && passedAll && kRetiredExactKeyCount == 4)
             ok("the exact-name scan finds fix.explorer_cam in a read, a message, a comment and at the end of a sentence, and passes hotkey.explorer_cam, "
                "fix.explorer_cam_eye_*, the trims and the smoothing beside it");
         else
             fail("the exact-name scan's own control", std::string(foundAll ? "" : "a retired spelling was missed; ") + (passedAll ? "" : "a live key was flagged"));
+    }
+
+    // The retired transition-flash switch, by its qualified name: found in a read, a message, a comment and at the end of a sentence, and the engine fix's own
+    // file and function names (which begin with the same words) pass.
+    {
+        const std::string retired[] = {
+            "Config::get().getBool(\"fix.transition_flash\", true)",
+            "the log says set fix.transition_flash = 0 and restart",
+            "# fix.transition_flash = 1\n",
+            "turns it off (fix.transition_flash).",
+            "fix.transition_flash",
+        };
+        const std::string liveNames[] = {
+            "#include \"transition_flash_eye_base.h\"",
+            "\"src\\d3d11\\transition_flash_eye_base.cpp\"",
+            "transitionFlashEyeBaseInstall();",
+            "transition flash: frame 12 held (event skip 11)",
+        };
+        bool foundAll = true, passedAll = true;
+        for (const std::string& t2 : retired) foundAll = foundAll && spellsRetiredKey(t2) != nullptr && std::strcmp(spellsRetiredKey(t2), "fix.transition_flash") == 0;
+        for (const std::string& t2 : liveNames) passedAll = passedAll && spellsRetiredKey(t2) == nullptr;
+        if (foundAll && passedAll)
+            ok("the exact-name scan finds fix.transition_flash in a read, a message, a comment and at the end of a sentence, and passes the engine fix's file and function names");
+        else
+            fail("the transition-flash exact-name scan's own control", std::string(foundAll ? "" : "a retired spelling was missed; ") + (passedAll ? "" : "a live name was flagged"));
     }
 
     // The shipped file: no template, no comment, no mention.
@@ -1553,7 +1583,7 @@ int main(int argc, char** argv) {
     // and all, was removed 2026-09-29.
     expectStr("experimental.foveation_centre", "<unset>", "the retired foveation centre key is absent");
     expectBool("fix.share_exposure", true, "a key in the first [fix] reads");
-    expectBool("fix.transition_flash", true, "...and another beside it");
+    expectBool("fix.weapon_stability", true, "...and another beside it");
     expectStr("hotkey.toggle_exposure", "SCROLLLOCK",
               "a key in the first [hotkey] reads");
     // The eye-run depth instrument ships as a commented template like the
@@ -1676,6 +1706,9 @@ int main(int argc, char** argv) {
     expectFloat("fix.explorer_cam_eye_trim_right", 0.0f, "...right 0.0,");
     expectFloat("fix.explorer_cam_follow_smoothing_ms", 0.0f, "...and the follow smoothing at 0 (exact follow)");
     expectStr("advanced.explorer_cam_probe", "<unset>", "the retired Explorer Cam probe key is absent from the shipped file (removed 2026-10-09; kRetiredKeys holds its name out of every source)");
+    // The transition-flash switch (removed 2026-10-13) is a bare [fix] key like fix.explorer_cam was: the exact-name scan holds its qualified name out of the
+    // sources and the file's text, and this lookup holds the [fix] line itself out.
+    expectStr("fix.transition_flash", "<unset>", "the retired transition-flash switch is absent from the shipped file (the hold is always on in the VR profile and has no setting)");
     expectFloat("fix.explorer_cam_eye_trim_up", ecm::kTrimUpDefault, "the shipped up trim is the code constant ecm::kTrimUpDefault");
     expectFloat("fix.explorer_cam_eye_trim_forward", ecm::kTrimForwardDefault, "...the shipped forward trim is ecm::kTrimForwardDefault");
     expectFloat("fix.explorer_cam_eye_trim_right", ecm::kTrimRightDefault, "...the shipped right trim is ecm::kTrimRightDefault");

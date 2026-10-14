@@ -1250,24 +1250,41 @@ EDVR_BOUNDARY_TICK(tkFormatSupport, "format_support");
 
 void configureDiagnosticHotkeys();   // defined beside ensureState
 
+// What the camera-history key writes: the temporal pass's history of the
+// camera rows it was handed (temporalPassDumpHistory prints the TEMP and TCAM
+// rows). The first line says what follows and how to tell whether the
+// transition-flash fix held a frame near the moment, because that is the
+// question the key is pressed to answer.
+void dumpCameraHistory(const char* trigger) {
+    Log::get().note(
+        "camera history dump (%s): the temporal pass's recent camera submissions follow, one TEMP "
+        "line per eye call and a TCAM line with the camera rows it saw. The transition flash fix is %s. "
+        "Every frame it holds is logged as 'transition flash: frame N held'; no such line near the "
+        "moment you reacted to means it did not hold one.",
+        trigger,
+        transitionFlashEyeBaseArmed()
+            ? "armed"
+            : "NOT armed (the log says why near its start), so it holds no frame");
+    temporalPassDumpHistory(trigger);
+}
+
 // The diagnostic keys (tkHotkeys). The exposure toggle is its own tick.
 void tickHotkeys() {
     // The history key dumps TWICE: now, and again two seconds from now.
     //
     // A flash you react to sits about 300 ms back, which is the last few
-    // rows of a ring that holds only what came BEFORE the press. And a bad
-    // frame is one that leaves the line and RETURNS -- a shape that needs
-    // frames on both sides of it, which an event at the ring's edge does
+    // rows of a history that holds only what came BEFORE the press. And a
+    // bad frame is one that leaves the line and RETURNS -- a shape that needs
+    // frames on both sides of it, which an event at the history's edge does
     // not have. So the one capture that is guaranteed to contain the thing
     // being chased is also the one least able to show it.
     //
-    // The second dump costs one more press of nothing: same ring, two
+    // The second dump costs one more press of nothing: same history, two
     // seconds later, by which time the event has moved to the middle with
     // its recovery behind it. The pair is the point -- the first is the
     // reaction-time capture, the second is the one you read.
     if (g_state->dumpKey.pressed()) {
-        dumpCameraRing("the history key");
-        temporalPassDumpHistory("the history key");
+        dumpCameraHistory("the history key");
         g_state->dumpDueMs = nowMs() + kDumpDelayMs;
     }
     // THE PRESS THAT WENT NOWHERE, said out loud.
@@ -1299,9 +1316,7 @@ void tickHotkeys() {
     // The delayed dump, armed by the history key.
     if (g_state->dumpDueMs != 0 && nowMs() >= g_state->dumpDueMs) {
         g_state->dumpDueMs = 0;
-        dumpCameraRing("a key you pressed two seconds ago",
-                       (uint32_t)(kDumpDelayMs / 1000));
-        temporalPassDumpHistory("a key you pressed two seconds ago");
+        dumpCameraHistory("a key you pressed two seconds ago");
     }
     // The draw census key (issue 69074). Same silent-failure shape as the
     // history key, same cure: a diagnostic keypress that another window
@@ -1929,8 +1944,7 @@ void readoptGameBindings() {
 // The Instruments page's rows: the same functions the diagnostic hotkeys
 // fire, reachable from a headset with no key bound.
 void menuActionDumpCamera(void*) {
-    dumpCameraRing("the settings menu");
-    temporalPassDumpHistory("the settings menu");
+    dumpCameraHistory("the settings menu");
 }
 void menuActionCensus(void*) {
     drawCensusRequest();
@@ -2061,7 +2075,7 @@ State& ensureState() {
         // path for live changes; its Instruments page gets the diagnostic
         // keys' functions as rows.
         menuRegisterAction("Dump the camera history now",
-                           "The PAUSE key's job: the last ten seconds of viewpoint history to the log.",
+                           "The PAUSE key's job: the temporal pass's recent camera history, to the log.",
                            &menuActionDumpCamera, nullptr);
         menuRegisterAction("Take a draw census and quad probe",
                            "The dump_draws key's job: every draw into the eyes for a few frames.",
@@ -2538,7 +2552,7 @@ void hookDevice(ID3D11Device* device) {
                 "d3d11 fixes are OFF by request (advanced.d3d11_fixes = 0), so no "
                 "hooks are installed on the device or on its context, this session "
                 "or any other: the black void, the panel distance, the exposure "
-                "share, the transition flash detector, the anti-aliasing passes, "
+                "share, the transition flash fix, the anti-aliasing passes, "
                 "the shader replacements and Explorer Cam are "
                 "all inert, and the game renders as it would without this half "
                 "installed. What is still hooked is the swapchain's Present and "
@@ -2569,7 +2583,7 @@ void hookDevice(ID3D11Device* device) {
             "ended in the first few seconds looks the same from here. EVERY fix in "
             "d3d11.dll is off for THIS session only, on every device, and it will try again next "
             "launch: the black void, the panel distance, the exposure share, the "
-            "transition flash detector and Explorer Cam. The game "
+            "transition flash fix and Explorer Cam. The game "
             "renders without EDVR's graphics treatments; the EDVR menu is unavailable "
             "until the next launch. The OpenVR half has its own recovery guard.\n"
             "  If this keeps happening, the hooks really are crashing and the log is "
@@ -2869,8 +2883,8 @@ void hookDevice(ID3D11Device* device) {
                     Config::get().iniName(), probe.c_str());
             }
             installExposureFix(device, ctxMode);
-            // Before the vScreen fixes, which ask it whether it needs the
-            // eye-draw count. It installs no hooks of its own -- it is driven
+            // Before the vScreen fixes, which ask it whether it needs their Map
+            // and Unmap hooks. It installs no hooks of its own -- it is driven
             // from vScreen's Map and Unmap -- so nothing else depends on the
             // order.
             installGlitchFrameFix();

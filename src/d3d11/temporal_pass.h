@@ -35,8 +35,9 @@
 // stands the pass down for the session with one line.
 #pragma once
 
-// Bounded CPU history of actual temporal submissions, written on Pause
-// alongside the camera history. Empty/stale history is reported explicitly.
+// Bounded CPU history of actual temporal submissions, written on Pause (the
+// camera-history key) and from the settings menu. Empty/stale history is
+// reported explicitly.
 namespace edvr { void temporalPassDumpHistory(const char* trigger); }
 
 #include <cstddef>
@@ -68,7 +69,7 @@ bool nativeTemporalOmissionCounters(uint64_t* skipped, uint64_t* historyKept, ui
 
 // The camera capture for the `camera` motion source. Every write of the
 // game's big scene-constants block passes through here (the Unmap tee
-// that already feeds the flash detector and the sun-glare fix); the rows
+// that already feeds the transition-flash tap and the sun-glare fix); the rows
 // at float 932 are the true view matrix (measured, sunglare_fix.cpp) and
 // are kept pending. The frame's FIRST eye-sized draw latches the pending
 // rows as this frame's camera -- the last scene write before the first

@@ -2,27 +2,38 @@
 
 ## Status
 
-- **State (2026-10-09): the flash is fixed in the engine's own frame order.**
-  `fix.transition_flash` (on by default) arms an exact withhold: the camera
-  driver's consume that reads a reset mailbox arms an event, and the one frame
-  drawn from it is held back (the compositor keeps the previous frame) instead
-  of shown. Flight 095137: every transition flown, no flash seen; 12 events, 13
-  frames held, no misses and no false holds, DLSS history kept every time. The
-  old detector described below is only the FALLBACK, used when the game build
-  is not the one EDVR knows or the camera-buffer tap cannot deliver (the log
-  says which, and whether any protection runs). Full story: `docs\design-transition-flash-engine-
-  fix-2026-09-23.md` (read its Status block first).
+- **State (2026-10-13): the flash is fixed in the engine's own frame order, and
+  that is the only mechanism left.** The exact withhold is ALWAYS ON with no
+  setting: the camera driver's consume that reads a reset mailbox arms an event,
+  and the one frame drawn from it is held back (the compositor keeps the
+  previous frame). Flight 095137: every transition flown, no flash seen; 12
+  events, 13 frames held, no misses, no false holds, DLSS history kept. When the
+  game build is not the one EDVR knows, the consumer hook does not install, or
+  the camera-buffer tap cannot deliver, the log says which and that NO frame is
+  held: the old fallback detector was removed 2026-10-13 (last entry). Full
+  story: `docs\design-transition-flash-engine-fix-2026-09-23.md` (Status first).
+- **Retired 2026-10-13 (Sean approved), quoted:** `fix.transition_flash` (`1`
+  on, `0` off, needs a restart; menu row "Stop the one-frame flash on jumps");
+  `transitionEnabled` in the frame ABI is now always 1. An old line is carried
+  by the installer as "no longer used", named by the config audit, read by
+  nothing. Already gone earlier (124b6d09, 2026-10-09): 
+  `advanced.transition_flash_units`, `_speed_factor`, `_max_consecutive`,
+  `_repeat_percent`, `_radius_tolerance`, `_park_units`, `_dwell_frames`,
+  `_burst_limit`, `_burst_window`, `_separation`, `_drift_pct`, `_resubmit`,
+  `_diagnostics` and `_eye_base`; `_prevent` went in 68bddaaa (2026-09-29).
+- **Kept, on purpose:** `hotkey.dump_camera` (Pause) and its dump, which now
+  prints the temporal pass's camera history only; `advanced.camera_buffer_bytes`
+  and `advanced.camera_buffer_offset` (they now gate only the camera-buffer tap:
+  **propose removing them, needs Sean**).
 - **What the bad frame is:** the HMDCamera (the head camera) is deactivated one
   frame and re-activated after the camera driver's consume, so the mailbox the
   driver composes the eyes from is still its reset value; the eye origin
   `cb1[275]` collapses to the head pose alone for that one frame. Correcting the
   frame in place was tried and flashed (the bad frame carries at least five
   other wrong structures); holding it does not.
-- **Cost:** an estimate, not an A/B measurement: the old detector ran every
-  frame even with the fix off; the engine fix is a 64-byte compare per consume
-  and the idle path of the camera-buffer Unmap (shared Map memo, guarded dispatch, one idle
-  test), about 0.1-0.4 ms of render-thread
-  CPU a frame less.
+- **Cost:** an estimate, not an A/B measurement: a 64-byte compare per consume
+  and the idle path of the camera-buffer Unmap; the detector's per-draw and
+  per-Map work is gone, and a build that cannot arm pays only the idle test.
 - **Open:** issue #34 (second and later jumps) was closed on timing and never
   re-measured on the engine fix.
 - **Ruled out:** listed at the end of the design doc.
@@ -167,9 +178,10 @@ shows the previous frame in its place; EDVR tells the temporal pass the camera
 stayed, so its history is kept. One held frame per transition, nothing written
 into the game, no guessing from camera distances.
 
-**The rest of this section describes the older DETECTOR**, which is now only the
-fallback when the engine fix cannot arm (an Elite build EDVR does not know). It
-**detects the bad frame while it is still being drawn and hands SteamVR a copy of
+**The rest of this section describes the older DETECTOR, REMOVED 2026-10-13**
+(it was only the fallback when the engine fix could not arm, an Elite build
+EDVR does not know); it stays as the record of what was built and measured. It
+**detected the bad frame while it is still being drawn and hands SteamVR a copy of
 the previous frame in its place** -- EDVR keeps a copy of the last frame it
 actually forwarded, and a caught frame becomes an on-time submit of that copy at
 the current pose. One repeated frame, no stall, always the game's own picture;
@@ -305,7 +317,77 @@ key pressed it. The history stays here so the idea is neither rediscovered from
 scratch nor dismissed on a measurement whose premise has moved.
 
 **If you see a flash that got through:** press **Pause** immediately, then quit
-and send `edvr_logs\`. That writes the last ten seconds of viewpoint history,
-which shows whether the frame was detected and let through or never detected at
-all. Those are different bugs and the log is the only thing that distinguishes
-them.
+and send `edvr_logs\`. That writes the temporal pass's recent camera history and
+says whether the hold was armed. A `transition flash: frame N held` line near the
+moment means a frame was held and the flash got through anyway; no such line
+means nothing was held. Those are different bugs and the log is the only thing
+that distinguishes them.
+
+---
+
+## 2026-10-13: the key and the fallback detector are gone
+
+Sean decided: the engine fix's hold is always on, and the independent detector
+that ran when it could not arm is removed. Nothing in a flight that mattered
+used the detector: it was dormant whenever the engine fix was armed (every
+flight since 095137), and its twelve tuning keys had already gone in Build 2d.
+
+- **Removed key, quoted:** `fix.transition_flash` (`1` on, `0` off, needs a
+  restart; menu row "Stop the one-frame flash on jumps"). Its `0` path did two
+  things, both gone: the engine fix's install (`transitionFlashEyeBaseConfigure`
+  read it once) and the provider's `transitionEnabled` word that gated the
+  compositor's hold in `native_frame.cpp` (`(transitionEnabled && marked) ||
+  held`; now `marked || held`, the ABI field stays and is always 1).
+- **The install is gated by the profile, not a key.** In the flat profile the
+  old key was refused by the profile allow-list and read false, so the engine
+  fix never installed there; it still does not (`runtimeVrProfile()` is the gate,
+  and a flat launch that switches to VR installs it then).
+- **Removed code:** the detector in `glitch_frame.cpp` (2,847 lines to 189:
+  the jump chain over the camera position, the separation memory, certified
+  orbits and parks, the pool-coherence cross-check and its scene-draw and
+  pool-recording hooks in `vscreen.cpp`, the camera-history ring and its dump
+  `dumpCameraRing`, the `GlitchTuning` constants, the churn instruments),
+  `glitch_scene.h`, `unmarkGlitchFrame` (only the detector withdrew a mark), the
+  `countForFlashFix` eye-draw counting and the dead `sceneDrawsThisFrame` it
+  summed, and `tools\glitch_test`'s detector cases with their three field
+  corpora. What the engine fix used stays: the camera-CB tap
+  (`glitchFrameObserve`), the event window, the hold (`glitchFrameEngineFixHold`)
+  and the verdict, the frame counter, the tap-availability check.
+- **Verified detector-only before cutting (origin/main 7e44b86c).** Armed, the
+  detector was dormant on every path: `glitchFrameObserve` returned at
+  `engineObserveIdle()` (glitch_frame.cpp:1604) and its jump chain at
+  `engineFixDormant()` (1700), pool and scene-draw recording stopped at
+  `poolRecordingWanted()` (1964, 1969, 2032), the boundary at 2093,
+  `glitchFrameNeedsEyeDraws()` answered false (1586, so `countForFlashFix`
+  counted nothing), and the dump refused (2593). `glitchFrameSceneGeometry` and
+  every `GlitchScene*` type had no caller outside the detector and its rig.
+  The twelve tuning keys and `_diagnostics` had no reader at all (Build 2d);
+  `GlitchTuning` (glitch_frame.h:33) held their old defaults for the detector
+  only. What the engine fix used and kept: the event window (1386), the Armed
+  report (1396), tap availability (1412), the hold (1435) and the verdict
+  (1447), `glitchFrameWantsBuffer` (1589), `glitchFrameObserve`'s finite check
+  and tap call (1597-1645) and the boundary's frame counter (2085).
+- **`dump_camera` (Pause) stays.** Its first line is now "camera history dump:
+  the temporal pass's recent camera submissions follow ... The transition flash
+  fix is armed / NOT armed", then `temporalPassDumpHistory`'s TEMP and TCAM
+  rows. `dump_camera_on_external_cam` was already retired 2026-10-07 with the
+  old Explorer Cam route (config_test's `kRetiredKeys`); nothing reads it.
+- **Stale lines are harmless:** nothing reads `fix.transition_flash`; the config
+  audit logs "N line(s) name settings this build does not read: ... a typo or a
+  retired setting -- those lines do nothing" once per session; the installer's
+  merge carries the line under "this version no longer uses it" (installer_test
+  pins it). config_test holds the qualified name out of every source and the
+  shipped file (`kRetiredExactKeys`, because the bare name begins the engine
+  fix's file names).
+- **A build the engine fix does not recognise now has no transition
+  protection.** The log says `engine fix NOT armed (<why>) ... No frame will be
+  held`. This is the price of removing the fallback, and was accepted.
+- **Tests:** `glitch_test` is rewritten for the tap (nomination until Armed, the
+  window gating the hand-over, the frame counter, the geometry checks with a
+  stale `fix.transition_flash` line, a hold's mark and verdict);
+  `native_temporal_test` runs the whole glue chain with a stale `0` in the
+  config and ends with the real install path run with no key, a stale `0`, a
+  stale `1`, the flat profile (installs nothing) and a switch to VR (installs);
+  `native_frame_test` marks a frame under four stale values and expects a jump
+  hold each time; `config_test` and `installer_test` hold the key out and pin
+  the carry-over.
