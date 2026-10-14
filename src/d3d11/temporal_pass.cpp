@@ -1,5 +1,6 @@
 #include "fixed_shader_source.h"
 #include "temporal_pass.h"
+#include "flat_diagnostic.h"
 #include "temporal_history.h"
 #include "../common/runtime_profile.h"
 #include "draw_census.h"
@@ -4957,7 +4958,7 @@ void temporalPassConfigure(Config& cfg) {
     // taking the record's exact motion there. It arms and disarms with the
     // mode, live; a hook that cannot install stands it down whole, logged.
     const bool engineMotionOn = runtimeFlatProfile()
-        ? temporalModeEnabled(cfg.requestedTemporalMode()) : detail::g_temporalPassWantedFssChrome;
+        ? temporalModeEnabled(cfg.requestedTemporalMode()) && flatdiag::enabled(flatdiag::Motion) : detail::g_temporalPassWantedFssChrome;
     engineVelocityConfigure(engineMotionOn);
     // Planet patch motion (celestial_motion.h) is part of fix.temporal_aa in the VR build, with no key of its own (a fix that always helps
     // gets no toggle): its capture and its records run exactly while the pass does. The flat profile has its own planet, its own pass.

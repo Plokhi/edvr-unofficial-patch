@@ -8,6 +8,7 @@
 #include "flat_map_bounce.h"
 #include "flat_mutation_diagnostic.h"
 #include "animated_history_writes.h"
+#include "flat_diagnostic.h"
 #include "flat_ui_layer.h"   // fix.ui_quality's flat layer: the draw scope's second issues (uiReissue)
 #include <optional>
 namespace edvr {
@@ -161,8 +162,8 @@ struct FlatRuntimeDrawScope {
     // write-back into the game's buffer, and the admitted tonemap's re-issue over the HDR HUD layer. Nothing otherwise.
     template <class Issue> void uiReissue(Issue issue) {
         if (!ctx) return;
-        if (uiTaken && flatUiLayerWriteBackBegin(ctx)) { issue(); flatUiLayerWriteBackEnd(ctx); }
-        if (uiTone && flatUiLayerToneBegin(ctx)) { issue(); flatUiLayerToneEnd(ctx); }
+        if (uiTaken && flatUiLayerWriteBackBegin(ctx)) { flatdiag::note(flatdiag::Replay); issue(); flatUiLayerWriteBackEnd(ctx); }
+        if (uiTone && flatUiLayerToneBegin(ctx)) { flatdiag::note(flatdiag::Replay); issue(); flatUiLayerToneEnd(ctx); }
     }
     ID3D11Texture2D* overlayHdr = nullptr;
     ID3D11DepthStencilView* overlayDsv = nullptr;

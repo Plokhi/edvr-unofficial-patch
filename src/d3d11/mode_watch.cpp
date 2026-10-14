@@ -2,6 +2,7 @@
 // files, the wait and the log lines; the rules see none of it. The commit switches the profile live, at the frame boundary. Design:
 // docs\design-unified-install-2026-10-12.md sections 3.2 to 3.4.
 #include "mode_watch.h"
+#include "flat_diagnostic.h"
 
 #include "device_hook.h"        // flatSwitchAvailable, deviceHookRequestConfigRefresh: the switch's gate and its forced configure sweep
 #include "dlaa.h"               // dlaaReleaseForSwitch: DLSS features released, NGX kept
@@ -447,6 +448,7 @@ void commitPosted(uint64_t packed) {
     }
     g_switches.fetch_add(1, std::memory_order_relaxed);
 
+    flatdiag::profileSwitch();  // the new profile starts with normal resolver policy
     runtimeProfileSet(target);
     setVrProfileActive(target == RuntimeProfile::Vr || target == RuntimeProfile::LegacyVr);
     Config::get().switchProfile();

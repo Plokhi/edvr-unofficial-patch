@@ -108,6 +108,11 @@ enum Family : unsigned {
     kHdrRoute,      // the HDR route's trigger detector (flat_hdr_route.h) on every draw, observe-only with the key off
     kForegroundCapture, // foreground identity/certificate and original-VS stream-output capture
     kInject,        // the camera inject callback (refreshPre / refreshPost): game threads
+    kSubmission,    // forwarded game draw, driver/wrapper CPU; excluded from EDVR total
+    kPresent,       // forwarded Present, including downstream blocking; excluded from EDVR total
+    kResourceSubmission, // forwarded Map/copy/update/resolve; excluded from EDVR total
+    kPreparation,   // temporal input preparation, binding and dispatch submission
+    kUiComposition, // UI-layer composition, including its submission work
     kFamilies
 };
 struct FamilyInfo {
@@ -133,6 +138,11 @@ inline constexpr FamilyInfo kInfo[kFamilies] = {
     {"hdr route", false},
     {"foreground capture", false},
     {"camera inject", true},
+    {"D3D11 draw submission", false},
+    {"Present downstream", false},
+    {"resource submission", false},
+    {"temporal preparation", false},
+    {"UI composition", false},
 };
 constexpr unsigned kCal = kFamilies;   // the calibration cell, never reported
 constexpr unsigned kCells = kFamilies + 1;
@@ -175,7 +185,8 @@ inline uint64_t makeGate(bool sampled, uint32_t renderTid) noexcept {
     return (sampled ? kSampledBit : uint64_t(0)) | renderTid;
 }
 inline bool gateClocks(uint64_t gate) noexcept {
-    return (gate & kSampledBit) != 0 || static_cast<uint32_t>(gate) == currentThreadId();
+    return (gate & kSampledBit) != 0 ||
+        (cpuGateHasThread(gate) && static_cast<uint32_t>(gate) == currentThreadId());
 }
 // Sampled and never-render gates, for the calibration.
 inline std::atomic<uint64_t> g_calGate{kSampledBit};
@@ -231,12 +242,25 @@ public:
         // The parent sees this scope's whole wall time as its child.
         ctx_->child = savedChild_ + (now - begin_);
     }
+    // Partition a sampled parent's time without checking the global gate again.
+    // An inactive parent forwards directly: no clock, slot or child registration.
+    template<class Call>
+    auto timeChild(unsigned family, Call call) -> decltype(call()) {
+        if (!live_) return call();
+        Scope child(family, Clocked{});
+        return call();
+    }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 
 private:
+    struct Clocked {};
+    Scope(unsigned family, Clocked) noexcept { openClocked(family); }
     void open(const std::atomic<uint64_t>& gate, unsigned family) noexcept {
         if (!gateClocks(gate.load(std::memory_order_relaxed))) return;
+        openClocked(family);
+    }
+    void openClocked(unsigned family) noexcept {
         ThreadCtx& c = t_ctx;
         Slot* s = c.slot;
         if (!s) s = registerSlot();
@@ -452,26 +476,17 @@ inline void percentiles(float* a, unsigned n, double* p50, double* p95) noexcept
     *p50 = static_cast<double>(a[i50]);
 }
 
-// Whether the census clocks anything. Under Proton an on-foot frame makes about 200,000 scopes,
-// and clocking one costs that frame about 21 ms (2026-10-02): a hitch at a random frame in every
-// block of kRenderPeriod, p95 present 37 ms against 16.7 ms at 60 Hz. The policy: on under Windows,
-// as it always was; off under Wine (Proton), the only place the hitch is measured. ntdll exporting
-// wine_get_version is how Wine is told apart. EDVR_FLAT_CPU_CLOCKS=1 or =0 decides it either way.
-// With the clocks off the line still prints the present and GPU figures.
+// Historical policy, retained for the original census regression tests. Under Proton,
+// clocking about 200,000 scopes cost a sampled frame about 21 ms (2026-10-02).
+// Production now requires explicit opt-in on every runtime and skips the census
+// entirely when disabled; clocksWanted() resolves the new switch and legacy alias.
 inline bool clocksPolicy(bool underWine, const char* env) noexcept {
     if (env && env[0] == '1') return true;
     if (env && env[0] == '0') return false;
     return !underWine;
 }
 inline bool clocksWanted() noexcept {
-    static const bool on = [] {
-        char v[4] = {};
-        const bool set = GetEnvironmentVariableA("EDVR_FLAT_CPU_CLOCKS", v, sizeof v) > 0;
-        const HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-        const bool underWine = ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
-        return clocksPolicy(underWine, set ? v : nullptr);
-    }();
-    return on;
+    return emcpu::profileWanted();
 }
 
 class Census {
@@ -481,9 +496,9 @@ public:
     // `renderPeriod` 1 clocks the render thread on every frame, as the census did until 2026-09-30:
     // what the rig compares a sampled window with.
     // `clocks` false: no thread is clocked on any frame (clocksWanted()).
-    explicit Census(unsigned renderPeriod = kRenderPeriod, bool clocks = true) noexcept
-        : renderPeriod_(renderPeriod ? renderPeriod : 1u), schedule_(renderPeriod ? renderPeriod : 1u, kSamplePeriod),
-          clocks_(clocks) {}
+    explicit Census(unsigned renderPeriod = kRenderPeriod, bool clocks = true, unsigned samplePeriod = kSamplePeriod) noexcept
+        : renderPeriod_(renderPeriod ? renderPeriod : 1u), samplePeriod_(samplePeriod ? samplePeriod : 1u),
+          clocks_(clocks), schedule_(renderPeriod ? renderPeriod : 1u, samplePeriod) {}
 
     // Once per Present, on the render thread. `paused`: the frame that just ended was a stood-down
     // Paused one. Decides the next frame's clocking and writes the gates (this instrument's and
@@ -581,7 +596,7 @@ public:
         out.sampledFrames = sampled_;
         out.renderClockedFrames = renderClocked_;
         out.renderPeriod = samplingOk_ ? renderPeriod_ : 1u;
-        out.samplePeriod = samplingOk_ ? kSamplePeriod : 1u;
+        out.samplePeriod = samplingOk_ ? samplePeriod_ : 1u;
         for (unsigned f = 0; f < kFamilies; ++f) {
             out.renderMs[f] = static_cast<double>(renderTicks_[f]) * msPerTick;
             out.otherMs[f] = static_cast<double>(otherTicks_[f]) * msPerTick;
@@ -650,6 +665,7 @@ private:
     int64_t freq_ = 0, lastTick_ = 0, windowStart_ = 0;
     uint32_t renderTid_ = 0;
     unsigned renderPeriod_;
+    unsigned samplePeriod_;
     bool clocks_ = true;
     Floor floor_;
     emcpu::Floor emFloor_;
@@ -775,7 +791,8 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
         emRenderCalls += r.emRenderCalls[p];
     }
     double totalMs = emRenderMs;
-    for (unsigned f = 0; f < kFamilies; ++f) totalMs += r.renderMs[f];
+    for (unsigned f = 0; f < kFamilies; ++f)
+        if (f < kSubmission || f > kResourceSubmission) totalMs += r.renderMs[f];
 
     char total[32] = "-";
     if (anyClocked) std::snprintf(total, sizeof(total), "%.3f ms", totalMs / clocked);
@@ -788,12 +805,22 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
                r.frames, r.pausedFrames, r.standingDown ? ", stood down now" : "", r.presentP50Ms, r.presentP95Ms,
                r.renderClockedFrames, r.frames, r.renderPeriod, total);
     if (anyClocked) {
-        for (unsigned f = 0; f < kFamilies; ++f) {
+        for (unsigned f = 0; f < kSubmission; ++f) {
             callsText(calls, sizeof(calls), static_cast<double>(r.renderCalls[f]) / clocked);
             tk.add(f == 0 ? " = " : " + ", "%s %.3f ms (calls %s)", kInfo[f].name, r.renderMs[f] / clocked, calls);
         }
         callsText(calls, sizeof(calls), static_cast<double>(emRenderCalls) / clocked);
         tk.add(" + ", "engine motion hooks %.3f ms (calls %s)", emRenderMs / clocked, calls);
+        for (unsigned f = kSubmission; f <= kResourceSubmission; ++f) {
+            if (!r.renderCalls[f]) { tk.add("; ", "%s - (no sampled calls)", kInfo[f].name); continue; }
+            callsText(calls, sizeof(calls), static_cast<double>(r.renderCalls[f]) / clocked);
+            tk.add("; ", "%s %.3f ms (calls %s); excluded from EDVR total",
+                kInfo[f].name, r.renderMs[f] / clocked, calls);
+        }
+        for (unsigned f = kPreparation; f < kFamilies; ++f) {
+            callsText(calls, sizeof(calls), static_cast<double>(r.renderCalls[f]) / clocked);
+            tk.add("; ", "%s %.3f ms (calls %s)", kInfo[f].name, r.renderMs[f] / clocked, calls);
+        }
     } else {
         if (r.clocksOff)
             tk.add(" = ", "render thread: clocks off (EDVR_FLAT_CPU_CLOCKS=1 turns them on)");

@@ -124,6 +124,27 @@ inline std::string joined(const edvr::flatcpu::Lines& lines) {
 }
 inline bool has(const std::string& text, const std::string& needle) { return text.find(needle) != std::string::npos; }
 
+// packLines drops the separator when a whole token starts a continuation line.
+// Require every expected token exactly once, in order, separated only by its
+// normal punctuation or that complete continuation boundary.
+template <size_t N>
+inline bool matchesReportTokens(const std::string& text, const char* const (&tokens)[N],
+                                const char* const (&separators)[N - 1]) {
+    size_t end = 0;
+    for (size_t i = 0; i < N; ++i) {
+        const size_t at = text.find(tokens[i]);
+        if (at == std::string::npos || text.find(tokens[i], at + std::strlen(tokens[i])) != std::string::npos)
+            return false;
+        if (i) {
+            if (at < end) return false;
+            const std::string boundary = text.substr(end, at - end);
+            if (boundary != separators[i - 1] && boundary != "\nflat cpu 5s (cont.): ") return false;
+        }
+        end = at + std::strlen(tokens[i]);
+    }
+    return true;
+}
+
 // Runs `frames` frames of `interval` ticks, each doing `work` on the render thread (the caller's),
 // and `otherWork` on the worker thread when there is one; returns the window closed at the end.
 struct Run {
@@ -285,9 +306,14 @@ inline int flatCpuTests() {
         const std::string text = joined(lines);
         expect(got && lines.count >= 1, "an empty window still closes and prints");
         bool all = true;
-        for (unsigned fam = 0; fam < flatcpu::kFamilies; ++fam)
+        for (unsigned fam = 0; fam < flatcpu::kFamilies; ++fam) {
+            if (fam >= flatcpu::kSubmission && fam <= flatcpu::kResourceSubmission) continue;
             all = all && has(text, std::string(flatcpu::kInfo[fam].name) + " 0.000 ms (calls 0.0)");
+        }
         expect(all, "every family is on the line of an empty window, as zeros");
+        expect(has(text, "D3D11 draw submission - (no sampled calls)") &&
+               has(text, "Present downstream - (no sampled calls)"),
+               "unobserved downstream calls print a dash rather than zero cost");
         expect(has(text, "EDVR per frame total 0.000 ms"), "and the total is zero");
         expect(has(text, "GPU frame - (") && has(text, "GPU resolve - ("), "a GPU span nobody timed prints a dash, not 0.00");
         expect(!has(text, "GPU frame p50") && !has(text, "GPU resolve p50"), "and no percentile");
@@ -468,10 +494,45 @@ inline int flatCpuTests() {
         const std::string text = joined(lines);
         expect(got && r.queries.served[depth] == 300ull * 1130 && r.queries.sampled[depth] == 20 && r.queries.sampled[blend] == 10,
                "the window sums the frames' query counts");
-        expect(has(text, "query shortcuts (answers a frame from what the runtime tracks; one frame in 64 also asks the context and compares): "
-                         "coverage depth view 1130.0 (checked 20, wrong 0), coverage shader identity 0.0 (checked 0, wrong 0), "
-                         "game blend state 40.0 (checked 10, wrong 0)"),
-               "the line says how many questions a frame were answered from what the runtime tracks, per state, and how many were checked");
+        const char* const queryTokens[] = {
+            "query shortcuts (answers a frame from what the runtime tracks; one frame in 64 also asks the context and compares)",
+            "coverage depth view 1130.0 (checked 20, wrong 0)",
+            "coverage shader identity 0.0 (checked 0, wrong 0)",
+            "game blend state 40.0 (checked 10, wrong 0)",
+            "game render targets 0.0 (checked 0, wrong 0)",
+            "MRT6 read-back 0.0 (checked 0, wrong 0)",
+            "no state asks the context again"
+        };
+        const char* const querySeparators[] = {": ", ", ", ", ", ", ", ", ", "; "};
+        expect(matchesReportTokens(text, queryTokens, querySeparators),
+               "the report lists every query state exactly once, in order, with its answers and checks across continuation lines");
+        // Controls: accept a break at any token boundary; reject a lost, repeated
+        // or reordered token, including when the sequence otherwise looks valid.
+        const size_t queryTokenCount = sizeof(queryTokens) / sizeof(queryTokens[0]);
+        std::string sequence = queryTokens[0];
+        for (size_t i = 1; i < queryTokenCount; ++i) sequence += std::string(querySeparators[i - 1]) + queryTokens[i];
+        expect(matchesReportTokens(sequence, queryTokens, querySeparators), "query token control: an unwrapped sequence passes");
+        for (size_t i = 0; i < queryTokenCount; ++i) {
+            std::string missing = sequence;
+            missing.erase(missing.find(queryTokens[i]), std::strlen(queryTokens[i]));
+            expect(!matchesReportTokens(missing, queryTokens, querySeparators), "query token control: a missing token fails");
+            std::string duplicated = sequence;
+            duplicated.insert(duplicated.find(queryTokens[i]), std::string(queryTokens[i]) + ", ");
+            expect(!matchesReportTokens(duplicated, queryTokens, querySeparators), "query token control: a duplicated token fails");
+            if (!i) continue;
+            std::string wrapped = sequence;
+            const size_t boundary = wrapped.find(queryTokens[i]) - std::strlen(querySeparators[i - 1]);
+            wrapped.replace(boundary, std::strlen(querySeparators[i - 1]), "\nflat cpu 5s (cont.): ");
+            expect(matchesReportTokens(wrapped, queryTokens, querySeparators), "query token control: a continuation boundary passes");
+            wrapped.replace(boundary, std::strlen("\nflat cpu 5s (cont.): "), "\n");
+            expect(!matchesReportTokens(wrapped, queryTokens, querySeparators), "query token control: a bare newline fails");
+            std::string reordered;
+            for (size_t j = 0; j < queryTokenCount; ++j) {
+                if (j) reordered += querySeparators[j - 1];
+                reordered += queryTokens[j == i - 1 ? i : j == i ? i - 1 : j];
+            }
+            expect(!matchesReportTokens(reordered, queryTokens, querySeparators), "query token control: reordered tokens fail");
+        }
         expect(has(text, "no state asks the context again"), "and says that no state fell back");
         expect(!lines.truncated, "and the window still fits the lines");
         // A state that fell back is named, with how often it asks now.

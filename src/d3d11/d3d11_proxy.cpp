@@ -36,6 +36,7 @@
 #include "vr_ssaa_hold.h"  // vrSsaaHoldEarlyInstall: the Supersampling hold's hooks at DLL load
 #include "mode_watch.h"    // modeWatchStart: the 3D mode watch, started after the profile lines
 #include "oculus_route.h"
+#include "proxy_passthrough_policy.h"
 
 extern "C" const EdvrNativeStartupRouting edvrNativeStartupRouting = {
     sizeof(EdvrNativeStartupRouting), EDVR_NATIVE_STARTUP_VERSION_1,
@@ -57,6 +58,7 @@ HMODULE g_realModule = nullptr;    // what exports currently forward to
 HMODULE g_systemModule = nullptr;  // Windows' own, always resolved, never null
 HMODULE g_selfModule = nullptr;
 std::wstring* g_moduleDir = nullptr;
+edvr::ProxyPassthroughPolicy g_startupPolicy{};
 // The file name of the graphics wrapper that handles the immediate context, written once before the flag (see
 // contextHookModeFor and flat_wrapper_note.h).
 char g_wrapperFile[64] = {};
@@ -148,7 +150,7 @@ size_t g_missingExports = 0;
 // called: the generated thunks jump through a table that has to be populated.
 // Config parsing and opening the log wait for ensureInitialised().
 void loaderPhase() {
-    edvr::breadcrumb("gfx: DllMain attach");
+    if (g_startupPolicy.edvrEnabled()) edvr::breadcrumb("gfx: DllMain attach");
 
     g_moduleDir = new std::wstring(edvr::moduleDirectory(g_selfModule));
 
@@ -165,13 +167,32 @@ void loaderPhase() {
     // returned. Loading the system copy first is not wasted: it guarantees every
     // export has somewhere to go for the window between DllMain and the first
     // export call, which is the window a deferred-only design would leave empty.
-    g_realModule = edvr::loadRealModule(*g_moduleDir, "", L"d3d11.dll", L"d3d11.dll");
+    if (g_startupPolicy.edvrEnabled()) {
+        g_realModule = edvr::loadRealModule(*g_moduleDir, "", L"d3d11.dll", L"d3d11.dll");
+    } else {
+        // The shared helper emits diagnostics and fatal-note files. A baseline
+        // proxy does neither: only load the system copy and populate its table.
+        wchar_t systemDir[MAX_PATH]{};
+        const UINT n = GetSystemDirectoryW(systemDir, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            const std::wstring path = std::wstring(systemDir) + L"\\d3d11.dll";
+            g_realModule = LoadLibraryW(path.c_str());
+        }
+    }
     g_systemModule = g_realModule;   // kept so chaining can fall back to it
     if (!g_realModule) {
-        edvr::breadcrumb("gfx: FAILED to load real d3d11.dll");
+        if (g_startupPolicy.edvrEnabled()) {
+            edvr::breadcrumb("gfx: FAILED to load real d3d11.dll");
+        } else {
+            // Generated thunks have no null guard, even when system loading
+            // fails. Keep the established unresolved-export fallback usable.
+            g_missingExports = edvr::resolveProcs(
+                nullptr, kExportNames, kExportCount, edvr_realProcs_d3d11,
+                reinterpret_cast<void*>(&edvr_unresolved_d3d11));
+        }
         return;
     }
-    edvr::breadcrumb("gfx: real d3d11 loaded");
+    if (g_startupPolicy.edvrEnabled()) edvr::breadcrumb("gfx: real d3d11 loaded");
 
     g_missingExports = edvr::resolveProcs(
         g_realModule, kExportNames, kExportCount, edvr_realProcs_d3d11,
@@ -185,7 +206,7 @@ void loaderPhase() {
     g_systemCreateDevice = g_realCreateDevice;
     g_systemCreateDeviceAndSwapChain = g_realCreateDeviceAndSwapChain;
 
-    edvr::breadcrumb(g_realCreateDevice ? "gfx: exports resolved, loader phase done"
+    if (g_startupPolicy.edvrEnabled()) edvr::breadcrumb(g_realCreateDevice ? "gfx: exports resolved, loader phase done"
                                         : "gfx: FAILED no D3D11CreateDevice");
 }
 
@@ -226,7 +247,7 @@ void chainThroughOtherProxy(edvr::Config& cfg) {
     const edvr::RealDllChoice choice = edvr::chooseRealDll(flatProfile, flatValue, sharedValue);
     const std::string said =
         edvr::realDllLogLine(choice, flatProfile, edvr::kIniNameVr, edvr::kIniNameFlat);
-    if (!said.empty()) edvr::Log::get().note("%s", said.c_str());
+    if (g_startupPolicy.edvrEnabled() && !said.empty()) edvr::Log::get().note("%s", said.c_str());
     const std::string configured = choice.value;
     if (configured.empty()) return;
 
@@ -243,7 +264,7 @@ void chainThroughOtherProxy(edvr::Config& cfg) {
     wchar_t want[MAX_PATH]{};
     if (GetFullPathNameW(path.c_str(), MAX_PATH, want, nullptr) &&
         _wcsicmp(self, want) == 0) {
-        edvr::Log::get().note(
+        if (g_startupPolicy.edvrEnabled()) edvr::Log::get().note(
             "advanced.real_dll points at edvr itself (%S). Ignored -- chaining to "
             "ourselves would recurse forever. Point it at the OTHER mod's renamed dll.",
             want);
@@ -252,7 +273,7 @@ void chainThroughOtherProxy(edvr::Config& cfg) {
 
     const HMODULE chained = LoadLibraryW(path.c_str());
     if (!chained) {
-        edvr::Log::get().note(
+        if (g_startupPolicy.edvrEnabled()) edvr::Log::get().note(
             "advanced.real_dll = %s could not be loaded from %S (error %lu). Still "
             "forwarding to the system d3d11.dll, so edvr works and the other mod does "
             "not. Check the name and that the file is really there.",
@@ -266,7 +287,7 @@ void chainThroughOtherProxy(edvr::Config& cfg) {
     auto create = reinterpret_cast<PFN_D3D11CreateDevice>(
         GetProcAddress(chained, "D3D11CreateDevice"));
     if (!create) {
-        edvr::Log::get().note(
+        if (g_startupPolicy.edvrEnabled()) edvr::Log::get().note(
             "advanced.real_dll = %s loaded but exports no D3D11CreateDevice, so it is "
             "not a d3d11 proxy. Ignored; still forwarding to the system d3d11.dll.",
             configured.c_str());
@@ -291,7 +312,7 @@ void chainThroughOtherProxy(edvr::Config& cfg) {
     }
     // else: keep the system one resolved during the loader phase.
 
-    edvr::Log::get().note(
+    if (g_startupPolicy.edvrEnabled()) edvr::Log::get().note(
         "chaining through %S -- %zu export(s) from it, %zu from the system d3d11.dll, "
         "%zu unresolved",
         path.c_str(), kExportCount - fromSystem - missing, fromSystem, missing);
@@ -300,6 +321,14 @@ void chainThroughOtherProxy(edvr::Config& cfg) {
 INIT_ONCE g_initOnce = INIT_ONCE_STATIC_INIT;
 
 BOOL CALLBACK initOnceCallback(PINIT_ONCE, PVOID, PVOID*) {
+    if (!g_startupPolicy.edvrEnabled()) {
+        // Preserve advanced.real_dll and profile-specific config selection,
+        // but open no log, pin no module and start no EDVR diagnostics/workers.
+        edvr::Config& cfg = edvr::Config::get();
+        cfg.init(*g_moduleDir);
+        chainThroughOtherProxy(cfg);
+        return TRUE;
+    }
     edvr::breadcrumb("gfx: first export call, opening log");
     edvr::Config& cfg = edvr::Config::get();
     cfg.init(*g_moduleDir);
@@ -420,6 +449,7 @@ struct CreateDepth {
 bool g_loopReported = false;
 
 void reportLoopOnce() {
+    if (!g_startupPolicy.edvrEnabled()) return;
     if (g_loopReported) return;
     g_loopReported = true;
     // A breadcrumb as well as the log: breadcrumbs are written immediately with
@@ -619,9 +649,9 @@ extern "C" HRESULT WINAPI edvr_impl_D3D11CreateDevice(
     ID3D11Device** ppDevice, D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppContext) {
     if (!g_realCreateDevice) return E_FAIL;
-    ensureInitialised();
-
     CreateDepth depth;
+    if (g_startupPolicy.initialiseCreation(depth.reentrant())) ensureInitialised();
+
     PFN_D3D11CreateDevice target = g_realCreateDevice;
     if (depth.reentrant()) {
         reportLoopOnce();
@@ -633,7 +663,8 @@ extern "C" HRESULT WINAPI edvr_impl_D3D11CreateDevice(
                numFeatureLevels, sdkVersion, ppDevice, pFeatureLevel, ppContext);
     // Only hook on the way out of the OUTERMOST call. Hooking the device a
     // second time on the way back up would install our vtable copy twice.
-    if (SUCCEEDED(hr) && ppDevice && *ppDevice && !depth.reentrant()) {
+    if (g_startupPolicy.attachDeviceAllowed(depth.reentrant()) &&
+        SUCCEEDED(hr) && ppDevice && *ppDevice) {
         attachToDevice(*ppDevice, nullptr, driverType, flags, hr);
     }
     return hr;
@@ -646,9 +677,9 @@ extern "C" HRESULT WINAPI edvr_impl_D3D11CreateDeviceAndSwapChain(
     ID3D11Device** ppDevice, D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppContext) {
     if (!g_realCreateDeviceAndSwapChain) return E_FAIL;
-    ensureInitialised();
-
     CreateDepth depth;
+    if (g_startupPolicy.initialiseCreation(depth.reentrant())) ensureInitialised();
+
     PFN_D3D11CreateDeviceAndSwapChain target = g_realCreateDeviceAndSwapChain;
     if (depth.reentrant()) {
         reportLoopOnce();
@@ -659,7 +690,8 @@ extern "C" HRESULT WINAPI edvr_impl_D3D11CreateDeviceAndSwapChain(
     const HRESULT hr = target(
         adapter, driverType, software, flags, featureLevels, numFeatureLevels, sdkVersion,
         swapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppContext);
-    if (SUCCEEDED(hr) && ppDevice && *ppDevice && !depth.reentrant()) {
+    if (g_startupPolicy.attachDeviceAllowed(depth.reentrant()) &&
+        SUCCEEDED(hr) && ppDevice && *ppDevice) {
         attachToDevice(*ppDevice, ppSwapChain ? *ppSwapChain : nullptr, driverType, flags, hr);
     }
     return hr;
@@ -683,19 +715,30 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         case DLL_PROCESS_ATTACH:
             g_selfModule = module;
             DisableThreadLibraryCalls(module);
+            {
+                wchar_t value[2]{};
+                const DWORD n = GetEnvironmentVariableW(L"EDVR_PASSTHROUGH", value, 2);
+                g_startupPolicy.passthrough = edvr::proxyPassthroughRequested(value, n);
+            }
             // Native routing is a build capability, available before Elite's
             // first VR probe. No configuration or logging under loader lock.
-            edvr::oculusRouteInstallEarly(true);
-            if (!edvr::oculusRouteProcessAttachAllowed())
-                return FALSE;
+            if (g_startupPolicy.edvrEnabled()) {
+                edvr::oculusRouteInstallEarly(true);
+                if (!edvr::oculusRouteProcessAttachAllowed())
+                    return FALSE;
+            }
             loaderPhase();
-            edvr::inputGateInstallEarly();
+            if (g_startupPolicy.edvrEnabled()) edvr::inputGateInstallEarly();
             // The VR Supersampling hold's hooks (vr_ssaa_hold.h): pure memory reads and writes, the build gate first, so a
             // stranger's process (the installer) refuses them silently. No config, file or log here.
-            edvr::vrSsaaHoldEarlyInstall();
+            if (g_startupPolicy.edvrEnabled()) edvr::vrSsaaHoldEarlyInstall();
             break;
 
         case DLL_PROCESS_DETACH:
+            // Passthrough started no EDVR workers or hooks and is deliberately
+            // unpinned. Do not initialize diagnostics or feature teardown on a
+            // FreeLibrary unload, or write files at process exit.
+            if (!g_startupPolicy.edvrEnabled()) break;
             edvr::oculusRouteUninstallEarly();
             // reserved != NULL means process termination: other threads are
             // already dead and may have been holding our spinlock or the heap

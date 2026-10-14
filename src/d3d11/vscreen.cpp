@@ -74,6 +74,7 @@
 #include "vscreen_footprint.h"   // fix.vscreen_res_width = auto's footprint instrument (the on-foot screen's width in the eye)
 #include "map_wait.h"         // the game's time inside Map, for the native timing line
 #include "flat_runtime.h"
+#include "flat_cpu.h"
 #include "flat_temporal.h"   // bounded, flat-profile-only scene discovery
 #include "cross_profile_cost.h"   // the flat PS constant-buffer observer's cost while VR is active (log only)
 #include "../common/runtime_profile.h"
@@ -109,6 +110,12 @@ std::atomic<bool> g_aaOffDraw{false};
 std::atomic<bool> g_shadowsSkipped{false};
 
 namespace {
+
+template<class Call>
+auto resourceSubmission(Call call) -> decltype(call()) {
+    flatcpu::Scope submission(flatcpu::kResourceSubmission);
+    return call();
+}
 
 // nullptr invalidates every cached input (command-list execution); otherwise
 // only writes to a source instance, bone or camera buffer invalidate them.
@@ -3221,7 +3228,7 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
     // abandoned. Drop that record before the driver can recycle its pointer.
     flatRuntimeMapBouncePreMap(res);
     if (g_flatComputeInternal) {
-        const HRESULT hr=g_state->realMap(self,res,sub,type,flags,mapped);
+        const HRESULT hr=resourceSubmission([&] { return g_state->realMap(self,res,sub,type,flags,mapped); });
         flatRuntimeMapBounceNoteMap(self,res,sub,type,true,SUCCEEDED(hr));
         return hr;
     }
@@ -3234,7 +3241,7 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
     if (type != D3D11_MAP_READ) uiAtlasNoteWrite(res, 1);  // one load until an atlas is watched
     if (foreignContext(self)) {
         if(type!=D3D11_MAP_READ)engineVelocityResourceUnknown(res);
-        const HRESULT hr=s->realMap(self, res, sub, type, flags, mapped);
+        const HRESULT hr=resourceSubmission([&] { return s->realMap(self, res, sub, type, flags, mapped); });
         flatRuntimeMapBounceNoteMap(self,res,sub,type,false,SUCCEEDED(hr));
         if (type!=D3D11_MAP_READ && SUCCEEDED(hr) && flatRuntimeActive())
             flatRuntimeOverlayForeignMutation();
@@ -3255,15 +3262,15 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
     if (mapWaitArmed()) {
         if (edvr::mapWaitSampleNext(edvr::mapWaitSampleSeq())) {
             LARGE_INTEGER mapT0{}; QueryPerformanceCounter(&mapT0);
-            hr = s->realMap(self, res, sub, type, flags, mapped);
+            hr = resourceSubmission([&] { return s->realMap(self, res, sub, type, flags, mapped); });
             LARGE_INTEGER mapT1{}; QueryPerformanceCounter(&mapT1);
             edvr::mapWaitNote(type, mapT1.QuadPart > mapT0.QuadPart ? static_cast<uint64_t>(mapT1.QuadPart - mapT0.QuadPart) : 0u);
         } else {
-            hr = s->realMap(self, res, sub, type, flags, mapped);
+            hr = resourceSubmission([&] { return s->realMap(self, res, sub, type, flags, mapped); });
         }
         edvr::mapWaitCall(type);
     } else {
-        hr = s->realMap(self, res, sub, type, flags, mapped);
+        hr = resourceSubmission([&] { return s->realMap(self, res, sub, type, flags, mapped); });
     }
     // THE MAP SUCCEEDED AND GAVE US SUBRESOURCE 0, asked once.
     //
@@ -3414,7 +3421,7 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
         engineVelocityResourceUnknown(res);
         if (flatRuntimeActive()) flatRuntimeOverlayForeignMutation();
         bounceLease.finish();
-        s->realUnmap(self, res, sub);
+        resourceSubmission([&] { s->realUnmap(self, res, sub); });
         return;
     }
     motionResourceWritten(res);
@@ -3490,7 +3497,7 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
         s->bbBytes = 0;
     }
     bounceLease.finish();
-    s->realUnmap(self, res, sub);
+    resourceSubmission([&] { s->realUnmap(self, res, sub); });
 }
 
 // The quad-skip re-issue, lifted out of forwardWithVerdict and NOINLINE.
@@ -4363,7 +4370,7 @@ void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
         drawCensusCopy('R', dst, 0, 0, 0, src, 0, false, 0, 0, 0, 0,
                        foreignContext(self));
     }
-    g_state->realCopyResource(self, dst, src);
+    resourceSubmission([&] { g_state->realCopyResource(self, dst, src); });
 }
 
 // The depth clear, record-only: the planet's terrain colour landing at all
@@ -4433,10 +4440,13 @@ void STDMETHODCALLTYPE hookedEnd(ID3D11DeviceContext* self,
 void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
     ID3D11DeviceContext* self, ID3D11Buffer* args, UINT off) {
     if (runtimeFlatProfile()) {
+        flatcpu::Scope drawHook(flatcpu::kOther);
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
         FlatRuntimeDrawScope flatDraw(self, 0, 'Z');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw(args, off);
-        g_state->realDrawIndexedInstancedIndirect(self, args, off);
+        drawHook.timeChild(flatcpu::kSubmission, [&] {
+            g_state->realDrawIndexedInstancedIndirect(self, args, off);
+        });
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { g_state->realDrawIndexedInstancedIndirect(self, args, off); });
         return;
@@ -4465,10 +4475,13 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
 void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
                                                    ID3D11Buffer* args, UINT off) {
     if (runtimeFlatProfile()) {
+        flatcpu::Scope drawHook(flatcpu::kOther);
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
         FlatRuntimeDrawScope flatDraw(self, 0, 'Y');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw(args, off);
-        g_state->realDrawInstancedIndirect(self, args, off);
+        drawHook.timeChild(flatcpu::kSubmission, [&] {
+            g_state->realDrawInstancedIndirect(self, args, off);
+        });
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { g_state->realDrawInstancedIndirect(self, args, off); });
         return;
@@ -4547,8 +4560,8 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
                        box ? box->right : 0, box ? box->bottom : 0,
                        foreignContext(self));
     }
-    g_state->realCopySubresourceRegion(self, dst, dstSub, dstX, dstY, dstZ, src, srcSub,
-                                       box);
+    resourceSubmission([&] { g_state->realCopySubresourceRegion(self, dst, dstSub, dstX, dstY, dstZ, src, srcSub,
+                                       box); });
 }
 
 // The CPU-upload path, recorded as kind 'U' with the destination box and no
@@ -4598,8 +4611,8 @@ void STDMETHODCALLTYPE hookedUpdateSubresource(ID3D11DeviceContext* self,
         flatRuntimeUpdate(dst, data, box);
     }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalUpdate(dst, data, box);
-    g_state->realUpdateSubresource(self, dst, dstSub, box, data, rowPitch,
-                                   depthPitch);
+    resourceSubmission([&] { g_state->realUpdateSubresource(self, dst, dstSub, box, data, rowPitch,
+                                   depthPitch); });
 }
 
 // The MSAA resolve, recorded as kind 'V'. The one call that turns a
@@ -4629,7 +4642,7 @@ void STDMETHODCALLTYPE hookedResolveSubresource(ID3D11DeviceContext* self,
     if (drawCensusArmed()) {
         drawCensusResolve(dst, dstSub, src, srcSub, static_cast<uint32_t>(fmt));
     }
-    g_state->realResolveSubresource(self, dst, dstSub, src, srcSub, fmt);
+    resourceSubmission([&] { g_state->realResolveSubresource(self, dst, dstSub, src, srcSub, fmt); });
 }
 
 // --- the FSS resolution fix's viewport half (fss_res.h) ---------------------
@@ -4750,6 +4763,7 @@ static inline bool flatStationSkipsDraw(ID3D11DeviceContext* self) {
 void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT start) {
     if (gpuPassProfileCapturing()) gpuPassProfileNoteDraw(self, 'D', count, 1);
     if (runtimeFlatProfile()) {
+        flatcpu::Scope drawHook(flatcpu::kOther);
         if (flatStationSkipsDraw(self)) return;
         ++g_state->thunkHits[kHitDraw];
         // Capture original game bindings before the temporal scope substitutes
@@ -4762,7 +4776,9 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         }
         FlatRuntimeDrawScope flatDraw(self, 1, 'D', count, 0, static_cast<int32_t>(start));
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
-        g_state->realDraw(self, count, start);
+        drawHook.timeChild(flatcpu::kSubmission, [&] {
+            g_state->realDraw(self, count, start);
+        });
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { g_state->realDraw(self, count, start); });
         return;
@@ -4804,10 +4820,13 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
 void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
     if (gpuPassProfileCapturing()) gpuPassProfileNoteDraw(self, 'A', 0, 1);
     if (runtimeFlatProfile()) {
+        flatcpu::Scope drawHook(flatcpu::kOther);
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
         FlatRuntimeDrawScope flatDraw(self, 0, 'A');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
-        g_state->realDrawAuto(self);
+        drawHook.timeChild(flatcpu::kSubmission, [&] {
+            g_state->realDrawAuto(self);
+        });
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { g_state->realDrawAuto(self); });
         return;
@@ -4824,6 +4843,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
                                          UINT startIndex, INT baseVertex) {
     if (gpuPassProfileCapturing()) gpuPassProfileNoteDraw(self, 'I', count, 1);
     if (runtimeFlatProfile()) {
+        flatcpu::Scope drawHook(flatcpu::kOther);
         if (flatStationSkipsDraw(self)) return;
         ++g_state->thunkHits[kHitDrawIndexed];
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, count, 1);
@@ -4835,7 +4855,9 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         }
         FlatRuntimeDrawScope flatDraw(self, 1, 'I', count, startIndex, baseVertex);
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
-        g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+        drawHook.timeChild(flatcpu::kSubmission, [&] {
+            g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+        });
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { g_state->realDrawIndexed(self, count, startIndex, baseVertex); });
         return;
@@ -4879,6 +4901,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
                                            UINT startInstance) {
     if (gpuPassProfileCapturing()) gpuPassProfileNoteDraw(self, 'N', perInstance, instances);
     if (runtimeFlatProfile()) {
+        flatcpu::Scope drawHook(flatcpu::kOther);
         if (flatStationSkipsDraw(self)) return;
         if (self == g_state->ownerCtx && flatTemporalCapturing())
             flatTemporalDraw(self, perInstance, instances);
@@ -4891,7 +4914,9 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         FlatRuntimeDrawScope flatDraw(self, instances, 'N', perInstance, 0,
                                       static_cast<int32_t>(startVertex), startInstance);
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
-        g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
+        drawHook.timeChild(flatcpu::kSubmission, [&] {
+            g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
+        });
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); });
         return;
@@ -4946,6 +4971,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
                                                   UINT startInstance) {
     if (gpuPassProfileCapturing()) gpuPassProfileNoteDraw(self, 'X', perInstance, instances);
     if (runtimeFlatProfile()) {
+        flatcpu::Scope drawHook(flatcpu::kOther);
         if (flatStationSkipsDraw(self)) return;
         if (self == g_state->ownerCtx && flatTemporalCapturing())
             flatTemporalDraw(self, perInstance, instances);
@@ -4959,8 +4985,10 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
         FlatRuntimeDrawScope flatDraw(self, instances, 'X', perInstance, startIndex,
                                       baseVertex, startInstance);
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
-        g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
-                                          baseVertex, startInstance);
+        drawHook.timeChild(flatcpu::kSubmission, [&] {
+            g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
+                                              baseVertex, startInstance);
+        });
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); });
         return;

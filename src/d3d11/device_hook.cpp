@@ -76,6 +76,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "scheduler_stack_probe.h"
 #include "temporal_pass.h"   // temporalPassArmEyeDump: the eye dump key's job
 #include "flat_runtime.h"
+#include "flat_cpu.h"
 #include "flat_hdr_crumbs.h"   // the flat HDR route's crash-safe breadcrumbs: the real Present's pair
 #include "format_support_log.h"   // the device capability log: the two hooks' reports and its closing tick
 #include "flat_temporal.h"   // flat profile discovery at owned Present
@@ -1781,7 +1782,11 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         }
     }
     const int64_t presentT0 = qpcNow();
-    const HRESULT hr = g_state->realPresent(self, syncInterval, flags);
+    HRESULT hr;
+    {
+        flatcpu::Scope submission(flatcpu::kPresent);
+        hr = g_state->realPresent(self, syncInterval, flags);
+    }
     const int64_t presentT1 = qpcNow();
     // The stall sampler's heartbeat (stall_watch.h): the render thread has just presented. A relaxed store and a
     // compare; the first call starts the watchdog thread, or says that advanced.freeze_location turned it off.

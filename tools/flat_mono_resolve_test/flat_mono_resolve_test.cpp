@@ -2,6 +2,7 @@
 // real GPU inputs and deliberately clobber state; SDK image quality is separate.
 #include "../../src/d3d11/flat_mono_resolve.h"
 #include "../../src/d3d11/flat_projection_math.h"
+#include "../../src/common/temporal_math.h"
 #include "../../src/d3d11/dlaa.h"
 #include "../../src/d3d11/fsr3_engine.h"
 #include "../../src/d3d11/metal_fx_engine.h"
@@ -39,6 +40,8 @@ float expectedNear=.025f;
 // Descriptor jitter recorded at the MetalFX seam.
 float observedMfxJx=0,observedMfxJy=0;bool observedMfxAutoExposure=false;int mfxCalls=0;
 edvr::mfx::FxGeneration observedMfxGeneration=edvr::mfx::FxGeneration::Metal3;
+bool captureMfxColor=false;std::vector<unsigned char> observedMfxColor;
+ID3D11Texture2D* observedMfxColorResource=nullptr;
 float observedMotion=0,observedMotionY=0,observedDepth=0;unsigned observedReject=0;
 // The whole motion texture the SDK was handed, decoded, and a hash over its raw bits: the shader's complete
 // output for the frame, so "bit-identical" can be asserted rather than sampled at one pixel.
@@ -189,8 +192,10 @@ bool xessAvailable(ID3D11Device*,const char**){return true;}
 void xessReleaseFeatures(){}
 void xessShutdown(){}
 bool xessBuiltIn(){return true;}
-bool xessEvaluate(ID3D11DeviceContext*,unsigned,ID3D11Texture2D*,ID3D11Texture2D*,ID3D11Texture2D*,
-                  ID3D11Texture2D*,uint32_t,uint32_t,uint32_t,uint32_t,float,float,bool,bool,const char**){return false;}
+bool xessEvaluate(ID3D11DeviceContext* c,unsigned,ID3D11Texture2D*,ID3D11Texture2D* depth,ID3D11Texture2D* mv,
+                  ID3D11Texture2D* out,uint32_t,uint32_t,uint32_t,uint32_t,float jx,float jy,bool reset,bool,const char** why){
+    return backend(c,depth,mv,nullptr,out,jx,jy,reset,why);
+}
 bool dlaaEvaluate(ID3D11DeviceContext* c,int slot,ID3D11Texture2D* colour,ID3D11Texture2D* depth,ID3D11Texture2D* mv,
     ID3D11Texture2D* out,ID3D11Texture2D* mask,uint32_t w,uint32_t h,uint32_t outW,uint32_t outH,float jx,float jy,bool reset,float,const char** why,bool hdr) {
     backendSlots.push_back(slot);
@@ -223,6 +228,10 @@ bool mfxEvaluate(ID3D11DeviceContext* c,ID3D11Texture2D* colour,ID3D11Texture2D*
     ID3D11Texture2D* out,uint32_t w,uint32_t h,uint32_t outW,uint32_t outH,float jx,float jy,bool reset,
     const char** why,bool hdr, edvr::mfx::FxGeneration generation) {
     observedMfxGeneration=generation;
+    if(captureMfxColor) {
+        observedMfxColorResource=colour;
+        check(readWhole(c,colour,observedMfxColor,8),"MetalFX complete FP16 input readback");
+    }
     ++mfxCalls;backendSlots.push_back(-1);
     observedInW=w;observedInH=h;observedOutW=outW;observedOutH=outH;
     observedHdr=hdr;observedColourFormat=DXGI_FORMAT_UNKNOWN;observedOutFormat=DXGI_FORMAT_UNKNOWN;

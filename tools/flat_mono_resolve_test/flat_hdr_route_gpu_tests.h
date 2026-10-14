@@ -11,6 +11,7 @@
 // overshoots the input range or makes a NaN; every refusal leaves the game's texture bit for bit what it was; the game's
 // pipeline state is restored on every exit; and the LDR route after an HDR frame is what it was.
 #pragma once
+#include "../../src/d3d11/flat_diagnostic.h"
 
 namespace hdrgpu {
 // R11G11B10_FLOAT by hand: no sign, 5 exponent bits (bias 15), 6 mantissa bits for red and green and 5 for blue.
@@ -1044,4 +1045,37 @@ inline void hdrRouteGpuTests(ID3D11Device* device, ID3D11DeviceContext* context)
         // The rig's default for whoever runs next: the gate shut, as on a Windows device.
         edvr::hdrCrumbEnable(false);
     }
+    // All selector combinations through the HDR in-place finish. These exercise the actual spatial
+    // shader/raw-radiance route and the state guard, not just the SDK seam or a source-string pin.
+    f={};f.color=hSrv.Get();f.depth=depthView.Get();f.hdr=true;
+    f.renderWidth=f.outputWidth=w;f.renderHeight=f.outputHeight=h;f.deltaMs=16.667f;f.frame=120000;
+    camera(f.camera);camera(f.previousCamera);expectedJx=expectedJy=0;expectedNear=f.camera[3][2];
+    for(const auto mode:{FlatMonoResolveMode::Taa,FlatMonoResolveMode::Xess,FlatMonoResolveMode::Fsr,FlatMonoResolveMode::Mfx,FlatMonoResolveMode::Mfx4}) {
+        edvr::flatMonoResolveReset();f.mode=mode;
+        const auto diagnosticRoute=edvr::flatResolveRoute(mode,f.renderWidth,f.renderHeight,f.outputWidth,f.outputHeight);
+        f.jitterCycle=edvr::temporalXessJitterPhases(8,f.renderWidth,f.renderHeight,diagnosticRoute.evalWidth,diagnosticRoute.evalHeight);
+
+        for(unsigned bits=0;bits<16;++bits) {
+            edvr::flatdiag::publish(edvr::flatdiag::selection(true,!(bits&1),!(bits&2),!(bits&4),!(bits&8)));
+            const int calls=backendCalls;edvr::flatdiag::clearCounts();
+            for(unsigned step=0;step<2;++step) {
+                fill([&](UINT,UINT,double* c){c[0]=step?3.5:2.5;c[1]=1.5;c[2]=.5;});
+                ++f.frame;bindOriginal();ComPtr<ID3D11ShaderResourceView> output;const char* why="unset";
+                check(edvr::flatMonoResolve(device,context,f,&output,&why) && !output && !why && restored(),
+                      "HDR isolation keeps in-place output and restores every original binding");
+                std::vector<uint32_t> got;
+                bool same=readH(got) && got.size()==texels.size();
+                for(size_t i=0;same && i<got.size();++i) {
+                    double actual[3]{},want[3]{};unpack(got[i],actual);unpack(texels[i],want);
+                    for(int k=0;k<3;++k)same &= std::abs(actual[k]-want[k])<=ulp(want[k],mantissa(k));
+                }
+                check(same,"HDR isolation displays current radiance above one, with no stale frame or UNORM clamp");
+                check(backendCalls==calls+(!(bits&8) && mode!=FlatMonoResolveMode::Taa?int(step+1):0),
+                      "HDR backend disabled only when requested, independently of preparation");
+            }
+            check(edvr::flatdiag::counts[edvr::flatdiag::Prepared]==((bits&2)?0u:2u) &&
+                  edvr::flatdiag::counts[edvr::flatdiag::Finished]==2,"HDR diagnostic work counts prove treatment remains active");
+        }
+    }
+    edvr::flatdiag::publish(0);edvr::flatdiag::clearCounts();edvr::flatMonoResolveReset();
 }

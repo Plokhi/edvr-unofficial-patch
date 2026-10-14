@@ -12,7 +12,13 @@ namespace edvr {
 inline bool flatProfileReadsKey(const char* key) {
     if (!key) return false;
     if (std::strncmp(key, "log.", 4) == 0 || std::strcmp(key, "advanced.real_dll") == 0) return true;
-    return std::strcmp(key, "advanced.d3d11_fixes") == 0 ||
+    // Temporary opt-in flat isolation controls, shared with the installer view.
+    return std::strcmp(key, "diagnostic.flat_session") == 0 ||
+        std::strcmp(key, "diagnostic.flat_motion") == 0 ||
+        std::strcmp(key, "diagnostic.flat_preparation") == 0 ||
+        std::strcmp(key, "diagnostic.flat_composition") == 0 ||
+        std::strcmp(key, "diagnostic.flat_backend") == 0 ||
+        std::strcmp(key, "advanced.d3d11_fixes") == 0 ||
         std::strcmp(key, "advanced.input_gate") == 0 ||
         std::strcmp(key, "advanced.flat_camera_producer_probe") == 0 ||
         std::strcmp(key, "hotkey.menu") == 0 ||

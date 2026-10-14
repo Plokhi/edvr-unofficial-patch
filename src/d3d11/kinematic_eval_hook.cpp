@@ -477,39 +477,30 @@ uintptr_t __fastcall bracket(uint32_t job,uintptr_t a,uintptr_t b,
         ~JobBit(){t_jobMask=prev;}
     } jobBit(job);
     KinematicEvalProbe* probe=observer.load(std::memory_order_acquire);
-    // Timing runs whenever the hooks own the job bodies, probe armed or not
-    // (the L1 brackets-only remeasure, perf doc 2026-09-20 17:55): the
-    // detailed observer's cost enters the measured region only while it is
-    // actually capturing, which is exactly the with/without comparison L1
-    // wants. The probe global is process-lifetime, so a flight with the
-    // probe never attached (fix.temporal_aa on) times too. jobs[] now
-    // accumulates per-session, not per capture window. Ownership capture
-    // stays capture-gated: observe()/noteOwnership keep their active() gates.
-    if(probe && probe->active())probe->noteOwnership(job,a);
+    // Job-body and dirty-queue statistics feed only the diagnostic JSON;
+    // motion observers and JobBit attribution above remain live. Keep full
+    // statistics during an explicit capture, otherwise let the sampled CPU
+    // instrument alone decide whether the forward needs clock readings.
+    const bool capture=probe && probe->active();
+    if(capture)probe->noteOwnership(job,a);
     // Job 2's dirty-queue append counter, read at entry (exit read after
     // the body below). Outside the timed region: L1 measures the job body,
-    // not this probe. Goes to the process-lifetime global, not the observer
-    // pointer, so flights without an eye run capture it too.
+    // not this probe. Capture statistics go to the process-lifetime global,
+    // with the same capture gate as the job timings.
     uint32_t queueEntry=0;
-    const bool queueArmed=(job==2)&&readQueueCount(a,&queueEntry);
+    const bool queueArmed=capture && (job==2)&&readQueueCount(a,&queueEntry);
     // Capture boundary (2026-09-20 review finding 8): samples commit only to
     // the generation they started in -- a reset/re-arm mid-job drops the
     // completion instead of contaminating the new capture -- and the three
     // counters publish between seq toggles so the JSON writer's seqlocked
     // read never serializes a torn snapshot. No drain: the finishing thread
     // may itself be inside an observed job, so draining could self-deadlock.
-    const uint64_t gen=kinematicEvalProbe.jobGeneration();
-    // The bracket takes its own two clock readings (the job statistics below
-    // need them on every call) and hands the same two to the instrument, so a
-    // sampled frame adds only the instrument's enter and its leave here, and a
-    // frame it does not clock adds nothing (engine_motion_cpu.h: pauseAt and
-    // resumeAt read no clock). The timed region is unchanged.
-    const int64_t start=qpcNow();
-    engineMotion.pauseAt(start);
-    const uintptr_t result=forward(a,b,c,d);
-    const int64_t stop=qpcNow();
-    engineMotion.resumeAt(stop);
-    const int64_t elapsed=stop-start;
+    const uint64_t gen=capture ? kinematicEvalProbe.jobGeneration() : 0;
+    // Capture shares its two readings with the instrument. Outside capture,
+    // pause/resume read no clock on unsampled frames and take no job-stat locks.
+    int64_t elapsed=0;
+    const uintptr_t result=cpuTimedForward(engineMotion,capture,[] { return qpcNow(); },
+        [&] { return forward(a,b,c,d); },elapsed);
     if(queueArmed) {
         // Exit read after the timing stops: the measured region stays the
         // job body alone. A torn/missing exit read drops the pair.
@@ -528,7 +519,7 @@ uintptr_t __fastcall bracket(uint32_t job,uintptr_t a,uintptr_t b,
             }
         }
     }
-    if(elapsed>0 && g_qpcFreq>0 && gen==kinematicEvalProbe.jobGeneration()) {
+    if(capture && elapsed>0 && g_qpcFreq>0 && gen==kinematicEvalProbe.jobGeneration()) {
         auto* stats=kinematicEvalProbe.jobStats();
         const uint64_t ns=uint64_t(elapsed)*1000000000ull/uint64_t(g_qpcFreq);
         stats[job].seq.fetch_add(1,std::memory_order_relaxed); // odd: commit in flight

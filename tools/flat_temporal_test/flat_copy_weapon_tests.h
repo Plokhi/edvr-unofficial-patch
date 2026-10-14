@@ -514,9 +514,9 @@ inline int flatCopyWeaponWiringTests() {
             "flatWeaponRoute(s.hdrKey==FlatHdrKey::Auto,s.hdrLatch.tripped,s.engine,k.width,k.height,", "==FlatWeaponRoute::Copy;",
             "weaponMotionFamilyVs(k.vs)", "copyWeapon()) {", "d.firstPersonCohort=!predictedWorld&&!worldCamera;",
             "(s.hdrKey==FlatHdrKey::Auto || copyWeapon())", "if(copyWeapon()) {", "d.alternateHdr=true;", "} else {",
-            "d.overlayProtected=true;", "overlayPlanned=true;", "FlatMonoFrame selected = [&]() -> FlatMonoFrame {",
+            "d.overlayProtected=true;", "overlayPlanned=flatdiag::enabled(flatdiag::Composition);", "FlatMonoFrame selected = [&]() -> FlatMonoFrame {",
             "flatRuntimeObserve(s.prefix, d);"}) &&
-            count(text, "d.overlayProtected=true;") == 1 && count(text, "overlayPlanned=true;") == 1 &&
+            count(text, "d.overlayProtected=true;") == 1 && count(text, "overlayPlanned=flatdiag::enabled(flatdiag::Composition);") == 1 &&
             count(text, "d.alternateHdr=true;") == 1 && count(text, "d.firstPersonCohort=") == 1;
     };
     expect(dispositionValid(scope),
@@ -584,7 +584,7 @@ inline int flatCopyWeaponWiringTests() {
     const std::string helper = compact(body(runtime, "static void foregroundContractAtH("));
     const auto helperValid = [&](const std::string& text) {
         return ordered(text, {
-            "f.foregroundRequired=f.mode!=FlatMonoResolveMode::Taa&&selected.mixedCamera;", "if(!f.foregroundRequired)return;",
+            "f.foregroundRequired=flatdiag::foregroundEnabled()&&f.mode!=FlatMonoResolveMode::Taa&&selected.mixedCamera;", "if(!f.foregroundRequired)return;",
             "s.foregroundRoute.pin(selected.depth);", "++s.foregroundCounts.hAttempts;", "if(!f.hdr)++s.copyWeaponWindow.hAttempts;",
             "candidate->pendingNull.matches(", "failH(\"foreground-pending-null-not-selected-world\");",
             "candidate->pendingNull.describeMismatch(", "flat foreground pending-null mismatch %u/12",
@@ -595,6 +595,8 @@ inline int flatCopyWeaponWiringTests() {
             "f.foregroundDepthNear=foregroundOutput.depthNear;", "++s.foregroundCounts.hQualified;", "if(!f.hdr)++s.copyWeaponWindow.hQualified;"});
     };
     expect(helperValid(helper), "the helper holds the whole H qualification, in the HDR route's order, and counts the copy route's attempts apart");
+    expect(!helperValid(without(helper, "flatdiag::foregroundEnabled()&&")),
+           "mutation control: losing the diagnostic foreground gate fails the wiring");
     expect(!helperValid(without(helper, "f.foregroundFrame=foregroundOutput.frame;")), "mutation control: a map handed over without its frame fails the wiring");
     expect(!helperValid(without(helper, "flat foreground pending-null mismatch %u/12")), "mutation control: losing the mismatch line fails the wiring");
     expect(!helperValid(without(helper, "f.foregroundResetRequired=foregroundOutput.resetRequired;")), "mutation control: losing the reset request fails the wiring");
