@@ -704,7 +704,8 @@ void alteredLineCases() {
     logAndResetWindow(start + 30000);
     line = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
     check(line && line->find("pool-family draws (EDVR's slot target and shaders) -, "
-                             "UI draws (redirected to EDVR's layer) -, other fix-wrapped draws -;") != std::string::npos &&
+                             "UI draws (redirected to EDVR's layer) -, HUD draws moved into the HDR HUD layer "
+                             "(the game's shading at the layer size) -, other fix-wrapped draws -;") != std::string::npos &&
               line->find("\"-\" means no such draw ran this window") != std::string::npos,
           "altered line: a window with no altered draw prints '-' for all three and says what that means");
     // The timer floor and the spans count include the altered sections' own timers.
