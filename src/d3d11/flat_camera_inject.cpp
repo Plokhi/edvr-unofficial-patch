@@ -193,10 +193,12 @@ struct InjectState {
     std::atomic<uint64_t> closes{0};           // frames closed through flatCameraInjectClose
     std::atomic<uint64_t> cleanCloses{0};      // ... of which the phase machine called clean
     std::atomic<uint64_t> historyResets{0};    // owner switches that reset the runtime's history
-    // The observe-only mode (flatCameraInjectObserveFrame): set before the hook is installed and never cleared, so
-    // the detour that exists in a VR process can only ever observe. False for the flat profile's whole life.
+    // The observe-only mode (flatCameraInjectObserveFrame): set before the hook is installed and never cleared by the
+    // VR side, so the detour that exists in a VR process can only ever observe. The flat profile's frame step clears
+    // it when it takes the frame over after a live switch (takeOverFromVr). False for a flat process that never ran VR.
     std::atomic<bool> observeOnly{false};
-    std::atomic<uint64_t> observedCalls{0};    // owner-thread calls the observe-only detour reported
+    bool stayObserveLogged = false;            // the "stays observe-only" note was written since the last re-arm
+    std::atomic<uint64_t> observedCalls{0};   // owner-thread calls the observe-only detour reported
     uint64_t windowFrames = 0;                 // frames begun this window (census denominator)
     uint32_t ownerNotes = 0;                   // owner-transition notes written (capped)
     FlatCameraRoute lastRoute = FlatCameraRoute::Off;
@@ -595,7 +597,7 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         refreshPreVr(r0, ctx, p2, camera, callNo, gate, vrBits);
         return;
     }
-    // The VR camera census's switch: a process that observes only never leaves it (flatCameraInjectObserveFrame).
+    // The VR camera census's switch: a process that observes only stays observe-only until the flat step re-arms it (takeOverFromVr).
     const bool observe = g_inject.observeOnly.load(std::memory_order_acquire);
     if (gate == FlatCameraGateVerdict::OffThread) {
         g_inject.offThreadCalls.fetch_add(1, std::memory_order_relaxed);
@@ -629,7 +631,6 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     admission.gate = gate;
     admission.observeOnly = observe;
     if (readable && kind == 3) {
-        g_inject.kind3Seen.store(true, std::memory_order_relaxed);
         if (!observe) { // observe mode asks the flat runtime nothing: there is no phase to read
             flatRuntimePhaseState(&jx, &jy, &rw, &rh, &applied);
             admission.upstreamOwns = g_inject.core.valid() && g_inject.core.route() == FlatCameraRoute::Upstream;
@@ -637,6 +638,9 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         }
     }
     const FlatCameraAdmit admit = flatCameraAdmit(admission);
+    // The fallback's release run counts kind-3 calls the injector could have injected on. An Observed call (a hook left observe-only)
+    // is a miss: set here, after the admission, rather than at the kind test above, so no observe-only state can release Legacy.
+    if (readable && kind == 3 && flatCameraAdmitCountsForRelease(admit)) g_inject.kind3Seen.store(true, std::memory_order_relaxed);
     switch (admit) {
         case FlatCameraAdmit::Unsupported:
             g_inject.unsupportedCameras.fetch_add(1, std::memory_order_relaxed);
@@ -652,6 +656,23 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         case FlatCameraAdmit::Observed:
         case FlatCameraAdmit::OffThread: break;
     }
+    // THE SIGNATURE SAMPLE (flat_camera_signature.h; log-only, no behaviour change). One kind-3 call in sixteen has
+    // its frustum read (four SEH-guarded loads, reads only, ahead of any write of the injection) and is counted by
+    // signature, with whether it ended injected. It sits ahead of the observe-only return so it measures in both
+    // modes: behind that return, a hook left observe-only printed kind3-calls=0 beside a census counting 42,360 kind-3
+    // calls a window (the 2026-10-14 06:21 log). Every exit reports it exactly once through noteSignature (the
+    // observe-only exit reports it uninjected); a window that never reaches this code prints no
+    // `flat camera signatures` line at all.
+    FlatCameraSignature signature;
+    const bool signatureSampled = readable && kind == 3 && g_inject.signatures.noteKind3Call();
+    if (signatureSampled) {
+        const FlatCameraVrFrustum f = readFrustum(camera);
+        signature = flatCameraSignatureOf(f.aspect, f.fov, f.nearZ, f.farZ, callerRva);
+    }
+    const auto noteSignature = [&](bool injected) noexcept {
+        if (signatureSampled) g_inject.signatures.note(signature, injected);
+    };
+    if (observe) noteSignature(false);  // the observe-only exit below: seen, never injected
     // THE OBSERVE-ONLY RETURN. Whatever the admission said (it cannot say Inject here), the census's call ends at
     // this block: no flush, no bound pair, no flag, no restore is reached below it. The pin in
     // tools\vr_camera_census_test holds this block ahead of every write in this function.
@@ -663,19 +684,6 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // the last phase, and the game re-derives only what its dirty bits name.
     // One write, once per such edge, never on a camera never injected.
     if (flatCameraFlushDecision(g_inject.injected, camera, admit)) flushCamera(camera);
-    // THE SIGNATURE SAMPLE (flat_camera_signature.h; log-only, no behaviour change). One kind-3 call in sixteen has
-    // its frustum read (four SEH-guarded loads, before any write of the injection) and is counted by signature,
-    // with whether it ended injected. Every exit below reports it exactly once through noteSignature; a window that
-    // never reaches this code prints no `flat camera signatures` line at all.
-    FlatCameraSignature signature;
-    const bool signatureSampled = readable && kind == 3 && g_inject.signatures.noteKind3Call();
-    if (signatureSampled) {
-        const FlatCameraVrFrustum f = readFrustum(camera);
-        signature = flatCameraSignatureOf(f.aspect, f.fov, f.nearZ, f.farZ, callerRva);
-    }
-    const auto noteSignature = [&](bool injected) noexcept {
-        if (signatureSampled) g_inject.signatures.note(signature, injected);
-    };
     if (admit != FlatCameraAdmit::Inject) {
         // A camera that is not the proven branch is named by the census (kinds, top cameras),
         // counted by the tick (kind-refusals, unsupported) and left untouched.
@@ -866,6 +874,34 @@ void installRefreshHook(bool observe, const char* vrAsked = nullptr) {
                     hex1, reinterpret_cast<void*>(callbackLiteral), reinterpret_cast<void*>(fwd), hex2, hex3);
 }
 
+// The flat frame step runs, so the flat profile has the frame. A process that started VR left the detour observe-only (the census's
+// switch is never cleared by the census) and possibly left the route's per-frame word at "driven"; a live switch to flat would
+// otherwise keep every kind-3 call "Observed", never injected. Re-arm the hook for injection once the VR side is out of the way
+// (flatCameraFlatTakeover); until then it stays observe-only and begin() hands the frame to Legacy. Once per flat frame, render thread.
+void takeOverFromVr() {
+    const uint32_t bits = g_vrBits.load(std::memory_order_acquire);
+    const bool observeOnly = g_inject.observeOnly.load(std::memory_order_acquire);
+    if (!observeOnly && bits == 0) return;  // a flat process that never ran VR: nothing to undo
+    const FlatCameraFlatTakeover t = flatCameraFlatTakeover(observeOnly, g_observer.load(std::memory_order_acquire) != nullptr, bits,
+                                                            g_inject.injected.empty());
+    if (t.clearVrBits) g_vrBits.store(0u, std::memory_order_release);
+    if (t.clearObserveOnly) {
+        g_inject.observeOnly.store(false, std::memory_order_release);
+        // A new contract: the decision, the history and the fallback's verdict were made under observation, and the VR census's window
+        // counts (calls, signatures) describe the other profile.
+        g_inject.core.reset();
+        g_inject.census.reset();
+        g_inject.signatures.reset();
+        g_inject.windowFrames = 0;
+        g_inject.stayObserveLogged = false;
+        Log::get().note("flat camera inject: switched from observe-only (VR census) to injection after a profile switch");
+    } else if (observeOnly && !g_inject.stayObserveLogged) {
+        g_inject.stayObserveLogged = true;
+        Log::get().note("flat camera inject: stays observe-only; legacy owns (a VR census observer or the VR world route still holds the "
+                        "detour: route word %u); injection resumes when they are gone", bits);
+    }
+}
+
 } // namespace
 
 bool flatCameraInjectUpstreamOwns() {
@@ -941,9 +977,13 @@ void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled) {
     }
     if (frame != g_inject.frame) {
         g_inject.frame = frame;
+        takeOverFromVr();
         // The upstream route is certified per call (the detour re-verifies kind
-        // 3); the fallback hysteresis feeds the policy's unsupported input.
-        const FlatCameraOwnershipDecision& decision = g_inject.core.begin(flatRuntimeLegacyPlanExists());
+        // 3), unless the hook is still observe-only (it cannot inject, and
+        // Legacy owns from this frame); the fallback hysteresis feeds the
+        // policy's unsupported input.
+        const FlatCameraOwnershipDecision& decision = g_inject.core.begin(
+            flatRuntimeLegacyPlanExists(), g_inject.observeOnly.load(std::memory_order_acquire));
         ++g_inject.windowFrames;
         if (decision.historyReset) g_inject.historyResets.fetch_add(1, std::memory_order_relaxed);
         const FlatCameraRoute route = g_inject.core.route();
@@ -1046,8 +1086,9 @@ void flatCameraInjectSetObserver(const FlatCameraObserver* observer) {
 }
 
 bool flatCameraInjectObserveFrame() {
-    // Before any install: the first call the new hook ever sees already observes, and the detour in a VR process can
-    // never leave the mode. The flat profile never reaches this function (its frame step is flatCameraInjectFrame).
+    // Before any install: the first call the new hook ever sees already observes, and the VR side never leaves the mode (only the
+    // flat profile's frame step re-arms it, after a live switch: takeOverFromVr). The flat profile never reaches this function
+    // (its frame step is flatCameraInjectFrame).
     g_inject.observeOnly.store(true, std::memory_order_release);
     // A detour the VR world route drives (flatCameraVrFrame ran first this frame): its injection frame keeps its mode -- the
     // census never switches an injection frame to observe-only -- and any other frame of it is the census's. The word is zero

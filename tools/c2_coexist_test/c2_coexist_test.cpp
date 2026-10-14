@@ -1046,6 +1046,92 @@ void testC17() {
     }
 }
 
+// C18 (2026-10-14): a hook left observe-only by the VR census, then a live switch to the flat profile. Every kind-3 call is admitted as
+// Observed and never injected; the ownership machine used to keep offering Upstream (upstreamCertified = true), which failed three armed
+// frames, was handed to Legacy, counted the Observed calls as kind-3 frames, released after 60 and tried Upstream again: a 63-frame cycle
+// of history resets and zero-jitter frames, the visible 1.3 Hz AA on/off of the 06:21 log. The fix has two independent halves, and each
+// is checked alone against the cycle: Legacy owns from the first frame (begin's observeOnly argument), and an Observed call is a miss for
+// the release run (flatCameraAdmitCountsForRelease), so no observe-only state can cycle.
+struct ObserveFrames {
+    FlatCameraFrameCore core;
+    uint64_t upstreamFrames = 0, legacyFrames = 0, historyResets = 0, ownerSwitches = 0, injectedFrames = 0;
+    FlatCameraRoute last = FlatCameraRoute::Off;
+    // One frame: begin, one kind-3 call admitted the way the detour would admit it, close. certifyObserve: begin's observeOnly argument.
+    // callObserve: the detour's observe-only flag for the call. countObservedAsKind3: the OLD kind3Seen rule (the control).
+    void frame(bool certifyObserve, bool callObserve, bool countObservedAsKind3) {
+        const FlatCameraOwnershipDecision& d = core.begin(true, certifyObserve);
+        if (core.takeHistoryReset()) ++historyResets;
+        const FlatCameraRoute route = core.route();
+        if (route != last) ++ownerSwitches;
+        last = route;
+        if (route == FlatCameraRoute::Upstream) ++upstreamFrames;
+        if (route == FlatCameraRoute::Legacy) ++legacyFrames;
+        FlatCameraAdmitInput in;
+        in.readable = true; in.kind = 3; in.gate = FlatCameraGateVerdict::Admit;
+        in.upstreamOwns = route == FlatCameraRoute::Upstream; in.phaseNonzero = true; in.observeOnly = callObserve;
+        const FlatCameraAdmit admit = flatCameraAdmit(in);
+        const bool injected = admit == FlatCameraAdmit::Inject;
+        if (injected) ++injectedFrames;
+        const bool kind3 = countObservedAsKind3 ? true : flatCameraAdmitCountsForRelease(admit);
+        const bool armed = d.owner == FlatCameraOwner::Upstream;
+        // A Legacy frame treats cleanly (the phase machine's verdict); an Upstream frame is clean only when an injection landed.
+        core.close(armed, injected, injected || route == FlatCameraRoute::Legacy, true, kind3);
+    }
+};
+void testC18() {
+    std::printf("C18 observe-only hook after a live switch to flat: no ownership cycle\n");
+    {
+        FlatCameraAdmit all[] = {FlatCameraAdmit::Inject, FlatCameraAdmit::Warming, FlatCameraAdmit::NotUpstream, FlatCameraAdmit::GateClosed,
+                                 FlatCameraAdmit::OffThread, FlatCameraAdmit::Unsupported, FlatCameraAdmit::OtherKind,
+                                 FlatCameraAdmit::Unreadable, FlatCameraAdmit::Observed};
+        bool table = true;
+        for (FlatCameraAdmit a : all) {
+            const bool want = a == FlatCameraAdmit::Inject || a == FlatCameraAdmit::Warming || a == FlatCameraAdmit::NotUpstream ||
+                              a == FlatCameraAdmit::GateClosed;
+            if (flatCameraAdmitCountsForRelease(a) != want) table = false;
+        }
+        check(table && !flatCameraAdmitCountsForRelease(FlatCameraAdmit::Observed),
+              "C18 only the four admissions the injector could still inject on count toward the release run; Observed is a miss");
+    }
+    constexpr uint32_t kFrames = 700;
+    {   // CONTROL: the old rules (Upstream offered to an observe-only hook, Observed counted as kind 3) cycle.
+        ObserveFrames old;
+        for (uint32_t i = 0; i < kFrames; ++i) old.frame(false, true, true);
+        check(old.core.fallback().engagements() >= 8 && old.core.fallback().releases() >= 8 && old.historyResets >= 16 && old.injectedFrames == 0,
+              "C18 control: with the old rules an observe-only hook engages and releases Legacy every ~63 frames, resetting history each time, and never injects");
+        std::printf("  note  old rules over %u frames: engagements=%llu releases=%llu history-resets=%llu owner-switches=%llu\n", kFrames,
+                    (unsigned long long)old.core.fallback().engagements(), (unsigned long long)old.core.fallback().releases(),
+                    (unsigned long long)old.historyResets, (unsigned long long)old.ownerSwitches);
+    }
+    {   // Half one: Legacy owns from the first flat frame; Upstream is never offered, so there is no miss to count.
+        ObserveFrames f;
+        for (uint32_t i = 0; i < kFrames; ++i) f.frame(true, true, true);
+        check(f.upstreamFrames == 0 && f.legacyFrames == kFrames && f.core.fallback().engagements() == 0 && f.ownerSwitches == 1,
+              "C18 begin(legacyPlan, observeOnly): Legacy owns every frame from the first, Upstream is never offered, the fallback never engages");
+        check(f.historyResets <= 1, "C18 ...and the history is reset at most once (the first frame), not every cycle");
+    }
+    {   // Half two alone: Upstream is still offered (certified), but Observed calls are misses, so Legacy once engaged never releases.
+        ObserveFrames f;
+        for (uint32_t i = 0; i < kFrames; ++i) f.frame(false, true, false);
+        check(f.core.fallback().engagements() == 1 && f.core.fallback().releases() == 0 && f.core.fallback().active() &&
+              f.ownerSwitches == 2 && f.injectedFrames == 0,
+              "C18 Observed calls count as misses: Upstream is tried for the ON-th frames once, Legacy engages once and never releases (no cycle)");
+        check(f.upstreamFrames == kFlatCameraFallbackFramesOn && f.historyResets <= 2,
+              "C18 ...the observe-only hook costs exactly the ON frames of the one engagement, not one engagement per 63 frames");
+    }
+    {   // The re-arm: observe-only cleared (takeOverFromVr), the core reset, injection works and Upstream owns steadily.
+        ObserveFrames f;
+        for (uint32_t i = 0; i < 100; ++i) f.frame(true, true, false);   // observe-only: Legacy
+        f.core.reset();                                                   // the re-arm's fresh contract
+        const uint64_t legacyBefore = f.legacyFrames, injectedBefore = f.injectedFrames;
+        f.last = FlatCameraRoute::Off;
+        for (uint32_t i = 0; i < kFrames; ++i) f.frame(false, false, false);
+        check(f.upstreamFrames == kFrames && f.legacyFrames == legacyBefore && f.injectedFrames - injectedBefore == kFrames &&
+              f.core.fallback().engagements() == 0,
+              "C18 after the re-arm (observeOnly cleared, core reset) Upstream owns every frame, every kind-3 call injects, and the fallback stays off");
+    }
+}
+
 int runSelfTest() {
     testC1();
     testC2();
@@ -1064,6 +1150,7 @@ int runSelfTest() {
     testC15();
     testC16();
     testC17();
+    testC18();
     if (g_failures == 0) {
         std::printf("c2 coexist: PASS\n");
         return 0;
