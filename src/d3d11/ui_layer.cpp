@@ -505,6 +505,10 @@ struct Window {
     uint64_t hdrDrawTimingEligible = 0, hdrDrawTimingDisabled = 0, hdrDrawTimingIssued = 0;
     uint64_t hdrDrawTimingAborted = 0;
     uint64_t hdrDeclined[static_cast<size_t>(CrispToneDecline::kCount)] = {};
+    // The seed census's counts for the 30 s line (2026-10-13): every issued seed by reason, the same by reason for a layer's second or
+    // later seed in its frame (a layer seeded again within one frame), and the passes the seeds planned.
+    uint64_t seedReason[kUiSeedReasonCount] = {}, seedLaterReason[kUiSeedReasonCount] = {};
+    uint64_t seedsCounted = 0, seedsLater = 0, seedPassTotal = 0;
     // The VR world route (ui_layer.h): 2D screen draws re-issued into the layer, draws the game left in an eye
     // image after its screen was re-issued (lost while the route owns that eye), and the route's own refusals by
     // reason (the decision's refusals are in decided[kScreen][...] as for any family).
@@ -533,6 +537,28 @@ struct Window {
     UiSceneCompositeWindow scene;
 };
 Window g_win;
+
+// The seed census's by-reason counts (Window::seedReason). A layer is keyed by eye and HDR-ness; a seed is "later" when that layer was
+// already seeded in this frame (g_seedSeenSeq is the frame's sequence, g_seedSeenMask its layers so far). Counted only while the census is
+// armed, which the seed itself already requires (its plan comes from the census).
+uint64_t g_seedSeenSeq = ~0ull;
+uint32_t g_seedSeenMask = 0;
+void noteSeedCounts(uint64_t frameSeq, int eye, bool hdr, const UiSeedPlan& plan) {
+    if (frameSeq != g_seedSeenSeq) {
+        g_seedSeenSeq = frameSeq;
+        g_seedSeenMask = 0;
+    }
+    const uint32_t bit = 1u << static_cast<uint32_t>((eye & 1) * 2 + (hdr ? 1 : 0));
+    const bool later = (g_seedSeenMask & bit) != 0;
+    g_seedSeenMask |= bit;
+    ++g_win.seedsCounted;
+    g_win.seedPassTotal += plan.passes;
+    tallyUiSeedReasons(plan.reason, g_win.seedReason);
+    if (later) {
+        ++g_win.seedsLater;
+        tallyUiSeedReasons(plan.reason, g_win.seedLaterReason);
+    }
+}
 
 // A change of the door's size (a FOV-trim adoption, an HMD
 // Quality change, a per-eye width): the families the layer took in the two
@@ -612,7 +638,10 @@ uint64_t g_routeLatestSeq = 0;              // the newest frame a stage began in
 constexpr size_t kStages = static_cast<size_t>(UiRouteStage::kCount);
 constexpr size_t kRouteTotal = kStages;     // the stats slot of the whole route's sum
 constexpr size_t kRouteWithMoved = kStages + 1;
-constexpr bool g_hdrDrawTimingOn = false;  // the per-draw timing census is off
+// TEMPORARY (2026-10-13 measurement build): on, so the HDR HUD draws' shading in the 4032^2 layer is priced (the moved draw's census
+// item, AlteredHdrHud, and the "HDR draw price" line), and the seed census and its by-reason counters run with it. Off again after the
+// flight: it arms per-draw timers on the shared clock. Its note: docs\gpu-pass-profile-2026-10-12.md (the 2026-10-13 UI instruments).
+constexpr bool g_hdrDrawTimingOn = true;
 UiSeedCensus g_seedCensus;
 UiHdrSeedGpuProbe g_hdrSeedGpu;
 UiHdrSeedGpuProbe::Token g_hdrSeedActive = 0; // explicit outer-guard recovery for SEH
@@ -697,6 +726,9 @@ int routeBegin(ID3D11DeviceContext* ctx, UiRouteStage stage, int eye, uint64_t s
     s.stage = stage;
     s.eye = eye;
     s.seq = seq;
+    // The moved HDR draw's census item (gpu_census.h AlteredHdrHud): opened with its route timer, closed in routeEnd. A begin that
+    // fails never reaches here, so the census never opens without its timer.
+    if (stage == UiRouteStage::kHdrMovedDraw) gpuCensusBegin(ctx, GpuCensusSection::AlteredHdrHud);
     s.coverage = g_routeCoverage.begin(stage, eye, seq, g_hdrDrawTimingOn);
     if (s.coverage.combined) ++g_routeCombinedArmedPending;
     if (stage == UiRouteStage::kHdrMovedDraw) ++g_routeHdrMovedPending;
@@ -708,11 +740,14 @@ int routeBegin(ID3D11DeviceContext* ctx, UiRouteStage stage, int eye, uint64_t s
 
 void routeEnd(ID3D11DeviceContext* ctx, int idx) {
     if (idx < 0 || idx >= static_cast<int>(kRouteRing) || !ctx) return;
+    // Closes the moved HDR draw's census item opened by routeBegin (the same slot, the same stage).
+    if (g_route[idx].stage == UiRouteStage::kHdrMovedDraw) gpuCensusEnd(ctx, GpuCensusSection::AlteredHdrHud);
     g_route[idx].timer.end(ctx);  // a failed end reads back as not measured
 }
 
 void routeAbort(ID3D11DeviceContext* ctx, int idx) {
     if (idx < 0 || idx >= static_cast<int>(kRouteRing) || !ctx) return;
+    if (g_route[idx].stage == UiRouteStage::kHdrMovedDraw) gpuCensusEnd(ctx, GpuCensusSection::AlteredHdrHud);
     // Keep the FIFO entry: routePoll consumes it as Invalid and spoils its
     // stage/combined eye-frame. Reset cancels its lease on the owner context.
     g_route[idx].timer.reset(ctx);
@@ -1677,6 +1712,7 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
                                 g_draw.hdr ? "a cockpit HUD draw" : "a UI draw", seedPlan);
             if (g_seedCensus.enabled) g_seedCensus.seed(g_draw.eye, g_draw.hdr, g_draw.seq,
                 gameDs, layerW, layerH, seedPlan, seeded);
+            if (g_seedCensus.enabled && seeded) noteSeedCounts(g_draw.seq, static_cast<int>(g_draw.eye), g_draw.hdr, seedPlan);
             if (!seeded) {
                 ++g_win.seedFailures;
                 releaseSaved();
@@ -2691,6 +2727,28 @@ void logTotals(double seconds) {
         static_cast<double>(g_win.jitterCancels) / frames,
         static_cast<unsigned long long>(g_win.composites),
         static_cast<unsigned long long>(g_win.overGameImage), price.c_str());
+    // The seed census's counts (2026-10-13): per frame, every issued seed by reason, and the same for a layer's second or later seed
+    // in its frame; the passes each seed planned. Printed only while the census is armed (it is with g_hdrDrawTimingOn).
+    if (g_seedCensus.enabled) {
+        const double perFrame = frames ? static_cast<double>(frames) : 1.0;
+        std::string all, later;
+        char cell[64];
+        for (size_t i = 0; i < kUiSeedReasonCount; ++i) {
+            std::snprintf(cell, sizeof(cell), "%s%s %.2f", i ? ", " : "", uiSeedReasonName(i),
+                          static_cast<double>(g_win.seedReason[i]) / perFrame);
+            all += cell;
+            std::snprintf(cell, sizeof(cell), "%s%s %.2f", i ? ", " : "", uiSeedReasonName(i),
+                          static_cast<double>(g_win.seedLaterReason[i]) / perFrame);
+            later += cell;
+        }
+        const double seeds = static_cast<double>(g_win.seedsCounted);
+        Log::get().note(
+            "ui quality: layer seeds: %.2f a frame issued (%.2f the second or a later seed of a layer in its frame), %.2f planned "
+            "passes a seed; by reason, a frame, all seeds: %s; by reason, a frame, second or later seeds: %s. A reason can "
+            "appear with others on one seed.",
+            seeds / perFrame, static_cast<double>(g_win.seedsLater) / perFrame,
+            seeds > 0 ? static_cast<double>(g_win.seedPassTotal) / seeds : 0.0, all.c_str(), later.c_str());
+    }
     std::string moved, combined;
     const size_t movedStage = static_cast<size_t>(UiRouteStage::kHdrMovedDraw);
     appendPrice(moved, movedStage);

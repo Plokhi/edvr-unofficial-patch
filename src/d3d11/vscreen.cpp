@@ -3687,6 +3687,7 @@ __declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char
                                                  UINT instances, const DrawArgs& args) {
     if (uiLayerCrispToneBegin(self)) {
         GpuCensusScope census(self, GpuCensusSection::FrameUiLayerReissues);
+        census.markIssued();   // the tonemap re-issue: its scope opens only when the begin admitted the draw
         pureDrawReissue(self, kind, count, instances, args);
         uiLayerCrispToneEnd(self);
     }
@@ -3847,10 +3848,12 @@ void uiLayerSecondIssues(ID3D11DeviceContext* self, char kind, UINT count, UINT 
     if (uiLayerIssueBlocked()) return;
     GpuCensusScope census(self, GpuCensusSection::FrameUiLayerReissues);
     if (uiLayerMultiplyBegin(self)) {
+        census.markIssued();   // a real pass: the multiply's draw (an empty scope is one where neither begin declines to issue)
         pureDrawReissue(self, kind, count, instances, args);
         uiLayerEnd(self);
     }
     if (uiLayerWriteBackBegin(self)) {
+        census.markIssued();
         pureDrawReissue(self, kind, count, instances, args);
         uiLayerWriteBackEnd(self);
     }

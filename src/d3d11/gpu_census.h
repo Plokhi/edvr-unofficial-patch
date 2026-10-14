@@ -33,6 +33,11 @@ enum class GpuCensusSection : uint8_t {
     DoorUpscaler,             // fsr/dlaa, and the fovea crops (periphery + centre) -- nested inside DoorTemporalWhole
     DoorMotionPrep,           // the motion-vector dispatch (mvCs) -- nested inside DoorTemporalWhole
     DoorHologramResolve,      // uiDepthHologramResolve + uiDepthTemporalDepth -- nested inside DoorTemporalWhole
+    // The three parts of the hologram resolve, each nested inside DoorHologramResolve (the umbrella keeps its own figure; these are its
+    // breakdown, never added to a total). Measurement-build sections (2026-10-13 UI pass costs, audit section 5).
+    DoorHoloDepthCopy,        // the private depth copy the resolve writes into (ui_depth_layer.h's acquire: one CopyResource on first use)
+    DoorHoloNearLight,        // the near-light compute dispatch (uiDepthHologramResolve)
+    DoorHoloResolveDraw,      // the resolve draw (uiDepthHologramResolve's vScreenDrawRaw)
     DoorUiResolve,            // applyUiResolve -- nested inside DoorTemporalWhole
     DoorSharpen,              // sharpen_pass.cpp's dispatch
     DoorMenu,                 // menu_panel.cpp's dispatch
@@ -78,6 +83,9 @@ enum class GpuCensusSection : uint8_t {
     // same stride and rotation); they own the line after the main one.
     AlteredPoolFamily,        // a pool-family draw with EDVR's MRT6 slot target bound and its shaders substituted
     AlteredUiLayer,           // a UI draw redirected into EDVR's UI layer target (fix.ui_quality)
+    AlteredHdrHud,            // a HUD draw moved into the HDR HUD layer (fix.ui_quality's crisp HUD, the layer at 4032^2): the game's shading
+                              // at the layer's size, timed by the route's moved-draw timer (ui_layer.cpp routeBegin/routeEnd). TEMPORARY with
+                              // g_hdrDrawTimingOn, which is on for the 2026-10-13 measurement build.
     // A draw wrapped in another fix's state change (RemLok, the loading hologram, scrim,
     // particles, the panel ...): ONE SECTION PER FIX, kAlteredFixCount of them, in AlteredFix's
     // order. They share ONE turn in the rotation (the first owns it, turnOwnerOf), one K and one
@@ -173,11 +181,17 @@ void gpuCensusEnd(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept;
 // RAII alternative for a call site that is a clean lexical block: construct
 // at the top, let it close at scope exit (including an early return) so a
 // span can never outlive the work it times.
+// gpuCensusNoteIssued: this occurrence issued at least one real GPU pass (a draw or a dispatch), as opposed to an empty scope that
+// returned before issuing anything. Counted per section per window ("issued" on the line); unconditional and cheap.
+void gpuCensusNoteIssued(GpuCensusSection section) noexcept;
+
 class GpuCensusScope {
 public:
     GpuCensusScope(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept
         : ctx_(ctx), section_(section) { gpuCensusBegin(ctx_, section_); }
     ~GpuCensusScope() { gpuCensusEnd(ctx_, section_); }
+    // Call where a real pass is issued inside the scope (see gpuCensusNoteIssued).
+    void markIssued() noexcept { gpuCensusNoteIssued(section_); }
     GpuCensusScope(const GpuCensusScope&) = delete;
     GpuCensusScope& operator=(const GpuCensusScope&) = delete;
 

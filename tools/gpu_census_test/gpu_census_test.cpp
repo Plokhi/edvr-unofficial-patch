@@ -1463,7 +1463,32 @@ void lineLengths() {
     }
 }
 
+// 2026-10-13 instruments: the hologram sub-sections nest in the umbrella's place, the moved HDR draw is an altered class, and the reissue
+// count tells real passes from empty scopes (the section's issued counter; an empty scope never reaches it).
+void instrumentCases() {
+    check(static_cast<size_t>(GpuCensusSection::DoorHoloDepthCopy) == static_cast<size_t>(GpuCensusSection::DoorHologramResolve) + 1 &&
+              static_cast<size_t>(GpuCensusSection::DoorHoloResolveDraw) == static_cast<size_t>(GpuCensusSection::DoorUiResolve) - 1,
+          "instruments: the hologram sub-sections sit between the resolve umbrella and UI resolve");
+    check(isDoorSection(GpuCensusSection::DoorHoloNearLight), "instruments: the hologram sub-sections are door sections (K=4)");
+    check(occurrenceCapFor(GpuCensusSection::DoorHoloResolveDraw) == 4, "instruments: a hologram sub-section caps at the door's 4");
+    check(kDoorBreakdownCount == 11, "instruments: eleven door items after the temporal whole");
+    check(GpuCensusSection::AlteredHdrHud > GpuCensusSection::AlteredUiLayer && GpuCensusSection::AlteredHdrHud < GpuCensusSection::AlteredFixFirst,
+          "instruments: the moved HDR draw is an altered class, before the fix sections");
+    check(kAlteredClassSections == 3 && std::strstr(kAlteredNames[2], "HDR HUD") != nullptr, "instruments: the altered class has its name");
+
+    // The issued counter: real passes only. Three occurrences in the window: two issued a pass, one was an empty scope (no note).
+    SectionState& st = g_section[static_cast<size_t>(GpuCensusSection::FrameUiLayerReissues)];
+    const uint64_t before = st.issued;
+    gpuCensusNoteIssued(GpuCensusSection::FrameUiLayerReissues);
+    gpuCensusNoteIssued(GpuCensusSection::FrameUiLayerReissues);
+    check(st.issued - before == 2, "issued: two issued passes are counted, and an empty scope adds nothing");
+    gpuCensusNoteIssued(GpuCensusSection::Count);   // out of range: ignored, never a write past the table
+    check(st.issued - before == 2, "issued: an out-of-range section is ignored");
+    st.issued = before;   // put the window's count back as it was
+}
+
 void run() {
+    instrumentCases();
     estimatorMathCases();
     calibrationMathCases();
     logFormatCase();

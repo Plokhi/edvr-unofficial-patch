@@ -38,6 +38,9 @@ v3 fixes (2026-10-13, after the six flights on cb712758; root causes in the Log)
 - Only 4 of 30 frames captured: 4 pass-scope slots for 30 frames. Now 128, and a boundary waits for another holder of the clock.
 - probe_cube on eye passes: squareness is not the rule any more. probe_cube = not at the eye size, and square up to 1024 or a cube array.
 - Check: 252x252 one-draw passes (post_smaller in v2) now count as probe_cube under the small-square rule.
+UI instruments (2026-10-13, TEMPORARY for this measurement build: g_hdrDrawTimingOn is on in ui_layer.cpp; turn it off after the flight):
+hologram resolve split into depth copy, near-light and resolve draw; moved HDR HUD draw as its own altered item; seeds by reason;
+reissues issued vs empty. Lines in the Log.
 
 Flight plan (one press each; the hangar trial is off for all three):
 1. Sealed hangar, seated: press the key once (default 30 frames), wait for the summary lines.
@@ -92,6 +95,24 @@ Still open: no flight yet; the overhead below is an estimate, not a measurement.
 
      Probe_cube in the first capture is 1.161 ms, of which 24 one-draw 252x252 passes are the bulk (the rule the spec gives counts
      them as probes; see Status). Only 4 frames per capture: these are not 30-frame figures.
+
+- 2026-10-13, the UI instruments (from reviews\ui-pass-costs-2026-10-13.md, section 5; census and UI layer lines, no new keys):
+  1. The hologram resolve census line now has its three parts as sub-items in brackets after "hologram resolve": "hologram depth copy"
+    (ui_depth_layer.h acquire's CopyResource), "hologram near-light" (the near-light Dispatch), "hologram resolve draw" (the resolve draw).
+    They nest inside the umbrella: never added to a total. Door sections DoorHoloDepthCopy, DoorHoloNearLight, DoorHoloResolveDraw.
+  2. The moved HDR HUD draw (the route's kHdrMovedDraw timer) is its own item on the altered line: "HUD draws moved into the HDR
+    HUD layer (the game's shading at the layer size)", section AlteredHdrHud, opened with the route timer and closed with it.
+    Not EDVR's cost; not in the EDVR total.
+  3. g_hdrDrawTimingOn = true (ui_layer.cpp), TEMPORARY for this build: it arms the HDR draw price, the seed census and the seed
+    sub-price, as before. Turn it back to false after the flight.
+  4. Reissues: the UI layer reissues item now reads "[N real a frame, M empty]". A scope counts as real when a multiply, write-back or
+    tonemap re-issue actually issued its draw (GpuCensusScope::markIssued); an empty scope returned before issuing anything.
+  5. Seeds by reason, on a new line after "ui quality: layer:": "ui quality: layer seeds: X a frame issued (Y the second or a later
+    seed of a layer in its frame), Z planned passes a seed; by reason, a frame, all seeds: first observed a, new frame b, source
+    changed c, size changed d, stale draw e, stale clear f, missing depth g, missing stencil h, unknown stale i; by reason, a frame,
+    second or later seeds: ...". Bits from UiSeedReason (ui_layer_seed_census.h); a seed with two reasons counts under both.
+  Tests: gpu_census_test (instrumentCases: the sub-section order, the door count, the altered class, the issued counter) and
+  ui_quality_test (testSeedReasonTally).
 
 ## What it does
 
